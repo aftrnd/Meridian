@@ -75,6 +75,12 @@ final class VMImageProvider {
     func downloadLatestImage(onProgress: @escaping @MainActor (Double, Int64, Int64) -> Void) async throws {
         let release = try await fetchLatestRelease()
 
+        // Clean up any partial files left from a previous failed attempt
+        // so createFile() succeeds and we don't resume a corrupt partial.
+        for staleURL in [partaaURL, partabURL, compressedURL] {
+            try? FileManager.default.removeItem(at: staleURL)
+        }
+
         // Match split parts by suffix — supports both "partaa/partab" (split -a2)
         // and "part1/part2" naming so the app works with any future release format.
         let parts = release.assets
@@ -288,6 +294,8 @@ final class VMImageProvider {
         let contentLength = http.expectedContentLength
         var received: Int64 = 0
 
+        // Remove any partial file from a previous attempt before creating fresh.
+        try? FileManager.default.removeItem(at: destination)
         guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
             throw ImageError.diskWriteFailed
         }
