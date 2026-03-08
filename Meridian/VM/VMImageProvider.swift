@@ -32,7 +32,14 @@ final class VMImageProvider {
     nonisolated static let supportDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir  = base.appending(path: "com.meridian.app/vm", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // createDirectory is idempotent with withIntermediateDirectories:true —
+        // safe to call even if the directory already exists.
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            // Log but don't crash — a real write failure will surface at download time
+            print("[VMImageProvider] WARNING: could not create supportDir: \(error)")
+        }
         return dir
     }()
 
@@ -145,14 +152,14 @@ final class VMImageProvider {
                 try FileManager.default.removeItem(at: compressed)
             }
             guard FileManager.default.createFile(atPath: compressed.path(), contents: nil) else {
-                throw ImageError.diskWriteFailed
+                throw ImageError.diskWriteFailed("Could not create compressed image file at \(compressed.path())")
             }
             let compOut = try FileHandle(forWritingTo: compressed)
             defer { try? compOut.close() }
 
             for partURL in [partaa, partab] {
                 guard FileManager.default.fileExists(atPath: partURL.path()) else {
-                    throw ImageError.diskWriteFailed
+                    throw ImageError.diskWriteFailed("Part file missing after download: \(partURL.lastPathComponent)")
                 }
                 let inHandle = try FileHandle(forReadingFrom: partURL)
                 defer { try? inHandle.close() }
@@ -192,7 +199,7 @@ final class VMImageProvider {
             try FileManager.default.removeItem(at: destination)
         }
         guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
-            throw ImageError.diskWriteFailed
+            throw ImageError.diskWriteFailed("Could not create decompressed image at \(destination.path())")
         }
 
         let inHandle  = try FileHandle(forReadingFrom: source)
@@ -294,10 +301,18 @@ final class VMImageProvider {
         let contentLength = http.expectedContentLength
         var received: Int64 = 0
 
+        // Ensure the parent directory exists (guards against sandbox container timing issues)
+        let parentDir = destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+
         // Remove any partial file from a previous attempt before creating fresh.
         try? FileManager.default.removeItem(at: destination)
         guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
-            throw ImageError.diskWriteFailed
+            let writable = FileManager.default.isWritableFile(atPath: parentDir.path())
+            throw ImageError.diskWriteFailed(
+                "createFile failed for \(destination.lastPathComponent). " +
+                "Dir writable: \(writable), path: \(parentDir.path())"
+            )
         }
         let handle = try FileHandle(forWritingTo: destination)
         defer { try? handle.close() }
@@ -337,7 +352,7 @@ final class VMImageProvider {
         case releaseNotFound(String)
         case assetsNotFound(String)
         case downloadFailed(String)
-        case diskWriteFailed
+        case diskWriteFailed(String)
         case decompressionFailed
 
         var errorDescription: String? {
@@ -354,8 +369,8 @@ final class VMImageProvider {
                 return "No image assets found in release \(tag). Expected files containing '.part'."
             case .downloadFailed(let file):
                 return "Download failed for \(file)."
-            case .diskWriteFailed:
-                return "Could not write to disk. Check available storage."
+            case .diskWriteFailed(let detail):
+                return "Could not write to disk. \(detail)"
             case .decompressionFailed:
                 return "Failed to decompress the VM image. The download may be corrupt — try again."
             }
