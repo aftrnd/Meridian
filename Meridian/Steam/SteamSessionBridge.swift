@@ -87,7 +87,7 @@ final class SteamSessionBridge {
 
         for dir in candidates {
             let loginUsers = dir.appending(path: "config/loginusers.vdf")
-            if FileManager.default.fileExists(atPath: loginUsers.path()) {
+            if FileManager.default.fileExists(atPath: loginUsers.path) {
                 return dir
             }
         }
@@ -112,7 +112,7 @@ final class SteamSessionBridge {
         var copiedAny = false
         for (src, dst) in files {
             let source = steamDir.appending(path: src)
-            guard fm.fileExists(atPath: source.path()) else { continue }
+            guard fm.fileExists(atPath: source.path) else { continue }
 
             let destination = staging.appending(path: dst)
             let destDir = destination.deletingLastPathComponent()

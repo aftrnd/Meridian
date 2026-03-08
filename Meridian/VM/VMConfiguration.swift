@@ -70,12 +70,12 @@ enum VMConfiguration {
         let kernelURL = vmDir.appending(path: "vmlinuz")
         let initrdURL = vmDir.appending(path: "initrd")
 
-        guard FileManager.default.fileExists(atPath: kernelURL.path()) else {
+        guard FileManager.default.fileExists(atPath: kernelURL.path) else {
             throw ConfigError.kernelNotFound
         }
 
         let loader = VZLinuxBootLoader(kernelURL: kernelURL)
-        if FileManager.default.fileExists(atPath: initrdURL.path()) {
+        if FileManager.default.fileExists(atPath: initrdURL.path) {
             loader.initialRamdiskURL = initrdURL
         }
         // quiet        — suppress verbose boot messages
@@ -91,7 +91,7 @@ enum VMConfiguration {
     private static func makeStorageDevices(settings: AppSettings) throws -> [VZStorageDeviceConfiguration] {
         let baseImageURL = assembledImageURL
 
-        guard FileManager.default.fileExists(atPath: baseImageURL.path()) else {
+        guard FileManager.default.fileExists(atPath: baseImageURL.path) else {
             throw ConfigError.baseImageNotFound
         }
 
@@ -101,7 +101,7 @@ enum VMConfiguration {
 
         // Writable expansion disk — game installs, Steam data
         let expandURL = vmSupportDir.appending(path: "expansion.img")
-        if !FileManager.default.fileExists(atPath: expandURL.path()) {
+        if !FileManager.default.fileExists(atPath: expandURL.path) {
             try createExpansionDisk(at: expandURL, sizeGiB: settings.vmDiskGiB)
         }
         let expandAttachment = try VZDiskImageStorageDeviceAttachment(url: expandURL, readOnly: false)
@@ -112,7 +112,7 @@ enum VMConfiguration {
 
     private static func createExpansionDisk(at url: URL, sizeGiB: Int) throws {
         let sizeBytes = UInt64(sizeGiB) * 1_024 * 1_024 * 1_024
-        guard FileManager.default.createFile(atPath: url.path(), contents: nil) else {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
             throw ConfigError.diskCreationFailed
         }
         let handle = try FileHandle(forWritingTo: url)

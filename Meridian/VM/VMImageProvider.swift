@@ -54,7 +54,7 @@ final class VMImageProvider {
     /// True when the decompressed disk image exists.
     /// vmlinuz/initrd are optional — older releases may not include them.
     var isImageReady: Bool {
-        FileManager.default.fileExists(atPath: assembledImageURL.path())
+        FileManager.default.fileExists(atPath: assembledImageURL.path)
     }
 
     // MARK: - Init
@@ -148,17 +148,17 @@ final class VMImageProvider {
 
         try await Task.detached(priority: .userInitiated) {
             // Step 1: concatenate parts → compressed file
-            if FileManager.default.fileExists(atPath: compressed.path()) {
+            if FileManager.default.fileExists(atPath: compressed.path) {
                 try FileManager.default.removeItem(at: compressed)
             }
-            guard FileManager.default.createFile(atPath: compressed.path(), contents: nil) else {
-                throw ImageError.diskWriteFailed("Could not create compressed image file at \(compressed.path())")
+            guard FileManager.default.createFile(atPath: compressed.path, contents: nil) else {
+                throw ImageError.diskWriteFailed("Could not create compressed image file at \(compressed.path)")
             }
             let compOut = try FileHandle(forWritingTo: compressed)
             defer { try? compOut.close() }
 
             for partURL in [partaa, partab] {
-                guard FileManager.default.fileExists(atPath: partURL.path()) else {
+                guard FileManager.default.fileExists(atPath: partURL.path) else {
                     throw ImageError.diskWriteFailed("Part file missing after download: \(partURL.lastPathComponent)")
                 }
                 let inHandle = try FileHandle(forReadingFrom: partURL)
@@ -195,11 +195,11 @@ final class VMImageProvider {
     /// on most Macs. The streaming approach keeps the working set to two
     /// fixed-size buffers (4 MB in + 8 MB out) regardless of file size.
     private static nonisolated func decompressLZFSE(from source: URL, to destination: URL) throws {
-        if FileManager.default.fileExists(atPath: destination.path()) {
+        if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
-        guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
-            throw ImageError.diskWriteFailed("Could not create decompressed image at \(destination.path())")
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw ImageError.diskWriteFailed("Could not create decompressed image at \(destination.path)")
         }
 
         let inHandle  = try FileHandle(forReadingFrom: source)
@@ -307,11 +307,11 @@ final class VMImageProvider {
 
         // Remove any partial file from a previous attempt before creating fresh.
         try? FileManager.default.removeItem(at: destination)
-        guard FileManager.default.createFile(atPath: destination.path(), contents: nil) else {
-            let writable = FileManager.default.isWritableFile(atPath: parentDir.path())
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            let writable = FileManager.default.isWritableFile(atPath: parentDir.path)
             throw ImageError.diskWriteFailed(
                 "createFile failed for \(destination.lastPathComponent). " +
-                "Dir writable: \(writable), path: \(parentDir.path())"
+                "Dir writable: \(writable), path: \(parentDir.path)"
             )
         }
         let handle = try FileHandle(forWritingTo: destination)
