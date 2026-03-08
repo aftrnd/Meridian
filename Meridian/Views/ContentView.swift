@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var launcher = GameLauncher()
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
+    @State private var showProvision = false
 
     var body: some View {
         Group {
@@ -18,16 +19,18 @@ struct ContentView: View {
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
-                    // The API key sheet lives here — on the authenticated branch only.
-                    // Attaching it to AuthView caused a SwiftUI invariant violation:
-                    // needsAPIKey can only be true when isAuthenticated is true, but
-                    // AuthView is only shown when isAuthenticated is false, so SwiftUI
-                    // would try to present the sheet on a view that was being removed.
                     .sheet(isPresented: Binding(
                         get: { steamAuth.needsAPIKey },
                         set: { _ in }
                     )) {
                         APIKeySetupSheet()
+                    }
+                    .sheet(isPresented: $showProvision) {
+                        VMProvisionView()
+                            .environment(vmManager)
+                    }
+                    .onAppear {
+                        if case .notProvisioned = vmManager.state { showProvision = true }
                     }
             }
         }
@@ -54,10 +57,10 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            VMStatusBarView()
-                .padding(.bottom, 8)
-                .padding(.horizontal, 12)
-        }
+                VMStatusBarView(onSetUp: { showProvision = true })
+                    .padding(.bottom, 8)
+                    .padding(.horizontal, 12)
+            }
     }
 }
 

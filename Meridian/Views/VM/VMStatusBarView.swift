@@ -4,6 +4,8 @@ import SwiftUI
 struct VMStatusBarView: View {
     @Environment(VMManager.self) private var vmManager
 
+    var onSetUp: (() -> Void)?
+
     var body: some View {
         HStack(spacing: 10) {
             VMStatusPill(state: vmManager.state)
@@ -20,7 +22,12 @@ struct VMStatusBarView: View {
 
             Spacer()
 
-            if vmManager.state.isRunning {
+            if case .notProvisioned = vmManager.state {
+                Button("Set Up VM…") { onSetUp?() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+            } else if vmManager.state.isRunning {
                 Button("Stop VM") {
                     Task { await vmManager.stop() }
                 }

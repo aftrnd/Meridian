@@ -4,6 +4,7 @@ import Virtualization
 struct GameDetailView: View {
     let game: Game
 
+    @Environment(SteamLibraryStore.self)  private var library
     @Environment(VMManager.self)          private var vmManager
     @Environment(SteamAuthService.self)   private var steamAuth
     @Environment(SteamSessionBridge.self) private var sessionBridge
@@ -26,7 +27,7 @@ struct GameDetailView: View {
                 .padding(24)
             }
         }
-        .navigationTitle(game.name)
+        .navigationTitle(currentGame.name)
         .sheet(isPresented: $showProvisionSheet) {
             VMProvisionView()
                 .environment(vmManager)
@@ -91,7 +92,7 @@ struct GameDetailView: View {
             Button {
                 handlePlayTapped()
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(primaryButtonTitle, systemImage: currentGame.isInstalled ? "play.fill" : "arrow.down.circle.fill")
                     .font(.headline)
                     .frame(minWidth: 120)
             }
@@ -158,20 +159,39 @@ struct GameDetailView: View {
 
         case .failed(let msg):
             VStack(alignment: .leading, spacing: 4) {
-                Button {
-                    handlePlayTapped()
-                } label: {
-                    Label("Retry", systemImage: "arrow.clockwise")
-                        .frame(minWidth: 120)
+                if isProvisioningError(msg) {
+                    Button {
+                        showProvisionSheet = true
+                    } label: {
+                        Label("Set Up VM…", systemImage: "arrow.down.circle")
+                            .frame(minWidth: 120)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                } else {
+                    Button {
+                        handlePlayTapped()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .frame(minWidth: 120)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
                 Text(msg)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private var currentGame: Game {
+        library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    private var primaryButtonTitle: String {
+        currentGame.isInstalled ? "Play" : "Install & Play"
     }
 
     /// Play is always tappable — handlePlayTapped() decides what to show:
@@ -195,9 +215,9 @@ struct GameDetailView: View {
         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
             GridRow {
                 Text("Playtime").foregroundStyle(.secondary).font(.subheadline)
-                Text(game.playtimeFormatted).font(.subheadline)
+                Text(currentGame.playtimeFormatted).font(.subheadline)
             }
-            if let recent = game.playtime2WeekMinutes {
+            if let recent = currentGame.playtime2WeekMinutes {
                 GridRow {
                     Text("Last 2 weeks").foregroundStyle(.secondary).font(.subheadline)
                     Text("\(recent / 60) hrs").font(.subheadline)
@@ -205,9 +225,9 @@ struct GameDetailView: View {
             }
             GridRow {
                 Text("App ID").foregroundStyle(.secondary).font(.subheadline)
-                Text(String(game.id)).font(.subheadline.monospaced())
+                Text(String(currentGame.id)).font(.subheadline.monospaced())
             }
-            if game.requiresProton {
+            if currentGame.requiresProton {
                 GridRow {
                     Text("Compatibility").foregroundStyle(.secondary).font(.subheadline)
                     ProtonBadge()
@@ -252,6 +272,10 @@ struct GameDetailView: View {
 
     // MARK: - Actions
 
+    private func isProvisioningError(_ msg: String) -> Bool {
+        msg.contains("kernel") || msg.contains("provision") || msg.contains("base image")
+    }
+
     private func handlePlayTapped() {
         guard vmManager.imageProvider.isImageReady else {
             showProvisionSheet = true
@@ -259,10 +283,11 @@ struct GameDetailView: View {
         }
         Task {
             await launcher.launch(
-                game: game,
+                game: currentGame,
                 vmManager: vmManager,
                 steamAuth: steamAuth,
-                sessionBridge: sessionBridge
+                sessionBridge: sessionBridge,
+                library: library
             )
         }
     }

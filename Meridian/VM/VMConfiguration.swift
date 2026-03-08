@@ -1,5 +1,6 @@
 import Virtualization
 import Foundation
+import Darwin
 
 /// Builds a VZVirtualMachineConfiguration for the Meridian VM.
 ///
@@ -43,6 +44,11 @@ enum VMConfiguration {
     // MARK: - Build
 
     static func build(settings: AppSettings) throws -> VZVirtualMachineConfiguration {
+        // Best-effort scrub of quarantine/provenance xattrs from the VM support
+        // tree. A quarantined parent directory can cause new/updated VM artifacts
+        // to inherit quarantine and trigger opaque VZ start failures.
+        stripQuarantineRecursively(in: vmSupportDir)
+
         let config = VZVirtualMachineConfiguration()
 
         config.cpuCount   = validatedCPUCount(settings.vmCPUCount)
@@ -73,16 +79,21 @@ enum VMConfiguration {
         guard FileManager.default.fileExists(atPath: kernelURL.path) else {
             throw ConfigError.kernelNotFound
         }
+        if isGzipFile(at: kernelURL) {
+            throw ConfigError.kernelCompressed
+        }
+        // Defensive: remove quarantine xattr each start so VZ can open kernel/initrd.
+        stripQuarantine(from: kernelURL)
 
         let loader = VZLinuxBootLoader(kernelURL: kernelURL)
         if FileManager.default.fileExists(atPath: initrdURL.path) {
+            stripQuarantine(from: initrdURL)
             loader.initialRamdiskURL = initrdURL
         }
-        // quiet        — suppress verbose boot messages
-        // loglevel=3   — errors only
-        // console=hvc0 — kernel log on virtio-serial (readable from host if needed)
-        // meridian=1   — tells the guest init it is running inside Meridian
-        loader.commandLine = "quiet loglevel=3 console=hvc0 meridian=1"
+        // root=         — rootfs device in the current base image
+        // console=hvc0  — kernel log on virtio-serial (written to console.log on host)
+        // meridian=1    — tells the guest init it is running inside Meridian
+        loader.commandLine = "root=/dev/vda1 rootwait rw console=hvc0 loglevel=3 meridian=1"
         return loader
     }
 
@@ -94,9 +105,11 @@ enum VMConfiguration {
         guard FileManager.default.fileExists(atPath: baseImageURL.path) else {
             throw ConfigError.baseImageNotFound
         }
+        // VZ start can fail with generic Code=1 when sandbox files carry quarantine.
+        stripQuarantine(from: baseImageURL)
 
-        // Read-only base image (OS, Steam, FEX-EMU, Proton-GE)
-        let baseAttachment = try VZDiskImageStorageDeviceAttachment(url: baseImageURL, readOnly: true)
+        // Read-write base image (needs rw for systemd to function properly)
+        let baseAttachment = try VZDiskImageStorageDeviceAttachment(url: baseImageURL, readOnly: false)
         let baseDisk = VZVirtioBlockDeviceConfiguration(attachment: baseAttachment)
 
         // Writable expansion disk — game installs, Steam data
@@ -104,6 +117,7 @@ enum VMConfiguration {
         if !FileManager.default.fileExists(atPath: expandURL.path) {
             try createExpansionDisk(at: expandURL, sizeGiB: settings.vmDiskGiB)
         }
+        stripQuarantine(from: expandURL)
         let expandAttachment = try VZDiskImageStorageDeviceAttachment(url: expandURL, readOnly: false)
         let expandDisk = VZVirtioBlockDeviceConfiguration(attachment: expandAttachment)
 
@@ -118,6 +132,33 @@ enum VMConfiguration {
         let handle = try FileHandle(forWritingTo: url)
         try handle.truncate(atOffset: sizeBytes)
         try handle.close()
+    }
+
+    private static func stripQuarantine(from url: URL) {
+        _ = removexattr(url.path, "com.apple.quarantine", 0)
+        _ = removexattr(url.path, "com.apple.provenance", 0)
+    }
+
+    private static func isGzipFile(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 2) else { return false }
+        return data.count == 2 && data[0] == 0x1f && data[1] == 0x8b
+    }
+
+    private static func stripQuarantineRecursively(in directory: URL) {
+        stripQuarantine(from: directory)
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsPackageDescendants]
+        ) else {
+            return
+        }
+
+        for case let url as URL in enumerator {
+            stripQuarantine(from: url)
+        }
     }
 
     // MARK: - Network
@@ -142,17 +183,17 @@ enum VMConfiguration {
 
     // MARK: - Serial (kernel console only — NOT the bridge channel)
 
-    /// The serial port is kept purely for kernel boot log / recovery access.
-    /// It is NOT used by ProtonBridge — use the vsock device instead.
-    /// The host end is wired to /dev/null because users don't need to see boot
-    /// messages; if you want a debug console, replace with a socketpair attachment.
+    /// The serial port captures the kernel console (hvc0) to a log file on the host.
+    /// Tail it with: tail -f ~/Library/Containers/com.meridian.app/.../vm/console.log
     private static func makeConsoleSerialPort() -> VZSerialPortConfiguration {
         let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        let logURL = vmSupportDir.appending(path: "console.log")
+        // Truncate/create fresh log on each boot so it doesn't grow unbounded.
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
         guard
             let rh = FileHandle(forReadingAtPath: "/dev/null"),
-            let wh = FileHandle(forWritingAtPath: "/dev/null")
+            let wh = FileHandle(forWritingAtPath: logURL.path)
         else {
-            // Fallback — should never fail for /dev/null
             return serial
         }
         serial.attachment = VZFileHandleSerialPortAttachment(
@@ -166,6 +207,15 @@ enum VMConfiguration {
 
     private static func makeDirectoryShares() throws -> [VZDirectorySharingDeviceConfiguration] {
         var shares: [VZDirectorySharingDeviceConfiguration] = []
+
+        // Rosetta x86_64 translation — tag "rosetta", guest mounts at /opt/rosetta.
+        // The guest's rosetta-setup.service calls `rosetta --register` to hook binfmt_misc
+        // so x86_64 ELF binaries (Steam, Proton) run transparently via Apple's Rosetta.
+        if VZLinuxRosettaDirectoryShare.availability == .installed {
+            let rosettaFS = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+            rosettaFS.share = try VZLinuxRosettaDirectoryShare()
+            shares.append(rosettaFS)
+        }
 
         // Game library — writable. Guest mounts at /mnt/games.
         // Steam's steamapps/ symlink inside the guest points here so game installs
@@ -207,13 +257,16 @@ enum VMConfiguration {
 
     enum ConfigError: LocalizedError {
         case kernelNotFound
+        case kernelCompressed
         case baseImageNotFound
         case diskCreationFailed
 
         var errorDescription: String? {
             switch self {
             case .kernelNotFound:
-                return "VM kernel not found. Please provision the VM first."
+                return "VM kernel (vmlinuz) not found. The base image doesn't include a kernel yet — use 'Set Up VM' to install an updated image."
+            case .kernelCompressed:
+                return "VM kernel is gzip-compressed. Virtualization.framework requires an uncompressed ARM64 kernel Image. Reinstall VM artifacts with an uncompressed vmlinuz."
             case .baseImageNotFound:
                 return "Meridian base image not found. Please provision the VM first."
             case .diskCreationFailed:

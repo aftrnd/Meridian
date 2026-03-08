@@ -57,6 +57,12 @@ final class VMImageProvider {
         FileManager.default.fileExists(atPath: assembledImageURL.path)
     }
 
+    /// True when both the disk image AND kernel exist — VM can actually boot.
+    var isFullyProvisioned: Bool {
+        let kernel = Self.supportDir.appending(path: "vmlinuz")
+        return isImageReady && FileManager.default.fileExists(atPath: kernel.path)
+    }
+
     // MARK: - Init
 
     init() {
@@ -135,6 +141,16 @@ final class VMImageProvider {
         cachedTag = release.tagName
     }
 
+    /// Installs from a local LZFSE-compressed image file on disk.
+    /// Decompresses directly from the source — no intermediate copy needed.
+    func installFromLocalFile(_ sourceURL: URL) async throws {
+        let output = assembledImageURL
+
+        try await Task.detached(priority: .userInitiated) {
+            try Self.decompressLZFSE(from: sourceURL, to: output)
+        }.value
+    }
+
     /// Concatenates downloaded parts, decompresses LZFSE, and cleans up temporaries.
     /// Must be called after downloadLatestImage() completes successfully.
     /// Runs entirely on a background task — never blocks the main actor.
@@ -209,6 +225,7 @@ final class VMImageProvider {
             try? outHandle.close()
         }
 
+        print("[LZFSE] Starting decompression: \(source.lastPathComponent) → \(destination.lastPathComponent)")
         let inBufSize  = 4 * 1024 * 1024
         let outBufSize = 8 * 1024 * 1024
         let inBuf  = UnsafeMutablePointer<UInt8>.allocate(capacity: inBufSize)
@@ -257,8 +274,10 @@ final class VMImageProvider {
             case COMPRESSION_STATUS_OK:
                 continue
             case COMPRESSION_STATUS_END:
+                print("[LZFSE] Decompression complete: \(destination.lastPathComponent)")
                 return  // success
             default:
+                print("[LZFSE] Decompression error — compression_stream_process returned \(status)")
                 throw ImageError.decompressionFailed
             }
         }

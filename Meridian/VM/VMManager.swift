@@ -30,7 +30,7 @@ final class VMManager: NSObject {
     /// Cached VZVirtualMachineView — created once, `virtualMachine` updated on restart.
     private var _vmView: VZVirtualMachineView?
 
-    private let vmQueue = DispatchQueue(label: "com.meridian.vm", qos: .userInteractive)
+    let vmQueue = DispatchQueue(label: "com.meridian.vm", qos: .userInteractive)
     private var startContinuation: CheckedContinuation<Void, Error>?
 
     // MARK: - Init
@@ -76,8 +76,21 @@ final class VMManager: NSObject {
         }
     }
 
-    /// Starts the VM. Throws if not in `.stopped` state.
+    /// Provisions the VM from a local LZFSE-compressed image file on disk.
+    func provisionLocal(from url: URL) async {
+        state = .assembling
+        do {
+            try await imageProvider.installFromLocalFile(url)
+            updateProvisionedState()
+        } catch {
+            state = .error(error.localizedDescription)
+        }
+    }
+
+    /// Starts the VM. Throws if not in a startable state.
     func start() async throws {
+        // Recover from a previous error — treat it as stopped and retry.
+        if case .error = state { state = .stopped }
         guard case .stopped = state else {
             if state.isRunning { return }  // already running — no-op
             throw VMError.notStopped
