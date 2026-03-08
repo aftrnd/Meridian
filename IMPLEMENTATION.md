@@ -4,6 +4,27 @@ macOS 26 / Swift 6 native app that virtualizes Windows Steam games via a lightwe
 
 ---
 
+## Current Status (as of last session)
+
+**What works:**
+- Steam sign-in (OpenID via ASWebAuthenticationSession + local BSD-socket loopback server)
+- Steam library display (direct api.steampowered.com calls with user's API key)
+- Provisioning sheet launches and starts downloading from GitHub Releases
+- Asset matching updated for actual release naming (`partaa/partab` + LZFSE)
+- Play button is always tappable (routes to provision sheet or launch correctly)
+
+**What to test next:**
+- Full provision: download → join parts → LZFSE decompress → `meridian-base.img`
+- VM boot (requires vmlinuz + initrd in the release, or manually placed in supportDir)
+- Bridge connection via vsock port 1234 (requires meridian-bridge daemon in guest image)
+
+**Known remaining work (guest side):**
+- The current `v1.0.2-base` release has no `vmlinuz` or `initrd` assets — VM cannot boot yet
+- `meridian-bridge` daemon not yet built/published
+- See Phase 1 in Roadmap below
+
+---
+
 ## Architecture Overview
 
 ```
@@ -272,3 +293,25 @@ The `meridian-base.img` must contain:
 - [ ] Proton compatibility ratings from ProtonDB API
 - [ ] Mac Menu Bar quick-access for running games
 - [ ] Sparkle or in-app update for the macOS app itself
+
+---
+
+## Bug Fix History (post-architecture overhaul)
+
+### Play button always greyed out
+`canLaunch` required `vmManager.state == .stopped`, which excluded `.notProvisioned` (no image downloaded yet) and any error state. The button was permanently disabled and the provision sheet was unreachable.  
+**Fix:** `canLaunch` now only disables during active VM transitions (starting/stopping/downloading). `handlePlayTapped()` already routes to the correct action based on state.  
+**Also fixed:** `VMManager.start()` now throws `VMError.notStopped` instead of silently returning when called from the wrong state. `GameLauncher.launch()` explicitly catches `.notProvisioned` and returns a clear error instead of hanging in `.preparingVM` forever.
+
+### "No split image assets found"
+The app was looking for assets ending in `.part1`/`.part2` but the actual release uses Unix `split` convention: `meridian-base-v2.img.lzfse.partaa` and `meridian-base-v2.img.lzfse.partab`.  
+**Fix:** Filter by `.contains(".part")` and sort alphabetically — handles any split naming convention. Also added LZFSE streaming decompression (Compression.framework `compression_stream`) because the image is LZFSE-compressed. Streaming with 4MB/8MB fixed buffers avoids loading 2.7GB into RAM. Updated `isImageReady` to only require the disk image (not vmlinuz, which isn't in the release yet).
+
+### "Could not write to disk" on first provision attempt
+`FileManager.createFile` returns `false` (not an error) when the destination already exists. On retry after a failed/cancelled download, leftover part files caused every subsequent attempt to fail immediately.  
+**Fix:** `try? removeItem` before every `createFile` call. `downloadLatestImage` also wipes all stale partaa/partab/lzfse files at the start of each provision attempt.  
+**Also fixed:** `diskWriteFailed` now carries a diagnostic message (dir path, writability). The parent directory is explicitly `createDirectory`'d before `createFile` to guard against sandbox container timing issues where `supportDir`'s lazy initializer ran before the container was ready.
+
+### `supportDir` swallowing createDirectory errors
+The `nonisolated static let supportDir` used `try? createDirectory` which silently discarded failures. If the sandbox container wasn't ready at static-initializer time, the directory would never be created and all subsequent `createFile` calls would fail with no indication why.  
+**Fix:** Errors are now printed to console. The real fix is the explicit `createDirectory` call in `downloadAsset` immediately before `createFile`.
