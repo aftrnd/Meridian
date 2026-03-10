@@ -1,0 +1,180 @@
+{
+  "": {
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/master.swiftdeps"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/App/AppDelegate.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDelegate.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDelegate.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDelegate~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDelegate.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDelegate.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/App/MeridianApp.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/MeridianApp.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/MeridianApp.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/MeridianApp~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/MeridianApp.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/MeridianApp.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Launch/GameLauncher.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameLauncher.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameLauncher.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameLauncher~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameLauncher.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameLauncher.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Models/AppDetails.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDetails.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDetails.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDetails~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDetails.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppDetails.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Models/AppSettings.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppSettings.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppSettings.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppSettings~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppSettings.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AppSettings.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Models/Game.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/Game.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/Game.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/Game~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/Game.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/Game.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Models/PlayerSummary.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/PlayerSummary.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/PlayerSummary.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/PlayerSummary~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/PlayerSummary.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/PlayerSummary.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Models/VMState.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMState.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMState.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMState~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMState.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMState.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Steam/SteamAPIService.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAPIService.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAPIService.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAPIService~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAPIService.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAPIService.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Steam/SteamAuthService.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAuthService.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAuthService.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAuthService~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAuthService.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamAuthService.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Steam/SteamLibraryStore.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLibraryStore.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLibraryStore.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLibraryStore~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLibraryStore.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLibraryStore.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Steam/SteamLocalAuthServer.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLocalAuthServer.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLocalAuthServer.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLocalAuthServer~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLocalAuthServer.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamLocalAuthServer.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Steam/SteamSessionBridge.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamSessionBridge.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamSessionBridge.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamSessionBridge~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamSessionBridge.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SteamSessionBridge.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/VM/ProtonBridge.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ProtonBridge.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ProtonBridge.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ProtonBridge~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ProtonBridge.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ProtonBridge.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/VM/VMConfiguration.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMConfiguration.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMConfiguration.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMConfiguration~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMConfiguration.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMConfiguration.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/VM/VMImageProvider.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMImageProvider.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMImageProvider.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMImageProvider~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMImageProvider.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMImageProvider.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/VM/VMManager.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMManager.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMManager.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMManager~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMManager.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMManager.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/Auth/AuthView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AuthView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AuthView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AuthView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AuthView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/AuthView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/ContentView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ContentView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ContentView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ContentView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ContentView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/ContentView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/Library/GameDetailView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameDetailView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameDetailView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameDetailView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameDetailView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameDetailView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/Library/GameGridView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameGridView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameGridView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameGridView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameGridView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/GameGridView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/Library/LibraryView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/LibraryView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/LibraryView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/LibraryView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/LibraryView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/LibraryView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/Settings/SettingsView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SettingsView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SettingsView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SettingsView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SettingsView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/SettingsView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/VM/VMProvisionView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMProvisionView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMProvisionView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMProvisionView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMProvisionView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMProvisionView.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Meridian/Views/VM/VMStatusBarView.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMStatusBarView.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMStatusBarView.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMStatusBarView~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMStatusBarView.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian.build/VMStatusBarView.dia"
+  }
+}

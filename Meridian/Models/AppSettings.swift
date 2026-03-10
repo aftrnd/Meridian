@@ -50,6 +50,31 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "imageRepoSlug") }
     }
 
+    /// Locally cached set of Steam app IDs that are known to be installed in the VM.
+    ///
+    /// This cache is refreshed opportunistically (launch/install checks) and keeps
+    /// the Installed filter useful between app launches.
+    var installedAppIDs: Set<Int> {
+        get { Set(UserDefaults.standard.array(forKey: "installedAppIDs") as? [Int] ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "installedAppIDs") }
+    }
+
+    func isInstalled(appID: Int) -> Bool {
+        installedAppIDs.contains(appID)
+    }
+
+    func markInstalled(appID: Int) {
+        var ids = installedAppIDs
+        ids.insert(appID)
+        installedAppIDs = ids
+    }
+
+    func markNotInstalled(appID: Int) {
+        var ids = installedAppIDs
+        ids.remove(appID)
+        installedAppIDs = ids
+    }
+
     private init() {}
 }
 

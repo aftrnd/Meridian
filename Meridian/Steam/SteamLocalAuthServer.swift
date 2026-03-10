@@ -70,7 +70,7 @@ final class SteamLocalAuthServer: @unchecked Sendable {
         // Discover which port the OS assigned.
         var boundAddr = sockaddr_in()
         var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        withUnsafeMutablePointer(to: &boundAddr) {
+        _ = withUnsafeMutablePointer(to: &boundAddr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 getsockname(serverFD, $0, &addrLen)
             }

@@ -14,6 +14,7 @@ final class SteamLibraryStore {
     var searchQuery: String = ""
     var sortOrder: SortOrder = .nameAscending
     var filter: LibraryFilter = .all
+    private let settings = AppSettings.shared
 
     // MARK: - Computed filtered / sorted view
 
@@ -58,11 +59,39 @@ final class SteamLibraryStore {
             async let owned  = SteamAPIService.shared.fetchOwnedGames(steamID: steamID, apiKey: apiKey)
             async let recent = SteamAPIService.shared.fetchRecentlyPlayed(steamID: steamID, apiKey: apiKey)
             let (ownedGames, recentlyPlayed) = try await (owned, recent)
-            games = ownedGames
-            recentGames = recentlyPlayed
+            games = applyInstallCache(to: ownedGames)
+            recentGames = applyInstallCache(to: recentlyPlayed)
             lastRefreshed = .now
         } catch {
             loadError = error.localizedDescription
+        }
+    }
+
+    func setInstalled(_ installed: Bool, for appID: Int) {
+        if installed {
+            settings.markInstalled(appID: appID)
+        } else {
+            settings.markNotInstalled(appID: appID)
+        }
+        updateInstalledFlag(for: appID, installed: installed)
+    }
+
+    // MARK: - Private helpers
+
+    private func applyInstallCache(to source: [Game]) -> [Game] {
+        source.map { game in
+            var copy = game
+            copy.isInstalled = settings.isInstalled(appID: game.id)
+            return copy
+        }
+    }
+
+    private func updateInstalledFlag(for appID: Int, installed: Bool) {
+        if let idx = games.firstIndex(where: { $0.id == appID }) {
+            games[idx].isInstalled = installed
+        }
+        if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
+            recentGames[idx].isInstalled = installed
         }
     }
 

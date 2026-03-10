@@ -51,10 +51,23 @@ final class VMImageProvider {
     private var kernelURL:      URL { Self.supportDir.appending(path: "vmlinuz") }
     private var initrdURL:      URL { Self.supportDir.appending(path: "initrd") }
 
-    /// True when the decompressed disk image exists.
-    /// vmlinuz/initrd are optional — older releases may not include them.
+    /// True when the decompressed base disk exists.
     var isImageReady: Bool {
         FileManager.default.fileExists(atPath: assembledImageURL.path)
+    }
+
+    /// Missing boot artifacts required to actually boot the VM.
+    var missingBootArtifacts: [String] {
+        var missing: [String] = []
+        if !FileManager.default.fileExists(atPath: assembledImageURL.path) { missing.append("meridian-base.img") }
+        if !FileManager.default.fileExists(atPath: kernelURL.path) { missing.append("vmlinuz") }
+        if !FileManager.default.fileExists(atPath: initrdURL.path) { missing.append("initrd") }
+        return missing
+    }
+
+    /// True when the base image and Linux boot artifacts are present.
+    var isFullyProvisioned: Bool {
+        missingBootArtifacts.isEmpty
     }
 
     // MARK: - Init
@@ -71,7 +84,7 @@ final class VMImageProvider {
         do {
             let release = try await fetchLatestRelease()
             state = .idle
-            return release.tagName != cachedTag || !isImageReady
+            return release.tagName != cachedTag || !isFullyProvisioned
         } catch {
             state = .error(error.localizedDescription)
             return false
@@ -103,13 +116,15 @@ final class VMImageProvider {
             (parts[1], partabURL),
         ]
 
-        // Optional kernel / initrd
         let kernelAsset = release.assets.first(where: { $0.name == "vmlinuz" })
         let initrdAsset  = release.assets.first(where: { $0.name == "initrd" })
+        guard let kernelAsset, let initrdAsset else {
+            throw ImageError.bootAssetsMissing(release.tagName)
+        }
 
         var downloads: [(asset: GitHubAsset, destination: URL)] = []
-        if let k = kernelAsset { downloads.append((k, kernelURL)) }
-        if let i = initrdAsset  { downloads.append((i, initrdURL)) }
+        downloads.append((kernelAsset, kernelURL))
+        downloads.append((initrdAsset, initrdURL))
         downloads.append(contentsOf: partURLs)
 
         let grandTotal = downloads.reduce(Int64(0)) { $0 + Int64($1.asset.size) }
@@ -133,6 +148,16 @@ final class VMImageProvider {
         // Assembly + decompression happens in VMManager.provision() via assembleImageAsync()
         // Store the tag now so assembleImageAsync() can persist it on success.
         cachedTag = release.tagName
+    }
+
+    /// Installs from a local LZFSE-compressed image file on disk.
+    /// Decompresses directly from the source — no intermediate copy needed.
+    func installFromLocalFile(_ sourceURL: URL) async throws {
+        let output = assembledImageURL
+
+        try await Task.detached(priority: .userInitiated) {
+            try Self.decompressLZFSE(from: sourceURL, to: output)
+        }.value
     }
 
     /// Concatenates downloaded parts, decompresses LZFSE, and cleans up temporaries.
@@ -209,6 +234,7 @@ final class VMImageProvider {
             try? outHandle.close()
         }
 
+        print("[LZFSE] Starting decompression: \(source.lastPathComponent) → \(destination.lastPathComponent)")
         let inBufSize  = 4 * 1024 * 1024
         let outBufSize = 8 * 1024 * 1024
         let inBuf  = UnsafeMutablePointer<UInt8>.allocate(capacity: inBufSize)
@@ -257,8 +283,10 @@ final class VMImageProvider {
             case COMPRESSION_STATUS_OK:
                 continue
             case COMPRESSION_STATUS_END:
+                print("[LZFSE] Decompression complete: \(destination.lastPathComponent)")
                 return  // success
             default:
+                print("[LZFSE] Decompression error — compression_stream_process returned \(status)")
                 throw ImageError.decompressionFailed
             }
         }
@@ -351,6 +379,7 @@ final class VMImageProvider {
         case rateLimited
         case releaseNotFound(String)
         case assetsNotFound(String)
+        case bootAssetsMissing(String)
         case downloadFailed(String)
         case diskWriteFailed(String)
         case decompressionFailed
@@ -367,6 +396,8 @@ final class VMImageProvider {
                 return "No releases found for \(slug). Check the repo slug in Settings."
             case .assetsNotFound(let tag):
                 return "No image assets found in release \(tag). Expected files containing '.part'."
+            case .bootAssetsMissing(let tag):
+                return "Release \(tag) is missing required boot assets (vmlinuz/initrd). Publish all VM artifacts before provisioning."
             case .downloadFailed(let file):
                 return "Download failed for \(file)."
             case .diskWriteFailed(let detail):

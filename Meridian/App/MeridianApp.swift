@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct MeridianApp: App {
@@ -38,6 +39,24 @@ struct MeridianApp: App {
                 .disabled(!steamAuth.isAuthenticated)
             }
         }
+
+        WindowGroup("Launch Log", id: "launch-log") {
+            LaunchLogWindow()
+                .environment(launcher)
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 560, height: 320)
+
+        // Full-screen game window opened when a game launches.
+        // Independent of the main Meridian window — the player interacts
+        // directly with the VM display here.
+        WindowGroup("Game", id: "game-window") {
+            VMGameWindow(vmManager: vmManager, launcher: launcher)
+                .environment(vmManager)
+                .environment(launcher)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
 
         Settings {
             SettingsView()

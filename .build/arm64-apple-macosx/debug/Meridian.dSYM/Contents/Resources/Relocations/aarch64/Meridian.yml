@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/Meridian'
+relocations:     []
+...

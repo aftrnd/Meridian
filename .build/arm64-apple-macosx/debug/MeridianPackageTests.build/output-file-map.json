@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/master.swiftdeps"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.derived/runner.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/runner.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/runner.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/runner~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/runner.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianPackageTests.build/runner.dia"
+  }
+}

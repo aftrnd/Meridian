@@ -107,9 +107,9 @@ private struct SteamSettingsTab: View {
             Section {
                 VMCredentialsSection()
             } header: {
-                Text("VM Auto-Login Fallback")
+                Text("Steam Login for Game Downloads")
             } footer: {
-                Text("Used only if Steam for Mac is not installed on this machine. Meridian prefers copying your existing macOS Steam session into the VM.")
+                Text("Required to install games. Meridian uses these credentials to download games inside the VM. Stored securely in Keychain.")
                     .font(.caption)
             }
         }
@@ -148,8 +148,17 @@ private struct VMCredentialsSection: View {
     @State private var password: String = ""
     @State private var saved = false
 
+    private var hasCreds: Bool { !steamAuth.vmUsername.isEmpty && !steamAuth.vmPassword.isEmpty }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if !hasCreds && !saved {
+                Label("Steam credentials required to install games",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
             TextField("Steam username", text: $username)
                 .textFieldStyle(.roundedBorder)
 

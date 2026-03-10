@@ -1,89 +1,113 @@
 # Meridian
 
-Native macOS application allowing you to run Windows games via a lightweight Ubuntu VM running Proton GE — invisibly, as if they were native Mac games.
+Native macOS app for running Windows Steam games through a lightweight Ubuntu VM with Proton GE.
 
-## How it works
+## How It Works
 
-1. **Sign in once** — Steam OpenID auth via `ASWebAuthenticationSession`. No password ever enters the app. The same session token is forwarded to the VM so Steam inside the guest is also authenticated.
-2. **Your library appears** — loaded via the Steam Web API (`IPlayerService/GetOwnedGames`) using your Steam Web API key.
-3. **Click Play** — Meridian auto-starts the Meridian VM (Apple `Virtualization.framework`), connects the Proton bridge over a virtio-serial socket, and sends a launch command.
-4. **Your game runs** — Proton GE inside the Ubuntu guest executes the Windows game. The display is rendered via a `VZVirtualMachineView` / `VZVirtioGraphicsDevice` back into a native macOS window.
+1. **Sign in with Steam** via OpenID (`ASWebAuthenticationSession`), no Steam password stored by Meridian.
+2. **Fetch library metadata** from Steam Web API (`IPlayerService/GetOwnedGames`).
+3. **Boot VM on demand** using Apple `Virtualization.framework`.
+4. **Connect host ↔ guest bridge** over virtio-vsock (port `1234`).
+5. **Install if needed, then launch** through Steam + Proton inside the guest.
+6. **Render in native window** via `VZVirtualMachineView` + virtio-gpu.
 
-Linux, Ubuntu, and Proton are completely invisible.
+## UI Behavior
+
+- Main app uses a two-pane layout: sidebar + full library content.
+- Clicking a game opens a dedicated game-detail window.
+- Launch logs in game detail are selectable and can be copied with a `Copy` button.
+- VM state appears as a compact floating status pill in the library, not a full-width bar.
 
 ## Requirements
 
-- macOS 15 Sequoia or later (macOS 26 Tahoe recommended)
-- Apple Silicon Mac (ARM64 VM image)
+- macOS 15+ (macOS 26 recommended)
+- Apple Silicon Mac
 - Xcode 16+ / Swift 6
-- A [Steam Web API key](https://steamcommunity.com/dev/apikey)
-- ~2 GB free disk space (base image) + space for game installs
+- Steam Web API key: [https://steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey)
+- Disk: ~12 GB base image + expansion disk + game installs
 
-## Setup
+## App Setup
 
-1. Open `Meridian.xcodeproj` in Xcode
-2. Set your Team in Signing & Capabilities
-3. Build & Run
-4. Paste your Steam Web API key in the sign-in screen
-5. Click **Sign in with Steam** — a browser overlay opens Steam's OpenID page
-6. On first launch, click **Set Up** to download the Meridian base image
+1. Open `Meridian.xcodeproj` in Xcode.
+2. Set your Team in Signing & Capabilities.
+3. Build and run.
+4. Sign in with Steam and provide your API key.
+5. Either click **Set Up** (download image), or install a local build image (see below).
 
-## Architecture
+## Build A Fresh Local Base Image (No UTM Manual Steps)
 
-```
-Meridian/
-├── App/
-│   ├── MeridianApp.swift          # @main, SwiftUI scene setup
-│   └── AppDelegate.swift
-├── Steam/
-│   ├── SteamAuthService.swift     # OpenID via ASWebAuthenticationSession, Keychain
-│   ├── SteamAPIService.swift      # Steam Web API actor (library, player summaries)
-│   └── SteamLibraryStore.swift    # @Observable game list + search/filter/sort
-├── VM/
-│   ├── VMManager.swift            # VZVirtualMachine lifecycle (@Observable)
-│   ├── VMConfiguration.swift      # VZVirtualMachineConfiguration builder
-│   ├── VMImageProvider.swift      # GitHub Releases API — always fetches latest tag
-│   └── ProtonBridge.swift         # Unix socket RPC to guest meridian-bridge daemon
-├── Launch/
-│   └── GameLauncher.swift         # Coordinates VM start → bridge connect → game launch
-├── Models/
-│   ├── Game.swift                 # Steam game model
-│   ├── PlayerSummary.swift        # Steam profile model
-│   ├── VMState.swift              # VM lifecycle enum
-│   └── AppSettings.swift          # UserDefaults-backed settings singleton
-└── Views/
-    ├── ContentView.swift           # NavigationSplitView root
-    ├── Library/
-    │   ├── LibraryView.swift       # Filtered game grid
-    │   ├── GameGridView.swift      # Capsule art tile
-    │   └── GameDetailView.swift    # Hero art + Play button + VM view
-    ├── VM/
-    │   ├── VMStatusBarView.swift   # Bottom status pill
-    │   └── VMProvisionView.swift   # First-run download sheet
-    ├── Auth/
-    │   └── AuthView.swift          # Sign-in screen
-    └── Settings/
-        └── SettingsView.swift      # API key, VM resources, repo slug
+Everything is scripted in-repo.
+
+### Host dependencies
+
+```bash
+brew install qemu sshpass lzfse
 ```
 
-## Meridian Base Image
+`cloud-localds` is optional; `Scripts/build-meridian-image.sh` falls back to `hdiutil` automatically when it is not installed.
 
-The VM base image is hosted on GitHub Releases at [`aftrnd/meridian`](https://github.com/aftrnd/meridian/releases).
+### Full local rebuild flow
 
-**The download URL is never hardcoded.** `VMImageProvider` calls the GitHub REST API:
+```bash
+# 1) Build latest guest agent
+cd Agent
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /tmp/meridian-agent-linux-arm64 .
 
+# 2) Build fresh VM image + kernel/initrd
+cd ..
+MERIDIAN_AGENT_BIN=/tmp/meridian-agent-linux-arm64 \
+NO_COMPRESS=1 \
+bash Scripts/build-meridian-image.sh
+
+# 3) Install into local Meridian VM directory
+bash Scripts/install-local.sh --vm-dir /tmp/meridian-vm
 ```
+
+Artifacts are copied to:
+
+- `~/Library/Application Support/com.meridian.app/vm/meridian-base.img`
+- `~/Library/Application Support/com.meridian.app/vm/vmlinuz`
+- `~/Library/Application Support/com.meridian.app/vm/initrd`
+
+## Smoke Test A Built Image
+
+```bash
+# Boots image in QEMU and validates Steam/Proton/agent/session wiring
+MERIDIAN_VM_DIR="$HOME/Library/Application Support/com.meridian.app/vm" \
+bash Tests/Integration/test-guest.sh
+```
+
+If a VM is already running on port `2222`, run with `--no-boot`.
+
+## Patch Existing Local VM Runtime (No Rebuild)
+
+If Steam boot in-guest prompts for package cache updates or fails with missing x86 loader paths, patch the current local VM image in place:
+
+```bash
+bash Scripts/patch-vm-steam-runtime.sh
+```
+
+This boots the image in QEMU, applies non-interactive Steam runtime prerequisites, then cleanly powers off.
+
+## Base Image Hosting
+
+The default image source is GitHub Releases at
+[aftrnd/meridian](https://github.com/aftrnd/meridian/releases).
+
+`VMImageProvider` resolves latest release dynamically:
+
+```text
 GET https://api.github.com/repos/{imageRepoSlug}/releases/latest
 ```
 
-and downloads the `.part1` / `.part2` assets from whatever the current latest release is. When you publish a new image release (e.g. `v1.0.3-base`), all users automatically receive it on next launch.
+The slug is configurable in Settings (`imageRepoSlug`) for forks/self-hosting.
 
-The repo slug (`aftrnd/meridian` by default) is configurable in **Settings → Advanced** so you can self-host or use a fork.
-
-## Guest image contents (v1.0.2-base)
+## Guest Image Contents (Current)
 
 - Ubuntu 24.04 ARM64
-- Proton GE 9-27
-- Steam (headless)
-- Sway (kiosk compositor for XWayland passthrough)
-- `meridian-bridge` daemon (listens on `/dev/hvc0`, accepts JSON launch commands)
+- Steam launcher/runtime
+- Proton GE (`GE-Proton9-27`)
+- Sway + XWayland session
+- Mesa + Vulkan userspace (`libgl1-mesa-dri`, `mesa-vulkan-drivers`, `vulkan-tools`)
+- `meridian-agent` systemd service (vsock bridge on port `1234`)
+- Rosetta setup service mountpoint/config for Meridian VZ runs

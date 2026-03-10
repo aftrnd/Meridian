@@ -1,0 +1,33 @@
+{
+  "": {
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/master.swiftdeps"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Tests/MeridianTests/ProtonBridgeProtocolTests.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/ProtonBridgeProtocolTests.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/ProtonBridgeProtocolTests.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/ProtonBridgeProtocolTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/ProtonBridgeProtocolTests.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/ProtonBridgeProtocolTests.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Tests/MeridianTests/SteamSessionBridgeTests.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/SteamSessionBridgeTests.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/SteamSessionBridgeTests.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/SteamSessionBridgeTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/SteamSessionBridgeTests.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/SteamSessionBridgeTests.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Tests/MeridianTests/VMDiagnosticTests.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMDiagnosticTests.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMDiagnosticTests.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMDiagnosticTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMDiagnosticTests.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMDiagnosticTests.dia"
+  },
+  "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Tests/MeridianTests/VMStateTests.swift": {
+    "dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMStateTests.d",
+    "object": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMStateTests.swift.o",
+    "swiftmodule": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMStateTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMStateTests.swiftdeps",
+    "diagnostics": "/Users/nickjackson/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/.build/arm64-apple-macosx/debug/MeridianTests.build/VMStateTests.dia"
+  }
+}

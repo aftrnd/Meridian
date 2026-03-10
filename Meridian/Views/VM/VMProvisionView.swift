@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Shown when the Meridian base image hasn't been downloaded yet,
 /// or when an update is available.
@@ -6,7 +7,7 @@ struct VMProvisionView: View {
     @Environment(VMManager.self) private var vmManager
     @Environment(\.dismiss) private var dismiss
 
-    @State private var isDownloading = false
+    @State private var isWorking = false
     @State private var errorMessage: String?
 
     var body: some View {
@@ -19,7 +20,7 @@ struct VMProvisionView: View {
                 Text("Set Up Meridian VM")
                     .font(.title2)
                     .fontWeight(.semibold)
-                Text("Meridian needs to download a lightweight Ubuntu VM image with Proton GE pre-installed. This is a one-time download (~2 GB).")
+                Text("Meridian needs a lightweight Ubuntu VM image with Proton GE pre-installed. Download it automatically, or point to a local copy.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -27,8 +28,8 @@ struct VMProvisionView: View {
             }
 
             // Progress / action
-            if isDownloading {
-                downloadProgress
+            if isWorking {
+                workingProgress
             } else {
                 actionButtons
             }
@@ -46,7 +47,7 @@ struct VMProvisionView: View {
     }
 
     @ViewBuilder
-    private var downloadProgress: some View {
+    private var workingProgress: some View {
         VStack(spacing: 16) {
             if case .downloading(let p, let rx, let total) = vmManager.state {
                 VStack(spacing: 8) {
@@ -71,33 +72,71 @@ struct VMProvisionView: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                ProgressView("Checking for image…")
+                ProgressView("Decompressing image…")
             }
         }
     }
 
     private var actionButtons: some View {
-        HStack(spacing: 14) {
-            Button("Cancel") { dismiss() }
-                .buttonStyle(.bordered)
-                .keyboardShortcut(.escape)
+        VStack(spacing: 12) {
+            HStack(spacing: 14) {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+                    .keyboardShortcut(.escape)
 
-            Button("Download & Install") {
-                startProvision()
+                Button("Download & Install") {
+                    startProvision()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return)
             }
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.return)
+
+            Button("Use Local File…") {
+                pickLocalFile()
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
         }
     }
 
     private func startProvision() {
-        isDownloading = true
+        isWorking = true
         errorMessage = nil
         Task {
             await vmManager.provision()
             if case .error(let msg) = vmManager.state {
                 errorMessage = msg
-                isDownloading = false
+                isWorking = false
+            } else {
+                dismiss()
+            }
+        }
+    }
+
+    private func pickLocalFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Meridian Base Image"
+        panel.message = "Choose a meridian-base-*.img.lzfse file"
+        panel.allowedContentTypes = []
+        panel.allowsOtherFileTypes = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // Start accessing the security-scoped resource so the sandbox
+        // allows reads from outside the container for the full duration.
+        let accessing = url.startAccessingSecurityScopedResource()
+
+        isWorking = true
+        errorMessage = nil
+        Task {
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            await vmManager.provisionLocal(from: url)
+            if case .error(let msg) = vmManager.state {
+                errorMessage = msg
+                isWorking = false
             } else {
                 dismiss()
             }

@@ -5,9 +5,9 @@ struct ContentView: View {
     @Environment(SteamLibraryStore.self) private var library
     @Environment(VMManager.self) private var vmManager
 
-    @State private var launcher = GameLauncher()
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
+    @State private var showProvision = false
 
     var body: some View {
         Group {
@@ -18,16 +18,23 @@ struct ContentView: View {
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
-                    // The API key sheet lives here — on the authenticated branch only.
-                    // Attaching it to AuthView caused a SwiftUI invariant violation:
-                    // needsAPIKey can only be true when isAuthenticated is true, but
-                    // AuthView is only shown when isAuthenticated is false, so SwiftUI
-                    // would try to present the sheet on a view that was being removed.
                     .sheet(isPresented: Binding(
                         get: { steamAuth.needsAPIKey },
                         set: { _ in }
                     )) {
                         APIKeySetupSheet()
+                    }
+                    .sheet(isPresented: $showProvision) {
+                        VMProvisionView()
+                            .environment(vmManager)
+                    }
+                    .sheet(item: $selectedGame) { game in
+                        GameDetailView(game: game) {
+                            selectedGame = nil
+                        }
+                    }
+                    .onAppear {
+                        if case .notProvisioned = vmManager.state { showProvision = true }
                     }
             }
         }
@@ -42,21 +49,17 @@ struct ContentView: View {
                 set: { library.filter = $0 }
             ))
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 220)
-        } content: {
-            LibraryView(selectedGame: $selectedGame)
-                .navigationSplitViewColumnWidth(min: 320, ideal: 380)
         } detail: {
-            if let game = selectedGame {
-                GameDetailView(game: game)
-                    .environment(launcher)
-            } else {
-                LibraryEmptyDetail()
-            }
-        }
-        .overlay(alignment: .bottom) {
-            VMStatusBarView()
-                .padding(.bottom, 8)
-                .padding(.horizontal, 12)
+            LibraryView(selectedGame: $selectedGame)
+                .navigationSplitViewColumnWidth(min: 720, ideal: 980)
+                .safeAreaInset(edge: .bottom) {
+                    HStack {
+                        Spacer()
+                        VMStatusBarView(onSetUp: { showProvision = true })
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                }
         }
     }
 }
@@ -75,17 +78,25 @@ private struct SidebarView: View {
         .listStyle(.sidebar)
         .navigationTitle("Meridian")
         .safeAreaInset(edge: .bottom) {
-            userRow
+            profileRow
         }
     }
 
-    private var userRow: some View {
+    // The avatar is clipped with ContainerRelativeShape so it adapts to the
+    // sidebar panel's corner radius at the bottom — the "inner radius" of the
+    // sidebar's rounded corner — rather than being a hard circle against whatever
+    // background is behind it. On macOS 26 Tahoe this rounds to match the glass
+    // panel geometry automatically.
+    private var profileRow: some View {
         HStack(spacing: 10) {
-            AsyncImage(url: steamAuth.avatarURL) { image in
-                image.resizable().scaledToFill()
-            } placeholder: {
-                Image(systemName: "person.circle.fill")
-                    .foregroundStyle(.secondary)
+            AsyncImage(url: steamAuth.avatarURL) { phase in
+                if case .success(let image) = phase {
+                    image.resizable().scaledToFill()
+                } else {
+                    Image(systemName: "person.circle.fill")
+                        .resizable()
+                        .foregroundStyle(.secondary)
+                }
             }
             .frame(width: 28, height: 28)
             .clipShape(Circle())
@@ -95,14 +106,15 @@ private struct SidebarView: View {
                     .font(.caption)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                Text("Steam ID: \(steamAuth.steamID.suffix(8))")
+                Text("Steam")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
             }
+
+            Spacer()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.regularMaterial)
     }
 
     private func filterIcon(_ filter: SteamLibraryStore.LibraryFilter) -> String {
@@ -112,22 +124,6 @@ private struct SidebarView: View {
         case .installed: return "internaldrive"
         case .windows:   return "cpu"
         }
-    }
-}
-
-// MARK: - Empty detail
-
-private struct LibraryEmptyDetail: View {
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "gamecontroller")
-                .font(.system(size: 56, weight: .thin))
-                .foregroundStyle(.quaternary)
-            Text("Select a game to get started")
-                .font(.title3)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
