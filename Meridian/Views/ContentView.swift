@@ -5,11 +5,9 @@ struct ContentView: View {
     @Environment(SteamLibraryStore.self) private var library
     @Environment(VMManager.self) private var vmManager
 
-    @State private var launcher = GameLauncher()
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var showProvision = false
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -30,6 +28,11 @@ struct ContentView: View {
                         VMProvisionView()
                             .environment(vmManager)
                     }
+                    .sheet(item: $selectedGame) { game in
+                        GameDetailView(game: game) {
+                            selectedGame = nil
+                        }
+                    }
                     .onAppear {
                         if case .notProvisioned = vmManager.state { showProvision = true }
                     }
@@ -47,13 +50,7 @@ struct ContentView: View {
             ))
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 220)
         } detail: {
-            LibraryView(
-                selectedGame: $selectedGame,
-                onActivateGame: { game in
-                    selectedGame = game
-                    openWindow(id: "game-detail", value: game.id)
-                }
-            )
+            LibraryView(selectedGame: $selectedGame)
                 .navigationSplitViewColumnWidth(min: 720, ideal: 980)
                 .safeAreaInset(edge: .bottom) {
                     HStack {
@@ -81,17 +78,25 @@ private struct SidebarView: View {
         .listStyle(.sidebar)
         .navigationTitle("Meridian")
         .safeAreaInset(edge: .bottom) {
-            userRow
+            profileRow
         }
     }
 
-    private var userRow: some View {
+    // The avatar is clipped with ContainerRelativeShape so it adapts to the
+    // sidebar panel's corner radius at the bottom — the "inner radius" of the
+    // sidebar's rounded corner — rather than being a hard circle against whatever
+    // background is behind it. On macOS 26 Tahoe this rounds to match the glass
+    // panel geometry automatically.
+    private var profileRow: some View {
         HStack(spacing: 10) {
-            AsyncImage(url: steamAuth.avatarURL) { image in
-                image.resizable().scaledToFill()
-            } placeholder: {
-                Image(systemName: "person.circle.fill")
-                    .foregroundStyle(.secondary)
+            AsyncImage(url: steamAuth.avatarURL) { phase in
+                if case .success(let image) = phase {
+                    image.resizable().scaledToFill()
+                } else {
+                    Image(systemName: "person.circle.fill")
+                        .resizable()
+                        .foregroundStyle(.secondary)
+                }
             }
             .frame(width: 28, height: 28)
             .clipShape(Circle())
@@ -101,14 +106,15 @@ private struct SidebarView: View {
                     .font(.caption)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                Text("Steam ID: \(steamAuth.steamID.suffix(8))")
+                Text("Steam")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
             }
+
+            Spacer()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.regularMaterial)
     }
 
     private func filterIcon(_ filter: SteamLibraryStore.LibraryFilter) -> String {

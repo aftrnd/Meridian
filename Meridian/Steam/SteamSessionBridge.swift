@@ -28,6 +28,16 @@ final class SteamSessionBridge {
     /// Whether a macOS Steam install with usable session files was found.
     private(set) var hasMacSteamSession: Bool = false
 
+    /// Populated from loginusers.vdf when macOS Steam is detected.
+    private(set) var detectedAccountName: String?
+
+    private var _authRef: SteamAuthService?
+
+    /// Whether steamcmd credentials (username + password) are available for VM game installs.
+    func hasInstallCredentials(auth: SteamAuthService) -> Bool {
+        !auth.vmUsername.isEmpty && !auth.vmPassword.isEmpty
+    }
+
     /// Path to the staging directory that VMConfiguration mounts as a virtio-fs share.
     nonisolated static let stagingDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -45,23 +55,41 @@ final class SteamSessionBridge {
     /// - Returns: The staging strategy that was applied.
     @discardableResult
     func prepare(auth: SteamAuthService) async -> SessionStrategy {
+        _authRef = auth
         let staging = Self.stagingDir
+        hasMacSteamSession = false
+        detectedAccountName = nil
         clearStaging(at: staging)
+
+        var strategy: SessionStrategy = .none
 
         if let steamDataDir = macSteamDataDirectory(), copySessionFiles(from: steamDataDir, to: staging) {
             hasMacSteamSession = true
-            return .sessionFileCopy
+            strategy = .sessionFileCopy
+
+            // Auto-extract the Steam account name from loginusers.vdf so the
+            // user doesn't have to re-enter their username manually.
+            if let accountName = parseAccountName(from: steamDataDir) {
+                detectedAccountName = accountName
+                if auth.vmUsername.isEmpty {
+                    auth.vmUsername = accountName
+                }
+            }
         }
 
-        // Fallback: write a transient credentials file for guest-side `steam +login`.
+        // Always write credentials.env when Keychain credentials are available.
+        // steamcmd needs username+password (it has its own auth, separate from
+        // the full Steam client's VDF session).
         let username = auth.vmUsername
         let password = auth.vmPassword
         if !username.isEmpty, !password.isEmpty {
             writeCredentials(username: username, password: password, to: staging)
-            return .credentialInjection
+            if strategy == .none {
+                strategy = .credentialInjection
+            }
         }
 
-        return .none
+        return strategy
     }
 
     // MARK: - Session strategy
@@ -97,6 +125,7 @@ final class SteamSessionBridge {
     /// Copies the minimum session files needed for auto-login.
     ///
     /// Files copied:
+    /// - `ssfn*`                 — machine auth tokens used during Steam login
     /// - `config/loginusers.vdf`   — tells Steam who is logged in
     /// - `config/config.vdf`       — stores auth tokens / remember-me state
     /// - `registry.vdf`            — Windows registry equivalent for Steam settings
@@ -120,6 +149,15 @@ final class SteamSessionBridge {
             try? fm.copyItem(at: source, to: destination)
             copiedAny = true
         }
+
+        // Keep the same token set that native Steam uses for remembered-device auth.
+        if let children = try? fm.contentsOfDirectory(at: steamDir, includingPropertiesForKeys: nil) {
+            for token in children where token.lastPathComponent.hasPrefix("ssfn") {
+                let destination = staging.appending(path: token.lastPathComponent)
+                try? fm.copyItem(at: token, to: destination)
+                copiedAny = true
+            }
+        }
         return copiedAny
     }
 
@@ -128,11 +166,55 @@ final class SteamSessionBridge {
     /// The guest reads this file, runs `steam +login $STEAM_USER $STEAM_PASS`,
     /// then deletes the file so credentials do not persist inside the VM.
     private func writeCredentials(username: String, password: String, to staging: URL) {
-        let content = "STEAM_USER=\(username)\nSTEAM_PASS=\(password)\n"
+        func shellQuote(_ value: String) -> String {
+            // credentials.env is sourced in bash; keep values literal/safe.
+            "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
+        }
+        let content = "STEAM_USER=\(shellQuote(username))\nSTEAM_PASS=\(shellQuote(password))\n"
         let dest = staging.appending(path: "credentials.env")
         try? content.write(to: dest, atomically: true, encoding: .utf8)
         // Mark the file as owner-read-only so only the Meridian process can read it
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest.path())
+    }
+
+    /// Extracts the `AccountName` from `config/loginusers.vdf`.
+    /// VDF format: `"AccountName"		"myusername"` inside a SteamID block.
+    private func parseAccountName(from steamDir: URL) -> String? {
+        let path = steamDir.appending(path: "config/loginusers.vdf")
+        guard let data = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+
+        // loginusers.vdf contains blocks like:
+        //   "76561198012345678" {
+        //       "AccountName"  "actualusername"
+        //       "MostRecent"   "1"
+        //   }
+        // We want the AccountName from the MostRecent=1 block, or the first one.
+        var bestName: String?
+        var currentName: String?
+        var isMostRecent = false
+
+        for line in data.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.lowercased().contains("\"accountname\"") {
+                let parts = trimmed.components(separatedBy: "\"").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                if parts.count >= 2 {
+                    currentName = parts.last
+                    if bestName == nil { bestName = currentName }
+                }
+            }
+            if trimmed.lowercased().contains("\"mostrecent\"") && trimmed.contains("\"1\"") {
+                isMostRecent = true
+            }
+            if trimmed == "}" {
+                if isMostRecent, let name = currentName {
+                    return name
+                }
+                currentName = nil
+                isMostRecent = false
+            }
+        }
+        return bestName
     }
 
     /// Removes all files from the staging directory.

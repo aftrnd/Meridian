@@ -163,7 +163,7 @@ ok "Deployed /usr/local/bin/meridian-vsock-probe.py"
 ssh_vm sudo tee /etc/systemd/system/meridian-agent.service << 'SVCEOF'
 [Unit]
 Description=Meridian Agent (vsock bridge)
-After=rosetta-setup.service network-online.target
+After=rosetta-setup.service
 Wants=rosetta-setup.service
 
 [Service]

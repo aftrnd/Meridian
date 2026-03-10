@@ -198,7 +198,7 @@ final class VMManager: NSObject {
     }
 
     private func updateProvisionedState() {
-        state = imageProvider.isImageReady ? .stopped : .notProvisioned
+        state = imageProvider.isFullyProvisioned ? .stopped : .notProvisioned
     }
 
     // MARK: - Errors

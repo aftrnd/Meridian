@@ -3,7 +3,7 @@
 # build-meridian-image.sh — Build the Meridian base VM image from scratch
 #
 # Builds a fresh Ubuntu 24.04 ARM64 image containing:
-#   - Steam (via official Valve CDN .deb — apt:amd64 conflict resolved)
+#   - Steam (via official Valve CDN .deb — apt:foreign-arch conflicts resolved)
 #   - Proton GE
 #   - sway kiosk compositor
 #   - meridian-agent (vsock RPC daemon)
@@ -294,40 +294,65 @@ apt-get install -y -qq --no-install-recommends \
     libgl1-mesa-dri mesa-vulkan-drivers mesa-utils vulkan-tools \
     pipewire pipewire-pulse wireplumber \
     fuse3 libfuse2 \
+    bubblewrap qemu-user-static xvfb \
     vim-tiny openssh-server \
     util-linux
 BASE_PKGS
 ok "Base packages installed"
 
 # ── Phase 7: Steam — resolve apt:amd64 conflict ───────────────────────────────
-info "Phase 7: Install Steam (apt:amd64 conflict resolved)"
+info "Phase 7: Install Steam (foreign-arch conflicts resolved)"
 
 ssh_vm sudo bash << 'STEAM'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# ── Add amd64 multiarch ───────────────────────────────────────────────────────
+# QEMU build and VZ runtime can expose different NIC names. Force a wildcard
+# netplan so DHCP works regardless of the virtio interface name.
+mkdir -p /etc/cloud/cloud.cfg.d /etc/netplan
+cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg << 'EOF'
+network: {config: disabled}
+EOF
+cat > /etc/netplan/01-meridian-all-ethernet-dhcp.yaml << 'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    meridian-all:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp6: false
+      optional: true
+EOF
+chmod 0644 /etc/netplan/01-meridian-all-ethernet-dhcp.yaml
+netplan generate >/dev/null 2>&1 || true
+netplan apply >/dev/null 2>&1 || true
+
+# ── Add foreign arches required by Steam runtime checks ───────────────────────
 dpkg --add-architecture amd64
+dpkg --add-architecture i386
 
 # Restrict existing Ubuntu ports sources to arm64 so apt doesn't try pulling
-# amd64 indexes from ports.ubuntu.com (which are 404).
+# non-arm indexes from ports.ubuntu.com (which are 404).
 if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-    if ! grep -q '^Architectures: arm64$' /etc/apt/sources.list.d/ubuntu.sources; then
-        sed -i '/^Suites:/a Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
-    fi
+    # Normalize existing Architectures line (if present) to arm64 only.
+    sed -i 's/^Architectures:.*/Architectures: arm64/' /etc/apt/sources.list.d/ubuntu.sources
+    grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources \
+        || sed -i '/^Suites:/a Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources
 fi
 if [[ -f /etc/apt/sources.list ]]; then
-    sed -i 's|^deb http://ports.ubuntu.com/ubuntu-ports|deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports|' /etc/apt/sources.list
+    sed -i 's|^deb \(\[.*\] \)\?http://ports.ubuntu.com/ubuntu-ports|deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports|' /etc/apt/sources.list
 fi
 
-# Route amd64 package resolution to the primary Ubuntu archives.
-# ARM64 uses ports.ubuntu.com, but amd64 indices live on archive/security.
-cat > /etc/apt/sources.list.d/ubuntu-amd64.list << 'AMD64EOF'
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
-deb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
-AMD64EOF
+# Route x86 package resolution to the primary Ubuntu archives.
+# ARM64 uses ports.ubuntu.com, but amd64/i386 indices live on archive/security.
+cat > /etc/apt/sources.list.d/ubuntu-x86.list << 'X86EOF'
+deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
+deb [arch=amd64,i386] http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+X86EOF
 
 apt-get update -qq
 
@@ -336,12 +361,12 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
     lsof policykit-1 python3 python3-apt xterm zenity
 
-# ── THE FIX: apt:amd64 vs apt (arm64) conflict ───────────────────────────────
+# ── THE FIX: apt:foreign-arch vs apt (arm64) conflict ────────────────────────
 #
 # Problem:
 #   On ARM64 Ubuntu 24.04 with amd64 multiarch enabled, `apt-get install
-#   steam-launcher` can fail because the amd64 dependency chain pulls in
-#   `apt:amd64`, which directly conflicts with the native ARM64 `apt` package.
+#   steam-launcher` can fail because foreign-arch chains pull in `apt:amd64`
+#   or `apt:i386`, which directly conflict with the native ARM64 `apt` package.
 #
 # Root cause:
 #   apt's control file on some Ubuntu versions does not declare
@@ -349,24 +374,31 @@ apt-get install -y -qq --no-install-recommends \
 #   incorrectly tries to satisfy `apt` deps via the amd64 counterpart.
 #
 # Fix:
-#   Pin `apt:amd64` to priority -1 (never install). The native arm64 `apt`
-#   (which IS marked Multi-Arch: foreign) satisfies the dependency legally.
+#   Pin `apt:amd64` and `apt:i386` to priority -1 (never install). The native
+#   arm64 `apt` (Multi-Arch: foreign) satisfies the dependency legally.
 #
 cat > /etc/apt/preferences.d/no-foreign-apt << 'PINEOF'
-# Prevent apt:amd64 from conflicting with the native arm64 apt package.
-# The arm64 apt is Multi-Arch: foreign and satisfies amd64 apt dependencies.
+# Prevent apt foreign-arch packages from conflicting with native arm64 apt.
+# The arm64 apt is Multi-Arch: foreign and satisfies x86 apt dependencies.
 Package: apt:amd64
+Pin: release *
+Pin-Priority: -1
+
+Package: apt:i386
 Pin: release *
 Pin-Priority: -1
 PINEOF
 
 apt-get update -qq
 
-# Extract minimal amd64 runtime so Rosetta can start x86_64 userland binaries.
+# Extract minimal x86 runtimes so Steam startup checks pass.
 # Use dpkg-deb -x (not apt install) to avoid cross-arch dpkg-divert conflicts.
-mkdir -p /tmp/meridian-amd64-runtime && cd /tmp/meridian-amd64-runtime
+mkdir -p /tmp/meridian-x86-runtime && cd /tmp/meridian-x86-runtime
 apt-get download -qq \
-    gcc-14-base:amd64 libc6:amd64 libgcc-s1:amd64 libstdc++6:amd64 zlib1g:amd64
+    gcc-14-base:amd64 libc6:amd64 libgcc-s1:amd64 libstdc++6:amd64 zlib1g:amd64 libcap2:amd64 \
+    gcc-14-base:i386 libc6:i386 libgcc-s1:i386 libstdc++6:i386 zlib1g:i386 libcap2:i386 \
+    libgl1:i386 libglx-mesa0:i386 libglx0:i386 libdrm2:i386 libglvnd0:i386 \
+    libgl1-mesa-dri:i386 libgl1-mesa-dri:amd64
 for deb in ./*.deb; do
     dpkg-deb -x "${deb}" /
 done
@@ -386,16 +418,73 @@ dpkg --force-architecture --force-depends -i /tmp/steam-installer.deb
 # remove steam-launcher entirely because some amd64 dependency chains are
 # intentionally unresolved in this Rosetta-driven setup.
 
+# Pre-seed Steam runtime files into meridian's home to avoid first-run
+# corruption/missing-runtime edge cases in headless bootstrap sessions.
+mkdir -p /home/meridian/.local/share/Steam /home/meridian/.steam
+ln -sfn /home/meridian/.local/share/Steam /home/meridian/.steam/steam
+ln -sfn /home/meridian/.local/share/Steam /home/meridian/.steam/root
+if [[ -d /usr/lib/steam/ubuntu12_32 ]]; then
+    mkdir -p /home/meridian/.local/share/Steam/ubuntu12_32
+    cp -a /usr/lib/steam/ubuntu12_32/. /home/meridian/.local/share/Steam/ubuntu12_32/
+fi
+chown -R meridian:meridian /home/meridian/.local /home/meridian/.steam || true
+
+# Warm steamdeps once in non-interactive mode so runtime checks are satisfied
+# before Meridian attempts protocol handoff without a controlling TTY.
+if [[ -x /usr/bin/steamdeps ]]; then
+    timeout 90s bash -lc 'printf "\n\n\n\n" | DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none TERM=dumb /usr/bin/steamdeps' || true
+fi
+
 # Ensure canonical x86_64 loader path exists for Rosetta-translated binaries.
 mkdir -p /lib64
 if [[ -f /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ]]; then
     ln -sf /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
 fi
+if [[ -f /lib/i386-linux-gnu/ld-linux.so.2 ]]; then
+    mkdir -p /lib32
+    ln -sf /lib/i386-linux-gnu/ld-linux.so.2 /lib32/ld-linux.so.2
+fi
+
+# Persist Steam-required namespace sysctls (same requirement as Flatpak sandboxing).
+cat > /etc/sysctl.d/99-meridian-steam-userns.conf << 'SYSCTLEOF'
+user.max_user_namespaces=28633
+kernel.unprivileged_userns_clone=1
+SYSCTLEOF
+sysctl -w user.max_user_namespaces=28633 >/dev/null 2>&1 || true
+if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+    sysctl -w kernel.unprivileged_userns_clone=1 >/dev/null 2>&1 || true
+fi
+
+# VZNAT may not provide DNS via DHCP; ensure systemd-resolved has fallback.
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/meridian-dns.conf << 'DNSEOF'
+[Resolve]
+DNS=8.8.8.8 1.1.1.1
+DNSEOF
+systemctl restart systemd-resolved 2>/dev/null || true
 
 # Verify
 dpkg -l steam-launcher | grep "^ii" >/dev/null \
     || { echo "ERROR: steam-launcher package not installed"; exit 1; }
 [[ -x /usr/bin/steam ]] || { echo "ERROR: /usr/bin/steam missing after install"; exit 1; }
+[[ -f /lib/i386-linux-gnu/libc.so.6 || -f /usr/lib/i386-linux-gnu/libc.so.6 ]] \
+    || { echo "ERROR: 32-bit libc.so.6 missing after runtime extraction"; exit 1; }
+[[ -f /usr/lib/i386-linux-gnu/libGL.so.1 || -f /lib/i386-linux-gnu/libGL.so.1 ]] \
+    || { echo "ERROR: i386 libGL.so.1 missing after runtime extraction"; exit 1; }
+[[ -f /usr/lib/i386-linux-gnu/libdrm.so.2 || -f /lib/i386-linux-gnu/libdrm.so.2 ]] \
+    || { echo "ERROR: i386 libdrm.so.2 missing after runtime extraction"; exit 1; }
+[[ -f /usr/lib/i386-linux-gnu/libGLdispatch.so.0 || -f /lib/i386-linux-gnu/libGLdispatch.so.0 ]] \
+    || { echo "ERROR: i386 libGLdispatch.so.0 missing after runtime extraction"; exit 1; }
+[[ -f /lib/x86_64-linux-gnu/libcap.so.2 || -f /usr/lib/x86_64-linux-gnu/libcap.so.2 ]] \
+    || { echo "ERROR: amd64 libcap.so.2 missing after runtime extraction"; exit 1; }
+[[ -x /usr/bin/bwrap ]] \
+    || { echo "ERROR: /usr/bin/bwrap missing after Steam install"; exit 1; }
+chown root:root /usr/bin/bwrap || true
+chmod u+s /usr/bin/bwrap || true
+# Unprivileged userns can fail in QEMU; Steam uses setuid bwrap. Warn only.
+sudo -u meridian -E env HOME=/home/meridian USER=meridian \
+    /usr/bin/unshare --user --map-root-user /usr/bin/true >/dev/null 2>&1 \
+    || echo "WARNING: unprivileged userns probe failed (setuid bwrap used for Steam)"
 apt-mark hold steam-launcher >/dev/null 2>&1 || true
 echo "  Steam version: $(dpkg -l steam-launcher | awk '/^ii/{print $3}')"
 rm -f /tmp/steam-installer.deb
@@ -479,6 +568,7 @@ set -euo pipefail
 
 export HOME=/home/meridian
 export USER=meridian
+export DISPLAY=":0"
 export XDG_RUNTIME_DIR="/run/user/1000"
 export WAYLAND_DISPLAY="wayland-1"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus"
@@ -493,21 +583,68 @@ fi
 STEAM_CFG="/home/meridian/.local/share/Steam/config"
 mkdir -p "${STEAM_CFG}"
 for f in loginusers.vdf config.vdf; do
-    if [[ -f "/mnt/steam-session/${f}" ]]; then
-        cp -f "/mnt/steam-session/${f}" "${STEAM_CFG}/${f}"
+    src=""
+    # Preferred layout from SteamSessionBridge: /mnt/steam-session/config/*.vdf
+    if [[ -f "/mnt/steam-session/config/${f}" ]]; then
+        src="/mnt/steam-session/config/${f}"
+    # Back-compat with older staging layouts.
+    elif [[ -f "/mnt/steam-session/${f}" ]]; then
+        src="/mnt/steam-session/${f}"
+    fi
+    if [[ -n "${src}" ]]; then
+        cp -f "${src}" "${STEAM_CFG}/${f}"
         chown meridian:meridian "${STEAM_CFG}/${f}"
     fi
 done
+if [[ -f "/mnt/steam-session/registry.vdf" ]]; then
+    cp -f "/mnt/steam-session/registry.vdf" "/home/meridian/.local/share/Steam/registry.vdf"
+    chown meridian:meridian "/home/meridian/.local/share/Steam/registry.vdf"
+fi
+for token in /mnt/steam-session/ssfn*; do
+    [[ -f "${token}" ]] || continue
+    cp -f "${token}" "/home/meridian/.local/share/Steam/$(basename "${token}")"
+    chown meridian:meridian "/home/meridian/.local/share/Steam/$(basename "${token}")"
+    chmod 600 "/home/meridian/.local/share/Steam/$(basename "${token}")" || true
+done
+
+# Optional credential fallback when macOS Steam session files are unavailable.
+STEAM_LOGIN_ARGS=()
+if [[ ! -f "${STEAM_CFG}/loginusers.vdf" && -f "/mnt/steam-session/credentials.env" ]]; then
+    # shellcheck disable=SC1091
+    source "/mnt/steam-session/credentials.env" || true
+    if [[ -n "${STEAM_USER:-}" && -n "${STEAM_PASS:-}" ]]; then
+        STEAM_LOGIN_ARGS=(+login "${STEAM_USER}" "${STEAM_PASS}")
+    fi
+fi
 
 # Start Steam as meridian user.
 # Steam refuses to run as root; sudo -u drops to uid=1000.
+# The full set of env vars must be present here so the meridian-agent never
+# needs to kill and restart Steam just to "apply a controlled env".  Killing
+# the session breaks the logged-in state and causes install/launch handoffs
+# to land on the stale steam.pipe of the dying process.
 exec sudo -u meridian -E \
     env HOME=/home/meridian \
+        DISPLAY="${DISPLAY}" \
         WAYLAND_DISPLAY="${WAYLAND_DISPLAY}" \
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
         DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS}" \
+        XDG_SESSION_TYPE=wayland \
         STEAM_RUNTIME=1 \
-    /usr/bin/steam -silent -no-cef-sandbox
+        STEAM_RUNTIME_PREFER_HOST_LIBRARIES=0 \
+        STEAM_DISABLE_ZENITY=1 \
+        STEAM_SKIP_LIBRARIES_CHECK=1 \
+        STEAMOS=1 \
+        GTK_A11Y=none \
+        LIBGL_ALWAYS_SOFTWARE=1 \
+        MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
+        GALLIUM_DRIVER=llvmpipe \
+        __GLX_VENDOR_LIBRARY_NAME=mesa \
+        LD_LIBRARY_PATH="/home/meridian/.local/share/Steam/ubuntu12_32/steam-runtime/pinned_libs_32:/home/meridian/.local/share/Steam/ubuntu12_32/steam-runtime/usr/lib/i386-linux-gnu:/home/meridian/.local/share/Steam/ubuntu12_32/steam-runtime/usr/lib32:/usr/lib/i386-linux-gnu:/lib/i386-linux-gnu" \
+        DEBIAN_FRONTEND=noninteractive \
+        APT_LISTCHANGES_FRONTEND=none \
+        TERM=dumb \
+    /usr/bin/steam -silent "${STEAM_LOGIN_ARGS[@]}"
 SESSIONEOF
 chmod +x /usr/local/bin/meridian-session.sh
 
@@ -551,7 +688,7 @@ fi
 # Register Rosetta as the binfmt_misc handler for x86_64 ELF.
 # Magic matches ELF + ELFCLASS64 + ELFDATA2LSB + ET_EXEC + EM_X86_64.
 # Flags: O=open-binary, C=credentials-aware, F=fix-binary (keep fd).
-echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/opt/rosetta/rosetta:CF' \
+echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/opt/rosetta/rosetta:OCF' \
     > /proc/sys/fs/binfmt_misc/register 2>/dev/null && \
     echo "[rosetta] registered x86_64 ELF handler via binfmt_misc" || \
     echo "[rosetta] binfmt_misc registration failed"
@@ -664,7 +801,7 @@ chmod +x /usr/local/bin/meridian-vsock-probe.py
 cat > /etc/systemd/system/meridian-agent.service << 'SVCEOF'
 [Unit]
 Description=Meridian Agent (vsock bridge)
-After=rosetta-setup.service network-online.target
+After=rosetta-setup.service
 Wants=rosetta-setup.service
 
 [Service]

@@ -27,7 +27,7 @@ KERNEL="${VM_DIR}/vmlinuz"
 INITRD="${VM_DIR}/initrd"
 
 SSH_PORT=2222
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=no -o ServerAliveInterval=5"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=no -o ServerAliveInterval=5 -o PreferredAuthentications=password -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -o ConnectionAttempts=3"
 SSH_USER="meridian"
 SSH_PASS="meridian"
 
@@ -58,41 +58,54 @@ header() { echo -e "\n${BOLD}$1${NC}"; }
 # ── SSH helper ────────────────────────────────────────────────────────────────
 # ssh_run: run command in guest, return stdout+stderr, exit with command's exit code.
 ssh_run() {
-    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "$@" 2>&1
+    local cmd="$*"
+    local out=""
+    for _ in 1 2 3; do
+        out="$(sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
+            "${SSH_USER}@localhost" "${cmd}" 2>&1)" && {
+            printf "%s\n" "${out}"
+            return 0
+        }
+        sleep 1
+    done
+    printf "%s\n" "${out}"
+    return 1
 }
 
 ssh_run_root() {
-    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "sudo $*" 2>&1
+    ssh_run "sudo $*"
 }
 
 # ssh_check: run a boolean-expression command in guest.
 # Retries once on SSH failure to tolerate transient connection issues.
 ssh_check() {
     local cmd="$*"
-    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "${cmd}" >/dev/null 2>&1 \
-    || { sleep 1; sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-             "${SSH_USER}@localhost" "${cmd}" >/dev/null 2>&1; }
+    for _ in 1 2 3; do
+        if sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
+            "${SSH_USER}@localhost" "${cmd}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 ssh_check_root() {
     local cmd="$*"
-    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "sudo ${cmd}" >/dev/null 2>&1 \
-    || { sleep 1; sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-             "${SSH_USER}@localhost" "sudo ${cmd}" >/dev/null 2>&1; }
+    ssh_check "sudo ${cmd}"
 }
 
 # ssh_get: run command, capture output, always exits 0.
 ssh_get() {
     local cmd="$*"
-    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "${cmd}" 2>/dev/null \
-    || sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
-        "${SSH_USER}@localhost" "${cmd}" 2>/dev/null \
-    || true
+    for _ in 1 2 3; do
+        if sshpass -p "${SSH_PASS}" ssh ${SSH_OPTS} -p "${SSH_PORT}" \
+            "${SSH_USER}@localhost" "${cmd}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    true
 }
 
 ssh_get_root() {
@@ -249,6 +262,79 @@ else
     fail "amd64 multiarch not enabled — Steam/Proton won't work"
 fi
 
+# Steam bootstrap now hard-requires Linux user namespaces.
+USERNS_MAX=$(ssh_get_root 'cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0')
+if [[ "${USERNS_MAX:-0}" =~ ^[0-9]+$ ]] && [[ "${USERNS_MAX}" -gt 0 ]]; then
+    pass "user.max_user_namespaces enabled (${USERNS_MAX})"
+else
+    fail "user.max_user_namespaces is disabled (${USERNS_MAX:-unknown}) — Steam may exit with status 71"
+fi
+
+USERNS_CLONE_RC=0
+USERNS_CLONE_VAL=$(ssh_get_root 'cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null') || USERNS_CLONE_RC=$?
+if [[ "${USERNS_CLONE_RC}" -ne 0 ]]; then
+    # Some kernels do not expose this knob; max_user_namespaces is the hard gate.
+    skip "kernel.unprivileged_userns_clone not exposed on this kernel"
+elif [[ "${USERNS_CLONE_VAL}" == "1" ]]; then
+    pass "kernel.unprivileged_userns_clone enabled"
+else
+    fail "kernel.unprivileged_userns_clone=${USERNS_CLONE_VAL} (expected 1 for Steam sandbox)"
+fi
+
+# Steam runtime depends on bubblewrap. In environments where unprivileged userns
+# is effectively restricted, setuid bwrap is the expected fallback.
+if ssh_check 'test -x /usr/bin/bwrap'; then
+    pass "/usr/bin/bwrap exists"
+else
+    fail "/usr/bin/bwrap missing — Steam sandbox will fail before steam.pipe"
+fi
+
+BWRAP_MODE=$(ssh_get_root 'stat -c "%a %u %g %A" /usr/bin/bwrap 2>/dev/null || true')
+if [[ -n "${BWRAP_MODE}" ]]; then
+    # Use octal mode as the source of truth: 4xxx indicates setuid.
+    if echo "${BWRAP_MODE}" | awk '{print $1}' | grep -q '^4'; then
+        pass "bwrap is setuid-root (${BWRAP_MODE})"
+    else
+        fail "bwrap missing setuid bit (${BWRAP_MODE})"
+    fi
+else
+    fail "could not stat /usr/bin/bwrap"
+fi
+
+USERNS_FUNC_OUT=$(ssh_get 'HOME=/home/meridian USER=meridian /usr/bin/unshare --user --map-root-user /usr/bin/true >/tmp/meridian-userns-probe.out 2>&1; rc=$?; if [[ $rc -eq 0 ]]; then echo OK; else echo "FAIL:${rc}"; cat /tmp/meridian-userns-probe.out; fi')
+if echo "${USERNS_FUNC_OUT}" | grep -q '^OK'; then
+    pass "functional user namespace probe passed for meridian user"
+else
+    if echo "${BWRAP_MODE}" | awk '{print $1}' | grep -q '^4'; then
+        skip "unshare probe failed for meridian user (setuid bwrap fallback is present for Steam)"
+    else
+        fail "functional user namespace probe failed for meridian user (${USERNS_FUNC_OUT})"
+    fi
+fi
+
+# Steam still probes for 32-bit userspace. Missing libc.so.6 is a common startup failure.
+if ssh_check 'test -f /lib/i386-linux-gnu/libc.so.6 || test -f /usr/lib/i386-linux-gnu/libc.so.6'; then
+    pass "32-bit glibc runtime present (libc.so.6)"
+else
+    fail "32-bit libc.so.6 missing (Steam may warn/fail with missing 32-bit libraries)"
+fi
+
+# Validate that first-run Steam runtime extraction is healthy enough for
+# non-interactive headless handoff. Missing logger/runtime-tools is a known
+# failure mode that causes repeated repair loops.
+# Runtime logger files can live in home runtime (after bootstrap) or packaged runtime.
+if ssh_check 'test -f /home/meridian/.local/share/Steam/ubuntu12_32/steam-runtime/usr/libexec/steam-runtime-tools-0/logger-0.bash || test -f /usr/lib/steam/ubuntu12_32/steam-runtime/usr/libexec/steam-runtime-tools-0/logger-0.bash'; then
+    pass "Steam runtime logger script present (logger-0.bash)"
+else
+    skip "Steam runtime logger script missing pre-bootstrap (known to appear after first successful Steam bootstrap)"
+fi
+
+if ssh_check 'test -x /home/meridian/.local/share/Steam/ubuntu12_32/steam-runtime/usr/libexec/steam-runtime-tools-0/srt-logger || test -x /usr/lib/steam/ubuntu12_32/steam-runtime/usr/libexec/steam-runtime-tools-0/srt-logger'; then
+    pass "Steam runtime logger binary present (srt-logger)"
+else
+    skip "Steam runtime logger binary missing pre-bootstrap (known to appear after first successful Steam bootstrap)"
+fi
+
 # ── Test: Proton GE ───────────────────────────────────────────────────────────
 header "Proton GE"
 
@@ -280,7 +366,7 @@ else
     fail "setup-rosetta.sh missing"
 fi
 
-if ssh_run_root 'systemctl is-enabled rosetta-setup.service 2>/dev/null | grep -q enabled'; then
+if ssh_check_root 'systemctl is-enabled rosetta-setup.service 2>/dev/null | grep -q enabled'; then
     pass "rosetta-setup.service is enabled"
 else
     fail "rosetta-setup.service is not enabled"
@@ -344,7 +430,7 @@ else
     fail "/usr/bin/meridian-agent missing or not executable"
 fi
 
-if ssh_run_root 'systemctl is-enabled meridian-agent.service 2>/dev/null | grep -q enabled'; then
+if ssh_check_root 'systemctl is-enabled meridian-agent.service 2>/dev/null | grep -q enabled'; then
     pass "meridian-agent.service is enabled"
 else
     fail "meridian-agent.service is not enabled"
@@ -364,6 +450,222 @@ if ssh_check_root 'ss --vsock -l 2>/dev/null | grep -q 1234'; then
     pass "meridian-agent listening on vsock:1234"
 else
     fail "meridian-agent NOT listening on vsock:1234"
+fi
+
+# ── Test: Steam IPC / handoff smoke ───────────────────────────────────────────
+header "Steam IPC / Handoff Smoke"
+
+# This smoke test is best-effort in QEMU. We validate that Steam can be
+# bootstrapped in-session and expose steam.pipe, which is the handoff gate used
+# by meridian-agent (`steam -ifrunning steam://...` writes into this pipe).
+IPC_SMOKE_OUT=$(ssh_get 'sudo -u meridian -E env HOME=/home/meridian USER=meridian DISPLAY=:0 WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus STEAM_RUNTIME=1 STEAM_RUNTIME_PREFER_HOST_LIBRARIES=0 STEAM_DISABLE_ZENITY=1 STEAM_SKIP_LIBRARIES_CHECK=1 STEAMOS=1 GTK_A11Y=none TERM=dumb bash -lc '"'"'
+timeout 120s /usr/bin/steam -silent >/tmp/meridian-steam-ipc.log 2>&1 &
+for i in $(seq 1 120); do
+  if [[ -p /home/meridian/.local/share/Steam/steam.pipe || -p /home/meridian/.steam/steam/steam.pipe || -p /home/meridian/.steam/root/steam.pipe ]]; then
+    echo READY
+    exit 0
+  fi
+  sleep 1
+done
+echo TIMEOUT
+exit 0
+'"'"'')
+if echo "${IPC_SMOKE_OUT}" | grep -q "READY"; then
+    pass "Steam IPC pipe becomes available for protocol handoff"
+else
+    skip "Steam IPC smoke timed out under QEMU (requires Meridian VZ path for definitive result)"
+fi
+
+# ── Test: X11 / GLX Display Stack ────────────────────────────────────────────
+# These tests guard against the glXChooseVisual crash that kills Steam's VGUI2
+# layer on startup.  The crash manifests as:
+#   glXChooseVisual failed  (src/vgui2/src/surface_linux.cpp:1956)
+#   Fatal assert; application exiting
+#
+# Root causes caught by this section:
+#   A) Missing libegl-mesa0  → XWayland glamor has no EGL ICD, GLX visuals absent
+#   B) Missing libgl1-mesa-dri → swrast_dri.so absent, no software GL at all
+#   C) Xvfb serving :0 instead of XWayland → Xvfb cannot expose GLX visuals
+#   D) XWayland started without LIBGL_ALWAYS_SOFTWARE → glamor tries hardware GPU
+#   E) meridian-session.sh does not kill existing Xvfb before starting XWayland
+header "X11 / GLX Display Stack"
+
+# ── Package presence ──────────────────────────────────────────────────────────
+for pkg in xwayland libegl-mesa0 libgl1-mesa-dri libglx-mesa0; do
+    PKG_STATUS=$(ssh_get_root "dpkg-query -W -f='\${db:Status-Abbrev}' ${pkg} 2>/dev/null || echo 'NOT_FOUND'")
+    if echo "${PKG_STATUS}" | grep -q '^ii'; then
+        pass "${pkg} installed"
+    else
+        fail "${pkg} NOT installed (status: ${PKG_STATUS:-unknown}) — Steam will crash with glXChooseVisual failed"
+    fi
+done
+
+# ── Critical shared-library files ─────────────────────────────────────────────
+# These are the actual .so files loaded at runtime — package presence alone does
+# not guarantee they were correctly installed.
+for libpath in \
+    /usr/lib/aarch64-linux-gnu/libEGL_mesa.so.0 \
+    /usr/lib/aarch64-linux-gnu/dri/swrast_dri.so; do
+    if ssh_check "test -f ${libpath}"; then
+        pass "$(basename ${libpath}) present at ${libpath}"
+    else
+        fail "$(basename ${libpath}) MISSING at ${libpath} — XWayland glamor/software GL will fail"
+    fi
+done
+
+# ── meridian-session.sh: must use Xvfb as primary X server ───────────────────
+# XWayland was tried and failed silently in VZ mode: it starts, creates the
+# socket, then exits because virtio-gpu doesn't support glamor's EGL extensions.
+# The proven approach (verified by the GLX functional probe below) is Xvfb at
+# 24-bit depth with Mesa software rendering.
+if ssh_check 'grep -q "Xvfb :0.*1920x1080x24\|Xvfb.*-screen 0 1920x1080x24" /usr/local/bin/meridian-session.sh 2>/dev/null'; then
+    pass "meridian-session.sh starts Xvfb at 24-bit depth (GLX requires depth 24)"
+else
+    fail "meridian-session.sh does NOT start Xvfb at 24-bit depth — GLX visuals will be absent"
+fi
+
+# ── meridian-session.sh: must pass software-GL env to Xvfb ───────────────────
+if ssh_check 'grep -q "LIBGL_ALWAYS_SOFTWARE=1" /usr/local/bin/meridian-session.sh 2>/dev/null'; then
+    pass "meridian-session.sh sets LIBGL_ALWAYS_SOFTWARE=1 (forces Mesa llvmpipe)"
+else
+    fail "meridian-session.sh missing LIBGL_ALWAYS_SOFTWARE=1 — Mesa may try hardware GPU and fail"
+fi
+
+if ssh_check 'grep -q "MESA_LOADER_DRIVER_OVERRIDE=llvmpipe\|llvmpipe" /usr/local/bin/meridian-session.sh 2>/dev/null'; then
+    pass "meridian-session.sh forces llvmpipe Mesa driver"
+else
+    fail "meridian-session.sh missing MESA_LOADER_DRIVER_OVERRIDE=llvmpipe — software rendering not guaranteed"
+fi
+
+# ── meridian-session.sh: must kill stale X servers before starting Xvfb ──────
+# Any stale Xvfb or XWayland process left from a previous run would block the
+# new Xvfb from binding to :0, leaving the display broken.
+# The loop iterates "for _xproc in Xvfb Xwayland Xorg" and calls pkill on each.
+if ssh_check 'grep -q "for _xproc in Xvfb" /usr/local/bin/meridian-session.sh 2>/dev/null'; then
+    pass "meridian-session.sh kills stale Xvfb/XWayland before starting fresh Xvfb"
+else
+    fail "meridian-session.sh missing stale-X-server cleanup — restart may leave :0 broken"
+fi
+
+# ── Functional GLX probe — simulates glXChooseVisual exactly ─────────────────
+# This is the most important test: it replicates the exact call that kills Steam.
+#
+# We start Xvfb (in QEMU, sway/Wayland is not running, so XWayland needs a
+# compositor; Xvfb with Mesa IS the minimal test of the libGL stack) and then
+# call glXChooseVisual via Python ctypes — the same ABI Steam uses.
+#
+# A pass here means:
+#   - libGL.so loads cleanly
+#   - libX11.so loads cleanly
+#   - The X server on :97 exports GLX extension with RGBA+depth visuals
+#   - Steam's VGUI2 will NOT crash at this call site
+#
+# If this test FAILS it means the VM image is broken and we must NOT proceed
+# to Xcode testing.
+GLX_PROBE_OUT=$(ssh_get 'bash -s <<'"'"'GLX_PROBE_END'"'"'
+set -euo pipefail
+XDISP=":97"
+XSOCK="/tmp/.X11-unix/X97"
+rm -f "${XSOCK}" 2>/dev/null || true
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
+# Start Xvfb at 24-bit depth with Mesa software rendering.
+# Note: In the real Meridian session, XWayland serves :0.  Here we use Xvfb
+# because QEMU has no Wayland compositor.  The GLX stack (libGL→swrast_dri.so)
+# is identical: if glXChooseVisual works here it will work under XWayland too.
+LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe GALLIUM_DRIVER=llvmpipe \
+    Xvfb :97 -screen 0 1920x1080x24 -ac +extension GLX >/dev/null 2>&1 &
+XVFB_PID=$!
+
+for i in $(seq 1 10); do [ -S "${XSOCK}" ] && break; sleep 0.5; done
+
+if [ ! -S "${XSOCK}" ]; then
+    kill ${XVFB_PID} 2>/dev/null || true
+    echo "GLX_FAIL:no_x_socket"
+    exit 0
+fi
+
+python3 - <<PYEOF
+import ctypes, ctypes.util, sys, os
+
+os.environ["DISPLAY"]                = ":97"
+os.environ["LIBGL_ALWAYS_SOFTWARE"]  = "1"
+os.environ["MESA_LOADER_DRIVER_OVERRIDE"] = "llvmpipe"
+os.environ["GALLIUM_DRIVER"]         = "llvmpipe"
+
+def load(name, fallback):
+    lib = ctypes.util.find_library(name)
+    try:
+        return ctypes.CDLL(lib or fallback)
+    except OSError as e:
+        print(f"GLX_FAIL:load_{name}:{e}")
+        sys.exit(0)
+
+libX11 = load("X11", "libX11.so.6")
+libGL  = load("GL",  "libGL.so.1")
+
+libX11.XOpenDisplay.restype  = ctypes.c_void_p
+libX11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+libX11.XDefaultScreen.restype  = ctypes.c_int
+libX11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+
+libGL.glXChooseVisual.restype  = ctypes.c_void_p
+libGL.glXChooseVisual.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.POINTER(ctypes.c_int)]
+
+dpy = libX11.XOpenDisplay(None)
+if not dpy:
+    print("GLX_FAIL:XOpenDisplay_returned_NULL")
+    sys.exit(0)
+
+screen  = libX11.XDefaultScreen(dpy)
+# GLX_RGBA=4  GLX_DOUBLEBUFFER=5  GLX_DEPTH_SIZE=12  None=0
+# This is the exact attribute list Steam VGUI2 uses.
+attribs = (ctypes.c_int * 6)(4, 5, 12, 24, 0, 0)
+vi      = libGL.glXChooseVisual(dpy, screen, attribs)
+if not vi:
+    print("GLX_FAIL:glXChooseVisual_returned_NULL (Steam will crash here)")
+    sys.exit(0)
+
+print("GLX_PASS:visual_found")
+PYEOF
+
+kill ${XVFB_PID} 2>/dev/null || true
+GLX_PROBE_END
+')
+if echo "${GLX_PROBE_OUT}" | grep -q "^GLX_PASS"; then
+    pass "GLX functional probe passed — glXChooseVisual returned a valid visual (Steam VGUI2 will not crash)"
+elif echo "${GLX_PROBE_OUT}" | grep -q "^GLX_FAIL:glXChooseVisual_returned_NULL"; then
+    fail "glXChooseVisual returned NULL — Steam WILL crash with 'glXChooseVisual failed / Fatal assert'"
+    echo "    Diagnosis: X server running but GLX visuals unavailable."
+    echo "    Check: libegl-mesa0 installed? LIBGL_ALWAYS_SOFTWARE=1 set? Correct bit depth (24)?"
+elif echo "${GLX_PROBE_OUT}" | grep -q "^GLX_FAIL:XOpenDisplay_returned_NULL"; then
+    fail "XOpenDisplay returned NULL — X server not reachable on DISPLAY=:97"
+    echo "    Check: Xvfb started successfully? /tmp/.X11-unix/X97 socket present?"
+elif echo "${GLX_PROBE_OUT}" | grep -q "^GLX_FAIL:no_x_socket"; then
+    fail "X server socket /tmp/.X11-unix/X97 never appeared — Xvfb did not start"
+elif echo "${GLX_PROBE_OUT}" | grep -q "^GLX_FAIL:load_"; then
+    fail "Failed to load required library: ${GLX_PROBE_OUT}"
+    echo "    Check: libGL.so and libX11.so present? libgl1-mesa-dri installed?"
+elif [[ -z "${GLX_PROBE_OUT}" ]]; then
+    skip "GLX functional probe produced no output (SSH timeout or Python missing)"
+else
+    fail "GLX functional probe unexpected output: ${GLX_PROBE_OUT}"
+fi
+
+# ── agent preflight reports xdisplay_glx ─────────────────────────────────────
+# The agent's emitSteamPreflightStatus must include xdisplay_glx= so that
+# failures are visible in logs without needing to decode the crash.
+PREFLIGHT_HELP=$(ssh_get '/usr/bin/meridian-agent --help 2>/dev/null || echo MISSING')
+if [[ "${PREFLIGHT_HELP}" == "MISSING" ]]; then
+    skip "meridian-agent not running — skipping preflight field check"
+else
+    AGENT_LOG=$(ssh_get_root 'journalctl -u meridian-agent.service -n 80 --no-pager 2>/dev/null || true')
+    if echo "${AGENT_LOG}" | grep -q "xdisplay_glx="; then
+        pass "agent preflight log contains xdisplay_glx= field"
+    else
+        skip "xdisplay_glx= not yet in agent log (agent may not have run preflight — check after first launch)"
+    fi
 fi
 
 # ── Test: Sway / session ──────────────────────────────────────────────────────

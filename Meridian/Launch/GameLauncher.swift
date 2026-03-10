@@ -38,6 +38,14 @@ final class GameLauncher {
     private(set) var launchState: LaunchState = .idle
     private(set) var logs: [String] = []
 
+    /// Human-readable summary of the current in-progress phase, derived from
+    /// agent log events. Shown inline in the game detail panel during long
+    /// operations (e.g. Steam bootstrap, IPC wait, install handoff).
+    private(set) var currentActivity: String?
+
+    /// When the install phase started, used to show elapsed time in the UI.
+    private(set) var installStartedAt: Date?
+
     // MARK: - Private
 
     private let bridge = ProtonBridge()
@@ -63,6 +71,8 @@ final class GameLauncher {
         }
 
         logs.removeAll()
+        currentActivity = nil
+        installStartedAt = nil
         launchState = .preparingVM
         log.info("launch started: appID=\(game.id) '\(game.name)' vmState=\(String(describing: vmManager.state))")
 
@@ -75,7 +85,11 @@ final class GameLauncher {
         if !vmManager.state.isRunning {
             if case .notProvisioned = vmManager.state {
                 log.error("[2] VM image not provisioned")
-                launchState = .failed("VM image not found. Please provision the VM first.")
+                let missing = vmManager.imageProvider.missingBootArtifacts.joined(separator: ", ")
+                launchState = .failed(
+                    "VM is not fully provisioned. Missing: \(missing). " +
+                    "Run VM setup to download base image + kernel + initrd."
+                )
                 return
             }
             log.info("[2] starting VM…")
@@ -126,6 +140,7 @@ final class GameLauncher {
         await bridge.onLog { [weak self] line in
             Task { @MainActor [weak self] in
                 self?.logs.append(line)
+                self?.parseActivity(from: line)
                 log.info("guest: \(line)")
             }
         }
@@ -133,12 +148,18 @@ final class GameLauncher {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 log.info("game exited code=\(code)")
-                self.launchState = .exited(appID: game.id, code: code)
+                self.currentActivity = nil
+                if code != 0 {
+                    self.launchState = .failed("Guest launch failed (exit code \(code)). Check Steam preflight logs.")
+                } else {
+                    self.launchState = .exited(appID: game.id, code: code)
+                }
                 self.bridgeConnected = false  // force reconnect on next launch
             }
         }
         await bridge.onProgress { [weak self] appID, pct in
             Task { @MainActor [weak self] in
+                if pct > 0 { self?.currentActivity = "Downloading..." }
                 self?.launchState = .installing(appID: appID, progress: pct)
             }
         }
@@ -163,17 +184,21 @@ final class GameLauncher {
 
             if !isInstalled {
                 log.info("[5] game not installed appID=\(game.id) → starting install")
+                installStartedAt = Date()
+                currentActivity = "Checking Steam status..."
                 launchState = .installing(appID: game.id, progress: 0)
                 let installOK = try await bridge.installGameAndWait(appID: game.id, timeout: .seconds(3600))
                 if installOK {
                     library?.setInstalled(true, for: game.id)
                     log.info("[5] install complete appID=\(game.id)")
                 } else {
-                    // Some guest Steam flows don't create appmanifest immediately even
-                    // though launch handoff can still queue/install the title correctly.
-                    log.warning("[5] install returned installed=false appID=\(game.id); continuing to launch")
+                    log.error("[5] install returned installed=false appID=\(game.id)")
                     library?.setInstalled(false, for: game.id)
-                    logs.append("[install] Guest did not confirm install state; attempting launch anyway.")
+                    launchState = .failed(
+                        "Steam did not confirm install completion for \(game.name). " +
+                        "Check guest launch logs for Steam bootstrap errors."
+                    )
+                    return
                 }
             } else {
                 library?.setInstalled(true, for: game.id)
@@ -243,6 +268,39 @@ final class GameLauncher {
             }
         }
         return false
+    }
+
+    /// Maps raw agent log lines to terse human-readable status messages shown
+    /// inline in the game detail panel. Only meaningful phase transitions update
+    /// currentActivity — noisy or diagnostic lines (steam-log:, snapshots) are
+    /// intentionally skipped so the message stays useful.
+    private func parseActivity(from line: String) {
+        // Skip raw Steam console log dumps and process snapshots — too noisy
+        guard !line.hasPrefix("steam-log:"),
+              !line.hasPrefix("steam console log"),
+              !line.hasPrefix("steam process snapshot") else { return }
+
+        let l = line.lowercased()
+
+        if l.contains("steam process not running") {
+            currentActivity = "Launching Steam..."
+        } else if l.contains("steam is bootstrapping") || l.contains("bootstrap started") {
+            currentActivity = "Steam is loading — first start can take several minutes"
+        } else if l.contains("steam binary running") && l.contains("waiting for steam.pipe") {
+            currentActivity = "Steam is initializing..."
+        } else if l.contains("steam ipc ready") {
+            currentActivity = "Steam ready, sending install request..."
+        } else if l.contains("handoff client succeeded") {
+            currentActivity = "Install request sent to Steam"
+        } else if l.contains("install waiting for appmanifest") {
+            currentActivity = "Waiting for Steam to begin download..."
+        } else if l.contains("install handoff reassert") {
+            currentActivity = "Retrying install request..."
+        } else if l.contains("steam client already running") {
+            currentActivity = "Connecting to Steam..."
+        } else if l.contains("install complete") {
+            currentActivity = "Download complete, preparing to launch..."
+        }
     }
 
     /// Starts a lightweight observation task that clears `bridgeConnected` when
