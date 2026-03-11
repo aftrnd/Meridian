@@ -189,28 +189,41 @@ private struct EngineSettingsTab: View {
 
 private struct EngineStatusRow: View {
     let engine: WineEngine
+    @State private var showSetup = false
 
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 3) {
-                Text(engine.isReady ? "Wine Runtime" : "Not detected")
+                Text(engine.isReady ? "Wine Runtime" : "Not installed")
                     .fontWeight(.medium)
                 if engine.isReady {
                     Text("Backend: \(engine.backendName)")
                         .font(.caption)
                         .foregroundStyle(.green)
                 } else {
-                    Text("Install CrossOver from codeweavers.com")
+                    Text("Download the open-source Wine engine to play games.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
-            Button("Re-detect") {
-                engine.detect()
+            if engine.isReady {
+                Button("Re-detect") {
+                    engine.detect()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            } else {
+                Button("Download…") {
+                    showSetup = true
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+        }
+        .sheet(isPresented: $showSetup) {
+            EngineSetupView()
+                .environment(engine)
         }
     }
 }

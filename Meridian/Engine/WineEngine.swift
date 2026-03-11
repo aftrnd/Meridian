@@ -7,14 +7,13 @@ private let log = Logger(subsystem: "com.meridian.app", category: "WineEngine")
 /// Manages the Wine runtime used to execute Windows games.
 ///
 /// Detection order:
-///   1. CrossOver.app — if installed, uses its wineloader + libraries.
-///      This is the most compatible option (wine-11.0, DXMT, DXVK, MoltenVK).
-///   2. Bundled engine — downloaded from GitHub releases to
+///   1. Bundled engine — downloaded from GitHub releases to
 ///      ~/Library/Application Support/com.meridian.app/engine/
+///      This is the primary, standalone path. No third-party app required.
+///   2. CrossOver.app — fallback if installed and no bundled engine present.
 ///
-/// All components used by CrossOver are open source:
+/// All runtime components are open source:
 ///   - Wine (LGPL), DXMT (open source), DXVK (open source), MoltenVK (Apache 2.0)
-///   - Long term: build Wine 11+ from source to remove CrossOver dependency
 @Observable
 @MainActor
 final class WineEngine {
@@ -84,8 +83,39 @@ final class WineEngine {
     /// Detects the best available Wine backend.
     func detect() {
         let fm = FileManager.default
+        let engineBase = Self.engineDir.path(percentEncoded: false)
 
-        // 1. Try CrossOver.app
+        // 1. Try bundled engine (primary — standalone, no third-party app needed)
+        let bundledWine = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
+        let bundledServer = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
+
+        if fm.isExecutableFile(atPath: bundledWine),
+           fm.isExecutableFile(atPath: bundledServer) {
+
+            wineExecutableURL = URL(filePath: bundledWine)
+            wineserverExecutableURL = URL(filePath: bundledServer)
+            libraryPath = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
+
+            let bundledDxmt = Self.engineDir.appending(path: "wine/lib/dxmt").path(percentEncoded: false)
+            if fm.fileExists(atPath: bundledDxmt) { dxmtPath = bundledDxmt }
+
+            let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
+            if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
+
+            backendName = "Meridian"
+            state = .ready
+
+            log.info("[detect] Bundled engine found at \(engineBase)")
+            log.info("[detect]   wine64=\(bundledWine)")
+            log.info("[detect]   wineserver=\(bundledServer)")
+            log.info("[detect]   lib=\(self.libraryPath ?? "none")")
+            log.info("[detect]   dxmt=\(self.dxmtPath ?? "none")")
+            log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
+            log.info("[detect] backend=Meridian ✓")
+            return
+        }
+
+        // 2. Fallback: CrossOver.app (if user happens to have it installed)
         if fm.isExecutableFile(atPath: Self.crossOverWineloader),
            fm.isExecutableFile(atPath: Self.crossOverWineserver) {
 
@@ -102,7 +132,7 @@ final class WineEngine {
             backendName = "CrossOver"
             state = .ready
 
-            log.info("[detect] CrossOver found")
+            log.info("[detect] CrossOver found (fallback)")
             log.info("[detect]   wineloader=\(Self.crossOverWineloader)")
             log.info("[detect]   wineserver=\(Self.crossOverWineserver)")
             log.info("[detect]   lib=\(Self.crossOverLib)")
@@ -112,29 +142,10 @@ final class WineEngine {
             return
         }
 
-        // 2. Try bundled engine
-        let bundledWine = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
-        let bundledServer = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
-
-        if fm.isExecutableFile(atPath: bundledWine),
-           fm.isExecutableFile(atPath: bundledServer) {
-
-            wineExecutableURL = URL(filePath: bundledWine)
-            wineserverExecutableURL = URL(filePath: bundledServer)
-            libraryPath = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
-
-            backendName = "Bundled"
-            state = .ready
-
-            log.info("[detect] Bundled engine found at \(Self.engineDir.path(percentEncoded: false))")
-            log.info("[detect] backend=Bundled ✓")
-            return
-        }
-
         // 3. Nothing found
         log.warning("[detect] No Wine backend found")
+        log.warning("[detect]   Bundled: \(engineBase) exists=\(fm.fileExists(atPath: engineBase))")
         log.warning("[detect]   CrossOver: \(Self.crossOverApp) exists=\(fm.fileExists(atPath: Self.crossOverApp))")
-        log.warning("[detect]   Bundled: \(Self.engineDir.path(percentEncoded: false)) exists=\(fm.fileExists(atPath: Self.engineDir.path(percentEncoded: false)))")
         state = .notInstalled
         backendName = "None"
     }
@@ -264,7 +275,7 @@ final class WineEngine {
         var errorDescription: String? {
             switch self {
             case .notInstalled:
-                return "No Wine backend found. Install CrossOver from codeweavers.com."
+                return "No Wine runtime found. Download the engine from Settings."
             }
         }
     }

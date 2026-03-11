@@ -32,6 +32,7 @@
 		B00E0007 /* GameProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0008 /* GameProcess.swift */; };
 		B00E0009 /* EngineSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E000A /* EngineSetupView.swift */; };
 		B00E0020 /* CachedAsyncImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0021 /* CachedAsyncImage.swift */; };
+		B00E0030 /* EngineDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0031 /* EngineDownloader.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -64,6 +65,7 @@
 		B00E0008 /* GameProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameProcess.swift; sourceTree = "<group>"; };
 		B00E000A /* EngineSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineSetupView.swift; sourceTree = "<group>"; };
 		B00E0021 /* CachedAsyncImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CachedAsyncImage.swift; sourceTree = "<group>"; };
+		B00E0031 /* EngineDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineDownloader.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -119,6 +121,7 @@
 			isa = PBXGroup;
 			children = (
 				B00E0002 /* WineEngine.swift */,
+				B00E0031 /* EngineDownloader.swift */,
 				B00E0004 /* WinePrefix.swift */,
 				B00E0006 /* WineSteamManager.swift */,
 				B00E0008 /* GameProcess.swift */,
@@ -313,6 +316,7 @@
 				B0010032 /* AuthView.swift in Sources */,
 				B0010034 /* AppSettings.swift in Sources */,
 				B0010035A /* AppDetails.swift in Sources */,
+				B00E0030 /* EngineDownloader.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
