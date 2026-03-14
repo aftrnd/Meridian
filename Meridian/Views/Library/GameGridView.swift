@@ -18,9 +18,36 @@ struct GameGridView: View {
 
     @State private var isHovered = false
     @State private var runningPulse = false
+    @State private var hoverLocation: CGPoint = .zero
+    @State private var cardSize: CGSize = .zero
 
     private var isRunning: Bool { gameState == .running }
     private var isLaunching: Bool { gameState == .launching || gameState == .stopping }
+
+    private let maxTilt: Double = 6
+    private let perspective: CGFloat = 0.4
+
+    private var tiltX: Double {
+        guard isHovered, cardSize.height > 0 else { return 0 }
+        let normalized = (hoverLocation.y / cardSize.height) - 0.5
+        return -normalized * maxTilt
+    }
+
+    private var tiltY: Double {
+        guard isHovered, cardSize.width > 0 else { return 0 }
+        let normalized = (hoverLocation.x / cardSize.width) - 0.5
+        return normalized * maxTilt
+    }
+
+    private var highlightOffset: UnitPoint {
+        guard isHovered, cardSize.width > 0, cardSize.height > 0 else {
+            return .center
+        }
+        return UnitPoint(
+            x: hoverLocation.x / cardSize.width,
+            y: hoverLocation.y / cardSize.height
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -35,8 +62,51 @@ struct GameGridView: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(cardBorderColor, lineWidth: cardBorderWidth)
         )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    RadialGradient(
+                        colors: [.white.opacity(0.12), .clear],
+                        center: highlightOffset,
+                        startRadius: 0,
+                        endRadius: max(cardSize.width, cardSize.height) * 0.8
+                    )
+                )
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(false)
+        }
+        .background(
+            GeometryReader { geo in
+                Color.clear.onAppear { cardSize = geo.size }
+            }
+        )
+        .rotation3DEffect(
+            .degrees(tiltX),
+            axis: (x: 1, y: 0, z: 0),
+            perspective: perspective
+        )
+        .rotation3DEffect(
+            .degrees(tiltY),
+            axis: (x: 0, y: 1, z: 0),
+            perspective: perspective
+        )
+        .scaleEffect(isHovered ? 1.03 : 1.0)
+        .shadow(
+            color: .black.opacity(isHovered ? 0.25 : 0.0),
+            radius: isHovered ? 12 : 0,
+            y: isHovered ? 6 : 0
+        )
         .animation(.easeOut(duration: 0.15), value: isHovered)
-        .onHover { isHovered = $0 }
+        .animation(.interactiveSpring(response: 0.15, dampingFraction: 0.7), value: hoverLocation)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                hoverLocation = location
+                isHovered = true
+            case .ended:
+                isHovered = false
+            }
+        }
         .contentShape(Rectangle())
         .onAppear { updatePulse() }
         .onChange(of: gameState) { _, _ in updatePulse() }
