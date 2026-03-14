@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import os.log
@@ -234,6 +235,10 @@ final class GameLauncher {
                 runningSince = .now
                 currentActivity = nil
                 log.info("[launch] state=RUNNING appID=\(game.id) — game processes confirmed")
+                // Send our windows to the back so the game window appears in front
+                for window in NSApplication.shared.windows {
+                    window.orderBack(nil)
+                }
             }
 
             try? await Task.sleep(for: .seconds(1))

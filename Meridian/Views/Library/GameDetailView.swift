@@ -526,8 +526,12 @@ struct GameDetailView: View {
         Button {
             Task { await launcher.stopGame(engine: engine, steamManager: steamManager) }
         } label: {
-            Label("Stop", systemImage: "stop.fill")
-                .frame(minHeight: GameDetailMetrics.launchButtonHeight)
+            HStack(spacing: 6) {
+                Image(systemName: "stop.fill")
+                    .foregroundStyle(.red)
+                Text("Stop")
+            }
+            .frame(minHeight: GameDetailMetrics.launchButtonHeight)
         }
         .buttonStyle(.bordered)
         .controlSize(.large)
