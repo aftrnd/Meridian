@@ -4,6 +4,7 @@ import AppKit
 // MARK: - Sidebar Navigation
 
 enum SidebarDestination: Hashable {
+    case home
     case library(SteamLibraryStore.LibraryFilter)
     case search
     case steamProfile
@@ -21,7 +22,7 @@ struct ContentView: View {
 
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
-    @State private var sidebarDestination: SidebarDestination = .library(.all)
+    @State private var sidebarDestination: SidebarDestination = .home
     @State private var hasAnimatedToFullSize = false
     @State private var splashVisible = true
 
@@ -82,6 +83,8 @@ struct ContentView: View {
     @ViewBuilder
     private var detailContent: some View {
         switch sidebarDestination {
+        case .home:
+            HomeView(selectedGame: $selectedGame)
         case .library:
             LibraryView(selectedGame: $selectedGame)
         case .search:
@@ -108,6 +111,9 @@ private struct SidebarView: View {
 
     var body: some View {
         List(selection: $selectedDestination) {
+            Label("Home", systemImage: "house")
+                .tag(SidebarDestination.home)
+
             Label("Search", systemImage: "magnifyingglass")
                 .tag(SidebarDestination.search)
 

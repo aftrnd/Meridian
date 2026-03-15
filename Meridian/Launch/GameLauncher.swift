@@ -234,6 +234,7 @@ final class GameLauncher {
                 launchState = .running(appID: game.id)
                 runningSince = .now
                 currentActivity = nil
+                AppSettings.shared.recordLaunch(appID: game.id)
                 log.info("[launch] state=RUNNING appID=\(game.id) — game processes confirmed")
                 // Send our windows to the back so the game window appears in front
                 for window in NSApplication.shared.windows {

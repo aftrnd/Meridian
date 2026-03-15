@@ -77,6 +77,38 @@ actor SteamAPIService {
         return games
     }
 
+    // MARK: - Friends
+
+    /// Returns the user's friend list (requires public profile).
+    func fetchFriendList(steamID: String, apiKey: String) async throws -> [SteamFriend] {
+        log.info("[fetchFriendList] steamID=\(steamID)")
+        let url = try buildURL(
+            path: "/ISteamUser/GetFriendList/v1/",
+            params: [
+                "key": apiKey,
+                "steamid": steamID,
+                "relationship": "friend",
+            ]
+        )
+        let envelope: FriendListEnvelope = try await get(url)
+        let friends = envelope.friendslist.friends
+        log.info("[fetchFriendList] returned \(friends.count) friends")
+        return friends
+    }
+
+    /// Batch-fetches player summaries for up to 100 Steam IDs at once.
+    func fetchPlayerSummaries(steamIDs: [String], apiKey: String) async throws -> [PlayerSummary] {
+        guard !steamIDs.isEmpty else { return [] }
+        log.info("[fetchPlayerSummaries] fetching \(steamIDs.count) summaries")
+        let url = try buildURL(
+            path: "/ISteamUser/GetPlayerSummaries/v2/",
+            params: ["key": apiKey, "steamids": steamIDs.joined(separator: ",")]
+        )
+        let envelope: PlayerSummariesEnvelope = try await get(url)
+        log.info("[fetchPlayerSummaries] returned \(envelope.response.players.count) players")
+        return envelope.response.players
+    }
+
     // MARK: - App details (no key required — public Store API)
 
     /// Fetches store metadata for a single appID.
@@ -157,6 +189,13 @@ private struct PlayerSummariesEnvelope: Decodable {
     let response: Response
 }
 
+private struct FriendListEnvelope: Decodable {
+    struct FriendsList: Decodable {
+        let friends: [SteamFriend]
+    }
+    let friendslist: FriendsList
+}
+
 private struct OwnedGamesEnvelope: Decodable {
     struct Response: Decodable {
         let games: [RawGame]?
@@ -182,6 +221,7 @@ struct RawGame: Decodable {
     let name: String?
     let playtimeForever: Int?
     let playtime2Weeks: Int?
+    let rtimeLastPlayed: Int?
     let imgIconURL: String?
     let imgLogoURL: String?
     let hasCommunityVisibleStats: Bool?
@@ -191,6 +231,7 @@ struct RawGame: Decodable {
         case name
         case playtimeForever          = "playtime_forever"
         case playtime2Weeks           = "playtime_2weeks"
+        case rtimeLastPlayed          = "rtime_last_played"
         case imgIconURL               = "img_icon_url"
         case imgLogoURL               = "img_logo_url"
         case hasCommunityVisibleStats = "has_community_visible_stats"

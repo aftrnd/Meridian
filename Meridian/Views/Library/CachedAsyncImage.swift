@@ -10,7 +10,22 @@ struct CachedAsyncImage<Content: View>: View {
     var fallbacks: [URL] = []
     @ViewBuilder let content: (AsyncImagePhase) -> Content
 
-    @State private var phase: AsyncImagePhase = .empty
+    @State private var phase: AsyncImagePhase
+
+    /// Initializes with a synchronous cache pre-check so `LazyVGrid` cells
+    /// that scroll back into view never flash blank -- they start fully rendered.
+    init(url: URL?, fallbacks: [URL] = [], @ViewBuilder content: @escaping (AsyncImagePhase) -> Content) {
+        self.url = url
+        self.fallbacks = fallbacks
+        self.content = content
+        let urlsToCheck = [url].compactMap { $0 } + fallbacks
+        if let hit = urlsToCheck.first(where: { ImageCache.shared.image(for: $0) != nil }),
+           let cached = ImageCache.shared.image(for: hit) {
+            _phase = State(initialValue: .success(Image(nsImage: cached)))
+        } else {
+            _phase = State(initialValue: .empty)
+        }
+    }
 
     var body: some View {
         content(phase)
@@ -53,7 +68,7 @@ struct CachedAsyncImage<Content: View>: View {
 }
 
 /// Thread-safe in-memory image cache backed by NSCache.
-private final class ImageCache: @unchecked Sendable {
+final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
 
     private let cache = NSCache<NSURL, NSImage>()

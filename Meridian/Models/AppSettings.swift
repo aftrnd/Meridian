@@ -90,6 +90,32 @@ final class AppSettings: @unchecked Sendable {
         hiddenAppIDs = ids
     }
 
+    // MARK: - Launch History
+
+    private var launchTimestamps: [Int: TimeInterval] {
+        get {
+            let raw = UserDefaults.standard.dictionary(forKey: "launchTimestamps") as? [String: Double] ?? [:]
+            return raw.reduce(into: [Int: TimeInterval]()) { result, pair in
+                if let key = Int(pair.key) { result[key] = pair.value }
+            }
+        }
+        set {
+            let stringKeyed = newValue.reduce(into: [String: Double]()) { $0[String($1.key)] = $1.value }
+            UserDefaults.standard.set(stringKeyed, forKey: "launchTimestamps")
+        }
+    }
+
+    func recordLaunch(appID: Int) {
+        var timestamps = launchTimestamps
+        timestamps[appID] = Date().timeIntervalSince1970
+        launchTimestamps = timestamps
+    }
+
+    func lastLaunchDate(appID: Int) -> Date? {
+        guard let ts = launchTimestamps[appID], ts > 0 else { return nil }
+        return Date(timeIntervalSince1970: ts)
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

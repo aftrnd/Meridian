@@ -23,6 +23,10 @@ struct GameGridView: View {
     @State private var runningPulse = false
     @State private var hoverLocation: CGPoint = .zero
     @State private var cardSize: CGSize = .zero
+    /// Single resolved image shared by artSection and infoRow.
+    /// Pre-populated from cache synchronously so the card never renders blank.
+    @State private var loadedImage: NSImage?
+    @State private var loadFailed = false
 
     private var isRunning: Bool { gameState == .running }
     private var isLaunching: Bool { gameState == .launching || gameState == .stopping }
@@ -116,6 +120,7 @@ struct GameGridView: View {
         }
         .onAppear { updatePulse() }
         .onChange(of: gameState) { _, _ in updatePulse() }
+        .task(id: game.capsuleURL) { await loadCardImage() }
     }
 
     private var cardBackgroundFill: Color {
@@ -145,22 +150,50 @@ struct GameGridView: View {
         }
     }
 
+    /// Loads the card image from cache (synchronous) or network (async).
+    /// Called via `.task(id: game.capsuleURL)` so it re-runs only when the URL changes.
+    private func loadCardImage() async {
+        let urlsToTry = [game.capsuleURL] + game.capsuleURLFallbacks
+
+        // Check cache first (synchronous -- no redraw if already cached)
+        for url in urlsToTry {
+            if let cached = ImageCache.shared.image(for: url) {
+                if loadedImage == nil { loadedImage = cached }
+                return
+            }
+        }
+
+        // Not cached — fetch from network
+        for url in urlsToTry {
+            guard !Task.isCancelled else { return }
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+                guard let nsImage = NSImage(data: data) else { continue }
+                ImageCache.shared.store(nsImage, for: url)
+                loadedImage = nsImage
+                return
+            } catch {
+                continue
+            }
+        }
+
+        loadFailed = true
+    }
+
     // MARK: - Art
 
     private var artSection: some View {
-        CachedAsyncImage(url: game.capsuleURL, fallbacks: game.capsuleURLFallbacks) { phase in
-            switch phase {
-            case .success(let image):
-                image
+        Group {
+            if let image = loadedImage {
+                Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-            case .empty:
+            } else if loadFailed {
+                artPlaceholder
+            } else {
                 Color.primary.opacity(0.05)
                     .overlay { ProgressView().scaleEffect(0.6) }
-            case .failure:
-                artPlaceholder
-            @unknown default:
-                artPlaceholder
             }
         }
         .aspectRatio(460.0 / 215.0, contentMode: .fit)
@@ -235,20 +268,18 @@ struct GameGridView: View {
 
     private var infoRow: some View {
         ZStack(alignment: .leading) {
-            CachedAsyncImage(url: game.capsuleURL, fallbacks: game.capsuleURLFallbacks) { phase in
-                if case .success(let image) = phase {
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .blur(radius: 20)
-                        .saturation(1.3)
-                        .brightness(-0.15)
-                } else {
-                    Color(white: 0.15)
-                }
+            if let image = loadedImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .blur(radius: 20)
+                    .saturation(1.3)
+                    .brightness(-0.15)
+            } else {
+                Color(white: 0.15)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
 
             LinearGradient(
                 colors: [.black.opacity(0.5), .black.opacity(0.3)],
@@ -322,6 +353,10 @@ private struct MouseTrackingView: NSViewRepresentable {
     final class Coordinator {
         var onHover: ((CGPoint?) -> Void)?
         var onResize: ((CGSize) -> Void)?
+        /// Tracks whether the cursor is currently inside this card.
+        /// Used to suppress mouseMoved events for cards the cursor
+        /// is merely passing over during a scroll gesture.
+        var isHovered = false
     }
 
     final class TrackingNSView: NSView {
@@ -361,14 +396,21 @@ private struct MouseTrackingView: NSViewRepresentable {
         }
 
         override func mouseEntered(with event: NSEvent) {
+            coordinator.isHovered = true
             coordinator.onHover?(convert(event.locationInWindow, from: nil))
         }
 
         override func mouseMoved(with event: NSEvent) {
+            // Only fire when the cursor is genuinely inside this card.
+            // During scroll the cursor drifts across cards without entering them,
+            // which would otherwise trigger @State mutations and full body re-renders
+            // at the mouse polling rate (~125Hz) for every card the cursor crosses.
+            guard coordinator.isHovered else { return }
             coordinator.onHover?(convert(event.locationInWindow, from: nil))
         }
 
         override func mouseExited(with event: NSEvent) {
+            coordinator.isHovered = false
             guard let window else {
                 coordinator.onHover?(nil)
                 return

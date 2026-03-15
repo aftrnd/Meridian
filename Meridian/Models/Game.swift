@@ -6,6 +6,7 @@ struct Game: Identifiable, Hashable, Sendable {
     let name: String
     let playtimeMinutes: Int
     let playtime2WeekMinutes: Int?
+    let lastPlayedDate: Date?
     let iconHash: String?
     var isInstalled: Bool = false
     var windowsOnly: Bool = false
@@ -52,6 +53,13 @@ struct Game: Identifiable, Hashable, Sendable {
         return "\(hours) hr\(hours == 1 ? "" : "s")"
     }
 
+    var lastPlayedFormatted: String? {
+        guard let date = lastPlayedDate else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: .now)
+    }
+
     // MARK: - Init from raw API response
 
     init(from raw: RawGame) {
@@ -60,6 +68,12 @@ struct Game: Identifiable, Hashable, Sendable {
         playtimeMinutes      = raw.playtimeForever ?? 0
         playtime2WeekMinutes = raw.playtime2Weeks
         iconHash             = raw.imgIconURL
+
+        if let ts = raw.rtimeLastPlayed, ts > 0 {
+            lastPlayedDate = Date(timeIntervalSince1970: TimeInterval(ts))
+        } else {
+            lastPlayedDate = nil
+        }
     }
 
     init(
@@ -67,6 +81,7 @@ struct Game: Identifiable, Hashable, Sendable {
         name: String,
         playtimeMinutes: Int = 0,
         playtime2WeekMinutes: Int? = nil,
+        lastPlayedDate: Date? = nil,
         iconHash: String? = nil,
         isInstalled: Bool = false,
         windowsOnly: Bool = false
@@ -75,6 +90,7 @@ struct Game: Identifiable, Hashable, Sendable {
         self.name                 = name
         self.playtimeMinutes      = playtimeMinutes
         self.playtime2WeekMinutes = playtime2WeekMinutes
+        self.lastPlayedDate       = lastPlayedDate
         self.iconHash             = iconHash
         self.isInstalled          = isInstalled
         self.windowsOnly          = windowsOnly

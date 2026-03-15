@@ -10,6 +10,7 @@ private let log = Logger(subsystem: "com.meridian.app", category: "SteamLibrary"
 final class SteamLibraryStore {
     private(set) var games: [Game] = []
     private(set) var recentGames: [Game] = []
+    private(set) var friendSummaries: [PlayerSummary] = []
     private(set) var isLoading: Bool = false
     private(set) var loadError: String?
     private(set) var lastRefreshed: Date?
@@ -51,7 +52,7 @@ final class SteamLibraryStore {
         case .nameAscending:       result.sort { $0.name < $1.name }
         case .nameDescending:      result.sort { $0.name > $1.name }
         case .playtimeDescending:  result.sort { $0.playtimeMinutes > $1.playtimeMinutes }
-        case .recentlyPlayed:      result.sort { ($0.playtime2WeekMinutes ?? 0) > ($1.playtime2WeekMinutes ?? 0) }
+        case .recentlyPlayed:      result.sort { effectiveLastPlayed($0) > effectiveLastPlayed($1) }
         }
 
         return result
@@ -86,6 +87,9 @@ final class SteamLibraryStore {
             loadError = error.localizedDescription
             log.error("[refresh] failed: \(error.localizedDescription)")
         }
+
+        // Friends are fetched separately — failure doesn't block the library
+        await fetchFriendsActivity(steamID: steamID, apiKey: apiKey)
     }
 
     func setInstalled(_ installed: Bool, for appID: Int) {
@@ -117,6 +121,49 @@ final class SteamLibraryStore {
         }
     }
 
+    // MARK: - Home tab helpers
+
+    /// Effective last-played date considering both Steam API and local launch tracking.
+    func effectiveLastPlayed(_ game: Game) -> Date {
+        let steam = game.lastPlayedDate ?? .distantPast
+        let local = settings.lastLaunchDate(appID: game.id) ?? .distantPast
+        return max(steam, local)
+    }
+
+    /// All games that have been played, sorted by most recently launched first.
+    var recentlyPlayedGames: [Game] {
+        games
+            .filter { effectiveLastPlayed($0) > .distantPast }
+            .sorted { effectiveLastPlayed($0) > effectiveLastPlayed($1) }
+    }
+
+    /// The single most recently played game (for the hero banner).
+    var mostRecentGame: Game? { recentlyPlayedGames.first }
+
+    /// Favorite games for the home quick-access row.
+    var favoriteGames: [Game] {
+        games.filter { settings.isFavorite(appID: $0.id) }
+    }
+
+    /// Fetches friend list and their profile summaries.
+    func fetchFriendsActivity(steamID: String, apiKey: String) async {
+        do {
+            let friends = try await SteamAPIService.shared.fetchFriendList(steamID: steamID, apiKey: apiKey)
+            let ids = friends.map(\.steamID)
+
+            var allSummaries: [PlayerSummary] = []
+            for batch in ids.chunked(into: 100) {
+                let summaries = try await SteamAPIService.shared.fetchPlayerSummaries(steamIDs: batch, apiKey: apiKey)
+                allSummaries.append(contentsOf: summaries)
+            }
+
+            friendSummaries = allSummaries.sorted { $0.activitySortOrder < $1.activitySortOrder }
+            log.info("[fetchFriendsActivity] loaded \(allSummaries.count) friend summaries")
+        } catch {
+            log.error("[fetchFriendsActivity] failed: \(error.localizedDescription)")
+        }
+    }
+
     /// Returns a game with playtime2WeekMinutes merged from recentGames when available.
     /// GetOwnedGames often returns 0 for playtime_2weeks; GetRecentlyPlayedGames has the real data.
     func gameWithMergedPlaytime(appID: Int) -> Game? {
@@ -129,6 +176,7 @@ final class SteamLibraryStore {
             name: base.name,
             playtimeMinutes: base.playtimeMinutes,
             playtime2WeekMinutes: twoWeek,
+            lastPlayedDate: base.lastPlayedDate,
             iconHash: base.iconHash,
             isInstalled: base.isInstalled,
             windowsOnly: base.windowsOnly
@@ -176,5 +224,15 @@ final class SteamLibraryStore {
         log.info("[unhideGame] appID=\(appID)")
         settings.unhideGame(appID: appID)
         hiddenAppIDs = settings.hiddenAppIDs
+    }
+}
+
+// MARK: - Array chunking
+
+extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
     }
 }
