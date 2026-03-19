@@ -90,6 +90,106 @@ final class SteamLibraryStore {
 
         // Friends are fetched separately — failure doesn't block the library
         await fetchFriendsActivity(steamID: steamID, apiKey: apiKey)
+
+        // Fetch library capsule hashes for newer games that use Steam's new CDN.
+        // Runs in a child Task so refresh() returns immediately after friends load.
+        // @Observable mutations inside the task trigger SwiftUI re-renders that
+        // restart the card's .task(id:), which then retries with new-CDN URLs.
+        Task { await prefetchLibraryCapsuleHashes(apiKey: apiKey) }
+    }
+
+    /// Fetches library capsule content hashes for all owned games and stores them on
+    /// game objects. Processed in batches of 50, then individually retries any games
+    /// that the batch pass missed, to handle API inconsistencies.
+    @MainActor
+    private func prefetchLibraryCapsuleHashes(apiKey: String) async {
+        let appIDs = games.map(\.id)
+        guard !appIDs.isEmpty else { return }
+        log.info("[prefetchLibraryCapsuleHashes] starting for \(appIDs.count) games")
+
+        // Pass 1: batch requests of 50 — fast, covers most games.
+        for batch in appIDs.chunked(into: 50) {
+            let hashes = await SteamAPIService.shared.fetchLibraryCapsuleHashes(
+                appIDs: batch, apiKey: apiKey
+            )
+            applyHashes(hashes)
+            try? await Task.sleep(for: .seconds(1))
+        }
+
+        // Pass 2: individually retry any game that the batch pass missed.
+        // The Steam API occasionally drops items from batched responses; single-item
+        // calls are more reliable for edge cases. Capped at 100 retries to avoid
+        // excessive API traffic for large libraries where most games use the legacy CDN.
+        let missing = games.filter { $0.libraryCapsuleHash == nil }.map(\.id)
+        if !missing.isEmpty {
+            log.info("[prefetchLibraryCapsuleHashes] retrying \(min(missing.count, 100)) games individually")
+            for appID in missing.prefix(100) {
+                let hashes = await SteamAPIService.shared.fetchLibraryCapsuleHashes(
+                    appIDs: [appID], apiKey: apiKey
+                )
+                applyHashes(hashes)
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+        }
+
+        // Pass 3: for recently-played games that still lack a logo hash, run the
+        // targeted appdetails probe. Previously gated on libraryCapsuleHash != nil,
+        // which meant a game with no capsule hash was never probed for its logo either.
+        // Also previously capped at 3; now covers all recently played games so the
+        // hero carousel always has logo art regardless of library position.
+        let logoMissing = recentlyPlayedGames
+            .filter { $0.logoHash == nil }
+            .map(\.id)
+        if !logoMissing.isEmpty {
+            log.info("[prefetchLibraryCapsuleHashes] probing logo hashes for \(logoMissing.count) recently played games")
+            for appID in logoMissing {
+                if let hash = await SteamAPIService.shared.probeLogoHash(appID: appID) {
+                    if let idx = games.firstIndex(where: { $0.id == appID }) {
+                        games[idx].logoHash = hash
+                    }
+                    if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
+                        recentGames[idx].logoHash = hash
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+
+        // Pass 4: recently-played games still missing a 600x900 capsule hash after
+        // passes 1 & 2 (e.g. very new games the batch call missed). Probe individually.
+        let capsuleMissing = recentlyPlayedGames
+            .filter { $0.libraryCapsuleHash == nil }
+            .map(\.id)
+        if !capsuleMissing.isEmpty {
+            log.info("[prefetchLibraryCapsuleHashes] probing capsule hashes for \(capsuleMissing.count) recently played games")
+            for appID in capsuleMissing {
+                if let hash = await SteamAPIService.shared.probeCapsuleHash(appID: appID) {
+                    if let idx = games.firstIndex(where: { $0.id == appID }) {
+                        games[idx].libraryCapsuleHash = hash
+                    }
+                    if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
+                        recentGames[idx].libraryCapsuleHash = hash
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+
+        log.info("[prefetchLibraryCapsuleHashes] complete")
+    }
+
+    /// Applies a hash dictionary to both the main games array and recentGames.
+    private func applyHashes(_ hashes: [Int: GameCDNHashes]) {
+        for (appID, cdnHashes) in hashes {
+            if let idx = games.firstIndex(where: { $0.id == appID }) {
+                if let h = cdnHashes.capsuleHash { games[idx].libraryCapsuleHash = h }
+                if let h = cdnHashes.logoHash    { games[idx].logoHash = h }
+            }
+            if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
+                if let h = cdnHashes.capsuleHash { recentGames[idx].libraryCapsuleHash = h }
+                if let h = cdnHashes.logoHash    { recentGames[idx].logoHash = h }
+            }
+        }
     }
 
     func setInstalled(_ installed: Bool, for appID: Int) {
@@ -179,7 +279,9 @@ final class SteamLibraryStore {
             lastPlayedDate: base.lastPlayedDate,
             iconHash: base.iconHash,
             isInstalled: base.isInstalled,
-            windowsOnly: base.windowsOnly
+            windowsOnly: base.windowsOnly,
+            libraryCapsuleHash: base.libraryCapsuleHash,
+            logoHash: base.logoHash
         )
     }
 

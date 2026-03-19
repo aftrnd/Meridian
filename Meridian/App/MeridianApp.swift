@@ -12,6 +12,7 @@ struct MeridianApp: App {
     @State private var sessionBridge = SteamSessionBridge()
     @State private var launcher      = GameLauncher()
     @State private var bootstrap     = BootstrapManager()
+    @State private var categories    = CategoryStore()
 
     var body: some Scene {
         WindowGroup {
@@ -23,6 +24,7 @@ struct MeridianApp: App {
                 .environment(sessionBridge)
                 .environment(launcher)
                 .environment(bootstrap)
+                .environment(categories)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 480, height: 300)

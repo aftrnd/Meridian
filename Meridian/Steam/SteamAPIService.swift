@@ -127,6 +127,260 @@ actor SteamAPIService {
         return data
     }
 
+    // MARK: - Logo hash probe via appdetails (new Steam CDN fallback)
+
+    /// Attempts to discover a logo hash for a game using the public appdetails API.
+    /// For new-CDN games, appdetails returns asset URLs containing per-asset SHA-1 hashes.
+    /// We extract every 40-char hex hash from those URLs and try each one with logo_2x.png
+    /// to find the one that resolves — without needing IStoreBrowseService to expose it.
+    func probeLogoHash(appID: Int) async -> String? {
+        guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appID)&filters=basic,header_image,capsule_image,screenshots") else { return nil }
+        guard let (data, _) = try? await session.data(from: url),
+              let jsonStr = String(data: data, encoding: .utf8) else { return nil }
+
+        // Extract all 40-char hex strings from the JSON — these are asset content hashes.
+        // We then probe logo_2x.png at each one; the correct hash will return HTTP 200.
+        var candidateHashes: [String] = []
+        let chars = Array(jsonStr)
+        var i = 0
+        while i < chars.count - 40 {
+            let slice = String(chars[i..<i+40])
+            if slice.allSatisfy(\.isHexDigit) {
+                candidateHashes.append(slice)
+                i += 40
+            } else {
+                i += 1
+            }
+        }
+        let uniqueHashes = Array(NSOrderedSet(array: candidateHashes)) as? [String] ?? candidateHashes
+
+        log.info("[probeLogoHash] appID=\(appID) probing \(uniqueHashes.count) candidate hashes")
+
+        let cdns = ["https://shared.fastly.steamstatic.com", "https://shared.akamai.steamstatic.com"]
+        // Try logo_2x.png first (confirmed naming for newer games), then logo.png fallback.
+        let filenames = ["logo_2x.png", "logo.png"]
+        for hash in uniqueHashes {
+            for cdn in cdns {
+                for filename in filenames {
+                    let probeURLStr = "\(cdn)/store_item_assets/steam/apps/\(appID)/\(hash)/\(filename)"
+                    guard let probeURL = URL(string: probeURLStr) else { continue }
+                    var req = URLRequest(url: probeURL)
+                    req.httpMethod = "HEAD"
+                    if let (_, resp) = try? await session.data(for: req),
+                       let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                        log.info("[probeLogoHash] appID=\(appID) found hash=\(hash.prefix(8))… via \(filename)")
+                        return hash
+                    }
+                }
+            }
+        }
+        log.warning("[probeLogoHash] appID=\(appID) no logo hash found from \(uniqueHashes.count) candidates")
+        return nil
+    }
+
+    // MARK: - Capsule hash probe via appdetails (new Steam CDN fallback)
+
+    /// Attempts to discover a 600×900 library capsule hash for a game using the public
+    /// appdetails API. Works identically to `probeLogoHash` but probes for
+    /// library_600x900.jpg / library_600x900_2x.jpg instead of the logo.
+    /// Used as a last-resort fallback for recently-played games that pass 1 & 2 missed.
+    func probeCapsuleHash(appID: Int) async -> String? {
+        guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appID)&filters=basic,header_image,capsule_image,screenshots") else { return nil }
+        guard let (data, _) = try? await session.data(from: url),
+              let jsonStr = String(data: data, encoding: .utf8) else { return nil }
+
+        var candidateHashes: [String] = []
+        let chars = Array(jsonStr)
+        var i = 0
+        while i < chars.count - 40 {
+            let slice = String(chars[i..<i+40])
+            if slice.allSatisfy(\.isHexDigit) {
+                candidateHashes.append(slice)
+                i += 40
+            } else {
+                i += 1
+            }
+        }
+        let uniqueHashes = Array(NSOrderedSet(array: candidateHashes)) as? [String] ?? candidateHashes
+
+        log.info("[probeCapsuleHash] appID=\(appID) probing \(uniqueHashes.count) candidate hashes")
+
+        let cdns = ["https://shared.fastly.steamstatic.com", "https://shared.akamai.steamstatic.com"]
+        let filenames = ["library_600x900.jpg", "library_600x900_2x.jpg"]
+        for hash in uniqueHashes {
+            for cdn in cdns {
+                for filename in filenames {
+                    let probeURLStr = "\(cdn)/store_item_assets/steam/apps/\(appID)/\(hash)/\(filename)"
+                    guard let probeURL = URL(string: probeURLStr) else { continue }
+                    var req = URLRequest(url: probeURL)
+                    req.httpMethod = "HEAD"
+                    if let (_, resp) = try? await session.data(for: req),
+                       let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                        log.info("[probeCapsuleHash] appID=\(appID) found hash=\(hash.prefix(8))… via \(filename)")
+                        return hash
+                    }
+                }
+            }
+        }
+        log.warning("[probeCapsuleHash] appID=\(appID) no capsule hash found from \(uniqueHashes.count) candidates")
+        return nil
+    }
+
+    // MARK: - Library capsule art hashes (new Steam CDN)
+
+    /// Batch-fetches library capsule content hashes for the given app IDs via
+    /// IStoreBrowseService/GetItems/v1. Returns a dictionary of appID → SHA-1 hash.
+    ///
+    /// Newer Steam titles (post ~2024) host portrait art exclusively on a new CDN:
+    ///   shared.*.steamstatic.com/store_item_assets/steam/apps/{id}/{hash}/library_600x900.jpg
+    ///
+    /// The hash is not returned by GetOwnedGames; this endpoint is the reliable way
+    /// to retrieve it. Up to 50 app IDs can be requested in a single call.
+    func fetchLibraryCapsuleHashes(appIDs: [Int], apiKey: String) async -> [Int: GameCDNHashes] {
+        guard !appIDs.isEmpty else { return [:] }
+        log.info("[fetchLibraryCapsuleHashes] fetching \(appIDs.count) IDs")
+
+        // Build the protobuf-compatible JSON input for IStoreBrowseService/GetItems/v1
+        struct AppIDRef: Encodable { let appid: Int }
+        struct Context: Encodable {
+            let language: String
+            let country_code: String
+            let steam_realm: Int
+        }
+        struct DataRequest: Encodable {
+            let include_assets: Bool
+            // Forces return of ALL asset variants, including the logo/hero logo
+            // which is sometimes omitted when include_assets alone is used.
+            let include_assets_without_overrides: Bool
+        }
+        struct BrowseInput: Encodable {
+            let ids: [AppIDRef]
+            let context: Context
+            let data_request: DataRequest
+        }
+
+        let input = BrowseInput(
+            ids: appIDs.map { AppIDRef(appid: $0) },
+            context: Context(language: "english", country_code: "US", steam_realm: 1),
+            data_request: DataRequest(include_assets: true, include_assets_without_overrides: true)
+        )
+        guard let inputData = try? JSONEncoder().encode(input),
+              let inputString = String(data: inputData, encoding: .utf8) else {
+            log.error("[fetchLibraryCapsuleHashes] failed to encode input")
+            return [:]
+        }
+        guard let url = try? buildURL(
+            path: "/IStoreBrowseService/GetItems/v1/",
+            params: ["key": apiKey, "input_json": inputString]
+        ) else {
+            log.error("[fetchLibraryCapsuleHashes] failed to build URL")
+            return [:]
+        }
+
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else {
+                log.warning("[fetchLibraryCapsuleHashes] non-2xx response")
+                return [:]
+            }
+            // Log full response and highlight any logo-related context
+            if let fullStr = String(data: data, encoding: .utf8) {
+                log.debug("[fetchLibraryCapsuleHashes] response \(fullStr.count) chars")
+                var searchFrom = fullStr.startIndex
+                while let r = fullStr.range(of: "logo", options: .caseInsensitive, range: searchFrom..<fullStr.endIndex) {
+                    let s = fullStr.index(r.lowerBound, offsetBy: -80, limitedBy: fullStr.startIndex) ?? fullStr.startIndex
+                    let e = fullStr.index(r.upperBound, offsetBy: 160, limitedBy: fullStr.endIndex) ?? fullStr.endIndex
+                    log.debug("[fetchLibraryCapsuleHashes] LOGO: ...\(String(fullStr[s..<e]))...")
+                    searchFrom = r.upperBound
+                    if searchFrom >= fullStr.endIndex { break }
+                }
+            }
+
+            var result: [Int: GameCDNHashes] = [:]
+
+            // Strategy 1: typed decode against known field names.
+            if let decoded = try? JSONDecoder().decode(StoreBrowseResponse.self, from: data) {
+                for item in decoded.response?.storeItems ?? [] {
+                    guard let appID = item.appid ?? item.id else { continue }
+                    let ch = item.assets?.libraryCapsuleHash
+                    let lh = item.assets?.libraryCapsuleLogoHash
+                    if ch != nil || lh != nil {
+                        result[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh)
+                        log.debug("[fetchLibraryCapsuleHashes] S1 appID=\(appID) capsule=\(ch?.prefix(8) ?? "-") logo=\(lh?.prefix(8) ?? "-")")
+                    }
+                }
+            }
+
+            // Strategy 2: raw JSON scan — fills in any missing items AND supplements
+            // games that Strategy 1 found a capsule hash for but missed a logo hash.
+            // Previously this used `where result[appID] == nil`, which meant a game
+            // with a capsule hash but nil logo hash would be skipped entirely.
+            let rawHashes = extractHashesFromRaw(data)
+            for (appID, hashes) in rawHashes {
+                if result[appID] == nil {
+                    result[appID] = hashes
+                    log.debug("[fetchLibraryCapsuleHashes] S2 appID=\(appID) capsule=\(hashes.capsuleHash?.prefix(8) ?? "-") logo=\(hashes.logoHash?.prefix(8) ?? "-")")
+                } else if result[appID]?.logoHash == nil, let lh = hashes.logoHash {
+                    // Capsule was found in S1 but logo was missing — fill it in from the raw scan.
+                    result[appID] = GameCDNHashes(capsuleHash: result[appID]?.capsuleHash, logoHash: lh)
+                    log.debug("[fetchLibraryCapsuleHashes] S2 supplement logo appID=\(appID) logo=\(lh.prefix(8))")
+                }
+            }
+
+            log.info("[fetchLibraryCapsuleHashes] resolved \(result.count)/\(appIDs.count)")
+            return result
+        } catch {
+            log.error("[fetchLibraryCapsuleHashes] \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
+    /// Parses the raw `IStoreBrowseService/GetItems` JSON without relying on
+    /// specific field names. Searches each item's assets for library capsule and
+    /// logo hashes using filename patterns, making it robust to field renames.
+    private func extractHashesFromRaw(_ data: Data) -> [Int: GameCDNHashes] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let resp  = json["response"] as? [String: Any],
+              let items = resp["store_items"] as? [[String: Any]] else { return [:] }
+
+        var out: [Int: GameCDNHashes] = [:]
+        for item in items {
+            guard let appID = (item["appid"] as? Int) ?? (item["id"] as? Int) else { continue }
+            let target: Any = (item["assets"] as? [String: Any]) ?? item
+            let ch = searchForHash(matching: "library_600x900", in: target)
+            let lh = searchForHash(matching: "logo", in: target)
+            if ch != nil || lh != nil {
+                out[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh)
+            }
+        }
+        return out
+    }
+
+    /// Recursively searches a JSON value for a string where a 40-char hex path
+    /// segment is followed by the given filename prefix.
+    private func searchForHash(matching filename: String, in value: Any) -> String? {
+        if let str = value as? String {
+            let parts = str.components(separatedBy: "/")
+            for (i, part) in parts.enumerated() {
+                guard part.count == 40, part.allSatisfy(\.isHexDigit) else { continue }
+                if i + 1 < parts.count, parts[i + 1].hasPrefix(filename) {
+                    return part
+                }
+            }
+        } else if let dict = value as? [String: Any] {
+            for (_, nested) in dict {
+                if let hash = searchForHash(matching: filename, in: nested) { return hash }
+            }
+        } else if let arr = value as? [Any] {
+            // Arrays were previously skipped — the logo may live inside a nested array.
+            for nested in arr {
+                if let hash = searchForHash(matching: filename, in: nested) { return hash }
+            }
+        }
+        return nil
+    }
+
     // MARK: - Private
 
     private func buildURL(path: String, params: [String: String]) throws -> URL {
@@ -214,6 +468,92 @@ private struct AppDetailsWrapper: Decodable {
     let success: Bool
     let data: AppDetails?
 }
+
+// MARK: - IStoreBrowseService/GetItems response types
+
+private struct StoreBrowseResponse: Decodable {
+    let response: ResponseBody?
+    struct ResponseBody: Decodable {
+        let storeItems: [StoreBrowseItem]?
+        enum CodingKeys: String, CodingKey { case storeItems = "store_items" }
+    }
+}
+
+private struct StoreBrowseItem: Decodable {
+    /// Some API versions return "id", others "appid".
+    let id: Int?
+    let appid: Int?
+    let assets: StoreBrowseAssets?
+}
+
+/// Art hashes returned by `fetchLibraryCapsuleHashes` for a single game.
+/// Both fields are optional because not every game has every asset type.
+struct GameCDNHashes {
+    let capsuleHash: String?
+    let logoHash: String?
+}
+
+private struct StoreBrowseAssets: Decodable {
+    /// URL template: "https://shared.*.steamstatic.com/.../apps/{appid}/{FILENAME}?t=…"
+    let assetUrlFormat: String?
+    /// "{40hexchars}/library_600x900.jpg" — primary field for library portrait.
+    let mainCapsule: String?
+    /// Alternative field name used in some API versions.
+    let libraryCapsule: String?
+    let libraryCapsule2x: String?
+    /// "{40hexchars}/logo.png" — logo lockup overlaid on the hero image.
+    /// Steam uses several different field names across API versions.
+    let libraryHeroLogo: String?
+    let logo: String?
+    let heroLogo: String?
+    let libraryLogo: String?
+    let logoSmall: String?
+    /// SteamDB shows the logo under "image2x/english" which serialises as logo_2x in JSON.
+    let logo2x: String?
+    let libraryHeroLogo2x: String?
+
+    enum CodingKeys: String, CodingKey {
+        case assetUrlFormat    = "asset_url_format"
+        case mainCapsule       = "main_capsule"
+        case libraryCapsule    = "library_capsule"
+        case libraryCapsule2x  = "library_capsule_2x"
+        case libraryHeroLogo   = "library_hero_logo"
+        case logo
+        case heroLogo          = "hero_logo"
+        case libraryLogo       = "library_logo"
+        case logoSmall         = "logo_small"
+        case logo2x            = "logo_2x"
+        case libraryHeroLogo2x = "library_hero_logo_2x"
+    }
+
+    /// Extracts the 40-char SHA-1 content hash from any library capsule field.
+    var libraryCapsuleHash: String? {
+        for candidate in [libraryCapsule, mainCapsule, libraryCapsule2x].compactMap({ $0 }) {
+            if let hash = extractHash(from: candidate) { return hash }
+        }
+        return nil
+    }
+
+    /// Extracts the 40-char SHA-1 content hash from any logo field.
+    /// Peak (3527290) confirmed: the logo lives at logo_2x.png under hash 7df31d9d…
+    var libraryCapsuleLogoHash: String? {
+        for candidate in [libraryHeroLogo, logo, logo2x, heroLogo, libraryLogo,
+                          logoSmall, libraryHeroLogo2x].compactMap({ $0 }) {
+            if let hash = extractHash(from: candidate) { return hash }
+        }
+        return nil
+    }
+
+    private func extractHash(from path: String) -> String? {
+        let parts = path.components(separatedBy: "/")
+        if let hash = parts.first, hash.count == 40, hash.allSatisfy(\.isHexDigit) {
+            return hash
+        }
+        return nil
+    }
+}
+
+// MARK: -
 
 // Raw game shape returned by GetOwnedGames / GetRecentlyPlayedGames
 struct RawGame: Decodable {

@@ -23,7 +23,7 @@ struct GameGridView: View {
     @State private var runningPulse = false
     @State private var hoverLocation: CGPoint = .zero
     @State private var cardSize: CGSize = .zero
-    /// Single resolved image shared by artSection and infoRow.
+    /// Single resolved image shared across the card.
     /// Pre-populated from cache synchronously so the card never renders blank.
     @State private var loadedImage: NSImage?
     @State private var loadFailed = false
@@ -57,44 +57,13 @@ struct GameGridView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 6) {
             artSection
-            infoRow
+            infoLabel
         }
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(cardBackgroundFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(cardBorderColor, lineWidth: cardBorderWidth)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(
-                    RadialGradient(
-                        colors: [.white.opacity(0.12), .clear],
-                        center: highlightOffset,
-                        startRadius: 0,
-                        endRadius: max(cardSize.width, cardSize.height) * 0.8
-                    )
-                )
-                .opacity(isHovered ? 1 : 0)
-                .allowsHitTesting(false)
-        }
-        .background {
-            MouseTrackingView(
-                onHover: { point in
-                    if let point {
-                        hoverLocation = point
-                        isHovered = true
-                    } else {
-                        isHovered = false
-                    }
-                },
-                onResize: { cardSize = $0 }
-            )
-        }
+        // Explicitly bound to the column/frame width so LazyVGrid's first lazy
+        // batch doesn't let any card inflate beyond its assigned column.
+        .frame(minWidth: 0, maxWidth: .infinity)
         .rotation3DEffect(
             .degrees(tiltX),
             axis: (x: 1, y: 0, z: 0),
@@ -107,9 +76,9 @@ struct GameGridView: View {
         )
         .scaleEffect(isHovered ? 1.03 : 1.0)
         .shadow(
-            color: .black.opacity(isHovered ? 0.25 : 0.0),
-            radius: isHovered ? 12 : 0,
-            y: isHovered ? 6 : 0
+            color: .black.opacity(isHovered ? 0.3 : 0.0),
+            radius: isHovered ? 16 : 0,
+            y: isHovered ? 8 : 0
         )
         .animation(.easeOut(duration: 0.15), value: isHovered)
         .animation(.interactiveSpring(response: 0.15, dampingFraction: 0.7), value: hoverLocation)
@@ -120,24 +89,9 @@ struct GameGridView: View {
         }
         .onAppear { updatePulse() }
         .onChange(of: gameState) { _, _ in updatePulse() }
-        .task(id: game.capsuleURL) { await loadCardImage() }
-    }
-
-    private var cardBackgroundFill: Color {
-        if isRunning { return .green.opacity(0.08) }
-        if isSelected { return .accentColor.opacity(0.1) }
-        return .clear
-    }
-
-    private var cardBorderColor: Color {
-        if isRunning { return .green.opacity(runningPulse ? 0.9 : 0.5) }
-        if isSelected { return .accentColor }
-        if isHovered { return .primary.opacity(0.12) }
-        return .clear
-    }
-
-    private var cardBorderWidth: CGFloat {
-        (isRunning || isSelected) ? 1.5 : 1
+        // Re-run whenever the game's hash arrives (nil → hash string triggers a reload
+        // so new-CDN games display their art as soon as the background fetch resolves).
+        .task(id: "\(game.id)-\(game.libraryCapsuleHash ?? "")") { await loadCardImage() }
     }
 
     private func updatePulse() {
@@ -151,11 +105,24 @@ struct GameGridView: View {
     }
 
     /// Loads the card image from cache (synchronous) or network (async).
-    /// Called via `.task(id: game.capsuleURL)` so it re-runs only when the URL changes.
+    ///
+    /// URL priority:
+    ///  1. New hash-based CDN (shared.*.steamstatic.com/store_item_assets/…) — required
+    ///     for games published after ~2024. Only tried when libraryCapsuleHash is set.
+    ///  2. Legacy CDN (cdn.akamai.steamstatic.com/steam/apps/…) — covers older titles.
+    ///
+    /// When Phase 1 fails and libraryCapsuleHash is not yet available, loadFailed is set.
+    /// The .task(id:) will re-run once SteamLibraryStore populates the hash, automatically
+    /// retrying with the new-CDN URLs.
     private func loadCardImage() async {
-        let urlsToTry = [game.capsuleURL] + game.capsuleURLFallbacks
+        loadFailed = false
 
-        // Check cache first (synchronous -- no redraw if already cached)
+        // New-CDN URLs are prepended when a hash is available; otherwise only legacy URLs.
+        let urlsToTry = game.newCDNCapsuleURLs
+            + [game.verticalCapsuleURL]
+            + game.verticalCapsuleURLFallbacks
+
+        // Synchronous cache check — avoids a blank flash for previously loaded images.
         for url in urlsToTry {
             if let cached = ImageCache.shared.image(for: url) {
                 if loadedImage == nil { loadedImage = cached }
@@ -163,7 +130,7 @@ struct GameGridView: View {
             }
         }
 
-        // Not cached — fetch from network
+        // Network fetch — try each URL in priority order.
         for url in urlsToTry {
             guard !Task.isCancelled else { return }
             do {
@@ -181,7 +148,7 @@ struct GameGridView: View {
         loadFailed = true
     }
 
-    // MARK: - Art
+    // MARK: - Art (portrait 2:3)
 
     private var artSection: some View {
         Group {
@@ -196,13 +163,81 @@ struct GameGridView: View {
                     .overlay { ProgressView().scaleEffect(0.6) }
             }
         }
-        .aspectRatio(460.0 / 215.0, contentMode: .fit)
+        .aspectRatio(600.0 / 900.0, contentMode: .fit)
         .frame(maxWidth: .infinity)
         .clipped()
+        // Radial highlight lives here so it's clipped to art bounds and
+        // highlightOffset / tiltX are computed against art dimensions only
+        // (not the full card including the text label below).
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    RadialGradient(
+                        colors: [.white.opacity(0.12), .clear],
+                        center: highlightOffset,
+                        startRadius: 0,
+                        endRadius: max(cardSize.width, cardSize.height) * 0.8
+                    )
+                )
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(false)
+        }
         .overlay(alignment: .topLeading) { statusBadge }
         .overlay(alignment: .topTrailing) { trailingBadges }
-        .clipShape(UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(cardBorderColor, lineWidth: cardBorderWidth)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        // Track mouse inside the art area. onResize gives art dimensions so
+        // tiltX/tiltY and highlightOffset are relative to the image, not the
+        // full card VStack which includes the text label below.
+        .background {
+            MouseTrackingView(
+                onHover: { point in
+                    if let point {
+                        hoverLocation = point
+                        isHovered = true
+                    } else {
+                        isHovered = false
+                    }
+                },
+                onResize: { cardSize = $0 }
+            )
+        }
     }
+
+    // MARK: - Info Label (below art, TV app style)
+
+    private var infoLabel: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(game.name)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(game.name)
+
+            HStack(spacing: 4) {
+                if game.playtimeMinutes > 0 {
+                    Text(game.playtimeFormatted)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if game.windowsOnly {
+                    WindowsBadge()
+                }
+            }
+        }
+        // minWidth: 0 is critical — it lets the label compress to any width,
+        // so long game titles don't inflate the card or the grid column.
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
+    }
+
+    // MARK: - State Badge
 
     @ViewBuilder
     private var statusBadge: some View {
@@ -264,55 +299,17 @@ struct GameGridView: View {
             }
     }
 
-    // MARK: - Info Row (blurred art background)
+    // MARK: - Border helpers
 
-    private var infoRow: some View {
-        ZStack(alignment: .leading) {
-            if let image = loadedImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .clipped()
-                    .blur(radius: 20)
-                    .saturation(1.3)
-                    .brightness(-0.15)
-            } else {
-                Color(white: 0.15)
-            }
+    private var cardBorderColor: Color {
+        if isRunning { return .green.opacity(runningPulse ? 0.9 : 0.5) }
+        if isSelected { return .accentColor }
+        if isHovered { return .primary.opacity(0.15) }
+        return .clear
+    }
 
-            LinearGradient(
-                colors: [.black.opacity(0.5), .black.opacity(0.3)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(game.name)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(game.name)
-
-                HStack(spacing: 6) {
-                    Text(game.playtimeFormatted)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.7))
-
-                    Spacer()
-
-                    if game.windowsOnly {
-                        WindowsBadge()
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-        }
-        .frame(height: 52)
-        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: 12, bottomTrailingRadius: 12))
+    private var cardBorderWidth: CGFloat {
+        (isRunning || isSelected) ? 1.5 : 1
     }
 }
 
@@ -401,10 +398,6 @@ private struct MouseTrackingView: NSViewRepresentable {
         }
 
         override func mouseMoved(with event: NSEvent) {
-            // Only fire when the cursor is genuinely inside this card.
-            // During scroll the cursor drifts across cards without entering them,
-            // which would otherwise trigger @State mutations and full body re-renders
-            // at the mouse polling rate (~125Hz) for every card the cursor crosses.
             guard coordinator.isHovered else { return }
             coordinator.onHover?(convert(event.locationInWindow, from: nil))
         }
@@ -422,12 +415,78 @@ private struct MouseTrackingView: NSViewRepresentable {
     }
 }
 
+// MARK: - Adaptive Card Layout Metrics
+
+/// Shared engine that computes card width, visible column count, and leading
+/// inset for both the horizontal scroll rows (HomeView) and the library grid
+/// (LibraryView) so both surfaces always display identically-sized cards.
+///
+/// **Formula derivation (symmetric peek):**
+/// We want `peekFraction` of the adjacent card to show on *both* the leading
+/// edge (when scrolled forward) and the trailing edge (always).
+///
+///   leadingPadding = spacing + peekFraction × cardWidth
+///   containerWidth = leadingPadding + N×cardWidth + N×spacing + peekFraction×cardWidth
+///                  = (N+1)×spacing + (N + 2×peekFraction)×cardWidth
+///   → cardWidth    = (containerWidth − (N+1)×spacing) / (N + 2×peekFraction)
+///
+/// Using `leadingPadding` as both leading and trailing padding in the library
+/// grid produces exactly `containerWidth` total — no leftover space.
+struct CardLayoutMetrics {
+    let cardWidth: CGFloat
+    let visibleCount: Int
+    /// Content inset for the leading edge. Produces a symmetric peek:
+    /// `peekFraction × cardWidth` shows on each side when scrolling.
+    let leadingPadding: CGFloat
+
+    /// Gap between cards (columns) and between grid rows.
+    /// 20 pt = 40 px at 2× Retina, matching the TV app's inter-card spacing.
+    static let spacing: CGFloat = 20
+    /// Fraction of the adjacent card that "peeks" at each scroll edge.
+    static let peekFraction: CGFloat = 0.2
+
+    /// Derives layout metrics for the given container width.
+    ///
+    /// - Parameters:
+    ///   - containerWidth: Available width of the scroll view or grid container.
+    ///   - maxCards:       Upper bound on visible column count (default 8,
+    ///                     matching the TV app's full-screen maximum).
+    ///   - minCards:       Lower bound on visible column count (default 5).
+    ///                     The window simply shows smaller cards rather than
+    ///                     dropping below 5 columns.
+    static func compute(
+        for containerWidth: CGFloat,
+        maxCards: Int = 8,
+        minCards: Int = 5
+    ) -> CardLayoutMetrics {
+        let s = spacing
+        let p = peekFraction
+
+        guard containerWidth > 0 else {
+            let w: CGFloat = 155
+            return CardLayoutMetrics(cardWidth: w, visibleCount: minCards, leadingPadding: s + p * w)
+        }
+
+        // Pick N by anchoring to a target card width so the column count steps
+        // predictably with window size (rather than always maximising columns).
+        let targetWidth: CGFloat = 155
+        let rawN = Int(floor(containerWidth / (targetWidth + s)))
+        let n = min(max(rawN, minCards), maxCards)
+
+        // No minimum card width clamp — cards shrink evenly when the window
+        // is narrow rather than reducing the column count below minCards.
+        let w = (containerWidth - CGFloat(n + 1) * s) / (CGFloat(n) + 2 * p)
+        let lp = s + p * w
+        return CardLayoutMetrics(cardWidth: w, visibleCount: n, leadingPadding: lp)
+    }
+}
+
 #Preview {
-    HStack {
+    HStack(alignment: .top, spacing: 16) {
         GameGridView(game: Game.previews[0], isSelected: false, isFavorite: true, gameState: .running)
         GameGridView(game: Game.previews[2], isSelected: true, isFavorite: false, gameState: .notInstalled)
         GameGridView(game: Game.previews[4], isSelected: false, isFavorite: false, gameState: .launching)
     }
     .padding()
-    .frame(width: 660)
+    .frame(width: 560)
 }

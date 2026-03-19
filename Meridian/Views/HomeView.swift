@@ -11,12 +11,17 @@ struct HomeView: View {
 
     @State private var carouselIndex: Int = 0
     @State private var carouselTimer: Timer?
+    /// Measured on homeContent so all fixed-position elements share the same
+    /// leading inset as the GameScrollRow section titles and cards.
+    @State private var contentWidth: CGFloat = 0
 
-    private static let gridSpacing: CGFloat = 16
+    private var leadingInset: CGFloat {
+        CardLayoutMetrics.compute(for: contentWidth).leadingPadding
+    }
+
     private static let sectionSpacing: CGFloat = 28
-    private static let cardWidth: CGFloat = 200
     private static let carouselCount = 3
-    private static let carouselInterval: TimeInterval = 6
+    private static let carouselInterval: TimeInterval = 20
 
     private var carouselGames: [Game] {
         Array(library.recentlyPlayedGames.prefix(Self.carouselCount))
@@ -48,7 +53,15 @@ struct HomeView: View {
                 }
 
                 if !library.recentlyPlayedGames.isEmpty {
-                    recentlyPlayedSection
+                    GameScrollRow(
+                        title: "Recently Played",
+                        games: Array(library.recentlyPlayedGames.prefix(20)),
+                        selectedGameID: selectedGame?.id,
+                        isFavorite: { library.isFavorite(appID: $0) },
+                        gameState: gameState(for:),
+                        onSelect: { selectedGame = $0 },
+                        contextMenu: { gameContextMenu(for: $0) }
+                    )
                 }
 
                 if !library.friendSummaries.isEmpty {
@@ -56,14 +69,24 @@ struct HomeView: View {
                 }
 
                 if !library.favoriteGames.isEmpty {
-                    favoritesSection
+                    GameScrollRow(
+                        title: "Favorites",
+                        games: library.favoriteGames,
+                        selectedGameID: selectedGame?.id,
+                        isFavorite: { _ in true },
+                        showFavoriteBadge: false,
+                        gameState: gameState(for:),
+                        onSelect: { selectedGame = $0 },
+                        contextMenu: { gameContextMenu(for: $0) }
+                    )
                 }
 
-                Spacer(minLength: Self.gridSpacing)
+                Spacer(minLength: Self.sectionSpacing)
             }
         }
         .ignoresSafeArea(edges: [.top, .bottom])
         .scrollIndicators(.hidden)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
     }
 
     // MARK: - Loading
@@ -90,6 +113,7 @@ struct HomeView: View {
                 HeroBannerImage(urls: [game.heroURL] + game.heroURLFallbacks)
                     .id(game.id)
                     .transition(.opacity)
+                    .applyBackgroundExtension()
             }
 
             LinearGradient(
@@ -99,18 +123,21 @@ struct HomeView: View {
             )
 
             if let game {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(game.name)
-                        .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(.white)
-                        .shadow(color: .black.opacity(0.5), radius: 4, y: 2)
-                        .id("title-\(game.id)")
-                        .transition(.opacity)
+                VStack(alignment: .leading, spacing: 2) {
+                    // Logo image with transparent background — falls back to bold text
+                    // if the game doesn't have a logo asset on Steam.
+                    HeroLogoImage(
+                        urls: game.newCDNLogoURLs + [game.logoURL] + game.logoURLFallbacks,
+                        fallbackName: game.name
+                    )
+                    .id("logo-\(game.id)")
+                    .transition(.opacity)
 
-                    Text("You recently played \(game.name). Pick up where you left off…")
-                        .font(.subheadline)
+                    Text(heroBannerSubtitle(for: game))
+                        .font(.callout)
                         .foregroundStyle(.white.opacity(0.7))
                         .lineLimit(2)
+                        .padding(.top, 4)
 
                     Button {
                         selectedGame = game
@@ -125,7 +152,8 @@ struct HomeView: View {
                     .controlSize(.large)
                     .padding(.top, 10)
                 }
-                .padding(.horizontal, Self.gridSpacing + 4)
+                .padding(.leading, leadingInset)
+                .padding(.trailing, 24)
                 .padding(.bottom, 20)
             }
 
@@ -138,10 +166,43 @@ struct HomeView: View {
                 .frame(maxWidth: .infinity)
             }
         }
+        .overlay(alignment: .leading) {
+            // Left chevron — sits horizontally centred within the leadingInset strip,
+            // vertically centred in the banner. No background; plain arrow only.
+            if games.count > 1 {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.5)) {
+                        carouselIndex = (safeIndex - 1 + games.count) % games.count
+                    }
+                    restartCarouselTimer()
+                } label: {
+                    Image(systemName: "chevron.compact.left")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: leadingInset)
+            }
+        }
+        .overlay(alignment: .trailing) {
+            // Right chevron — mirrored positioning.
+            if games.count > 1 {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.5)) {
+                        carouselIndex = (safeIndex + 1) % games.count
+                    }
+                    restartCarouselTimer()
+                } label: {
+                    Image(systemName: "chevron.compact.right")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .frame(width: leadingInset)
+            }
+        }
         .frame(maxWidth: .infinity)
-        .frame(height: 300)
-        .clipped()
-        .applyBackgroundExtension()
+        .frame(height: 302)
         .contentShape(Rectangle())
         .onTapGesture {
             if let game { selectedGame = game }
@@ -178,90 +239,40 @@ struct HomeView: View {
         startCarouselTimer()
     }
 
-    // MARK: - Recently Played
-
-    private var recentlyPlayedSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Recently Played")
-                .padding(.horizontal, Self.gridSpacing)
-
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: Self.gridSpacing) {
-                    ForEach(Array(library.recentlyPlayedGames.prefix(20))) { game in
-                        GameGridView(
-                            game: game,
-                            isSelected: selectedGame?.id == game.id,
-                            isFavorite: library.isFavorite(appID: game.id),
-                            showFavoriteBadge: true,
-                            gameState: gameState(for: game)
-                        )
-                        .frame(width: Self.cardWidth)
-                        .onTapGesture { selectedGame = game }
-                        .contextMenu { gameContextMenu(for: game) }
-                    }
-                }
-                .padding(.horizontal, Self.gridSpacing)
-                .padding(.vertical, 4)
-            }
-            .scrollIndicators(.hidden)
-        }
-    }
-
     // MARK: - Friend Activity
 
     private var friendActivitySection: some View {
         let topFriends = Array(library.friendSummaries.prefix(15))
-        return VStack(alignment: .leading, spacing: 10) {
+        return VStack(alignment: .leading, spacing: 0) {
             sectionHeader("Friends")
-                .padding(.horizontal, Self.gridSpacing)
+                .padding(.leading, leadingInset)
+                .padding(.bottom, 12)
 
             ScrollView(.horizontal) {
-                LazyHStack(spacing: 12) {
+                LazyHStack(spacing: CardLayoutMetrics.spacing) {
                     ForEach(topFriends) { friend in
                         FriendCard(friend: friend)
                     }
                 }
-                .padding(.horizontal, Self.gridSpacing)
-                .padding(.vertical, 4)
+                .padding(.bottom, 4)
             }
+            .contentMargins(.leading, leadingInset, for: .scrollContent)
             .scrollIndicators(.hidden)
-        }
-    }
-
-    // MARK: - Favorites
-
-    private var favoritesSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Favorites")
-                .padding(.horizontal, Self.gridSpacing)
-
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: Self.gridSpacing) {
-                    ForEach(library.favoriteGames) { game in
-                        GameGridView(
-                            game: game,
-                            isSelected: selectedGame?.id == game.id,
-                            isFavorite: true,
-                            showFavoriteBadge: false,
-                            gameState: gameState(for: game)
-                        )
-                        .frame(width: Self.cardWidth)
-                        .onTapGesture { selectedGame = game }
-                        .contextMenu { gameContextMenu(for: game) }
-                    }
-                }
-                .padding(.horizontal, Self.gridSpacing)
-                .padding(.vertical, 4)
-            }
-            .scrollIndicators(.hidden)
+            .scrollClipDisabled()
         }
     }
 
     // MARK: - Shared helpers
 
+    private func heroBannerSubtitle(for game: Game) -> String {
+        let time = game.playtime2WeekFormatted ?? game.playtimeFormatted
+        let qualifier = game.playtime2WeekFormatted != nil ? "in the last two weeks" : "recently"
+        return "You've played \(game.name) for \(time) \(qualifier)."
+    }
+
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
-            .font(.title3.weight(.semibold))
+            .font(.title2.weight(.semibold))
             .foregroundStyle(.primary)
     }
 
@@ -306,6 +317,137 @@ struct HomeView: View {
     }
 }
 
+// MARK: - Tahoe TV App Snap-Scroll Row
+
+private struct GameScrollRow<MenuContent: View>: View {
+    let title: String
+    let games: [Game]
+    let selectedGameID: Int?
+    let isFavorite: (Int) -> Bool
+    var showFavoriteBadge: Bool = true
+    let gameState: (Game) -> GameCardState
+    let onSelect: (Game) -> Void
+    @ViewBuilder let contextMenu: (Game) -> MenuContent
+
+    @State private var isRowHovered = false
+    @State private var scrollPosition = ScrollPosition(idType: Int.self)
+    /// Measured by onGeometryChange; drives all adaptive sizing.
+    @State private var containerWidth: CGFloat = 0
+
+    /// Recomputed whenever containerWidth changes.
+    private var metrics: CardLayoutMetrics {
+        CardLayoutMetrics.compute(for: containerWidth)
+    }
+
+    /// Number of cards to advance per arrow press, equals the visible count
+    /// so one press shows the next "page" of cards.
+    private var pageSize: Int { metrics.visibleCount }
+
+    private var visibleStartIndex: Int {
+        guard let id = scrollPosition.viewID(type: Int.self),
+              let idx = games.firstIndex(where: { $0.id == id }) else { return 0 }
+        return idx
+    }
+
+    private var canScrollBack: Bool { visibleStartIndex > 0 }
+    private var canScrollForward: Bool { visibleStartIndex < games.count - pageSize }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Section title aligns with the leading edge of the first card.
+            Text(title)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.primary)
+                .padding(.leading, metrics.leadingPadding)
+                .padding(.bottom, 14)
+
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: CardLayoutMetrics.spacing) {
+                        ForEach(games) { game in
+                            GameGridView(
+                                game: game,
+                                isSelected: selectedGameID == game.id,
+                                isFavorite: isFavorite(game.id),
+                                showFavoriteBadge: showFavoriteBadge,
+                                gameState: gameState(game)
+                            )
+                            .frame(width: metrics.cardWidth)
+                            .id(game.id)
+                            .onTapGesture { onSelect(game) }
+                            .contextMenu { contextMenu(game) }
+                        }
+                    }
+                    .scrollTargetLayout()
+                    .padding(.bottom, 8)
+                }
+                // Use contentMargins (not inner LazyHStack padding) so the
+                // leading inset becomes the scroll view's snap anchor. This
+                // makes scroll offset 0 a valid snap position that shows the
+                // first card at leadingPadding from the left, and causes the
+                // previous card to peek by exactly peekFraction×cardWidth on
+                // the left edge when scrolled forward — matching TV app.
+                .contentMargins(.leading, metrics.leadingPadding, for: .scrollContent)
+                .scrollTargetBehavior(.viewAligned)
+                .scrollClipDisabled()
+                .scrollIndicators(.hidden)
+                .scrollPosition($scrollPosition)
+                .overlay(alignment: .leading) {
+                    scrollArrow(direction: .back, proxy: proxy)
+                }
+                .overlay(alignment: .trailing) {
+                    scrollArrow(direction: .forward, proxy: proxy)
+                }
+            }
+        }
+        .onHover { isRowHovered = $0 }
+        // Measure the row's container width to drive adaptive sizing.
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { containerWidth = $0 }
+    }
+
+    @ViewBuilder
+    private func scrollArrow(direction: ArrowDirection, proxy: ScrollViewProxy) -> some View {
+        let show = isRowHovered && (direction == .back ? canScrollBack : canScrollForward)
+        Button {
+            let currentIndex = visibleStartIndex
+            let targetIndex: Int
+            if direction == .back {
+                targetIndex = max(0, currentIndex - pageSize)
+            } else {
+                targetIndex = min(games.count - 1, currentIndex + pageSize)
+            }
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
+                proxy.scrollTo(games[targetIndex].id, anchor: .leading)
+            }
+        } label: {
+            Image(systemName: direction == .back ? "chevron.left" : "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .background {
+            if #available(macOS 26.0, *) {
+                Circle().glassEffect(.regular.interactive())
+            } else {
+                Circle()
+                    .fill(.regularMaterial)
+                    .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
+            }
+        }
+        .padding(.horizontal, 10)
+        // Offset upward so the arrow is centred on the card art rather than
+        // the full card height (art + text label + bottom padding).
+        // Shift = (VStack spacing 6 + label ~31 + bottom padding 8) / 2 ≈ 22 pt.
+        .offset(y: -22)
+        .opacity(show ? 1 : 0)
+        .animation(.easeInOut(duration: 0.18), value: show)
+        .allowsHitTesting(show)
+    }
+
+    private enum ArrowDirection { case back, forward }
+}
+
 // MARK: - Background Extension Effect (macOS 26)
 
 private struct BackgroundExtensionModifier: ViewModifier {
@@ -321,6 +463,70 @@ private struct BackgroundExtensionModifier: ViewModifier {
 extension View {
     func applyBackgroundExtension() -> some View {
         modifier(BackgroundExtensionModifier())
+    }
+}
+
+// MARK: - Hero Logo Image
+
+/// Loads the game's logo PNG (transparent, styled title lockup) from Steam CDN.
+/// Falls back to bold text matching the original title style when no logo exists.
+private struct HeroLogoImage: View {
+    let urls: [URL]
+    let fallbackName: String
+
+    @State private var loadedImage: NSImage?
+    @State private var loadFailed = false
+
+    var body: some View {
+        Group {
+            if let image = loadedImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 100)
+                    .frame(maxWidth: 420, alignment: .leading)
+                    .shadow(color: .black.opacity(0.6), radius: 8, y: 4)
+            } else if loadFailed {
+                // Fallback: plain bold text matching the previous carousel style
+                Text(fallbackName)
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 4, y: 2)
+                    .lineLimit(2)
+            } else {
+                // Loading: show invisible placeholder of similar height so
+                // layout doesn't jump when the logo arrives.
+                Color.clear.frame(height: 72)
+            }
+        }
+        .task(id: urls.first) { await loadLogo() }
+    }
+
+    private func loadLogo() async {
+        loadFailed = false
+
+        for url in urls {
+            if let cached = ImageCache.shared.image(for: url) {
+                loadedImage = cached
+                return
+            }
+        }
+
+        for url in urls {
+            guard !Task.isCancelled else { return }
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+                guard let nsImage = NSImage(data: data) else { continue }
+                ImageCache.shared.store(nsImage, for: url)
+                loadedImage = nsImage
+                return
+            } catch {
+                continue
+            }
+        }
+
+        loadFailed = true
     }
 }
 
@@ -529,5 +735,5 @@ private struct FriendCard: View {
         .environment(SteamAuthService())
         .environment(SteamLibraryStore())
         .environment(GameLauncher())
-        .frame(width: 800, height: 700)
+        .frame(width: 900, height: 800)
 }

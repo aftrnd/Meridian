@@ -7,7 +7,7 @@ private let log = Logger(subsystem: "com.meridian.app", category: "AppDelegate")
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let splashSize     = NSSize(width: 480, height: 300)
-    private static let fullFrameSize  = NSSize(width: 1085, height: 651)
+    private static let fullFrameSize  = NSSize(width: 1030, height: 625)
 
     private var readyObserver: NSObjectProtocol?
 
