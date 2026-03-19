@@ -206,7 +206,7 @@ actor SteamAPIService {
         log.info("[probeCapsuleHash] appID=\(appID) probing \(uniqueHashes.count) candidate hashes")
 
         let cdns = ["https://shared.fastly.steamstatic.com", "https://shared.akamai.steamstatic.com"]
-        let filenames = ["library_600x900.jpg", "library_600x900_2x.jpg"]
+        let filenames = ["library_600x900.jpg", "library_600x900_2x.jpg", "library_capsule_2x.jpg", "library_capsule.jpg"]
         for hash in uniqueHashes {
             for cdn in cdns {
                 for filename in filenames {
@@ -348,7 +348,11 @@ actor SteamAPIService {
         for item in items {
             guard let appID = (item["appid"] as? Int) ?? (item["id"] as? Int) else { continue }
             let target: Any = (item["assets"] as? [String: Any]) ?? item
-            let ch = searchForHash(matching: "library_600x900", in: target)
+            // Eagerly compute both capsule naming variants before combining with ??
+            // so `target` (non-Sendable Any) is not captured lazily across the operator.
+            let ch600 = searchForHash(matching: "library_600x900", in: target)
+            let chCap = searchForHash(matching: "library_capsule", in: target)
+            let ch = ch600 ?? chCap
             let lh = searchForHash(matching: "logo", in: target)
             if ch != nil || lh != nil {
                 out[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh)

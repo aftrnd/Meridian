@@ -56,6 +56,15 @@ enum GameArtOverrides {
             capsuleHash: "480bd879ac737921bfa2529a6fea15961267ad21"
         ),
 
+        // Super Battle Golf (2024) — hashes confirmed via SteamDB 2026-03-18
+        // logo:    https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/4069520/a5bf0704312c45ce5af99b6fb7fc7c08b1828806/logo_2x.png
+        // capsule: https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/4069520/2fc1510d6b70cf26a95252290633b6cfd8e4bff1/library_capsule_2x.jpg
+        // hero:    https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/4069520/81ccebfda24722ce39d61462a406e186b166b06e/library_hero_2x.jpg
+        4069520: GameArtOverride(
+            logoHash:    "a5bf0704312c45ce5af99b6fb7fc7c08b1828806",
+            capsuleHash: "2fc1510d6b70cf26a95252290633b6cfd8e4bff1"
+        ),
+
     ]
 
     // MARK: - Lookups

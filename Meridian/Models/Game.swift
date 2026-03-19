@@ -86,15 +86,21 @@ struct Game: Identifiable, Hashable, Sendable {
     /// URLs for Steam's new hash-based CDN, required for games published after ~2024.
     /// Prefers the manual override hash from GameArtOverrides, then the auto-fetched hash.
     ///
-    /// URL format: shared.{cdn}.steamstatic.com/store_item_assets/steam/apps/{id}/{hash}/library_600x900.jpg
+    /// Tries both the library_600x900 naming (most games) and the library_capsule naming
+    /// (some newer titles, e.g. Super Battle Golf use library_capsule_2x.jpg instead).
     var newCDNCapsuleURLs: [URL] {
         guard let hash = effectiveCapsuleHash, !hash.isEmpty else { return [] }
         return [
+            // library_600x900 naming (most games)
             URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_600x900.jpg"),
             URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_600x900.jpg"),
             URL(string: "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_600x900.jpg"),
             URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_600x900_2x.jpg"),
             URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_600x900_2x.jpg"),
+            // library_capsule naming (some newer titles)
+            URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_capsule_2x.jpg"),
+            URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_capsule_2x.jpg"),
+            URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_capsule.jpg"),
         ].compactMap { $0 }
     }
 
