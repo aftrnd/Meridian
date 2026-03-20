@@ -17,17 +17,15 @@ struct SplashView: View {
         VStack(spacing: 0) {
             Spacer()
 
-            VStack(spacing: 20) {
-                Image(systemName: "gamecontroller.fill")
-                    .font(.system(size: 48, weight: .thin))
-                    .foregroundStyle(.tint)
-                    .symbolRenderingMode(.hierarchical)
+            // Logo — template rendering in the asset catalog fills it with
+            // .primary automatically: black in light mode, white in dark mode.
+            Image("MeridianLogo")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 260)
+                .foregroundStyle(.primary)
 
-                Text("Meridian")
-                    .font(.system(size: 36, weight: .bold, design: .rounded))
-            }
-
-            Spacer().frame(height: 48)
+            Spacer().frame(height: 40)
 
             if isFailed {
                 failedContent
@@ -36,6 +34,8 @@ struct SplashView: View {
             }
 
             Spacer()
+
+            finePrint
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .opacity(isExiting ? 0 : 1)
@@ -64,7 +64,7 @@ struct SplashView: View {
             ProgressView()
                 .scaleEffect(0.8)
 
-            Text(bootstrap.statusMessage.isEmpty ? "Starting Meridian…" : bootstrap.statusMessage)
+            Text(bootstrap.statusMessage.isEmpty ? "Starting up…" : bootstrap.statusMessage)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .animation(.easeInOut(duration: 0.2), value: bootstrap.statusMessage)
@@ -102,6 +102,21 @@ struct SplashView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
         }
+    }
+
+    // MARK: - Fine Print
+
+    private var finePrint: some View {
+        VStack(spacing: 3) {
+            Text("Not affiliated with or endorsed by Valve Corporation or Apple Inc.")
+            Text("Wine is free software distributed under the GNU LGPL · © 2026 Meridian · All rights reserved.")
+        }
+        .font(.system(size: 9, weight: .regular))
+        .foregroundStyle(.tertiary)
+        .multilineTextAlignment(.center)
+        .lineSpacing(1)
+        .padding(.horizontal, 28)
+        .padding(.bottom, 14)
     }
 }
 
