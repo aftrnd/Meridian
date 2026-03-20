@@ -233,6 +233,11 @@ struct GameGridView: View {
                 .help(game.name)
 
             HStack(spacing: 4) {
+                if isFavorite, showFavoriteBadge {
+                    Image(systemName: "heart.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.pink)
+                }
                 if game.playtimeMinutes > 0 {
                     Text(game.playtimeFormatted)
                         .font(.caption)
@@ -293,14 +298,7 @@ struct GameGridView: View {
 
     @ViewBuilder
     private var trailingBadges: some View {
-        if isFavorite, showFavoriteBadge {
-            Image(systemName: "heart.fill")
-                .font(.caption2)
-                .foregroundStyle(.white)
-                .padding(5)
-                .background(.pink.opacity(0.85), in: Circle())
-                .padding(6)
-        }
+        EmptyView()
     }
 
     private var artPlaceholder: some View {

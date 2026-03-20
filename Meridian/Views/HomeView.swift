@@ -486,16 +486,13 @@ private struct ChevronNavButton: View {
     var onHoverChanged: ((Bool) -> Void)? = nil
 
     @State private var isHovered = false
-    /// Records when the button was last clicked so the onHover handler can
-    /// ignore the spurious mouseExited that NSTrackingArea fires mid-animation
-    /// when SwiftUI rebuilds the view tree (e.g. carousel identity swap).
-    @State private var lastClickTime: Date = .distantPast
 
     var body: some View {
         Button {
+            // Re-assert hover so material stays visible at the moment of the
+            // click, before onContinuousHover has a chance to re-evaluate.
             isHovered = true
             onHoverChanged?(true)
-            lastClickTime = Date()
             action()
         } label: {
             Image(systemName: direction == .back ? "chevron.compact.left" : "chevron.compact.right")
@@ -517,23 +514,25 @@ private struct ChevronNavButton: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
                 .opacity(isHovered || showMaterial ? 1 : 0)
         }
-        // onHover (NSTrackingArea) re-fires when the view re-renders with the
-        // cursor already inside — onContinuousHover only fires on mouse movement,
-        // so it gets stuck at false after any parent re-render.
-        // The 0.4s guard silences the spurious mouseExited that AppKit fires
-        // during the carousel animation rebuild, preventing the material from
-        // blinking off while the cursor is still over the button.
-        .onHover { hovered in
-            if !hovered, Date().timeIntervalSince(lastClickTime) < 0.4 { return }
-            isHovered = hovered
-            onHoverChanged?(hovered)
+        // onContinuousHover fires .ended only on a genuine cursor exit, never
+        // on view re-renders. The old onHover (NSTrackingArea) approach used a
+        // debounce to suppress the spurious mouseExited AppKit fires during
+        // animation, but that debounce was swallowing the real exit event too —
+        // leaving the material stuck on after the cursor had already left.
+        .onContinuousHover { phase in
+            switch phase {
+            case .active:
+                isHovered = true
+                onHoverChanged?(true)
+            case .ended:
+                isHovered = false
+                onHoverChanged?(false)
+            }
         }
         // Never block hit testing even when invisible. If allowsHitTesting were
         // tied to isVisible, a stale hover state (e.g. after switching tabs)
         // creates a deadlock: the button is non-hittable so the cursor can never
         // hover it to make isRowHovered/isBackButtonHovered true again.
-        // Keeping hit testing live means hovering the button area always
-        // self-recovers the hover state, regardless of row-level hover.
         .opacity(isVisible ? 1 : 0)
     }
 }
