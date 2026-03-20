@@ -189,22 +189,22 @@ struct GameGridView: View {
                 .strokeBorder(cardBorderColor, lineWidth: cardBorderWidth)
         }
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        // Track mouse inside the art area. onResize gives art dimensions so
-        // tiltX/tiltY and highlightOffset are relative to the image, not the
-        // full card VStack which includes the text label below.
-        .background {
-            MouseTrackingView(
-                onHover: { point in
-                    if let point {
-                        hoverLocation = point
-                        isHovered = true
-                    } else {
-                        isHovered = false
-                    }
-                },
-                onResize: { cardSize = $0 }
-            )
+        // Track hover inside the art area using native SwiftUI APIs.
+        // onContinuousHover fires on every mouse-move (not just boundary crossing),
+        // provides view-local coordinates with no conversion needed, and fires .ended
+        // automatically on disappear / tab-switch — no NSTrackingArea lifecycle to manage.
+        // onGeometryChange replaces the old NSView layout() size callback.
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let point):
+                hoverLocation = point
+                isHovered = true
+            case .ended:
+                isHovered = false
+                hoverLocation = .zero
+            }
         }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { cardSize = $0 }
     }
 
     // MARK: - Info Label (below art, TV app style)
@@ -327,93 +327,6 @@ struct WindowsBadge: View {
     }
 }
 
-// MARK: - AppKit mouse tracking
-
-private struct MouseTrackingView: NSViewRepresentable {
-    var onHover: (CGPoint?) -> Void
-    var onResize: (CGSize) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeNSView(context: Context) -> TrackingNSView {
-        let view = TrackingNSView(coordinator: context.coordinator)
-        context.coordinator.onHover = onHover
-        context.coordinator.onResize = onResize
-        return view
-    }
-
-    func updateNSView(_ nsView: TrackingNSView, context: Context) {
-        context.coordinator.onHover = onHover
-        context.coordinator.onResize = onResize
-    }
-
-    final class Coordinator {
-        var onHover: ((CGPoint?) -> Void)?
-        var onResize: ((CGSize) -> Void)?
-        /// Tracks whether the cursor is currently inside this card.
-        /// Used to suppress mouseMoved events for cards the cursor
-        /// is merely passing over during a scroll gesture.
-        var isHovered = false
-    }
-
-    final class TrackingNSView: NSView {
-        private let coordinator: Coordinator
-        private var currentArea: NSTrackingArea?
-
-        init(coordinator: Coordinator) {
-            self.coordinator = coordinator
-            super.init(frame: .zero)
-        }
-
-        required init?(coder: NSCoder) { fatalError() }
-
-        override var isFlipped: Bool { true }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if window == nil { coordinator.onHover?(nil) }
-        }
-
-        override func updateTrackingAreas() {
-            super.updateTrackingAreas()
-            if let currentArea { removeTrackingArea(currentArea) }
-            let area = NSTrackingArea(
-                rect: bounds,
-                options: [.mouseEnteredAndExited, .mouseMoved,
-                          .activeInKeyWindow, .inVisibleRect],
-                owner: self
-            )
-            addTrackingArea(area)
-            currentArea = area
-        }
-
-        override func layout() {
-            super.layout()
-            coordinator.onResize?(bounds.size)
-        }
-
-        override func mouseEntered(with event: NSEvent) {
-            coordinator.isHovered = true
-            coordinator.onHover?(convert(event.locationInWindow, from: nil))
-        }
-
-        override func mouseMoved(with event: NSEvent) {
-            guard coordinator.isHovered else { return }
-            coordinator.onHover?(convert(event.locationInWindow, from: nil))
-        }
-
-        override func mouseExited(with event: NSEvent) {
-            coordinator.isHovered = false
-            guard let window else {
-                coordinator.onHover?(nil)
-                return
-            }
-            let mouse = convert(window.mouseLocationOutsideOfEventStream, from: nil)
-            guard !bounds.contains(mouse) else { return }
-            coordinator.onHover?(nil)
-        }
-    }
-}
 
 // MARK: - Adaptive Card Layout Metrics
 

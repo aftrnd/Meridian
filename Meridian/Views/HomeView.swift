@@ -14,7 +14,6 @@ struct HomeView: View {
     /// Measured on homeContent so all fixed-position elements share the same
     /// leading inset as the GameScrollRow section titles and cards.
     @State private var contentWidth: CGFloat = 0
-
     private var leadingInset: CGFloat {
         CardLayoutMetrics.compute(for: contentWidth).leadingPadding
     }
@@ -130,8 +129,6 @@ struct HomeView: View {
                         urls: game.newCDNLogoURLs + [game.logoURL] + game.logoURLFallbacks,
                         fallbackName: game.name
                     )
-                    .id("logo-\(game.id)")
-                    .transition(.opacity)
 
                     Text(heroBannerSubtitle(for: game))
                         .font(.callout)
@@ -155,6 +152,10 @@ struct HomeView: View {
                 .padding(.leading, leadingInset)
                 .padding(.trailing, 24)
                 .padding(.bottom, 20)
+                // Give this block its own identity so SwiftUI crossfades it cleanly
+                // when the carousel game changes, instead of sliding.
+                .id(game.id)
+                .transition(.opacity)
             }
 
             if games.count > 1 {
@@ -167,47 +168,34 @@ struct HomeView: View {
             }
         }
         .overlay(alignment: .leading) {
-            // Left chevron — sits horizontally centred within the leadingInset strip,
-            // vertically centred in the banner. No background; plain arrow only.
             if games.count > 1 {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.5)) {
-                        carouselIndex = (safeIndex - 1 + games.count) % games.count
+                ChevronNavButton(direction: .back, isVisible: true) {
+                    let count = carouselGames.count
+                    guard count > 1 else { return }
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        carouselIndex = (carouselIndex - 1 + count) % count
                     }
                     restartCarouselTimer()
-                } label: {
-                    Image(systemName: "chevron.compact.left")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.primary)
                 }
-                .buttonStyle(.plain)
-                .frame(width: leadingInset)
+                // Centre the button within the leading-inset strip.
+                .padding(.leading, max(0, (leadingInset - 24) / 2))
             }
         }
         .overlay(alignment: .trailing) {
-            // Right chevron — mirrored positioning.
             if games.count > 1 {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.5)) {
-                        carouselIndex = (safeIndex + 1) % games.count
+                ChevronNavButton(direction: .forward, isVisible: true) {
+                    let count = carouselGames.count
+                    guard count > 1 else { return }
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        carouselIndex = (carouselIndex + 1) % count
                     }
                     restartCarouselTimer()
-                } label: {
-                    Image(systemName: "chevron.compact.right")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.primary)
                 }
-                .buttonStyle(.plain)
-                .frame(width: leadingInset)
+                .padding(.trailing, max(0, (leadingInset - 24) / 2))
             }
         }
         .frame(maxWidth: .infinity)
         .frame(height: 302)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if let game { selectedGame = game }
-        }
-        .animation(.easeInOut(duration: 0.5), value: carouselIndex)
     }
 
     private func carouselIndicators(count: Int, current: Int) -> some View {
@@ -229,7 +217,11 @@ struct HomeView: View {
         guard carouselGames.count > 1 else { return }
         carouselTimer = Timer.scheduledTimer(withTimeInterval: Self.carouselInterval, repeats: true) { _ in
             Task { @MainActor in
-                carouselIndex += 1
+                let count = carouselGames.count
+                guard count > 1 else { return }
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    carouselIndex = (carouselIndex + 1) % count
+                }
             }
         }
     }
@@ -330,27 +322,27 @@ private struct GameScrollRow<MenuContent: View>: View {
     @ViewBuilder let contextMenu: (Game) -> MenuContent
 
     @State private var isRowHovered = false
+    @State private var isBackButtonHovered = false
+    @State private var isForwardButtonHovered = false
     @State private var scrollPosition = ScrollPosition(idType: Int.self)
-    /// Measured by onGeometryChange; drives all adaptive sizing.
+    @State private var currentIndex = 0
+    /// Records when the last programmatic scroll was triggered. Any `.idle`
+    /// phase within 0.5 s of a button tap is ignored — this covers both the
+    /// primary animation settling and the subsequent viewAligned micro-correction
+    /// that fires a second idle, which was overwriting currentIndex with the
+    /// wrong card on rapid taps.
+    @State private var programmaticScrollTime: Date = .distantPast
     @State private var containerWidth: CGFloat = 0
 
-    /// Recomputed whenever containerWidth changes.
     private var metrics: CardLayoutMetrics {
         CardLayoutMetrics.compute(for: containerWidth)
     }
 
-    /// Number of cards to advance per arrow press, equals the visible count
-    /// so one press shows the next "page" of cards.
-    private var pageSize: Int { metrics.visibleCount }
+    private var canScrollBack: Bool { currentIndex > 0 }
+    private var canScrollForward: Bool { currentIndex < games.count - metrics.visibleCount }
 
-    private var visibleStartIndex: Int {
-        guard let id = scrollPosition.viewID(type: Int.self),
-              let idx = games.firstIndex(where: { $0.id == id }) else { return 0 }
-        return idx
-    }
-
-    private var canScrollBack: Bool { visibleStartIndex > 0 }
-    private var canScrollForward: Bool { visibleStartIndex < games.count - pageSize }
+    private var backVisible: Bool { (isRowHovered || isBackButtonHovered) && canScrollBack }
+    private var forwardVisible: Bool { (isRowHovered || isForwardButtonHovered) && canScrollForward }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -361,6 +353,12 @@ private struct GameScrollRow<MenuContent: View>: View {
                 .padding(.leading, metrics.leadingPadding)
                 .padding(.bottom, 14)
 
+            // ScrollViewReader.proxy.scrollTo drives animation directly through
+            // the scroll view's internal renderer — this is the only reliable
+            // path for smooth programmatic scrolling on macOS. ScrollPosition
+            // .scrollTo(id:) cannot be trusted to animate inside withAnimation
+            // on macOS; it fires an instant jump that viewAligned then
+            // corrects, producing the skip/backwards artifacts.
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: CardLayoutMetrics.spacing) {
@@ -392,60 +390,143 @@ private struct GameScrollRow<MenuContent: View>: View {
                 .scrollClipDisabled()
                 .scrollIndicators(.hidden)
                 .scrollPosition($scrollPosition)
+                // Only sync currentIndex from user drags once the scroll is
+                // fully at rest AND outside the debounce window. The 0.5 s
+                // guard covers both the primary animation (0.3 s) and the
+                // viewAligned micro-correction idle that fires right after —
+                // the old boolean flag cleared on that first idle, letting the
+                // second idle overwrite currentIndex with the wrong card.
+                .onScrollPhaseChange { _, new in
+                    guard new == .idle else { return }
+                    guard Date().timeIntervalSince(programmaticScrollTime) > 0.5 else { return }
+                    if let id = scrollPosition.viewID(type: Int.self),
+                       let idx = games.firstIndex(where: { $0.id == id }) {
+                        currentIndex = idx
+                    }
+                }
                 .overlay(alignment: .leading) {
-                    scrollArrow(direction: .back, proxy: proxy)
+                    ChevronNavButton(
+                        direction: .back,
+                        isVisible: backVisible,
+                        action: {
+                            guard !games.isEmpty else { return }
+                            programmaticScrollTime = Date()
+                            let target = max(0, currentIndex - 1)
+                            currentIndex = target
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                proxy.scrollTo(games[target].id, anchor: .leading)
+                            }
+                        },
+                        onHoverChanged: { isBackButtonHovered = $0 }
+                    )
+                    .padding(.leading, 10)
+                    // Offset upward so the arrow is centred on the card art
+                    // rather than the full card height (art + label + padding).
+                    .offset(y: -22)
                 }
                 .overlay(alignment: .trailing) {
-                    scrollArrow(direction: .forward, proxy: proxy)
+                    ChevronNavButton(
+                        direction: .forward,
+                        isVisible: forwardVisible,
+                        action: {
+                            guard !games.isEmpty else { return }
+                            programmaticScrollTime = Date()
+                            let target = min(games.count - 1, currentIndex + 1)
+                            currentIndex = target
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                proxy.scrollTo(games[target].id, anchor: .leading)
+                            }
+                        },
+                        onHoverChanged: { isForwardButtonHovered = $0 }
+                    )
+                    .padding(.trailing, 10)
+                    .offset(y: -22)
                 }
             }
         }
-        .onHover { isRowHovered = $0 }
-        // Measure the row's container width to drive adaptive sizing.
+        // onContinuousHover fires ONLY on actual cursor movement, never during
+        // view re-renders. onHover (NSTrackingArea) fires spurious mouseExited
+        // every time a re-render occurs — and proxy.scrollTo causes one per
+        // animation frame (60 fps). That cascading spurious false was setting
+        // isRowHovered = false mid-animation, collapsing backVisible and
+        // forwardVisible and making buttons permanently disappear.
+        .onContinuousHover { phase in
+            switch phase {
+            case .active: isRowHovered = true
+            case .ended:  isRowHovered = false
+            }
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { containerWidth = $0 }
     }
+}
 
-    @ViewBuilder
-    private func scrollArrow(direction: ArrowDirection, proxy: ScrollViewProxy) -> some View {
-        let show = isRowHovered && (direction == .back ? canScrollBack : canScrollForward)
+// MARK: - Shared Chevron Navigation Button
+
+/// A rounded-rect chevron button used in both the hero carousel and GameScrollRow.
+/// The background material appears instantly on hover (no animation), and the button
+/// is hidden (zero opacity, non-hittable) when isVisible is false.
+private struct ChevronNavButton: View {
+    enum Direction { case back, forward }
+
+    let direction: Direction
+    let isVisible: Bool
+    let action: () -> Void
+    /// Called immediately (no animation) when the cursor enters or exits the button.
+    /// Used by the parent to keep itself visible while the cursor is over an
+    /// offset button that lies outside the parent's layout frame.
+    var onHoverChanged: ((Bool) -> Void)? = nil
+
+    @State private var isHovered = false
+    /// Records when the button was last clicked so the onHover handler can
+    /// ignore the spurious mouseExited that NSTrackingArea fires mid-animation
+    /// when SwiftUI rebuilds the view tree (e.g. carousel identity swap).
+    @State private var lastClickTime: Date = .distantPast
+
+    var body: some View {
         Button {
-            let currentIndex = visibleStartIndex
-            let targetIndex: Int
-            if direction == .back {
-                targetIndex = max(0, currentIndex - pageSize)
-            } else {
-                targetIndex = min(games.count - 1, currentIndex + pageSize)
-            }
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
-                proxy.scrollTo(games[targetIndex].id, anchor: .leading)
-            }
+            isHovered = true
+            onHoverChanged?(true)
+            lastClickTime = Date()
+            action()
         } label: {
-            Image(systemName: direction == .back ? "chevron.left" : "chevron.right")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 32, height: 32)
+            Image(systemName: direction == .back ? "chevron.compact.left" : "chevron.compact.right")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                // Frame and contentShape must be INSIDE the label so the button
+                // uses them for its own hit testing. When placed outside the
+                // button (as view modifiers after .buttonStyle(.plain)), they
+                // apply to a wrapper view — the button's internal hit area
+                // remains the tiny chevron glyph (~12×16pt). Inside the label,
+                // the full 24×44 rounded rect becomes the click target.
+                .frame(width: 24, height: 44)
+                .contentShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .background {
-            if #available(macOS 26.0, *) {
-                Circle().glassEffect(.regular.interactive())
-            } else {
-                Circle()
-                    .fill(.regularMaterial)
-                    .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
-            }
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.regularMaterial)
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+                .opacity(isHovered ? 1 : 0)
         }
-        .padding(.horizontal, 10)
-        // Offset upward so the arrow is centred on the card art rather than
-        // the full card height (art + text label + bottom padding).
-        // Shift = (VStack spacing 6 + label ~31 + bottom padding 8) / 2 ≈ 22 pt.
-        .offset(y: -22)
-        .opacity(show ? 1 : 0)
-        .animation(.easeInOut(duration: 0.18), value: show)
-        .allowsHitTesting(show)
+        // onHover (NSTrackingArea) re-fires when the view re-renders with the
+        // cursor already inside — onContinuousHover only fires on mouse movement,
+        // so it gets stuck at false after any parent re-render.
+        // The 0.4s guard silences the spurious mouseExited that AppKit fires
+        // during the carousel animation rebuild, preventing the material from
+        // blinking off while the cursor is still over the button.
+        .onHover { hovered in
+            if !hovered, Date().timeIntervalSince(lastClickTime) < 0.4 { return }
+            isHovered = hovered
+            onHoverChanged?(hovered)
+        }
+        // Never block hit testing even when invisible. If allowsHitTesting were
+        // tied to isVisible, a stale hover state (e.g. after switching tabs)
+        // creates a deadlock: the button is non-hittable so the cursor can never
+        // hover it to make isRowHovered/isBackButtonHovered true again.
+        // Keeping hit testing live means hovering the button area always
+        // self-recovers the hover state, regardless of row-level hover.
+        .opacity(isVisible ? 1 : 0)
     }
-
-    private enum ArrowDirection { case back, forward }
 }
 
 // MARK: - Background Extension Effect (macOS 26)
