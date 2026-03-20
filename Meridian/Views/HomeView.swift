@@ -121,21 +121,42 @@ struct HomeView: View {
                 endPoint: .bottom
             )
 
+            // ── Logo ──────────────────────────────────────────────────────────
+            // alignment: .leading  =  Alignment(.leading, .center) in SwiftUI —
+            // horizontally anchored to leadingInset, vertically centred in the
+            // full 302 pt banner height. No VStack+Spacer needed; the frame's
+            // alignment does both jobs in one modifier.
             if let game {
-                VStack(alignment: .leading, spacing: 2) {
-                    // Logo image with transparent background — falls back to bold text
-                    // if the game doesn't have a logo asset on Steam.
-                    HeroLogoImage(
-                        urls: game.newCDNLogoURLs + [game.logoURL] + game.logoURLFallbacks,
-                        fallbackName: game.name
-                    )
+                HeroLogoImage(
+                    urls: game.newCDNLogoURLs + [game.logoURL] + game.logoURLFallbacks,
+                    fallbackName: game.name
+                )
+                .padding(.leading, leadingInset)
+                .padding(.trailing, 24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .id(game.id)
+                .transition(.opacity)
+            }
 
+            // ── Subtitle + button ─────────────────────────────────────────────
+            // All values derived from user specifications (÷2 = @2x → pt):
+            //
+            //   .padding(.bottom, 22.25)
+            //     msg1 baseline  62.5 px ÷ 2  = 31.25 pt  button bottom from banner bottom
+            //     msg2  −9 px ÷ 2 = −4.5 pt   → 26.75 pt
+            //     msg3  −9 px ÷ 2 = −4.5 pt   → 22.25 pt  ← final
+            //
+            //   Spacer().frame(height: 15.5)
+            //     msg1 baseline  36 px ÷ 2  = 18 pt   subtitle bottom to button top
+            //     msg2  −5 px ÷ 2 = −2.5 pt  → 15.5 pt  ← final (msg3: "perfect, unchanged")
+            if let game {
+                VStack(alignment: .leading, spacing: 0) {
+                    Spacer()
                     Text(heroBannerSubtitle(for: game))
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.7))
                         .lineLimit(2)
-                        .padding(.top, 4)
-
+                    Spacer().frame(height: 15.5)
                     Button {
                         selectedGame = game
                     } label: {
@@ -147,13 +168,11 @@ struct HomeView: View {
                     .tint(controlActiveState == .inactive ? nil : .white)
                     .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.black))
                     .controlSize(.large)
-                    .padding(.top, 10)
                 }
                 .padding(.leading, leadingInset)
                 .padding(.trailing, 24)
-                .padding(.bottom, 20)
-                // Give this block its own identity so SwiftUI crossfades it cleanly
-                // when the carousel game changes, instead of sliding.
+                .padding(.bottom, 26.75)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .id(game.id)
                 .transition(.opacity)
             }
