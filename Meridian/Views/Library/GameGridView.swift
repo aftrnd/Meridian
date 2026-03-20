@@ -193,7 +193,6 @@ struct GameGridView: View {
         // onContinuousHover fires on every mouse-move (not just boundary crossing),
         // provides view-local coordinates with no conversion needed, and fires .ended
         // automatically on disappear / tab-switch — no NSTrackingArea lifecycle to manage.
-        // onGeometryChange replaces the old NSView layout() size callback.
         .onContinuousHover { phase in
             switch phase {
             case .active(let point):
@@ -203,6 +202,20 @@ struct GameGridView: View {
                 isHovered = false
                 hoverLocation = .zero
             }
+        }
+        // Recovery for the post-scroll "stuck at false" case: when proxy.scrollTo
+        // animates the scroll row, a card translates under the cursor. onContinuousHover
+        // only fires on pointer movement so a stationary cursor never triggers .active
+        // for the newly arrived card. onHover (NSTrackingArea) re-evaluates whenever
+        // the view's frame settles, catching this case.
+        // Only recover to true — false is handled exclusively by onContinuousHover
+        // .ended to avoid spurious clears from scroll view re-renders.
+        .onHover { hovered in
+            guard hovered, !isHovered else { return }
+            // Position to card center as a neutral default; onContinuousHover
+            // .active will correct it to the actual cursor location on first move.
+            hoverLocation = CGPoint(x: cardSize.width / 2, y: cardSize.height / 2)
+            isHovered = true
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: { cardSize = $0 }
     }

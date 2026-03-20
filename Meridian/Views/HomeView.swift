@@ -386,6 +386,7 @@ private struct GameScrollRow<MenuContent: View>: View {
                 // previous card to peek by exactly peekFraction×cardWidth on
                 // the left edge when scrolled forward — matching TV app.
                 .contentMargins(.leading, metrics.leadingPadding, for: .scrollContent)
+                .contentMargins(.trailing, metrics.leadingPadding, for: .scrollContent)
                 .scrollTargetBehavior(.viewAligned)
                 .scrollClipDisabled()
                 .scrollIndicators(.hidden)
@@ -417,6 +418,7 @@ private struct GameScrollRow<MenuContent: View>: View {
                                 proxy.scrollTo(games[target].id, anchor: .leading)
                             }
                         },
+                        showMaterial: isRowHovered,
                         onHoverChanged: { isBackButtonHovered = $0 }
                     )
                     .padding(.leading, 10)
@@ -437,6 +439,7 @@ private struct GameScrollRow<MenuContent: View>: View {
                                 proxy.scrollTo(games[target].id, anchor: .leading)
                             }
                         },
+                        showMaterial: isRowHovered,
                         onHoverChanged: { isForwardButtonHovered = $0 }
                     )
                     .padding(.trailing, 10)
@@ -463,14 +466,20 @@ private struct GameScrollRow<MenuContent: View>: View {
 // MARK: - Shared Chevron Navigation Button
 
 /// A rounded-rect chevron button used in both the hero carousel and GameScrollRow.
-/// The background material appears instantly on hover (no animation), and the button
-/// is hidden (zero opacity, non-hittable) when isVisible is false.
+/// Pass showMaterial: true (driven by row-level hover) for scroll rows so the
+/// background appears the instant the row is hovered — matching the icon visibility.
+/// Leave it at the default false for the hero carousel, where the material should
+/// only appear when the cursor is directly over the button.
 private struct ChevronNavButton: View {
     enum Direction { case back, forward }
 
     let direction: Direction
     let isVisible: Bool
     let action: () -> Void
+    /// When true, the material background is shown whenever the button is visible,
+    /// not just when the cursor is directly over the button. Used by GameScrollRow
+    /// so hovering anywhere in the row shows the full button (icon + material).
+    var showMaterial: Bool = false
     /// Called immediately (no animation) when the cursor enters or exits the button.
     /// Used by the parent to keep itself visible while the cursor is over an
     /// offset button that lies outside the parent's layout frame.
@@ -506,7 +515,7 @@ private struct ChevronNavButton: View {
             RoundedRectangle(cornerRadius: 10)
                 .fill(.regularMaterial)
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
-                .opacity(isHovered ? 1 : 0)
+                .opacity(isHovered || showMaterial ? 1 : 0)
         }
         // onHover (NSTrackingArea) re-fires when the view re-renders with the
         // cursor already inside — onContinuousHover only fires on mouse movement,
