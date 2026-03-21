@@ -137,6 +137,15 @@ final class AppSettings: @unchecked Sendable {
         favoriteAppIDs = ids
     }
 
+    /// Removes all account-scoped data from UserDefaults.
+    /// Called on sign-out so a subsequent sign-in (or a different account) starts clean.
+    func clearAccountData() {
+        installedAppIDs = []
+        hiddenAppIDs    = []
+        favoriteAppIDs  = []
+        UserDefaults.standard.removeObject(forKey: "launchTimestamps")
+    }
+
     private init() {}
 }
 

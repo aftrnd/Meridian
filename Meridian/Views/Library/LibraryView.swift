@@ -1,9 +1,11 @@
 import SwiftUI
 
 struct LibraryView: View {
-    @Environment(SteamLibraryStore.self) private var library
-    @Environment(GameLauncher.self)      private var launcher
-    @Environment(CategoryStore.self)     private var categoryStore
+    @Environment(SteamLibraryStore.self)  private var library
+    @Environment(GameLauncher.self)       private var launcher
+    @Environment(CategoryStore.self)      private var categoryStore
+    @Environment(WineEngine.self)         private var engine
+    @Environment(WineSteamManager.self)   private var steamManager
     @Binding var selectedGame: Game?
 
     // MARK: - Category mode
@@ -118,6 +120,20 @@ struct LibraryView: View {
             selectedGame = game
         } label: {
             Label("View Details", systemImage: "info.circle")
+        }
+
+        if game.isInstalled {
+            Divider()
+            Button(role: .destructive) {
+                launcher.uninstall(
+                    game: game,
+                    engine: engine,
+                    steamManager: steamManager,
+                    library: library
+                )
+            } label: {
+                Label("Uninstall", systemImage: "trash")
+            }
         }
 
         if !isInCategoryMode {

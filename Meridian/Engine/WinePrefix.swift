@@ -197,25 +197,76 @@ struct WinePrefix: Sendable {
         return copiedCount > 0 || ssfnCount > 0
     }
 
+    // MARK: - Steam Library Folders
+
+    /// All Steam library folders configured in this prefix, including the default one.
+    ///
+    /// Parses `steamapps/libraryfolders.vdf` (both the legacy numeric-key format
+    /// and the current nested `"path"` format) to discover any additional libraries
+    /// the user may have configured inside Steam. Falls back to just the default
+    /// `steamInstallDir` if the file is absent or unreadable.
+    var steamLibraryFolders: [URL] {
+        var libraries: [URL] = [steamInstallDir]
+
+        let vdfURL = steamInstallDir.appending(path: "steamapps/libraryfolders.vdf")
+        guard let contents = try? String(contentsOfFile: vdfURL.path(percentEncoded: false), encoding: .utf8) else {
+            return libraries
+        }
+
+        for line in contents.components(separatedBy: .newlines) {
+            guard let (key, value) = vdfKeyValue(from: line), !value.isEmpty else { continue }
+
+            // Accept both: "path" "<winpath>" (new) and "1" "<winpath>" (legacy numeric key)
+            let isPathKey = key == "path"
+            let isNumericNonZero = key != "0" && key.allSatisfy(\.isNumber)
+            guard isPathKey || isNumericNonZero else { continue }
+
+            // Value is a Windows path (e.g. "C:\\Program Files (x86)\\Steam") or
+            // a Unix path on some configurations. Convert to a macOS URL.
+            if let url = windowsPathToURL(value) {
+                let canonical = url.standardizedFileURL.path(percentEncoded: false)
+                let defaultCanonical = steamInstallDir.standardizedFileURL.path(percentEncoded: false)
+                if canonical != defaultCanonical {
+                    libraries.append(url)
+                    log.info("[steamLibraryFolders] additional library: \(url.path(percentEncoded: false))")
+                }
+            }
+        }
+
+        return libraries
+    }
+
+    /// Returns the URL to the appmanifest ACF file for `appID`, searching every
+    /// Steam library folder. Returns `nil` if the game is not installed anywhere.
+    func acfURL(for appID: Int) -> URL? {
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let candidate = library.appending(path: "steamapps/appmanifest_\(appID).acf")
+            if fm.fileExists(atPath: candidate.path(percentEncoded: false)) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     /// Checks whether a specific Steam game is installed by looking for its
-    /// appmanifest ACF file.
+    /// appmanifest ACF file across all configured Steam library folders.
     func isGameInstalled(appID: Int) -> Bool {
-        let manifest = steamInstallDir
-            .appending(path: "steamapps/appmanifest_\(appID).acf")
-        let result = FileManager.default.fileExists(atPath: manifest.path(percentEncoded: false))
-        log.debug("[isGameInstalled] appID=\(appID) manifest=\(manifest.path(percentEncoded: false)) → \(result)")
+        let result = acfURL(for: appID) != nil
+        log.debug("[isGameInstalled] appID=\(appID) → \(result)")
         return result
     }
 
     /// Reads the Steam appmanifest for a game and returns the `installdir` value.
     ///
-    /// The installdir is the folder name under `steamapps/common/` where the
-    /// game is installed (e.g. "Animal Well"). This is used as a `pgrep -f`
-    /// pattern to detect whether the game process is running, since Wine on
-    /// macOS exposes Windows-style paths in process listings.
+    /// Searches all Steam library folders. The installdir is the folder name under
+    /// `steamapps/common/` where the game is installed (e.g. "Animal Well"). This
+    /// is used as a `pgrep -f` pattern to detect whether the game process is running.
     func gameInstallDir(appID: Int) -> String? {
-        let manifest = steamInstallDir
-            .appending(path: "steamapps/appmanifest_\(appID).acf")
+        guard let manifest = acfURL(for: appID) else {
+            log.warning("[gameInstallDir] ACF not found for appID=\(appID)")
+            return nil
+        }
         let manifestPath = manifest.path(percentEncoded: false)
 
         guard let contents = try? String(contentsOfFile: manifestPath, encoding: .utf8) else {
@@ -224,22 +275,83 @@ struct WinePrefix: Sendable {
         }
 
         for line in contents.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("\"installdir\"") else { continue }
-
-            let parts = trimmed.components(separatedBy: "\t").filter { !$0.isEmpty }
-            guard parts.count >= 2 else { continue }
-            let value = parts.last!
-                .trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-
-            guard !value.isEmpty else { continue }
+            guard let (key, value) = vdfKeyValue(from: line), key == "installdir", !value.isEmpty else { continue }
             log.info("[gameInstallDir] appID=\(appID) → \"\(value)\"")
             return value
         }
 
         log.warning("[gameInstallDir] 'installdir' not found in manifest for appID=\(appID)")
         return nil
+    }
+
+    // MARK: - VDF / Path Helpers
+
+    /// Parses a single VDF line of the form `"key"\t"value"` and returns the pair.
+    private func vdfKeyValue(from line: String) -> (key: String, value: String)? {
+        var s = line.trimmingCharacters(in: .whitespaces)
+        guard s.hasPrefix("\"") else { return nil }
+        s = String(s.dropFirst())
+        guard let keyEnd = s.firstIndex(of: "\"") else { return nil }
+        let key = String(s[s.startIndex..<keyEnd])
+        s = String(s[s.index(after: keyEnd)...]).trimmingCharacters(in: .whitespaces)
+        guard s.hasPrefix("\"") else { return nil }
+        s = String(s.dropFirst())
+        guard let valueEnd = s.firstIndex(of: "\"") else { return nil }
+        let value = String(s[s.startIndex..<valueEnd])
+        return (key, value)
+    }
+
+    /// Converts a Windows-style path from a VDF file to a macOS URL inside this prefix.
+    ///
+    /// - `C:\Program Files (x86)\Steam` → `prefix/drive_c/Program Files (x86)/Steam`
+    /// - Other drives → resolved via `prefix/dosdevices/<letter>:` symlinks
+    private func windowsPathToURL(_ windowsPath: String) -> URL? {
+        let normalized = windowsPath
+            .replacingOccurrences(of: "\\\\", with: "/")
+            .replacingOccurrences(of: "\\", with: "/")
+
+        guard normalized.count >= 3 else { return nil }
+        let driveIdx = normalized.index(normalized.startIndex, offsetBy: 1)
+        guard normalized[driveIdx] == ":" else {
+            // Already a Unix path (some Steam configs store Unix paths directly)
+            return URL(filePath: windowsPath)
+        }
+
+        let driveLetter = String(normalized.prefix(1)).lowercased()
+        let afterDrive = normalized.index(normalized.startIndex, offsetBy: min(3, normalized.count))
+        let remainingPath = String(normalized[afterDrive...])
+
+        if driveLetter == "c" {
+            return driveC.appending(path: remainingPath)
+        }
+
+        // Resolve the drive letter via dosdevices symlink
+        let linkPath = path.appending(path: "dosdevices/\(driveLetter):").path(percentEncoded: false)
+        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: linkPath) else {
+            return nil
+        }
+        return URL(filePath: target).appending(path: remainingPath)
+    }
+
+    /// Deletes only the Steam install directory inside the prefix, leaving the
+    /// Wine registry and wineboot state intact. Called automatically on retry
+    /// after a failed Steam install or bootstrap so the next attempt starts
+    /// from a verified-clean state rather than a partial directory.
+    func resetSteamInstall() {
+        let installPath = steamInstallDir.path(percentEncoded: false)
+        log.info("[resetSteamInstall] removing \(installPath)")
+
+        guard FileManager.default.fileExists(atPath: installPath) else {
+            log.info("[resetSteamInstall] Steam dir does not exist — nothing to remove")
+            return
+        }
+
+        do {
+            try FileManager.default.removeItem(at: steamInstallDir)
+            log.info("[resetSteamInstall] Steam install dir removed ✓")
+        } catch {
+            log.error("[resetSteamInstall] failed: \(error.localizedDescription)")
+        }
     }
 
     /// Deletes the entire prefix directory. Use when the prefix is corrupted

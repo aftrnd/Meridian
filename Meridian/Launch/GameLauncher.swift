@@ -25,9 +25,11 @@ final class GameLauncher {
         case preparingEngine
         case preparingPrefix
         case bootstrappingSteam
+        case installing   // waiting for Steam to download + write the ACF manifest
         case launching
         case running(appID: Int)
         case stopping(appID: Int)
+        case uninstalling // waiting for Steam to delete the ACF manifest
         case exited(appID: Int)
         case failed(String)
     }
@@ -49,6 +51,10 @@ final class GameLauncher {
     private let gameProcess = GameProcess()
     private let prefix = WinePrefix.defaultPrefix
     private var launchTask: Task<Void, Never>?
+
+    /// Set by `MeridianApp` so the launch pipeline can pause/resume window suppression
+    /// around install and game-process confirmation.
+    var windowSuppressor: SteamWindowSuppressor?
 
     // MARK: - Public API
 
@@ -73,7 +79,8 @@ final class GameLauncher {
         library: SteamLibraryStore?
     ) async {
         switch launchState {
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching, .stopping:
+        case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
+             .installing, .launching, .stopping, .uninstalling:
             log.warning("[launch] ignoring — already in state \(String(describing: self.launchState))")
             return
         case .running:
@@ -102,6 +109,11 @@ final class GameLauncher {
         launchTask = nil
 
         await cleanupProcesses(engine: engine, steamManager: steamManager)
+
+        // Re-engage suppression in case it was paused for a game that never completed.
+        if let pid = steamManager.persistentProcessIdentifier {
+            windowSuppressor?.resumeSuppressing(pid: pid)
+        }
 
         launchState = .idle
         runningSince = nil
@@ -133,7 +145,75 @@ final class GameLauncher {
         processesConfirmed = false
         launchState = .exited(appID: appID)
         currentActivity = nil
+        // Re-engage suppression so Steam cannot surface its window after game exit.
+        if let pid = steamManager.persistentProcessIdentifier {
+            windowSuppressor?.resumeSuppressing(pid: pid)
+        }
         log.info("[stopGame] exited appID=\(appID)")
+    }
+
+    /// Uninstalls a game by sending a silent IPC command to Steam, then waiting
+    /// for Steam to remove the ACF manifest from disk.
+    func uninstall(
+        game: Game,
+        engine: WineEngine,
+        steamManager: WineSteamManager,
+        library: SteamLibraryStore?
+    ) {
+        Task { [weak self] in
+            guard let self else { return }
+
+            // Allow uninstall from any quiescent state (idle, exited, or failed).
+            // Only block when an active operation is already in flight.
+            switch launchState {
+            case .idle, .exited, .failed:
+                break
+            default:
+                log.warning("[uninstall] ignoring — launcher busy (state=\(String(describing: self.launchState)))")
+                return
+            }
+            activeAppID = game.id
+            transition(to: .uninstalling, activity: "Uninstalling \(game.name)…")
+
+            // Ensure suppression is active before we delete the ACF. Steam monitors
+            // its steamapps folder and will surface its library window the moment it
+            // detects the ACF disappear. Calling resumeSuppressing/suppressNow here
+            // hides any existing Steam windows immediately before that happens.
+            if let pid = steamManager.persistentProcessIdentifier {
+                windowSuppressor?.resumeSuppressing(pid: pid)
+            } else {
+                windowSuppressor?.suppressNow()
+            }
+
+            do {
+                try await steamManager.uninstallGame(appID: game.id, prefix: prefix)
+            } catch {
+                fail("Failed to uninstall game: \(error.localizedDescription)", error: error)
+                activeAppID = nil
+                return
+            }
+
+            // Poll for ACF removal as a safety net. With direct file deletion the
+            // loop exits immediately on the first check since the ACF is already gone.
+            let deadline = ContinuousClock.now + .seconds(30)
+            while prefix.isGameInstalled(appID: game.id) {
+                guard ContinuousClock.now < deadline else {
+                    fail("Uninstall timed out. Open Steam to check the status.")
+                    activeAppID = nil
+                    return
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+
+            // Brief pause so the "Uninstalling…" label is visible long enough to feel
+            // intentional — without it the state flips in under 200ms which is jarring.
+            try? await Task.sleep(for: .milliseconds(1500))
+
+            library?.setInstalled(false, for: game.id)
+            launchState = .idle
+            activeAppID = nil
+            log.info("[uninstall] complete appID=\(game.id)")
+        }
     }
 
     /// Kills all Wine processes. Call on app termination or prefix reset.
@@ -181,7 +261,59 @@ final class GameLauncher {
             fail("Wine environment not ready — restart the app to reinitialize.")
             return
         }
+
+        // If the persistent Steam process has died since bootstrap (crash, OOM, etc.)
+        // restart it silently before proceeding. Without this, launchGame would spawn
+        // a fresh Steam from scratch which can surface its main window.
+        if !steamManager.isSteamProcessAlive {
+            log.warning("[launch] persistent Steam not alive — restarting before launch")
+            transition(to: .bootstrappingSteam, activity: "Reconnecting to Steam…")
+            do {
+                try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                try await steamManager.waitUntilReady(prefix: prefix)
+            } catch {
+                fail("Failed to restart Steam: \(error.localizedDescription)", error: error)
+                return
+            }
+            // Re-engage suppression for the new Steam PID.
+            if let pid = steamManager.persistentProcessIdentifier {
+                windowSuppressor?.resumeSuppressing(pid: pid)
+            }
+        }
+
         appendLog("Environment ready — Steam is running")
+
+        guard !Task.isCancelled else { return }
+
+        // If the game isn't installed yet, queue a silent install and wait for
+        // Steam to write the ACF manifest before proceeding to launch.
+        if !prefix.isGameInstalled(appID: game.id) {
+            // Suppression is already active from bootstrap; the AXObserver will
+            // minimize Steam's download progress window the moment it appears.
+            transition(to: .installing, activity: "Installing \(game.name)…")
+            appendLog("Queuing silent install for appID=\(game.id)")
+            do {
+                try await steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
+            } catch {
+                fail("Failed to queue install: \(error.localizedDescription)", error: error)
+                return
+            }
+
+            // Poll for appmanifest_<appID>.acf — Steam writes it when the game is ready.
+            // The AXObserver on the suppressor handles any new windows during this wait.
+            // 4-hour hard cap; user can always Cancel.
+            let installDeadline = ContinuousClock.now + .seconds(4 * 3600)
+            while !prefix.isGameInstalled(appID: game.id) {
+                guard !Task.isCancelled else { return }
+                guard ContinuousClock.now < installDeadline else {
+                    fail("Installation timed out. Check the Steam client for progress details.")
+                    return
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
+            appendLog("Game installed — ACF manifest found")
+            library?.setInstalled(true, for: game.id)
+        }
 
         guard !Task.isCancelled else { return }
 
@@ -202,6 +334,9 @@ final class GameLauncher {
             fail("Launch failed: \(error.localizedDescription)", error: error)
             return
         }
+
+        // The AXObserver suppressor is already active; it will minimize any Steam
+        // "launching game" splash immediately. No explicit hide call is needed.
 
         library?.setInstalled(true, for: game.id)
 
@@ -236,6 +371,9 @@ final class GameLauncher {
                 currentActivity = nil
                 AppSettings.shared.recordLaunch(appID: game.id)
                 log.info("[launch] state=RUNNING appID=\(game.id) — game processes confirmed")
+                // Pause new-window suppression so the game's window can appear.
+                // Steam's existing minimized windows stay minimized.
+                windowSuppressor?.stopSuppressingNewWindows()
                 // Send our windows to the back so the game window appears in front
                 for window in NSApplication.shared.windows {
                     window.orderBack(nil)
@@ -248,6 +386,12 @@ final class GameLauncher {
         guard !Task.isCancelled else {
             log.info("[launch] task cancelled — not setting exited state")
             return
+        }
+
+        // Game has exited — re-engage suppression so Steam cannot surface its
+        // window when it detects the game process exiting.
+        if let pid = steamManager.persistentProcessIdentifier {
+            windowSuppressor?.resumeSuppressing(pid: pid)
         }
 
         // Determine final state based on how the monitor exited

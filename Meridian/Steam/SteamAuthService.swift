@@ -192,7 +192,10 @@ final class SteamAuthService: NSObject {
         displayName = ""
         avatarURL = nil
         deleteSecret(key: KeychainKey.steamID)
+        deleteSecret(key: KeychainKey.apiKey)
         apiKeyPromptDismissed = false
+        AppSettings.shared.clearAccountData()
+        log.info("[signOut] Keychain cleared, account data reset")
     }
 
     // MARK: - Private helpers

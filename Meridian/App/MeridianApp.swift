@@ -13,8 +13,18 @@ struct MeridianApp: App {
     @State private var launcher      = GameLauncher()
     @State private var bootstrap     = BootstrapManager()
     @State private var categories    = CategoryStore()
+    @State private var suppressor    = SteamWindowSuppressor()
 
     var body: some Scene {
+        // Wire cross-object dependencies. These assignments are idempotent —
+        // they run on every body evaluation but always set the same references.
+        let _ = {
+            bootstrap.windowSuppressor = suppressor
+            launcher.windowSuppressor  = suppressor
+            steamManager.windowSuppressor = suppressor
+            appDelegate.suppressor     = suppressor
+        }()
+
         WindowGroup {
             ContentView()
                 .environment(steamAuth)
@@ -25,6 +35,14 @@ struct MeridianApp: App {
                 .environment(launcher)
                 .environment(bootstrap)
                 .environment(categories)
+                .environment(suppressor)
+                // Refresh permission state when Meridian becomes active (user may
+                // have just granted Accessibility access in System Preferences).
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.didBecomeActiveNotification
+                )) { _ in
+                    suppressor.refreshPermission()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 480, height: 300)
@@ -50,6 +68,7 @@ struct MeridianApp: App {
                 .environment(steamAuth)
                 .environment(engine)
                 .environment(library)
+                .environment(suppressor)
         }
     }
 }

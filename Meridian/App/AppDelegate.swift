@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var readyObserver: NSObjectProtocol?
 
+    /// Set by MeridianApp so suppression observers are torn down at termination.
+    var suppressor: SteamWindowSuppressor?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
@@ -97,6 +100,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var mainWindow: NSWindow? {
         NSApp.windows.first { !$0.isSheet && $0.styleMask.contains(.titled) }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        suppressor?.stopSuppressing()
+        if let observer = readyObserver {
+            NotificationCenter.default.removeObserver(observer)
+            readyObserver = nil
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

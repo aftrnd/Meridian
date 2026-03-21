@@ -204,12 +204,41 @@ final class SteamLibraryStore {
 
     // MARK: - Private helpers
 
+    /// Derives install status from ACF manifests on disk (the authoritative source),
+    /// then syncs the result back into AppSettings so the UserDefaults cache stays current.
+    ///
+    /// If the Wine prefix doesn't exist (fresh install or after a prefix wipe) every game
+    /// is marked uninstalled and the stale UserDefaults cache is cleared.  When the prefix
+    /// does exist, a fast stat() check for each appmanifest_<appID>.acf file is the source
+    /// of truth — stale UserDefaults flags are ignored.
+    ///
+    /// The optimistic "mark installed immediately on launch" write in GameLauncher is still
+    /// useful: it flips the card before Steam writes the ACF, and the next refresh confirms.
     private func applyInstallCache(to source: [Game]) -> [Game] {
-        source.map { game in
+        let prefix = WinePrefix.defaultPrefix
+
+        guard prefix.exists else {
+            if !settings.installedAppIDs.isEmpty {
+                log.info("[applyInstallCache] prefix absent — clearing \(self.settings.installedAppIDs.count) stale installed IDs")
+                settings.installedAppIDs = []
+            }
+            return source.map { var g = $0; g.isInstalled = false; return g }
+        }
+
+        var reconciledIDs = Set<Int>()
+        let result: [Game] = source.map { game in
             var copy = game
-            copy.isInstalled = settings.isInstalled(appID: game.id)
+            copy.isInstalled = prefix.isGameInstalled(appID: game.id)
+            if copy.isInstalled { reconciledIDs.insert(game.id) }
             return copy
         }
+
+        if reconciledIDs != settings.installedAppIDs {
+            log.info("[applyInstallCache] reconciled installedAppIDs: \(reconciledIDs.count) installed on disk")
+            settings.installedAppIDs = reconciledIDs
+        }
+
+        return result
     }
 
     private func updateInstalledFlag(for appID: Int, installed: Bool) {

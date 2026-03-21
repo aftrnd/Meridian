@@ -198,14 +198,31 @@ struct GameDetailView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
 
+            Divider().padding(.leading, 12)
+
+            Button {
+                showInfoPopover = false
+                try? steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
+            } label: {
+                Label("Show Steam", systemImage: "gamecontroller")
+            }
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+
             if currentGame.isInstalled {
                 Divider().padding(.leading, 12)
 
                 Button(role: .destructive) {
                     showInfoPopover = false
-                    library.setInstalled(false, for: currentGame.id)
+                    launcher.uninstall(
+                        game: currentGame,
+                        engine: engine,
+                        steamManager: steamManager,
+                        library: library
+                    )
                 } label: {
-                    Label("Mark as Uninstalled", systemImage: "trash")
+                    Label("Uninstall", systemImage: "trash")
                 }
                 .buttonStyle(.borderless)
                 .padding(.horizontal, 12)
@@ -381,7 +398,8 @@ struct GameDetailView: View {
     private var isThisGameActive: Bool {
         guard isThisGame else { return false }
         switch launcher.launchState {
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching, .running, .stopping:
+        case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
+             .installing, .launching, .running, .stopping, .uninstalling:
             return true
         default:
             return false
@@ -417,6 +435,12 @@ struct GameDetailView: View {
                 cancelButton
             }
 
+        case .installing:
+            HStack(spacing: 8) {
+                ProgressButton(launcher.currentActivity ?? "Installing…")
+                cancelButton
+            }
+
         case .launching:
             HStack(spacing: 8) {
                 ProgressButton("Launching…")
@@ -442,6 +466,9 @@ struct GameDetailView: View {
 
         case .stopping:
             ProgressButton("Stopping…")
+
+        case .uninstalling:
+            ProgressButton(launcher.currentActivity ?? "Uninstalling…")
 
         case .failed(let msg):
             VStack(alignment: .leading, spacing: 6) {

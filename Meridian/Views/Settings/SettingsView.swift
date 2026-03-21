@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(WineEngine.self) private var engine
+    @Environment(SteamWindowSuppressor.self) private var suppressor
 
     var body: some View {
         TabView {
@@ -11,6 +12,9 @@ struct SettingsView: View {
 
             EngineSettingsTab()
                 .tabItem { Label("Engine", systemImage: "gearshape.2") }
+
+            PermissionsSettingsTab()
+                .tabItem { Label("Permissions", systemImage: "hand.raised") }
         }
         .frame(width: 520)
         .padding(24)
@@ -199,6 +203,55 @@ private struct EngineSettingsTab: View {
                     }
                     .padding(.top, 4)
                 }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Permissions tab
+
+private struct PermissionsSettingsTab: View {
+    @Environment(SteamWindowSuppressor.self) private var suppressor
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 12) {
+                    Image(systemName: suppressor.isPermissionGranted
+                          ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                        .font(.title2)
+                        .foregroundStyle(suppressor.isPermissionGranted ? .green : .orange)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Accessibility")
+                            .fontWeight(.medium)
+                        Text(suppressor.isPermissionGranted
+                             ? "Granted — Steam windows will be suppressed automatically."
+                             : "Not granted — Steam UI may appear during installs and launches.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    if suppressor.isPermissionGranted {
+                        Label("Granted", systemImage: "checkmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.green)
+                    } else {
+                        Button("Grant Access") {
+                            suppressor.requestPermission()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+            } header: {
+                Text("macOS Permissions")
+            } footer: {
+                Text("Accessibility permission allows Meridian to minimize Steam's windows automatically, keeping Steam running silently in the background. If the prompt does not appear, open System Settings → Privacy & Security → Accessibility and enable Meridian manually.")
+                    .font(.caption)
             }
         }
         .formStyle(.grouped)
