@@ -163,11 +163,13 @@ struct HomeView: View {
                         Label("Continue Playing", systemImage: "play.fill")
                             .font(.headline)
                             .frame(minWidth: 140, minHeight: 24)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 9)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(controlActiveState == .inactive ? nil : .white)
-                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.black))
-                    .controlSize(.large)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .background(Capsule().fill(.regularMaterial))
+                    .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
                 }
                 .padding(.leading, leadingInset)
                 .padding(.trailing, 24)
