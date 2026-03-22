@@ -32,14 +32,18 @@ Windows Game (.exe)
 
 ## Wine Backend
 
-Meridian detects and uses CrossOver's Wine binary (wine-11.0 with DXMT, DXVK, MoltenVK). Detection order:
+**Meridian is standalone.** Users do **not** need paid [CrossOver](https://www.codeweavers.com/crossover). The normal path is a one-time download of the open-source Wine engine from Meridian’s GitHub releases into Application Support.
 
-1. `/Applications/CrossOver.app/` — CrossOver 26+ (recommended)
-2. `~/Library/Application Support/com.meridian.app/engine/` — bundled fallback
+Detection order (see `WineEngine.swift`):
 
-### Why CrossOver's Wine?
+1. **`~/Library/Application Support/com.meridian.app/engine/`** — **Primary.** Downloaded in-app (Settings → Engine). No third-party app required.
+2. **`/Applications/CrossOver.app/`** — **Optional fallback** if someone already owns CrossOver and has not installed the Meridian engine yet.
 
-CrossOver uses **wine-11.0** (2026). The open-source Gcenx builds use wine-8.0.1 (2024), which can't render Steam's Chromium-based UI. The difference is 2 years of upstream Wine patches.
+### Engine quality (maintainers)
+
+When **you** run `Scripts/release-engine.sh`, it prefers **CrossOver.app** on your Mac as the *packaging source* (newer Wine tree) if present, otherwise the **Gcenx** `wine-crossover` cask. That only affects what goes into the `.tar.gz` you upload — **end users still just download the engine; they never install CodeWeavers CrossOver.**
+
+CrossOver 26 bundles **wine-11.0**; the Gcenx cask currently ships **wine-8.0.1**. Newer Wine helps Steam’s Chromium UI; that’s why maintainers often package from CrossOver when they have a license.
 
 ### All Components Are Open Source
 
@@ -85,13 +89,14 @@ cd MoltenVK && ./fetchDependencies --macos && make macos
 
 - macOS 15+ (macOS 26 recommended)
 - Apple Silicon Mac
-- [CrossOver](https://www.codeweavers.com/crossover) installed (or custom Wine 11+ build)
+- **No paid CrossOver required** — Meridian downloads the Wine engine on first run (or from Settings → Engine)
+- *(Optional)* Paid CrossOver can be used as a fallback if the downloaded engine is not installed
 - Steam Web API key: [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey)
 
 ## First-Time Setup
 
-1. Install CrossOver from [codeweavers.com](https://www.codeweavers.com/crossover)
-2. Open `Meridian.xcodeproj` in Xcode, set your Team, build and run
+1. Open `Meridian.xcodeproj` in Xcode, set your Team, build and run
+2. If prompted, download the Wine engine (Settings → Engine) — one-time, open-source runtime
 3. Sign in with Steam and provide your API key
 4. Click **Play** on any game — Steam will prompt for login on first launch
 5. After authenticating once, all future launches are silent
@@ -115,6 +120,55 @@ Single shared prefix for Steam and all games:
 - **First login**: Requires one-time Steam authentication through the Wine window
 - **Per-game tuning**: Some games need specific DLL overrides or renderer settings
 - **Rendering**: DXMT handles most DX11 games well; some titles may have visual artifacts
+
+## Updates
+
+Meridian uses a **unified update model**: one Meridian release = one app version + one Wine engine snapshot. Users never manage app updates and engine updates separately.
+
+### How updates work
+
+Settings → Updates shows the current Meridian version, the installed engine release tag, and a "Check for Updates" button. When a newer release is found on GitHub, a banner appears with release notes and a "Download →" button that opens the release page in the browser.
+
+On every app launch, Meridian silently checks whether the app version has changed since the last run. If it has, it automatically downloads the latest engine in the background — so the next session always uses the freshest Wine build.
+
+### Developer release workflow
+
+```bash
+# 1. Update Wine/CrossOver locally (brew update wine-crossover, etc.)
+
+# 2. Package and publish the new engine snapshot to GitHub Releases
+bash Scripts/release-engine.sh           # auto-increments patch version
+# or with explicit version:
+bash Scripts/release-engine.sh v2.1.0   # publishes v2.1.0-engine tag
+
+# 3. Bump MARKETING_VERSION in Xcode (Build Settings → Versioning)
+#    This is the version users see in Settings → Updates
+
+# 4. Build, sign, notarize, then publish the .dmg to GitHub Releases
+#    Tag: v2.1.0  (no -engine suffix — the update checker filters by this)
+```
+
+`release-engine.sh` embeds a `wine/meridian-engine-version.txt` file in the archive containing the release tag. The app reads this file to display the installed engine version in Settings → Updates.
+
+### Redistribution
+
+All bundled components are freely redistributable open source:
+
+| Component | License |
+|-----------|---------|
+| Wine | LGPL |
+| DXMT | Open source |
+| DXVK | Zlib |
+| MoltenVK | Apache 2.0 |
+
+### Key files
+
+| File | Role |
+|------|------|
+| `Meridian/Engine/AppUpdateChecker.swift` | GitHub Releases API checker, rate-limited (24h), `@Observable` |
+| `Meridian/Engine/EngineDownloader.swift` | Downloads and extracts engine archives |
+| `Meridian/Views/Settings/SettingsView.swift` | Updates tab UI |
+| `Scripts/release-engine.sh` | Developer script — packages Wine and publishes engine release |
 
 ## Settings
 

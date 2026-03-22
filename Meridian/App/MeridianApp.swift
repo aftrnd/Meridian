@@ -5,15 +5,19 @@ import AppKit
 struct MeridianApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
-    @State private var steamAuth     = SteamAuthService()
-    @State private var library       = SteamLibraryStore()
-    @State private var engine        = WineEngine()
-    @State private var steamManager  = WineSteamManager()
-    @State private var sessionBridge = SteamSessionBridge()
-    @State private var launcher      = GameLauncher()
-    @State private var bootstrap     = BootstrapManager()
-    @State private var categories    = CategoryStore()
-    @State private var suppressor    = SteamWindowSuppressor()
+    @State private var steamAuth         = SteamAuthService()
+    @State private var library           = SteamLibraryStore()
+    @State private var engine            = WineEngine()
+    @State private var steamManager      = WineSteamManager()
+    @State private var sessionBridge     = SteamSessionBridge()
+    @State private var launcher          = GameLauncher()
+    @State private var bootstrap         = BootstrapManager()
+    @State private var categories        = CategoryStore()
+    @State private var suppressor        = SteamWindowSuppressor()
+    @State private var updateChecker     = AppUpdateChecker()
+    @State private var engineRefresher   = EngineDownloader()
+
+    private let settings = AppSettings.shared
 
     var body: some Scene {
         // Wire cross-object dependencies. These assignments are idempotent —
@@ -36,12 +40,30 @@ struct MeridianApp: App {
                 .environment(bootstrap)
                 .environment(categories)
                 .environment(suppressor)
+                .environment(updateChecker)
                 // Refresh permission state when Meridian becomes active (user may
                 // have just granted Accessibility access in System Preferences).
                 .onReceive(NotificationCenter.default.publisher(
                     for: NSApplication.didBecomeActiveNotification
                 )) { _ in
                     suppressor.refreshPermission()
+                    suppressor.onMeridianDidBecomeActive(
+                        resumeForSteamPID: steamManager.persistentProcessIdentifier
+                    )
+                }
+                .task {
+                    // Rate-limited background update check (once per 24 hours).
+                    updateChecker.checkIfStale()
+
+                    // Silently refresh the Wine engine when the app version changes.
+                    // Only runs when the engine is already installed, so it never
+                    // interferes with a fresh install that still needs EngineSetupView.
+                    let current = AppUpdateChecker.currentVersion
+                    let previous = settings.lastLaunchAppVersion
+                    settings.lastLaunchAppVersion = current
+                    if !previous.isEmpty && previous != current && engine.isReady {
+                        engineRefresher.download { engine.detect() }
+                    }
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -69,6 +91,7 @@ struct MeridianApp: App {
                 .environment(engine)
                 .environment(library)
                 .environment(suppressor)
+                .environment(updateChecker)
         }
     }
 }

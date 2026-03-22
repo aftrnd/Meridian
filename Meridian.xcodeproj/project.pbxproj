@@ -39,10 +39,12 @@
 		B00E0009 /* EngineSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E000A /* EngineSetupView.swift */; };
 		B00E0020 /* CachedAsyncImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0021 /* CachedAsyncImage.swift */; };
 		B00E0030 /* EngineDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0031 /* EngineDownloader.swift */; };
+		B00E00B0 /* AppUpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00B1 /* AppUpdateChecker.swift */; };
 		B00E0040 /* TerminationCleanup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0041 /* TerminationCleanup.swift */; };
 		B00E0050 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0051 /* SearchView.swift */; };
 		B00E0060 /* SteamWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0061 /* SteamWebView.swift */; };
 		B00E0070 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0071 /* HomeView.swift */; };
+		B00E00C0 /* HeroArtViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00C1 /* HeroArtViews.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -81,10 +83,12 @@
 		B00E000A /* EngineSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineSetupView.swift; sourceTree = "<group>"; };
 		B00E0021 /* CachedAsyncImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CachedAsyncImage.swift; sourceTree = "<group>"; };
 		B00E0031 /* EngineDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineDownloader.swift; sourceTree = "<group>"; };
+		B00E00B1 /* AppUpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdateChecker.swift; sourceTree = "<group>"; };
 		B00E0041 /* TerminationCleanup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminationCleanup.swift; sourceTree = "<group>"; };
 		B00E0051 /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
 		B00E0061 /* SteamWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWebView.swift; sourceTree = "<group>"; };
 		B00E0071 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		B00E00C1 /* HeroArtViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeroArtViews.swift; sourceTree = "<group>"; };
 		EE9307949871471AB0E85285 /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -191,6 +195,7 @@
 				B0010029 /* GameGridView.swift */,
 				B001002B /* GameDetailView.swift */,
 				B00E0021 /* CachedAsyncImage.swift */,
+				B00E00C1 /* HeroArtViews.swift */,
 			);
 			path = Library;
 			sourceTree = "<group>";
@@ -232,6 +237,7 @@
 			children = (
 				B00E0002 /* WineEngine.swift */,
 				B00E0031 /* EngineDownloader.swift */,
+				B00E00B1 /* AppUpdateChecker.swift */,
 				B00E0004 /* WinePrefix.swift */,
 				B00E0006 /* WineSteamManager.swift */,
 				B00E00A1 /* SteamWindowSuppressor.swift */,
@@ -338,6 +344,7 @@
 				B0010026 /* LibraryView.swift in Sources */,
 				B0010028 /* GameGridView.swift in Sources */,
 				B001002A /* GameDetailView.swift in Sources */,
+				B00E00C0 /* HeroArtViews.swift in Sources */,
 				B00E0009 /* EngineSetupView.swift in Sources */,
 				B00E0020 /* CachedAsyncImage.swift in Sources */,
 				B0010030 /* SettingsView.swift in Sources */,
@@ -345,6 +352,7 @@
 				B0010034 /* AppSettings.swift in Sources */,
 				B0010035A /* AppDetails.swift in Sources */,
 				B00E0030 /* EngineDownloader.swift in Sources */,
+				B00E00B0 /* AppUpdateChecker.swift in Sources */,
 				B00E0040 /* TerminationCleanup.swift in Sources */,
 				B00E0050 /* SearchView.swift in Sources */,
 				B00E0060 /* SteamWebView.swift in Sources */,

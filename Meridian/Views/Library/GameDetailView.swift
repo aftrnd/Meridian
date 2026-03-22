@@ -4,6 +4,9 @@ import AppKit
 private enum GameDetailMetrics {
     static let launchButtonHeight: CGFloat = 24
     static let launchButtonMinWidth: CGFloat = 140
+    /// Max width of the hero + text column; centered when the split-view detail column is wider.
+    static let maxContentWidth: CGFloat = 920
+    static let horizontalPadding: CGFloat = 20
 }
 
 struct GameDetailView: View {
@@ -23,21 +26,54 @@ struct GameDetailView: View {
     @State private var showResetConfirm = false
     @State private var showInfoPopover = false
     @State private var appDetails: AppDetails? = nil
+    /// Width÷height from the loaded hero `NSImage` (falls back to Steam's typical 1920×622 until decode).
+    @State private var heroAspectRatio: CGFloat = SteamLibraryHeroMetrics.aspectRatio
+
+    private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
+        contentWidth / heroAspectRatio
+    }
+
+    /// Standard window background; keeps detail readable alongside the split-view chrome (incl. Tahoe-style side panels).
+    private var detailRootBackground: some View {
+        Color(nsColor: .windowBackgroundColor)
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            heroBanner
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    launchSection
-                    statsSection
+        GeometryReader { proxy in
+            let contentWidth = min(GameDetailMetrics.maxContentWidth, proxy.size.width)
+            let bannerH = bannerHeight(contentWidth: contentWidth)
+
+            VStack(spacing: 0) {
+                heroBanner(contentWidth: contentWidth, bannerFrameHeight: bannerH)
+                    .frame(maxWidth: .infinity)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        launchSection
+                        statsSection
+                    }
+                    .padding(.horizontal, GameDetailMetrics.horizontalPadding)
+                    .padding(.vertical, GameDetailMetrics.horizontalPadding)
+                    .frame(maxWidth: contentWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(20)
+                .frame(maxHeight: .infinity)
             }
-            Divider()
-            footerBar
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .background(detailRootBackground)
         }
-        .frame(minWidth: 520, minHeight: 520)
+        .navigationTitle(currentGame.name)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Done", action: onDismiss)
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .onExitCommand(perform: onDismiss)
+        .onChange(of: game.id) { _, _ in
+            heroAspectRatio = SteamLibraryHeroMetrics.aspectRatio
+            appDetails = nil
+        }
         .task(id: game.id) {
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
         }
@@ -57,114 +93,87 @@ struct GameDetailView: View {
         }
     }
 
-    // MARK: - Hero Banner (art + overlaid title)
+    // MARK: - Hero Banner (full Steam hero, natural aspect — `.fit` inside width × derived height)
 
-    private var heroBanner: some View {
-        Color.black
-            .frame(maxWidth: .infinity)
-            .frame(height: 260)
-            .overlay {
-                heroArtImage
-            }
+    private func heroBanner(contentWidth: CGFloat, bannerFrameHeight: CGFloat) -> some View {
+        let g = currentGame
+        let w = contentWidth
+        let h = bannerFrameHeight
+
+        return ZStack(alignment: .bottomLeading) {
+            Color.black
+
+            HeroBannerImage(
+                urls: [g.heroURL] + g.heroURLFallbacks,
+                contentMode: .fit,
+                onResolvedImageSize: { size in
+                    let r = size.width / size.height
+                    guard r > 0.05, r < 20 else { return }
+                    heroAspectRatio = r
+                }
+            )
+            .id(g.id)
+            .frame(width: w, height: h)
             .clipped()
-            .overlay {
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.7)],
-                    startPoint: .init(x: 0.5, y: 0.3),
-                    endPoint: .bottom
-                )
-                .allowsHitTesting(false)
-            }
-            .overlay(alignment: .bottomLeading) {
-                HStack(alignment: .bottom, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(currentGame.name)
-                            .font(.title)
-                            .fontWeight(.bold)
-                            .foregroundStyle(.white)
-                            .lineLimit(2)
-                            .shadow(color: .black.opacity(0.5), radius: 4, y: 2)
+            .applyBackgroundExtension()
 
-                        if currentGame.playtimeMinutes > 0 {
-                            Text(currentGame.playtimeFormatted + " played")
-                                .font(.subheadline)
-                                .foregroundStyle(.white.opacity(0.8))
-                        }
-                    }
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.75)],
+                startPoint: .init(x: 0.5, y: 0.3),
+                endPoint: .bottom
+            )
+            .allowsHitTesting(false)
 
-                    Spacer(minLength: 0)
+            HeroLogoImage(
+                urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
+                fallbackName: g.name
+            )
+            .padding(.leading, GameDetailMetrics.horizontalPadding)
+            .padding(.trailing, 24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .id(g.id)
+            .allowsHitTesting(false)
 
-                    HStack(spacing: 8) {
-                        Button {
-                            library.toggleFavorite(appID: currentGame.id)
-                        } label: {
-                            Image(systemName: library.isFavorite(appID: currentGame.id) ? "heart.fill" : "heart")
-                                .font(.title3)
-                                .foregroundStyle(library.isFavorite(appID: currentGame.id) ? .pink : .white.opacity(0.8))
-                        }
-                        .buttonStyle(.borderless)
-                        .help(library.isFavorite(appID: currentGame.id) ? "Remove from Favorites" : "Add to Favorites")
-
-                        Button { showInfoPopover.toggle() } label: {
-                            Image(systemName: "info.circle")
-                                .font(.title3)
-                                .foregroundStyle(.white.opacity(0.8))
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Game info and logs")
-                        .popover(isPresented: $showInfoPopover, arrowEdge: .bottom) {
-                            infoPopoverContent
-                        }
+            HStack(alignment: .bottom, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if g.playtimeMinutes > 0 {
+                        Text(g.playtimeFormatted + " played")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 16)
-            }
-    }
 
-    @ViewBuilder
-    private var heroArtImage: some View {
-        CachedAsyncImage(url: game.heroURL, fallbacks: game.heroURLFallbacks) { phase in
-            switch phase {
-            case .success(let image):
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            case .failure:
-                CachedAsyncImage(url: game.capsuleURL, fallbacks: game.capsuleURLFallbacks) { capsulePhase in
-                    switch capsulePhase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                    case .empty:
-                        artShimmer
-                    default:
-                        artPlaceholder
+                Spacer(minLength: 0)
+
+                HStack(spacing: 8) {
+                    Button {
+                        library.toggleFavorite(appID: g.id)
+                    } label: {
+                        Image(systemName: library.isFavorite(appID: g.id) ? "heart.fill" : "heart")
+                            .font(.title3)
+                            .foregroundStyle(library.isFavorite(appID: g.id) ? .pink : .white.opacity(0.85))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(library.isFavorite(appID: g.id) ? "Remove from Favorites" : "Add to Favorites")
+
+                    Button { showInfoPopover.toggle() } label: {
+                        Image(systemName: "info.circle")
+                            .font(.title3)
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Game info and logs")
+                    .popover(isPresented: $showInfoPopover, arrowEdge: .bottom) {
+                        infoPopoverContent
                     }
                 }
-            case .empty:
-                artShimmer
-            @unknown default:
-                artPlaceholder
             }
+            .padding(.horizontal, GameDetailMetrics.horizontalPadding)
+            .padding(.bottom, 16)
         }
-    }
-
-    private var artShimmer: some View {
-        Rectangle()
-            .fill(.quaternary)
-            .overlay { ShimmerView() }
-    }
-
-    private var artPlaceholder: some View {
-        Rectangle()
-            .fill(.quaternary)
-            .overlay {
-                Image(systemName: "photo")
-                    .font(.title)
-                    .foregroundStyle(.tertiary)
-            }
+        .frame(width: w, height: h)
+        .clipped()
     }
 
     // MARK: - Info Popover
@@ -244,21 +253,6 @@ struct GameDetailView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-    }
-
-    // MARK: - Footer
-
-    private var footerBar: some View {
-        HStack {
-            Spacer()
-            Button("Done") { onDismiss() }
-                .keyboardShortcut(.defaultAction)
-                .keyboardShortcut(.cancelAction)
-                .inactiveAwareProminence(controlActiveState == .inactive)
-                .controlSize(.large)
-        }
-        .padding(.trailing, 20)
-        .padding(.vertical, 12)
     }
 
     // MARK: - Launch section

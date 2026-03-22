@@ -22,6 +22,9 @@ actor SteamAPIService {
         return URLSession(configuration: config)
     }()
 
+    /// Store metadata is static for a session; cache avoids a network round-trip every time the user opens game details.
+    private var appDetailsCache: [Int: AppDetails] = [:]
+
     // MARK: - Player
 
     /// Fetches the public profile for a given Steam64 ID.
@@ -113,6 +116,10 @@ actor SteamAPIService {
 
     /// Fetches store metadata for a single appID.
     func fetchAppDetails(appID: Int) async throws -> AppDetails {
+        if let cached = appDetailsCache[appID] {
+            log.debug("[fetchAppDetails] cache hit appID=\(appID)")
+            return cached
+        }
         log.info("[fetchAppDetails] appID=\(appID)")
         guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appID)&filters=basic,categories,genres") else {
             log.error("[fetchAppDetails] bad URL for appID=\(appID)")
@@ -124,6 +131,7 @@ actor SteamAPIService {
             throw APIError.notFound("App \(appID)")
         }
         log.info("[fetchAppDetails] appID=\(appID) name=\(data.name ?? "unknown")")
+        appDetailsCache[appID] = data
         return data
     }
 

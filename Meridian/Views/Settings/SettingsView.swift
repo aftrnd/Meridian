@@ -4,6 +4,7 @@ struct SettingsView: View {
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(WineEngine.self) private var engine
     @Environment(SteamWindowSuppressor.self) private var suppressor
+    @Environment(AppUpdateChecker.self) private var updateChecker
 
     var body: some View {
         TabView {
@@ -15,6 +16,9 @@ struct SettingsView: View {
 
             PermissionsSettingsTab()
                 .tabItem { Label("Permissions", systemImage: "hand.raised") }
+
+            UpdatesSettingsTab()
+                .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
         }
         .frame(width: 520)
         .padding(24)
@@ -255,6 +259,135 @@ private struct PermissionsSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+// MARK: - Updates tab
+
+private struct UpdatesSettingsTab: View {
+    @Environment(WineEngine.self) private var engine
+    @Environment(AppUpdateChecker.self) private var updateChecker
+    private let settings = AppSettings.shared
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("Meridian") {
+                    Text(fullVersionString)
+                        .foregroundStyle(.secondary)
+                        .font(.system(.body, design: .monospaced))
+                }
+                LabeledContent("Wine Engine") {
+                    Text(engineVersionString)
+                        .foregroundStyle(.secondary)
+                        .font(.system(.body, design: .monospaced))
+                }
+            } header: {
+                Text("Installed")
+            }
+
+            Section {
+                HStack(alignment: .center) {
+                    updateStatusLabel
+                    Spacer()
+                    Button(updateChecker.state == .checking ? "Checking…" : "Check for Updates") {
+                        updateChecker.checkNow()
+                    }
+                    .disabled(updateChecker.state == .checking)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if let last = settings.lastUpdateCheck {
+                    Text("Last checked \(last.formatted(.relative(presentation: .named)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Updates")
+            } footer: {
+                Text("Updates include the latest Wine engine — no separate engine download needed.")
+                    .font(.caption)
+            }
+
+            if case .updateAvailable(let version) = updateChecker.state {
+                Section {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.blue)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Version \(cleanTag(version))")
+                                .fontWeight(.semibold)
+
+                            if let notes = updateChecker.releaseNotes, !notes.isEmpty {
+                                Text(String(notes.prefix(500)) + (notes.count > 500 ? "…" : ""))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(8)
+                            }
+                        }
+
+                        Spacer()
+                    }
+
+                    Button {
+                        updateChecker.openReleasePage()
+                    } label: {
+                        Label("Download Meridian \(cleanTag(version))", systemImage: "safari")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                } header: {
+                    Text("What's New")
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Helpers
+
+    private var fullVersionString: String {
+        let v = AppUpdateChecker.currentVersion
+        let b = AppUpdateChecker.currentBuild
+        return "\(v) (Build \(b))"
+    }
+
+    private var engineVersionString: String {
+        if let v = engine.engineVersion {
+            return v
+        }
+        return engine.isReady ? engine.backendName : "Not installed"
+    }
+
+    @ViewBuilder
+    private var updateStatusLabel: some View {
+        switch updateChecker.state {
+        case .idle:
+            EmptyView()
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7)
+                Text("Checking…").foregroundStyle(.secondary)
+            }
+        case .upToDate:
+            Label("Up to date", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .updateAvailable(let version):
+            Label("\(cleanTag(version)) available", systemImage: "arrow.down.circle.fill")
+                .foregroundStyle(.blue)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .font(.caption)
+                .lineLimit(2)
+        }
+    }
+
+    private func cleanTag(_ tag: String) -> String {
+        tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
     }
 }
 

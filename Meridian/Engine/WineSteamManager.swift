@@ -288,6 +288,9 @@ final class WineSteamManager {
     /// surface its main window without launching a second Steam process.
     func showSteamUI(engine: WineEngine, prefix: WinePrefix) throws {
         log.info("[showSteamUI] activating Steam window")
+        // Pause suppression first — otherwise the 0.5s poll + AX observers minimize Steam
+        // as fast as it appears. Re-engages when Meridian becomes active again.
+        windowSuppressor?.allowSteamUITemporarily()
         try sendSteamCommand(["-activate"], engine: engine, prefix: prefix)
     }
 

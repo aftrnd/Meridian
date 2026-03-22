@@ -31,6 +31,11 @@ final class WineEngine {
     /// Describes the detected Wine backend.
     private(set) var backendName: String = "None"
 
+    /// The Meridian engine release tag bundled with the installed engine, e.g. `v1.2.0-engine`.
+    /// Read from `wine/meridian-engine-version.txt` written by `release-engine.sh`.
+    /// Nil when the engine was installed without a version file (older releases or CrossOver).
+    private(set) var engineVersion: String?
+
     // MARK: - Detected Paths
 
     /// Path to the Wine executable (wineloader or wine64).
@@ -103,6 +108,7 @@ final class WineEngine {
             if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
 
             backendName = "Meridian"
+            engineVersion = readEngineVersion()
             state = .ready
 
             log.info("[detect] Bundled engine found at \(engineBase)")
@@ -111,6 +117,7 @@ final class WineEngine {
             log.info("[detect]   lib=\(self.libraryPath ?? "none")")
             log.info("[detect]   dxmt=\(self.dxmtPath ?? "none")")
             log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
+            log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
             log.info("[detect] backend=Meridian ✓")
             return
         }
@@ -130,6 +137,7 @@ final class WineEngine {
             if fm.fileExists(atPath: dxvk) { dxvkPath = dxvk }
 
             backendName = "CrossOver"
+            engineVersion = nil
             state = .ready
 
             log.info("[detect] CrossOver found (fallback)")
@@ -148,6 +156,15 @@ final class WineEngine {
         log.warning("[detect]   CrossOver: \(Self.crossOverApp) exists=\(fm.fileExists(atPath: Self.crossOverApp))")
         state = .notInstalled
         backendName = "None"
+        engineVersion = nil
+    }
+
+    /// Reads the engine release tag from the version file written by `release-engine.sh`.
+    private func readEngineVersion() -> String? {
+        let versionFile = Self.engineDir.appending(path: "wine/meridian-engine-version.txt")
+        return try? String(contentsOf: versionFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
     }
 
     // MARK: - Environment
@@ -279,4 +296,11 @@ final class WineEngine {
             }
         }
     }
+}
+
+// MARK: - String helpers
+
+private extension String {
+    /// Returns `self` if non-empty, otherwise `nil`.
+    var nonEmpty: String? { isEmpty ? nil : self }
 }

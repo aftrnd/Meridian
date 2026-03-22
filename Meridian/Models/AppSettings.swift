@@ -116,6 +116,21 @@ final class AppSettings: @unchecked Sendable {
         return Date(timeIntervalSince1970: ts)
     }
 
+    // MARK: - Updates
+
+    /// Timestamp of the last update check. Used to rate-limit background checks to once per day.
+    var lastUpdateCheck: Date? {
+        get { UserDefaults.standard.object(forKey: "lastUpdateCheck") as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: "lastUpdateCheck") }
+    }
+
+    /// The app version string from the previous launch. Used to detect upgrades and
+    /// trigger an automatic engine refresh when the app version changes.
+    var lastLaunchAppVersion: String {
+        get { UserDefaults.standard.string(forKey: "lastLaunchAppVersion") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "lastLaunchAppVersion") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

@@ -45,12 +45,6 @@ struct ContentView: View {
                     )) {
                         APIKeySetupSheet()
                     }
-                    .sheet(item: $selectedGame) { game in
-                        GameDetailView(game: game) {
-                            selectedGame = nil
-                        }
-                        .presentationSizing(.fitted)
-                    }
             }
         }
         .onChange(of: bootstrap.isReady) { _, ready in
@@ -70,17 +64,29 @@ struct ContentView: View {
             SidebarView(selectedDestination: $sidebarDestination)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 220, max: .infinity)
         } detail: {
-            detailContent
+            NavigationStack {
+                detailColumnRoot
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .navigationDestination(item: $selectedGame) { game in
+                        GameDetailView(game: game) {
+                            selectedGame = nil
+                        }
+                        .id(game.id)
+                    }
+            }
         }
         .onChange(of: sidebarDestination) { _, newValue in
             if case .library(let filter) = newValue {
                 library.filter = filter
             }
+            // Dismiss game detail when changing sections — matches standard master–detail behaviour.
+            selectedGame = nil
         }
     }
 
+    /// Root of the split-view detail column; game details push on top via `navigationDestination`.
     @ViewBuilder
-    private var detailContent: some View {
+    private var detailColumnRoot: some View {
         switch sidebarDestination {
         case .home:
             HomeView(selectedGame: $selectedGame)

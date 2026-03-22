@@ -85,6 +85,13 @@ final class SteamWindowSuppressor {
     private var workspaceObserver: NSObjectProtocol?
     private var pollingTickCount: Int = 0
 
+    /// Coalesces AX-driven hide sweeps so we don't hammer Steam every few ms — that
+    /// fight causes Steam to restore windows repeatedly ("reopens and reopens").
+    private var lastGlobalHideAt: Date = .distantPast
+
+    /// Set by `allowSteamUITemporarily()`; when true, returning to Meridian re-engages suppression.
+    private var reengageSuppressionWhenMeridianActivates: Bool = false
+
     // MARK: - Init
 
     init() {
@@ -149,6 +156,7 @@ final class SteamWindowSuppressor {
     /// right away. The polling timer handles any other Wine processes.
     func resumeSuppressing(pid: pid_t) {
         guard isPermissionGranted else { return }
+        reengageSuppressionWhenMeridianActivates = false
         suppressionActive = true
         isSuppressing = true
         if pid > 0 {
@@ -162,9 +170,28 @@ final class SteamWindowSuppressor {
     /// Pause new-window minimization so the game's own window can appear on screen.
     /// The polling timer and observers remain active; call `resumeSuppressing` to re-enable.
     func stopSuppressingNewWindows() {
+        reengageSuppressionWhenMeridianActivates = false
         suppressionActive = false
         isSuppressing = false
         log.info("[suppressor] suppression paused — game window will appear")
+    }
+
+    /// Call before `steam.exe -activate` so the window can appear. Suppression turns
+    /// back on when Meridian becomes the active app again (user finished with Steam).
+    func allowSteamUITemporarily() {
+        reengageSuppressionWhenMeridianActivates = true
+        suppressionActive = false
+        isSuppressing = false
+        log.info("[suppressor] paused for explicit Show Steam — will resume when Meridian activates")
+    }
+
+    /// Invoke from `NSApplication.didBecomeActiveNotification` for Meridian.
+    func onMeridianDidBecomeActive(resumeForSteamPID pid: pid_t?) {
+        guard reengageSuppressionWhenMeridianActivates else { return }
+        guard let pid, pid > 0 else { return }
+        reengageSuppressionWhenMeridianActivates = false
+        resumeSuppressing(pid: pid)
+        log.info("[suppressor] Meridian active again — resumed suppression pid=\(pid)")
     }
 
     /// Tear down all layers. Call at app termination.
@@ -224,7 +251,7 @@ final class SteamWindowSuppressor {
             // CFRunLoopGetMain). assumeIsolated gives us direct @MainActor access.
             MainActor.assumeIsolated {
                 guard self?.suppressionActive == true else { return }
-                self?.hideAllObservedWindows()
+                self?.throttledHideAllObservedWindows()
             }
         }
         let boxPtr = Unmanaged.passRetained(box).toOpaque()
@@ -293,11 +320,15 @@ final class SteamWindowSuppressor {
         for pid in winePIDs where observerEntries[pid] == nil {
             log.info("[suppressor] pollingTick discovered new Wine PID=\(pid)")
             installObserver(for: pid)
+            if suppressionActive {
+                hideWindows(for: pid)
+            }
         }
 
-        // 3. If suppression is active, hide all visible windows.
-        if suppressionActive {
-            hideAllObservedWindows()
+        // 3. Periodic safety sweep only — hiding every 0.5 s fights Steam, which keeps
+        //    restoring its client and feels like an infinite reopen loop.
+        if suppressionActive, pollingTickCount % 10 == 0 {
+            throttledHideAllObservedWindows()
         }
 
         // Periodic diagnostic: log process counts every 10 ticks (~5s).
@@ -376,6 +407,14 @@ final class SteamWindowSuppressor {
 
     private func hideAllObservedWindows() {
         for pid in observerEntries.keys { hideWindows(for: pid) }
+    }
+
+    /// AX notifications can fire in bursts; spacing global sweeps avoids a hide/restore tug-of-war with Steam.
+    private func throttledHideAllObservedWindows() {
+        let now = Date()
+        guard now.timeIntervalSince(lastGlobalHideAt) >= 0.45 else { return }
+        lastGlobalHideAt = now
+        hideAllObservedWindows()
     }
 
     /// Public surface so call sites in GameLauncher can trigger an immediate
