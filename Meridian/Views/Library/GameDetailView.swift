@@ -54,6 +54,7 @@ struct GameDetailView: View {
                     }
                     .padding(.horizontal, GameDetailMetrics.horizontalPadding)
                     .padding(.vertical, GameDetailMetrics.horizontalPadding)
+                    .padding(.bottom, 8)
                     .frame(maxWidth: contentWidth, alignment: .leading)
                     .frame(maxWidth: .infinity)
                 }
