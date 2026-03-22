@@ -59,6 +59,13 @@ struct GameGridView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             artSection
+            if isSelected {
+                Image(systemName: "chevron.compact.up")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.tint)
+                    .frame(maxWidth: .infinity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+            }
             infoLabel
         }
         // Explicitly bound to the column/frame width so LazyVGrid's first lazy

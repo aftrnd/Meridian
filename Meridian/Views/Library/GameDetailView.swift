@@ -4,9 +4,14 @@ import AppKit
 private enum GameDetailMetrics {
     static let launchButtonHeight: CGFloat = 24
     static let launchButtonMinWidth: CGFloat = 140
-    /// Max width of the hero + text column; centered when the split-view detail column is wider.
-    static let maxContentWidth: CGFloat = 920
     static let horizontalPadding: CGFloat = 20
+    /// Uniform inset between the window edge and each floating card.
+    /// Also the gap between the two cards, so all spacing is visually identical.
+    static let cardInset: CGFloat = 16
+    /// Corner radius for floating cards.
+    /// Concentric with the NavigationSplitView detail-column corner radius
+    /// (~28 pt on macOS Tahoe): 28 − cardInset (16) = 12 pt.
+    static let cardCornerRadius: CGFloat = 12
 }
 
 struct GameDetailView: View {
@@ -28,55 +33,97 @@ struct GameDetailView: View {
     @State private var appDetails: AppDetails? = nil
     /// Width÷height from the loaded hero `NSImage` (falls back to Steam's typical 1920×622 until decode).
     @State private var heroAspectRatio: CGFloat = SteamLibraryHeroMetrics.aspectRatio
+    /// Drives the zoom-in appear animation.
+    @State private var appeared = false
+    /// Banner image loaded directly — avoids the `GeometryReader` wrapper inside
+    /// `HeroBannerImage`, which introduced an internal CALayer boundary that
+    /// produced a faint rounded-corner artefact at the clip boundary on macOS 15.
+    @State private var bannerImage: NSImage? = nil
+    @State private var bannerImageFailed = false
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
     }
 
-    /// Standard window background; keeps detail readable alongside the split-view chrome (incl. Tahoe-style side panels).
-    private var detailRootBackground: some View {
-        Color(nsColor: .windowBackgroundColor)
-    }
-
     var body: some View {
         GeometryReader { proxy in
-            let contentWidth = min(GameDetailMetrics.maxContentWidth, proxy.size.width)
-            let bannerH = bannerHeight(contentWidth: contentWidth)
+            let inset  = GameDetailMetrics.cardInset
+            let radius = GameDetailMetrics.cardCornerRadius
+            // Cards are inset 16 pt on each side, so their render width is the
+            // column width minus two insets.
+            let cardWidth = proxy.size.width - inset * 2
 
-            VStack(spacing: 0) {
-                heroBanner(contentWidth: contentWidth, bannerFrameHeight: bannerH)
-                    .frame(maxWidth: .infinity)
+            ScrollView {
+                VStack(alignment: .leading, spacing: inset) {
 
-                ScrollView {
+                    // ── Banner card ───────────────────────────────────────────
+                    // Flat ZStack: Color.black + direct Image from @State (no
+                    // GeometryReader inside), gradient, logo, buttons.
+                    // ONE clipShape with .continuous corners — nothing else clips
+                    // this view tree, so there is exactly one rounded boundary.
+                    heroBanner(
+                        contentWidth: cardWidth,
+                        bannerFrameHeight: bannerHeight(contentWidth: cardWidth)
+                    )
+
+                    // ── Info card ─────────────────────────────────────────────
+                    // Background: direct Image from @State (no HeroBannerImage /
+                    // GeometryReader), blurred + thinMaterial.  No extra clip
+                    // inside .background{}; the single outer clipShape below is
+                    // the ONLY rounded boundary on this card.
                     VStack(alignment: .leading, spacing: 12) {
                         launchSection
                         statsSection
                     }
-                    .padding(.horizontal, GameDetailMetrics.horizontalPadding)
-                    .padding(.vertical, GameDetailMetrics.horizontalPadding)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: contentWidth, alignment: .leading)
-                    .frame(maxWidth: .infinity)
+                    .padding(GameDetailMetrics.horizontalPadding)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        Group {
+                            if let img = bannerImage {
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .blur(radius: 60)
+                                    .saturation(1.5)
+                            } else {
+                                Color(nsColor: .windowBackgroundColor)
+                            }
+                        }
+                        .overlay(.thinMaterial)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: radius, style: .continuous)
+                            .strokeBorder(.separator, lineWidth: 0.5)
+                    )
                 }
-                .frame(maxHeight: .infinity)
+                .padding(inset)
             }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
-            .background(detailRootBackground)
+            .contentMargins(.top, 0, for: .scrollContent)
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .scaleEffect(appeared ? 1 : 0.94, anchor: .center)
+        .opacity(appeared ? 1 : 0)
+        .blur(radius: appeared ? 0 : 6)
+        .onAppear {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                appeared = true
+            }
         }
         .navigationTitle(currentGame.name)
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("Done", action: onDismiss)
-                    .keyboardShortcut(.cancelAction)
-            }
-        }
         .onExitCommand(perform: onDismiss)
         .onChange(of: game.id) { _, _ in
+            appeared = false
             heroAspectRatio = SteamLibraryHeroMetrics.aspectRatio
             appDetails = nil
+            bannerImage = nil
+            bannerImageFailed = false
         }
         .task(id: game.id) {
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
+        }
+        .task(id: game.id) {
+            await loadBannerImage()
         }
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
@@ -94,37 +141,48 @@ struct GameDetailView: View {
         }
     }
 
-    // MARK: - Hero Banner (full Steam hero, natural aspect — `.fit` inside width × derived height)
+    // MARK: - Hero Banner
 
     private func heroBanner(contentWidth: CGFloat, bannerFrameHeight: CGFloat) -> some View {
         let g = currentGame
         let w = contentWidth
         let h = bannerFrameHeight
 
-        return ZStack(alignment: .bottomLeading) {
-            Color.black
-
-            HeroBannerImage(
-                urls: [g.heroURL] + g.heroURLFallbacks,
-                contentMode: .fit,
-                onResolvedImageSize: { size in
-                    let r = size.width / size.height
-                    guard r > 0.05, r < 20 else { return }
-                    heroAspectRatio = r
-                }
-            )
-            .id(g.id)
-            .frame(width: w, height: h)
-            .clipped()
-            .applyBackgroundExtension()
-
+        // clipShape lives here, directly on the art — not on a ZStack that also
+        // contains gradients, logos, and buttons.  Those elements go into .overlay
+        // calls on the already-clipped view so they are never inside the clip
+        // computation and cannot produce corner-boundary artefacts.
+        return Group {
+            if let img = bannerImage {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else if bannerImageFailed {
+                Rectangle()
+                    .fill(.black)
+                    .overlay {
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 48, weight: .thin))
+                            .foregroundStyle(.tertiary)
+                    }
+            } else {
+                Rectangle()
+                    .fill(.black)
+                    .overlay { ShimmerView() }
+            }
+        }
+        .id(g.id)
+        .frame(width: w, height: h)
+        // ── overlays first, then ONE clip for everything ──────────────────
+        .overlay {
             LinearGradient(
                 colors: [.clear, .black.opacity(0.75)],
                 startPoint: .init(x: 0.5, y: 0.3),
                 endPoint: .bottom
             )
             .allowsHitTesting(false)
-
+        }
+        .overlay {
             HeroLogoImage(
                 urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
                 fallbackName: g.name
@@ -134,7 +192,8 @@ struct GameDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .id(g.id)
             .allowsHitTesting(false)
-
+        }
+        .overlay(alignment: .bottom) {
             HStack(alignment: .bottom, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     if g.playtimeMinutes > 0 {
@@ -172,9 +231,43 @@ struct GameDetailView: View {
             }
             .padding(.horizontal, GameDetailMetrics.horizontalPadding)
             .padding(.bottom, 16)
+            .frame(width: w)
         }
-        .frame(width: w, height: h)
-        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
+    }
+
+    // MARK: - Banner image loading
+
+    /// Loads the hero banner image via the cache then network, mirroring
+    /// `HeroBannerImage.loadImage()` but writing directly to `@State`
+    /// so the banner can render as a plain `Image` with no `GeometryReader`.
+    private func loadBannerImage() async {
+        let urls = [currentGame.heroURL] + currentGame.heroURLFallbacks
+
+        for url in urls {
+            if let cached = ImageCache.shared.image(for: url) {
+                let r = cached.size.width / cached.size.height
+                if r > 0.05, r < 20 { heroAspectRatio = r }
+                bannerImage = cached
+                return
+            }
+        }
+
+        for url in urls {
+            guard !Task.isCancelled else { return }
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+                guard let img = NSImage(data: data) else { continue }
+                ImageCache.shared.store(img, for: url)
+                let r = img.size.width / img.size.height
+                if r > 0.05, r < 20 { heroAspectRatio = r }
+                bannerImage = img
+                return
+            } catch { continue }
+        }
+
+        bannerImageFailed = true
     }
 
     // MARK: - Info Popover
@@ -306,7 +399,8 @@ struct GameDetailView: View {
                 DetailRow(icon: "calendar", label: "Last 2 Weeks", value: value)
             }
         }
-        .modifier(GlassRoundedBackground(cornerRadius: 10))
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
     }
 
     @ViewBuilder
@@ -358,7 +452,8 @@ struct GameDetailView: View {
                     DetailRow(icon: "building.2", label: "Publisher", value: pub)
                 }
             }
-            .modifier(GlassRoundedBackground(cornerRadius: 10))
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
         }
     }
 
@@ -700,7 +795,8 @@ private struct StatusCard: View {
                 }
                 .padding(12)
             }
-            .modifier(GlassRoundedBackground(cornerRadius: 10))
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
         }
     }
 

@@ -68,10 +68,8 @@ struct ContentView: View {
                 detailColumnRoot
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .navigationDestination(item: $selectedGame) { game in
-                        GameDetailView(game: game) {
-                            selectedGame = nil
-                        }
-                        .id(game.id)
+                        GameDetailView(game: game) { selectedGame = nil }
+                            .id(game.id)
                     }
             }
         }
@@ -108,7 +106,7 @@ struct ContentView: View {
                 categoryGames: categoryStore.games(in: id, from: library.games),
                 categoryTitle: cat?.name
             )
-            .id(id) // force full re-init when switching between categories
+            .id(id)
         }
     }
 }

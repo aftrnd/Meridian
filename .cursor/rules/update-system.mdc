@@ -1,0 +1,50 @@
+---
+description: Meridian unified update system — architecture, developer workflow, and key files
+alwaysApply: true
+---
+
+# Unified Update System
+
+Meridian uses a single update flow. One app version = one Wine engine snapshot. Users never deal with separate app and engine updates.
+
+## How It Works
+
+- `AppUpdateChecker` (`Meridian/Engine/AppUpdateChecker.swift`) queries `https://api.github.com/repos/{engineRepoSlug}/releases`, filters out `-engine` tagged releases, and compares against the installed app version (`CFBundleShortVersionString`).
+- On every launch, `MeridianApp` compares `AppSettings.lastLaunchAppVersion` to the current version. If changed and the engine is already installed, it silently triggers `EngineDownloader` in the background.
+- Settings → Updates tab shows current Meridian version, installed engine tag, update status, release notes, and a "Download →" button.
+
+## End users vs maintainers
+
+- **End users** do **not** need paid CodeWeavers CrossOver. `WineEngine` uses the engine in Application Support first (downloaded via `EngineDownloader`); CrossOver.app is only an optional fallback.
+- **Maintainers** may use CrossOver.app on their machine only as a *source* when running `release-engine.sh` to produce a newer Wine tree for the public engine tarball.
+
+## Developer Release Workflow
+
+```
+1. Update Wine locally (CrossOver and/or Gcenx cask — see release-engine.sh)
+2. bash Scripts/release-engine.sh        # publishes vX.Y.Z-engine tag
+3. Bump MARKETING_VERSION in Xcode
+4. Build → sign → notarize → publish .dmg to GitHub Releases as vX.Y.Z
+```
+
+Engine releases are tagged `vX.Y.Z-engine`. App releases are tagged `vX.Y.Z`. The update checker uses the `-engine` suffix to distinguish them.
+
+`release-engine.sh` writes `wine/meridian-engine-version.txt` into the archive. `WineEngine.engineVersion` reads this file and surfaces it in Settings → Updates.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `Meridian/Engine/AppUpdateChecker.swift` | `@Observable @MainActor` update checker |
+| `Meridian/Engine/EngineDownloader.swift` | Downloads and extracts engine archives |
+| `Meridian/App/MeridianApp.swift` | Injects `updateChecker`; triggers background engine refresh on version change |
+| `Meridian/Models/AppSettings.swift` | `lastUpdateCheck` (rate-limit) + `lastLaunchAppVersion` (upgrade detection) |
+| `Meridian/Views/Settings/SettingsView.swift` | Updates tab — `UpdatesSettingsTab` struct |
+| `Scripts/release-engine.sh` | Developer script — packages Wine + embeds version file |
+
+## Important Constraints
+
+- Do NOT add separate "engine update" and "app update" buttons. The update model is intentionally unified.
+- `AppUpdateChecker` has no external package dependencies — consistent with the rest of the codebase (`dependencies: []`).
+- The rate limit for background checks is 86,400 seconds (24 hours), stored in `AppSettings.lastUpdateCheck`.
+- Engine auto-refresh only fires when `engine.isReady` is true (engine already installed). It never interferes with a fresh install going through `EngineSetupView`.
