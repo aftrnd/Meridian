@@ -78,18 +78,19 @@ struct GameDetailView: View {
                     .padding(GameDetailMetrics.horizontalPadding)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background {
-                        Group {
-                            if let img = bannerImage {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .blur(radius: 60)
-                                    .saturation(1.5)
-                            } else {
-                                Color(nsColor: .windowBackgroundColor)
-                            }
+                        // System window colour at full opacity as the base, then
+                        // the blurred art at exactly 25 % on top — same ratio in
+                        // both light and dark mode, so the card always feels
+                        // consistent regardless of colour scheme.
+                        Color(nsColor: .windowBackgroundColor)
+                        if let img = bannerImage {
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .blur(radius: 60)
+                                .saturation(1.2)
+                                .opacity(0.25)
                         }
-                        .overlay(.thinMaterial)
                     }
                     .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                     .overlay(
@@ -101,6 +102,20 @@ struct GameDetailView: View {
             }
             .contentMargins(.top, 0, for: .scrollContent)
             .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .background {
+            // Very subtle ambient colour bleed from the game's art — fills the
+            // full column including safe areas so the tint shows in the margins
+            // and behind the navigation bar, matching the Apple Music album feel.
+            if let img = bannerImage {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .ignoresSafeArea()
+                    .blur(radius: 80)
+                    .saturation(1.2)
+                    .opacity(0.12)
+            }
         }
         .scaleEffect(appeared ? 1 : 0.94, anchor: .center)
         .opacity(appeared ? 1 : 0)
