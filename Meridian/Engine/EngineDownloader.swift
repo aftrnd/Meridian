@@ -10,7 +10,7 @@ private let log = Logger(subsystem: "com.meridian.app", category: "EngineDownloa
 ///   - `bin/wine64`, `bin/wineserver`
 ///   - `lib/wine/`, `lib/dxmt/`, `lib/dxvk/` (optional)
 ///
-/// Wine (LGPL), DXMT (open source), DXVK (open source), MoltenVK (Apache 2.0)
+/// Wine (LGPL), DXMT (MIT), DXVK (Zlib), MoltenVK (Apache 2.0)
 /// are all freely redistributable open-source components.
 @Observable
 @MainActor
@@ -61,7 +61,7 @@ final class EngineDownloader {
         log.info("[cancel] download cancelled")
     }
 
-    // MARK: - Private
+    // MARK: - Pipeline
 
     private func executeDownload(onComplete: @escaping () -> Void) async {
         let repoSlug = settings.engineRepoSlug
@@ -150,7 +150,6 @@ final class EngineDownloader {
                 let assets = release["assets"] as? [[String: Any]]
             else { continue }
 
-            // Skip drafts.
             if let isDraft = release["draft"] as? Bool, isDraft { continue }
 
             log.info("[fetchLatestAsset] engine release: \(tagName), \(assets.count) asset(s)")
@@ -168,7 +167,6 @@ final class EngineDownloader {
                 }
             }
 
-            // Found an engine release but no archive asset — log and keep looking.
             log.warning("[fetchLatestAsset] engine release \(tagName) has no .tar.gz/.tar.xz asset")
         }
 
@@ -176,6 +174,11 @@ final class EngineDownloader {
     }
 
     // MARK: - Download
+    //
+    // Uses URLSessionDownloadTask + delegate so the OS networking stack handles
+    // the transfer at full speed. The old URLSession.bytes(from:) approach iterated
+    // one byte at a time through an async loop (133M suspensions for a 127 MB file),
+    // which throttled real-world throughput to ~200 KB/s regardless of bandwidth.
 
     private func downloadAsset(_ asset: ReleaseAsset) async throws -> URL {
         guard let url = URL(string: asset.downloadURL) else {
@@ -186,52 +189,37 @@ final class EngineDownloader {
         downloadedBytes = 0
         state = .downloading(progress: 0)
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let destPath = tempDir.appending(path: asset.name)
+        let destPath = FileManager.default.temporaryDirectory.appending(path: asset.name)
         try? FileManager.default.removeItem(at: destPath)
 
-        let (asyncBytes, response) = try await URLSession.shared.bytes(from: url)
-        if let http = response as? HTTPURLResponse {
-            log.info("[downloadAsset] HTTP \(http.statusCode) | content-length=\(http.expectedContentLength)")
-            if http.expectedContentLength > 0 {
-                totalBytes = http.expectedContentLength
-            }
+        log.info("[downloadAsset] starting URLSessionDownloadTask → \(destPath.lastPathComponent)")
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let delegate = DownloadProgressDelegate(
+                expectedBytes: asset.size,
+                destination: destPath,
+                onProgress: { [weak self] received, total in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.downloadedBytes = received
+                        self.totalBytes = max(total, self.totalBytes)
+                        let progress = total > 0 ? Double(received) / Double(total) : 0
+                        self.state = .downloading(progress: min(progress, 1.0))
+                    }
+                },
+                continuation: continuation
+            )
+
+            let session = URLSession(
+                configuration: .default,
+                delegate: delegate,
+                delegateQueue: nil   // URLSession manages its own background queue
+            )
+            let task = session.downloadTask(with: url)
+            delegate.sessionRef = session  // Keep session alive until delegate fires
+            task.resume()
+            log.info("[downloadAsset] task resumed")
         }
-
-        let handle = try FileHandle(forWritingTo: {
-            FileManager.default.createFile(atPath: destPath.path(percentEncoded: false), contents: nil)
-            return destPath
-        }())
-
-        var written: Int64 = 0
-        let chunkSize = 65536
-        var buffer = Data()
-        buffer.reserveCapacity(chunkSize)
-
-        for try await byte in asyncBytes {
-            buffer.append(byte)
-            if buffer.count >= chunkSize {
-                handle.write(buffer)
-                written += Int64(buffer.count)
-                buffer.removeAll(keepingCapacity: true)
-
-                downloadedBytes = written
-                let progress = totalBytes > 0 ? Double(written) / Double(totalBytes) : 0
-                state = .downloading(progress: min(progress, 1.0))
-            }
-        }
-
-        if !buffer.isEmpty {
-            handle.write(buffer)
-            written += Int64(buffer.count)
-        }
-        handle.closeFile()
-
-        downloadedBytes = written
-        state = .downloading(progress: 1.0)
-        log.info("[downloadAsset] downloaded \(written) bytes to \(destPath.path(percentEncoded: false))")
-
-        return destPath
     }
 
     // MARK: - Extraction
@@ -303,16 +291,77 @@ final class EngineDownloader {
     }
 }
 
-// MARK: - Architecture helper
+// MARK: - Download progress delegate
 
-private extension ProcessInfo {
-    var machineArchitecture: String {
-        var sysinfo = utsname()
-        uname(&sysinfo)
-        return withUnsafePointer(to: &sysinfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
-                String(cString: $0)
+/// Bridges URLSessionDownloadTask callbacks into a Swift checked continuation.
+/// All delegate methods are called on URLSession's internal serial queue, so
+/// the `resumed` guard is sufficient to prevent double-continuation-resume.
+private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+
+    private let expectedBytes: Int64
+    private let destination: URL
+    private let onProgress: (Int64, Int64) -> Void
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var resumed = false
+
+    /// Held strongly so the session (and delegate) survive until the transfer completes.
+    var sessionRef: URLSession?
+
+    init(
+        expectedBytes: Int64,
+        destination: URL,
+        onProgress: @escaping (Int64, Int64) -> Void,
+        continuation: CheckedContinuation<URL, Error>
+    ) {
+        self.expectedBytes = expectedBytes
+        self.destination = destination
+        self.onProgress = onProgress
+        self.continuation = continuation
+    }
+
+    // Progress updates — called frequently on the session queue.
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData _: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
+        onProgress(totalBytesWritten, total)
+    }
+
+    // Download complete — move temp file then resume the continuation.
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        do {
+            // location is only valid inside this callback; move it immediately.
+            if FileManager.default.fileExists(atPath: destination.path(percentEncoded: false)) {
+                try FileManager.default.removeItem(at: destination)
             }
+            try FileManager.default.moveItem(at: location, to: destination)
+            resume(with: .success(destination))
+        } catch {
+            resume(with: .failure(error))
         }
+    }
+
+    // Called after didFinishDownloadingTo (error == nil) or on failure (error != nil).
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            resume(with: .failure(error))
+        }
+        sessionRef?.finishTasksAndInvalidate()
+        sessionRef = nil
+    }
+
+    private func resume(with result: Result<URL, Error>) {
+        guard !resumed else { return }
+        resumed = true
+        continuation?.resume(with: result)
+        continuation = nil
     }
 }
