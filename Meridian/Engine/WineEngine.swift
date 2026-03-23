@@ -6,11 +6,12 @@ private let log = Logger(subsystem: "com.meridian.app", category: "WineEngine")
 
 /// Manages the Wine runtime used to execute Windows games.
 ///
-/// Detection order:
-///   1. Bundled engine — downloaded from GitHub releases to
-///      ~/Library/Application Support/com.meridian.app/engine/
-///      This is the primary, standalone path. No third-party app required.
-///   2. CrossOver.app — fallback if installed and no bundled engine present.
+/// Detection: bundled engine only — downloaded from GitHub releases to
+///   ~/Library/Application Support/com.meridian.app/engine/
+///
+/// Meridian is fully standalone. No third-party app (CrossOver, etc.) is
+/// required or consulted at runtime. State is .notInstalled until the user
+/// downloads the engine via EngineSetupView or Settings → Engine.
 ///
 /// All runtime components are open source:
 ///   - Wine (LGPL), DXMT (open source), DXVK (open source), MoltenVK (Apache 2.0)
@@ -33,7 +34,7 @@ final class WineEngine {
 
     /// The Meridian engine release tag bundled with the installed engine, e.g. `v1.2.0-engine`.
     /// Read from `wine/meridian-engine-version.txt` written by `release-engine.sh`.
-    /// Nil when the engine was installed without a version file (older releases or CrossOver).
+    /// Nil when the engine was installed without a version file (older releases).
     private(set) var engineVersion: String?
 
     // MARK: - Detected Paths
@@ -65,12 +66,6 @@ final class WineEngine {
     private let settings = AppSettings.shared
 
     // MARK: - Known Paths
-
-    private static let crossOverApp = "/Applications/CrossOver.app"
-    private static let crossOverRoot = "\(crossOverApp)/Contents/SharedSupport/CrossOver"
-    private static let crossOverWineloader = "\(crossOverRoot)/CrossOver-Hosted Application/wineloader"
-    private static let crossOverWineserver = "\(crossOverRoot)/CrossOver-Hosted Application/wineserver"
-    private static let crossOverLib = "\(crossOverRoot)/lib"
 
     static let engineDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -122,38 +117,9 @@ final class WineEngine {
             return
         }
 
-        // 2. Fallback: CrossOver.app (if user happens to have it installed)
-        if fm.isExecutableFile(atPath: Self.crossOverWineloader),
-           fm.isExecutableFile(atPath: Self.crossOverWineserver) {
-
-            wineExecutableURL = URL(filePath: Self.crossOverWineloader)
-            wineserverExecutableURL = URL(filePath: Self.crossOverWineserver)
-            libraryPath = Self.crossOverLib
-
-            let dxmt = "\(Self.crossOverLib)/dxmt"
-            if fm.fileExists(atPath: dxmt) { dxmtPath = dxmt }
-
-            let dxvk = "\(Self.crossOverLib)/dxvk"
-            if fm.fileExists(atPath: dxvk) { dxvkPath = dxvk }
-
-            backendName = "CrossOver"
-            engineVersion = nil
-            state = .ready
-
-            log.info("[detect] CrossOver found (fallback)")
-            log.info("[detect]   wineloader=\(Self.crossOverWineloader)")
-            log.info("[detect]   wineserver=\(Self.crossOverWineserver)")
-            log.info("[detect]   lib=\(Self.crossOverLib)")
-            log.info("[detect]   dxmt=\(self.dxmtPath ?? "none")")
-            log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
-            log.info("[detect] backend=CrossOver ✓")
-            return
-        }
-
-        // 3. Nothing found
+        // 2. Nothing found — bundled engine is the only supported runtime.
         log.warning("[detect] No Wine backend found")
         log.warning("[detect]   Bundled: \(engineBase) exists=\(fm.fileExists(atPath: engineBase))")
-        log.warning("[detect]   CrossOver: \(Self.crossOverApp) exists=\(fm.fileExists(atPath: Self.crossOverApp))")
         state = .notInstalled
         backendName = "None"
         engineVersion = nil
@@ -176,14 +142,6 @@ final class WineEngine {
             "WINE_LARGE_ADDRESS_AWARE": "1",
             "MTL_HUD_ENABLED": settings.metalHUD ? "1" : "0",
         ]
-
-        // CrossOver's wineloader requires CX_ROOT to find its compat database,
-        // DLL overrides, and internal libraries. Without it, the launcher fails
-        // to set up DLL paths and the child process may not start correctly.
-        if backendName == "CrossOver" {
-            env["CX_ROOT"] = Self.crossOverRoot
-            env["CX_BOTTLE"] = prefix.path.path(percentEncoded: false)
-        }
 
         if let lib = libraryPath {
             env["DYLD_FALLBACK_LIBRARY_PATH"] = lib

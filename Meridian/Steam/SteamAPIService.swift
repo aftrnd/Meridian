@@ -121,7 +121,7 @@ actor SteamAPIService {
             return cached
         }
         log.info("[fetchAppDetails] appID=\(appID)")
-        guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appID)&filters=basic,categories,genres") else {
+        guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appID)&filters=basic,categories,genres,achievements,release_date,metacritic") else {
             log.error("[fetchAppDetails] bad URL for appID=\(appID)")
             throw APIError.badURL
         }
@@ -133,6 +133,60 @@ actor SteamAPIService {
         log.info("[fetchAppDetails] appID=\(appID) name=\(data.name ?? "unknown")")
         appDetailsCache[appID] = data
         return data
+    }
+
+    // MARK: - Achievements
+
+    /// Fetches the current user's achievement state for a game and merges it with the
+    /// game schema to produce display names and icon URLs.
+    ///
+    /// Returns an empty array (not an error) when the game has no achievement system,
+    /// when the user's profile is private, or when the game has no stats configured.
+    func fetchPlayerAchievements(steamID: String, apiKey: String, appID: Int) async throws -> [GameAchievement] {
+        log.info("[fetchPlayerAchievements] appID=\(appID)")
+
+        // ── 1. Player stats ────────────────────────────────────────────────────
+        let playerURL = try buildURL(
+            path: "/ISteamUserStats/GetPlayerAchievements/v1/",
+            params: ["key": apiKey, "steamid": steamID, "appid": String(appID), "l": "english"]
+        )
+        guard let playerEnvelope: PlayerAchievementsEnvelope = try? await get(playerURL),
+              playerEnvelope.playerstats.success == true,
+              let rawAchievements = playerEnvelope.playerstats.achievements,
+              !rawAchievements.isEmpty else {
+            log.info("[fetchPlayerAchievements] appID=\(appID) no achievements or private")
+            return []
+        }
+        log.info("[fetchPlayerAchievements] appID=\(appID) \(rawAchievements.count) achievements")
+
+        // ── 2. Schema (icon URLs) ──────────────────────────────────────────────
+        var schemaLookup: [String: SchemaAchievement] = [:]
+        if let schemaURL = try? buildURL(
+            path: "/ISteamUserStats/GetSchemaForGame/v2/",
+            params: ["key": apiKey, "appid": String(appID), "l": "english"]
+        ), let schema: SchemaEnvelope = try? await get(schemaURL) {
+            for ach in schema.game.availableGameStats?.achievements ?? [] {
+                schemaLookup[ach.name] = ach
+            }
+            log.debug("[fetchPlayerAchievements] schema loaded \(schemaLookup.count) entries for appID=\(appID)")
+        }
+
+        // ── 3. Merge ───────────────────────────────────────────────────────────
+        return rawAchievements.map { raw in
+            let schema = schemaLookup[raw.apiname]
+            return GameAchievement(
+                apiName:     raw.apiname,
+                displayName: raw.name ?? schema?.displayName ?? raw.apiname,
+                description: raw.description ?? schema?.description,
+                achieved:    raw.achieved == 1,
+                unlockDate:  raw.unlocktime > 0
+                    ? Date(timeIntervalSince1970: TimeInterval(raw.unlocktime))
+                    : nil,
+                iconURL:     schema?.icon.flatMap { URL(string: $0) },
+                iconGrayURL: schema?.icongray.flatMap { URL(string: $0) },
+                isHidden:    schema?.hidden == 1
+            )
+        }
     }
 
     // MARK: - Logo hash probe via appdetails (new Steam CDN fallback)
@@ -563,6 +617,49 @@ private struct StoreBrowseAssets: Decodable {
         }
         return nil
     }
+}
+
+// MARK: - Achievement response types
+
+private struct PlayerAchievementsEnvelope: Decodable {
+    let playerstats: PlayerStats
+
+    struct PlayerStats: Decodable {
+        let success: Bool?
+        let achievements: [RawPlayerAchievement]?
+    }
+}
+
+private struct RawPlayerAchievement: Decodable {
+    let apiname: String
+    let achieved: Int
+    let unlocktime: Int
+    let name: String?
+    let description: String?
+}
+
+private struct SchemaEnvelope: Decodable {
+    let game: SchemaGame
+
+    struct SchemaGame: Decodable {
+        let availableGameStats: SchemaStats?
+        enum CodingKeys: String, CodingKey {
+            case availableGameStats = "availableGameStats"
+        }
+    }
+}
+
+private struct SchemaStats: Decodable {
+    let achievements: [SchemaAchievement]?
+}
+
+private struct SchemaAchievement: Decodable {
+    let name: String
+    let displayName: String?
+    let hidden: Int?
+    let description: String?
+    let icon: String?
+    let icongray: String?
 }
 
 // MARK: -

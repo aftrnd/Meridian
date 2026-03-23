@@ -28,6 +28,7 @@
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
 		B0010034 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035 /* AppSettings.swift */; };
 		B0010035A /* AppDetails.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035B /* AppDetails.swift */; };
+		B0010036A /* GameAchievement.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010036B /* GameAchievement.swift */; };
 		B0010036 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0010037 /* Assets.xcassets */; };
 		B0010038 /* SteamSessionBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001003D /* SteamSessionBridge.swift */; };
 		B001003E /* SteamLocalAuthServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001003F /* SteamLocalAuthServer.swift */; };
@@ -68,6 +69,7 @@
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
 		B0010035 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		B0010035B /* AppDetails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDetails.swift; sourceTree = "<group>"; };
+		B0010036B /* GameAchievement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameAchievement.swift; sourceTree = "<group>"; };
 		B0010037 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B0010039 /* Meridian.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Meridian.entitlements; sourceTree = "<group>"; };
 		B001003A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -159,6 +161,7 @@
 				B0010017 /* PlayerSummary.swift */,
 				B0010035 /* AppSettings.swift */,
 				B0010035B /* AppDetails.swift */,
+				B0010036B /* GameAchievement.swift */,
 				46B315635523C0CF2D44F9BA /* CategoryStore.swift */,
 			);
 			path = Models;
@@ -351,6 +354,7 @@
 				B0010032 /* AuthView.swift in Sources */,
 				B0010034 /* AppSettings.swift in Sources */,
 				B0010035A /* AppDetails.swift in Sources */,
+				B0010036A /* GameAchievement.swift in Sources */,
 				B00E0030 /* EngineDownloader.swift in Sources */,
 				B00E00B0 /* AppUpdateChecker.swift in Sources */,
 				B00E0040 /* TerminationCleanup.swift in Sources */,
@@ -377,7 +381,7 @@
 				CODE_SIGN_ENTITLEMENTS = Meridian/Meridian.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_APP_SANDBOX = NO;
@@ -419,7 +423,7 @@
 				CODE_SIGN_ENTITLEMENTS = Meridian/Meridian.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;

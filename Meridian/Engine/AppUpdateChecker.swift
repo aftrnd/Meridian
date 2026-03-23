@@ -100,6 +100,12 @@ final class AppUpdateChecker {
                 state = .upToDate
                 log.info("[check] up to date")
             }
+        } catch UpdateError.noRelease {
+            // No app release published yet (pre-release / development build).
+            // Silently treat as up to date rather than surfacing an error to the user.
+            settings.lastUpdateCheck = Date()
+            state = .upToDate
+            log.info("[check] no app release found — treating as up to date")
         } catch {
             state = .failed(error.localizedDescription)
             log.error("[check] failed: \(error.localizedDescription)")
@@ -143,8 +149,13 @@ final class AppUpdateChecker {
                 let pageURL = URL(string: pageURLString)
             else { continue }
 
-            // Engine-only releases are tagged with "-engine" — skip them.
-            guard !tagName.contains("-engine") else { continue }
+            // Only accept clean vX.Y.Z tags as app releases. Any tag with a hyphen
+            // suffix (-engine, -base, -beta, -rc, etc.) is not a full app release.
+            let versionPart = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
+            guard !versionPart.contains("-") else { continue }
+
+            // Must look like a version number (contains at least one dot).
+            guard versionPart.contains(".") else { continue }
 
             // Skip drafts.
             if let isDraft = release["draft"] as? Bool, isDraft { continue }

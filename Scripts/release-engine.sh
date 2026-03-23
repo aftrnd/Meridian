@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release-engine.sh — Package and upload the Wine+GPTK engine runtime.
+# release-engine.sh — Package and upload the Wine engine runtime.
 #
 # Usage:
 #   bash Scripts/release-engine.sh [VERSION]
@@ -11,31 +11,42 @@
 #
 # Prerequisites:
 #   - gh CLI authenticated:   brew install gh && gh auth login
-#   - Wine source (one of):
-#       Preferred — CrossOver 26+: https://www.codeweavers.com/crossover  (wine-11.0)
-#       Fallback  — Gcenx cask:    brew tap gcenx/wine && brew install --cask wine-crossover
+#   - Wine source (preferred — open source, freely redistributable):
+#       brew tap gcenx/wine && brew install --cask wine-crossover
 #
 # What it does:
-#   1. Auto-detects the best available Wine source (CrossOver 26 > Gcenx cask)
-#   2. Stages wine/bin + wine/lib (open-source components only — no cx* tools)
+#   1. Auto-detects Wine source (Gcenx open-source cask preferred; CrossOver local fallback)
+#   2. Stages wine/bin + wine/lib (open-source components only)
 #   3. Embeds wine/meridian-engine-version.txt (read by Settings → Updates)
 #   4. Verifies wine64 and wineserver are present
 #   5. Creates a .tar.gz archive
 #   6. Uploads it as a GitHub release to aftrnd/meridian tagged vX.Y.Z-engine
 #
+# REDISTRIBUTION NOTICE
+# ---------------------
+# Public engine releases MUST be built from the Gcenx wine-crossover cask (or from
+# Wine source). This cask is compiled from CodeWeavers' open-source Wine fork and is
+# freely redistributable under the LGPL.
+#
+# CrossOver.app is a paid commercial product. Its binaries may NOT be repackaged and
+# redistributed publicly even though the underlying Wine code is LGPL — doing so would
+# violate CodeWeavers' End User License Agreement. CrossOver is only supported here as
+# a local fallback for internal/development builds. NEVER publish a release built from
+# CrossOver sources to the public GitHub releases page.
+#
 set -euo pipefail
 
 REPO="aftrnd/meridian"
 
-# Wine source detection.
-# CrossOver.app (26+, wine-11.0) is preferred when available — it is a much newer
-# base than the Gcenx open-source cask (23.7.1, wine-8.0.1). Both are LGPL-licensed
-# and freely redistributable. CrossOver-specific proprietary tools (cxstart, etc.)
-# are deliberately NOT included in the engine package.
-CX_APP="/Applications/CrossOver.app"
-CX_ROOT="${CX_APP}/Contents/SharedSupport/CrossOver"
+# Wine source paths.
+# Gcenx wine-crossover cask (open-source, LGPL — preferred for public releases):
+#   brew tap gcenx/wine && brew install --cask wine-crossover
 GCENX_APP="/Applications/Wine Crossover.app"
 GCENX_RESOURCES="${GCENX_APP}/Contents/Resources"
+
+# CrossOver.app (commercial — local development fallback ONLY, NOT for public releases):
+CX_APP="/Applications/CrossOver.app"
+CX_ROOT="${CX_APP}/Contents/SharedSupport/CrossOver"
 
 STAGING="/tmp/meridian-engine"
 ARCHIVE="/tmp/meridian-engine-arm64.tar.gz"
@@ -57,17 +68,33 @@ echo ""
 command -v gh >/dev/null 2>&1 || die "gh CLI not found. Install: brew install gh"
 gh auth status >/dev/null 2>&1 || die "gh CLI not authenticated. Run: gh auth login"
 
-# Detect Wine source — CrossOver 26+ preferred, Gcenx cask as fallback.
-if [ -d "${CX_APP}" ] && [ -f "${CX_ROOT}/CrossOver-Hosted Application/wineloader" ]; then
+# Detect Wine source.
+# Gcenx open-source cask is always preferred for public releases. CrossOver is only
+# accepted as a local fallback and triggers a prominent redistribution warning.
+if [ -d "${GCENX_APP}" ] && [ -f "${GCENX_RESOURCES}/wine/bin/wine64" ]; then
+    WINE_SOURCE="gcenx"
+    WINE_SOURCE_VERSION="Wine Crossover (Gcenx open-source cask)"
+elif [ -d "${CX_APP}" ] && [ -f "${CX_ROOT}/CrossOver-Hosted Application/wineloader" ]; then
     WINE_SOURCE="crossover"
     WINE_SOURCE_VERSION="CrossOver $(defaults read "${CX_APP}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo '?')"
-elif [ -d "${GCENX_APP}" ] && [ -f "${GCENX_RESOURCES}/wine/bin/wine64" ]; then
-    WINE_SOURCE="gcenx"
-    WINE_SOURCE_VERSION="Wine Crossover (Gcenx)"
+    echo ""
+    red  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    red  "  WARNING: CrossOver selected as Wine source"
+    red  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    yellow "  CrossOver is a commercial product. Its binaries MUST NOT"
+    yellow "  be redistributed publicly. This build is for LOCAL / DEV"
+    yellow "  use only. Do NOT publish it to GitHub Releases."
+    red  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo ""
+    yellow "  To build a redistributable release, install the Gcenx cask:"
+    yellow "    brew tap gcenx/wine && brew install --cask wine-crossover"
+    echo ""
+    read -rp "  Continue for LOCAL use only? [y/N] " CX_CONFIRM
+    [[ "${CX_CONFIRM}" =~ ^[Yy]$ ]] || { echo "  Aborted."; exit 0; }
 else
     die "No Wine installation found.
-  Option A (recommended): Install CrossOver from https://www.codeweavers.com/crossover
-  Option B (FOSS):        brew tap gcenx/wine && brew install --cask wine-crossover"
+  Install the Gcenx open-source cask (required for public releases):
+    brew tap gcenx/wine && brew install --cask wine-crossover"
 fi
 yellow "Wine source: ${WINE_SOURCE_VERSION} (${WINE_SOURCE})"
 
@@ -174,7 +201,7 @@ NOTES="Wine engine runtime for Meridian.
 
 **Wine version:** ${WINE_VERSION}
 **Source:** ${WINE_SOURCE_VERSION}
-**Architecture:** arm64 / x86_64 (Rosetta 2)
+**Architecture:** arm64 (Apple Silicon)
 **Archive size:** ${ARCHIVE_SIZE}
 **Files:** ${FILE_COUNT}
 
@@ -189,7 +216,8 @@ NOTES="Wine engine runtime for Meridian.
 **Install target:**
 \`~/Library/Application Support/com.meridian.app/engine/\`
 
-**License:** Wine LGPL · DXMT open source · DXVK Zlib · MoltenVK Apache 2.0"
+**License:** Wine LGPL 2.1 · DXMT MIT · DXVK Zlib · MoltenVK Apache 2.0
+**Source code:** https://github.com/Gcenx/wine (CodeWeavers open-source Wine fork)"
 
 gh release create "${TAG}" \
     --repo "${REPO}" \

@@ -1,10 +1,14 @@
 import SwiftUI
 
-/// Shown at app launch while the bootstrap pipeline runs.
+/// Shown at app launch while the engine and bootstrap pipeline run.
 ///
-/// Displays a spinner and live status while Wine/Steam initialize.
-/// Transitions to the main app once `BootstrapManager.phase == .ready`.
-/// Shows an error state with a retry button if anything fails.
+/// First-launch flow (fully automatic — no user interaction required):
+///   1. Engine not installed → auto-download begins immediately with inline progress
+///   2. Download completes  → engine.detect() → engine.isReady
+///   3. Bootstrap starts    → Wine prefix / Steam setup
+///   4. Ready               → fade out to main UI
+///
+/// Subsequent launches skip step 1 and go straight to bootstrap.
 struct SplashView: View {
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(WineEngine.self) private var engine
@@ -13,13 +17,12 @@ struct SplashView: View {
     @Environment(SteamWindowSuppressor.self) private var suppressor
 
     @State private var isExiting = false
+    @State private var engineDownloader = EngineDownloader()
 
     var body: some View {
         VStack(spacing: 0) {
             Spacer()
 
-            // Logo — template rendering in the asset catalog fills it with
-            // .primary automatically: black in light mode, white in dark mode.
             Image("MeridianLogo")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
@@ -28,13 +31,18 @@ struct SplashView: View {
 
             Spacer().frame(height: 40)
 
-            if isFailed {
-                failedContent
-            } else if case .awaitingPermission = bootstrap.phase {
-                permissionGate
-            } else {
-                statusContent
+            Group {
+                if isDownloadFailed || isBootstrapFailed {
+                    failedContent
+                } else if case .awaitingPermission = bootstrap.phase {
+                    permissionGate
+                } else if engineDownloader.isActive || needsEngineDownload {
+                    engineDownloadContent
+                } else {
+                    statusContent
+                }
             }
+            .transition(.opacity.animation(.easeInOut(duration: 0.25)))
 
             Spacer()
 
@@ -47,22 +55,110 @@ struct SplashView: View {
         .onChange(of: bootstrap.isReady) { _, ready in
             if ready { isExiting = true }
         }
+        .onChange(of: engine.isReady) { _, ready in
+            // Engine just became ready (download finished) — start bootstrap automatically.
+            if ready && bootstrap.phase == .idle {
+                bootstrap.start(
+                    engine: engine,
+                    steamManager: steamManager,
+                    sessionBridge: sessionBridge
+                )
+            }
+        }
         .task {
-            // Center the window here — .task fires after SwiftUI layout is fully
-            // settled, making it more reliable than AppDelegate's async dispatch.
             NSApp.mainWindow?.center()
-            bootstrap.start(
-                engine: engine,
-                steamManager: steamManager,
-                sessionBridge: sessionBridge
-            )
+
+            if engine.isReady {
+                // Engine already installed — go straight to bootstrap.
+                bootstrap.start(
+                    engine: engine,
+                    steamManager: steamManager,
+                    sessionBridge: sessionBridge
+                )
+            } else {
+                // No engine — download it first. Bootstrap will start automatically
+                // once engine.isReady via the .onChange observer above.
+                startEngineDownload()
+            }
+        }
+    }
+
+    // MARK: - Engine Download
+
+    /// True during the initial engine-install window before download has been triggered.
+    private var needsEngineDownload: Bool {
+        engine.state == .notInstalled && bootstrap.phase == .idle
+    }
+
+    private func startEngineDownload() {
+        engineDownloader.download { engine.detect() }
+    }
+
+    @ViewBuilder
+    private var engineDownloadContent: some View {
+        VStack(spacing: 10) {
+            switch engineDownloader.state {
+            case .idle:
+                ProgressView().scaleEffect(0.8)
+                Text("Preparing…")
+                    .font(.callout).foregroundStyle(.secondary)
+
+            case .fetching:
+                ProgressView().scaleEffect(0.8)
+                Text("Finding latest engine…")
+                    .font(.callout).foregroundStyle(.secondary)
+
+            case .downloading(let progress):
+                ProgressView(value: progress)
+                    .frame(maxWidth: 220)
+                    .animation(.linear(duration: 0.2), value: progress)
+                Text(downloadProgressLabel)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .monospacedDigit()
+
+            case .extracting:
+                ProgressView().scaleEffect(0.8)
+                Text("Installing Wine engine…")
+                    .font(.callout).foregroundStyle(.secondary)
+
+            case .complete:
+                ProgressView().scaleEffect(0.8)
+                Text("Starting up…")
+                    .font(.callout).foregroundStyle(.secondary)
+
+            case .failed:
+                EmptyView() // handled by failedContent
+            }
+        }
+    }
+
+    private var downloadProgressLabel: String {
+        let dl = engineDownloader.downloadedBytes
+        let total = engineDownloader.totalBytes
+        guard total > 0 else { return "Downloading Wine engine…" }
+        return "Downloading Wine engine — \(formatMB(dl)) / \(formatMB(total)) MB"
+    }
+
+    private func formatMB(_ bytes: Int64) -> String {
+        String(format: "%.0f", Double(bytes) / 1_000_000)
+    }
+
+    // MARK: - Status (bootstrap in progress)
+
+    @ViewBuilder
+    private var statusContent: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .scaleEffect(0.8)
+            Text(bootstrap.statusMessage.isEmpty ? "Starting up…" : bootstrap.statusMessage)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .animation(.easeInOut(duration: 0.2), value: bootstrap.statusMessage)
         }
     }
 
     // MARK: - Permission Gate
 
-    /// Full-screen gate that blocks the bootstrap pipeline until the user grants
-    /// Accessibility permission or explicitly chooses to continue without it.
     private var permissionGate: some View {
         VStack(spacing: 16) {
             Image(systemName: "hand.raised.fill")
@@ -104,29 +200,20 @@ struct SplashView: View {
         .transition(.opacity.combined(with: .scale(scale: 0.97)))
     }
 
-    // MARK: - Status
-
-    @ViewBuilder
-    private var statusContent: some View {
-        VStack(spacing: 10) {
-            ProgressView()
-                .scaleEffect(0.8)
-
-            Text(bootstrap.statusMessage.isEmpty ? "Starting up…" : bootstrap.statusMessage)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .animation(.easeInOut(duration: 0.2), value: bootstrap.statusMessage)
-        }
-    }
-
     // MARK: - Failed
 
-    private var isFailed: Bool {
+    private var isDownloadFailed: Bool {
+        if case .failed = engineDownloader.state { return true }
+        return false
+    }
+
+    private var isBootstrapFailed: Bool {
         if case .failed = bootstrap.phase { return true }
         return false
     }
 
     private var failureMessage: String {
+        if case .failed(let msg) = engineDownloader.state { return msg }
         if case .failed(let msg) = bootstrap.phase { return msg }
         return "Something went wrong."
     }
@@ -140,15 +227,26 @@ struct SplashView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
 
-            Button("Retry") {
-                bootstrap.retry(
-                    engine: engine,
-                    steamManager: steamManager,
-                    sessionBridge: sessionBridge
-                )
+            if isDownloadFailed {
+                Button {
+                    startEngineDownload()
+                } label: {
+                    Label("Retry Download", systemImage: "arrow.counterclockwise")
+                        .frame(minWidth: 180)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+            } else {
+                Button("Retry") {
+                    bootstrap.retry(
+                        engine: engine,
+                        steamManager: steamManager,
+                        sessionBridge: sessionBridge
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
         }
     }
 
