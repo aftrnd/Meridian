@@ -67,6 +67,30 @@ App releases are tagged `vX.Y.Z` with a `.dmg` asset.
 | `Scripts/release-app.sh` | Builds, signs, notarizes, publishes app .dmg |
 | `.github/workflows/engine-release.yml` | CI workflow — Gcenx cask on macOS runner, workflow_dispatch |
 
+## Redistribution Legality
+
+Engine releases MUST be built only from the Gcenx open-source Wine cask. CrossOver binaries are from a paid commercial product and violate CodeWeavers' EULA if redistributed publicly — even though the underlying Wine source is LGPL.
+
+| Component | Source | License | Public release OK |
+|-----------|--------|---------|:-----------------:|
+| Wine binaries | Gcenx `wine-crossover` cask (built from CodeWeavers OSS fork) | LGPL 2.1 | Yes |
+| DXMT | Gcenx cask | MIT | Yes |
+| DXVK | Gcenx cask | Zlib | Yes |
+| MoltenVK | Gcenx cask | Apache 2.0 | Yes |
+| CrossOver binaries | CrossOver.app (paid commercial product) | CodeWeavers EULA | **No — never ship** |
+
+Wine source code: https://github.com/Gcenx/wine (CodeWeavers open-source fork, compiled clean).
+
+## Tag Conventions
+
+| Tag | Asset | Picked up by |
+|-----|-------|-------------|
+| `vX.Y.Z` | `.dmg` app installer | `AppUpdateChecker` |
+| `vX.Y.Z-engine` | `.tar.gz` Wine tarball | `EngineDownloader` |
+| Anything with `-` suffix (`-base`, `-beta`, `-rc`) | — | Skipped by both |
+
+`AppUpdateChecker` only accepts tags where the version part (after stripping `v`) contains no hyphens and at least one dot.
+
 ## Important Constraints
 
 - Do NOT add a CrossOver fallback back to `WineEngine.detect()`. Isolation is intentional — CrossOver's runtime state would be corrupted by Meridian's Wine usage.
