@@ -1,0 +1,62 @@
+name: Engine Release
+
+# Triggered manually from the GitHub Actions UI (Actions → Engine Release → Run workflow).
+# Installs the Gcenx open-source Wine cask on a macOS runner and runs release-engine.sh.
+#
+# This workflow produces public, legally redistributable engine releases because it only
+# ever sources Wine from the Gcenx cask (LGPL open-source CodeWeavers Wine fork).
+# CrossOver is never installed on GitHub-hosted runners.
+#
+# Usage:
+#   1. Go to Actions → Engine Release → Run workflow
+#   2. Optionally enter an explicit version (e.g. v1.2.0). Leave blank to auto-increment.
+#   3. Click "Run workflow"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. v1.2.0). Leave blank to auto-increment patch."
+        required: false
+        default: ""
+
+jobs:
+  release-engine:
+    name: Package and publish engine
+    runs-on: macos-15
+
+    permissions:
+      contents: write  # Required for gh release create
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Gcenx Wine cask
+        # The Gcenx cask provides an LGPL-licensed build of the CodeWeavers open-source
+        # Wine fork — the same source used by CrossOver, without proprietary additions.
+        # Source: https://github.com/Gcenx/wine
+        run: |
+          brew tap gcenx/wine
+          brew install --cask wine-crossover
+
+      - name: Verify Wine installation
+        run: |
+          WINE_BIN="/Applications/Wine Crossover.app/Contents/Resources/wine/bin/wine64"
+          if [ ! -x "${WINE_BIN}" ]; then
+            echo "ERROR: wine64 not found at expected path after cask install" >&2
+            exit 1
+          fi
+          echo "wine64 OK: $("${WINE_BIN}" --version 2>/dev/null || echo 'unknown')"
+
+      - name: Package and publish engine release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Pass explicit version if provided, otherwise let the script auto-increment.
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -n "${VERSION}" ]; then
+            bash Scripts/release-engine.sh "${VERSION}"
+          else
+            bash Scripts/release-engine.sh
+          fi

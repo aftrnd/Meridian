@@ -67,7 +67,7 @@ final class EngineDownloader {
         let repoSlug = settings.engineRepoSlug
 
         state = .fetching
-        log.info("[download] fetching latest release from \(repoSlug)")
+        log.info("[download] fetching latest engine release from \(repoSlug)")
 
         do {
             let asset = try await fetchLatestAsset(repoSlug: repoSlug)
@@ -112,7 +112,11 @@ final class EngineDownloader {
     }
 
     private func fetchLatestAsset(repoSlug: String) async throws -> ReleaseAsset {
-        let urlString = "https://api.github.com/repos/\(repoSlug)/releases/latest"
+        // Use the releases list (not /releases/latest) so we can filter specifically
+        // for engine-tagged releases. GitHub's "latest" endpoint resolves to the
+        // most-recently-published release regardless of tag, which may be an app
+        // DMG release with no tarball asset when an app release follows an engine release.
+        let urlString = "https://api.github.com/repos/\(repoSlug)/releases?per_page=20"
         guard let url = URL(string: urlString) else {
             throw DownloadError.badURL(urlString)
         }
@@ -131,29 +135,44 @@ final class EngineDownloader {
             throw DownloadError.networkError("GitHub API returned HTTP \(http.statusCode)")
         }
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let assets = json["assets"] as? [[String: Any]] else {
-            throw DownloadError.parseError("Could not parse release JSON")
+        guard let releases = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw DownloadError.parseError("Could not parse releases JSON")
         }
 
-        let tagName = json["tag_name"] as? String ?? "unknown"
-        log.info("[fetchLatestAsset] release tag: \(tagName), \(assets.count) asset(s)")
+        log.info("[fetchLatestAsset] received \(releases.count) release(s)")
 
-        let archSuffix = ProcessInfo.processInfo.machineArchitecture
-        log.info("[fetchLatestAsset] looking for architecture: \(archSuffix)")
+        // Iterate newest-first (GitHub default). Pick the first release whose tag
+        // contains "-engine" — these are engine snapshots, not app releases.
+        for release in releases {
+            guard
+                let tagName = release["tag_name"] as? String,
+                tagName.contains("-engine"),
+                let assets = release["assets"] as? [[String: Any]]
+            else { continue }
 
-        for asset in assets {
-            guard let name = asset["name"] as? String,
-                  let downloadURL = asset["browser_download_url"] as? String,
-                  let size = asset["size"] as? Int64 else { continue }
+            // Skip drafts.
+            if let isDraft = release["draft"] as? Bool, isDraft { continue }
 
-            if name.hasSuffix(".tar.gz") || name.hasSuffix(".tar.xz") {
-                log.info("[fetchLatestAsset] matched: \(name)")
-                return ReleaseAsset(name: name, downloadURL: downloadURL, size: size)
+            log.info("[fetchLatestAsset] engine release: \(tagName), \(assets.count) asset(s)")
+
+            for asset in assets {
+                guard
+                    let name = asset["name"] as? String,
+                    let downloadURL = asset["browser_download_url"] as? String,
+                    let size = asset["size"] as? Int64
+                else { continue }
+
+                if name.hasSuffix(".tar.gz") || name.hasSuffix(".tar.xz") {
+                    log.info("[fetchLatestAsset] matched: \(name) (\(size) bytes)")
+                    return ReleaseAsset(name: name, downloadURL: downloadURL, size: size)
+                }
             }
+
+            // Found an engine release but no archive asset — log and keep looking.
+            log.warning("[fetchLatestAsset] engine release \(tagName) has no .tar.gz/.tar.xz asset")
         }
 
-        throw DownloadError.noAssetFound("No .tar.gz or .tar.xz asset found in release \(tagName)")
+        throw DownloadError.noAssetFound("No engine release with a .tar.gz asset found in \(repoSlug)")
     }
 
     // MARK: - Download

@@ -168,7 +168,7 @@ struct HomeView: View {
                             .background(.thinMaterial, in: Capsule())
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.white))
                 }
                 .padding(.leading, leadingInset)
                 .padding(.trailing, 24)

@@ -56,8 +56,8 @@ struct MeridianApp: App {
                     updateChecker.checkIfStale()
 
                     // Silently refresh the Wine engine when the app version changes.
-                    // Only runs when the engine is already installed, so it never
-                    // interferes with a fresh install that still needs EngineSetupView.
+                    // Only runs when the engine is already installed; fresh installs
+                    // download the engine automatically via SplashView on first launch.
                     let current = AppUpdateChecker.currentVersion
                     let previous = settings.lastLaunchAppVersion
                     settings.lastLaunchAppVersion = current

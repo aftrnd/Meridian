@@ -29,7 +29,6 @@ struct GameDetailView: View {
 
     @State private var showEngineSetup = false
     @State private var showResetConfirm = false
-    @State private var showInfoPopover = false
     @State private var appDetails: AppDetails? = nil
     /// Width÷height from the loaded hero `NSImage` (falls back to Steam's typical 1920×622 until decode).
     @State private var heroAspectRatio: CGFloat = SteamLibraryHeroMetrics.aspectRatio
@@ -40,68 +39,77 @@ struct GameDetailView: View {
     /// produced a faint rounded-corner artefact at the clip boundary on macOS 15.
     @State private var bannerImage: NSImage? = nil
     @State private var bannerImageFailed = false
+    @State private var achievements: [GameAchievement] = []
+    @State private var achievementsLoading = false
+    @State private var achievementsUnavailable = false
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
     }
 
     var body: some View {
+        // Read isFavorite at body-evaluation time so SwiftUI's @Observable tracking
+        // registers the dependency here, not inside the toolbar closure where macOS
+        // doesn't always re-evaluate on change.
+        let isFavorite = library.isFavorite(appID: currentGame.id)
+        // GeometryReader fills the nav-bar-excluded content area naturally —
+        // no ignoresSafeArea, no explicit frame on the ScrollView.  Those
+        // approaches caused two bugs: content sliding under the toolbar (because
+        // proxy.safeAreaInsets.top is always 0 inside a NavigationStack child),
+        // and a phantom scrollbar on navigation (oversized ScrollView frame
+        // making SwiftUI think the content needed to scroll before any gesture).
         GeometryReader { proxy in
             let inset  = GameDetailMetrics.cardInset
             let radius = GameDetailMetrics.cardCornerRadius
-            // Cards are inset 16 pt on each side, so their render width is the
-            // column width minus two insets.
+            // Cards are inset 16 pt on each side.
             let cardWidth = proxy.size.width - inset * 2
 
             ScrollView {
                 VStack(alignment: .leading, spacing: inset) {
 
                     // ── Banner card ───────────────────────────────────────────
-                    // Flat ZStack: Color.black + direct Image from @State (no
-                    // GeometryReader inside), gradient, logo, buttons.
-                    // ONE clipShape with .continuous corners — nothing else clips
-                    // this view tree, so there is exactly one rounded boundary.
                     heroBanner(
                         contentWidth: cardWidth,
                         bannerFrameHeight: bannerHeight(contentWidth: cardWidth)
                     )
 
-                    // ── Info card ─────────────────────────────────────────────
-                    // Background: direct Image from @State (no HeroBannerImage /
-                    // GeometryReader), blurred + thinMaterial.  No extra clip
-                    // inside .background{}; the single outer clipShape below is
-                    // the ONLY rounded boundary on this card.
-                    VStack(alignment: .leading, spacing: 12) {
-                        launchSection
-                        statsSection
-                    }
-                    .padding(GameDetailMetrics.horizontalPadding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background {
-                        // System window colour at full opacity as the base, then
-                        // the blurred art at exactly 25 % on top — same ratio in
-                        // both light and dark mode, so the card always feels
-                        // consistent regardless of colour scheme.
-                        Color(nsColor: .windowBackgroundColor)
-                        if let img = bannerImage {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .blur(radius: 60)
-                                .saturation(1.2)
-                                .opacity(0.25)
+                    // ── Info + Achievements (two-column) ──────────────────────
+                    HStack(alignment: .top, spacing: inset) {
+
+                        // Left: launch controls + game info
+                        VStack(alignment: .leading, spacing: 12) {
+                            launchSection
+                            statsSection
                         }
+                        .padding(GameDetailMetrics.horizontalPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background {
+                            Color(nsColor: .windowBackgroundColor)
+                            if let img = bannerImage {
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .blur(radius: 60)
+                                    .saturation(1.2)
+                                    .opacity(0.25)
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                                .strokeBorder(.separator, lineWidth: 0.5)
+                        )
+
+                        // Right: achievements — natural 1/4 width, minimum 425 pt.
+                        // At large windows the 1/4 rule applies; at small windows the
+                        // 425 pt floor holds and the left card shrinks to whatever remains.
+                        achievementsCard(radius: radius)
+                            .frame(width: max(250, (cardWidth - inset) / 4))
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: radius, style: .continuous)
-                            .strokeBorder(.separator, lineWidth: 0.5)
-                    )
                 }
-                .padding(inset)
+                .padding(.horizontal, inset)
+                .padding(.bottom, inset)
             }
-            .contentMargins(.top, 0, for: .scrollContent)
-            .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .background {
             // Very subtle ambient colour bleed from the game's art — fills the
@@ -126,6 +134,59 @@ struct GameDetailView: View {
             }
         }
         .navigationTitle(currentGame.name)
+        .toolbar {
+            // A flexible-space item pushes everything after it to the trailing
+            // end of the macOS toolbar (equivalent to NSToolbarFlexibleSpaceItem).
+            // Without it, .automatic items cluster on the leading side next to
+            // the back button. The ToolbarItemGroup after the spacer renders as
+            // the Tahoe glass pill on the right side of the toolbar.
+            ToolbarItem(placement: .automatic) {
+                Spacer()
+            }
+            ToolbarItemGroup(placement: .automatic) {
+                Button {
+                    library.toggleFavorite(appID: currentGame.id)
+                } label: {
+                    Image(systemName: isFavorite ? "heart.fill" : "heart")
+                        .foregroundStyle(isFavorite ? .pink : .primary)
+                }
+                .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
+
+                Menu {
+                    Button {
+                        openWindow(id: "launch-log")
+                    } label: {
+                        Label("View Launch Logs", systemImage: "terminal")
+                    }
+
+                    Button {
+                        try? steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
+                    } label: {
+                        Label("Show Steam", systemImage: "gamecontroller")
+                    }
+
+                    if currentGame.isInstalled {
+                        Divider()
+                        Button(role: .destructive) {
+                            launcher.uninstall(
+                                game: currentGame,
+                                engine: engine,
+                                steamManager: steamManager,
+                                library: library
+                            )
+                        } label: {
+                            Label("Uninstall", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                // Suppress the automatic disclosure chevron that SwiftUI adds
+                // to Menu labels in toolbars — the three dots are sufficient.
+                .menuIndicator(.hidden)
+                .help("More options")
+            }
+        }
         .onExitCommand(perform: onDismiss)
         .onChange(of: game.id) { _, _ in
             appeared = false
@@ -133,12 +194,18 @@ struct GameDetailView: View {
             appDetails = nil
             bannerImage = nil
             bannerImageFailed = false
+            achievements = []
+            achievementsLoading = false
+            achievementsUnavailable = false
         }
         .task(id: game.id) {
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
         }
         .task(id: game.id) {
             await loadBannerImage()
+        }
+        .task(id: game.id) {
+            await loadAchievements()
         }
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
@@ -163,92 +230,60 @@ struct GameDetailView: View {
         let w = contentWidth
         let h = bannerFrameHeight
 
-        // clipShape lives here, directly on the art — not on a ZStack that also
-        // contains gradients, logos, and buttons.  Those elements go into .overlay
-        // calls on the already-clipped view so they are never inside the clip
-        // computation and cannot produce corner-boundary artefacts.
-        return Group {
-            if let img = bannerImage {
-                Image(nsImage: img)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else if bannerImageFailed {
-                Rectangle()
-                    .fill(.black)
-                    .overlay {
-                        Image(systemName: "gamecontroller.fill")
-                            .font(.system(size: 48, weight: .thin))
-                            .foregroundStyle(.tertiary)
-                    }
-            } else {
-                Rectangle()
-                    .fill(.black)
-                    .overlay { ShimmerView() }
+        // Color.black establishes the frame as a concrete view (not a Group),
+        // which prevents the SwiftUI layout engine from implicitly clipping the
+        // image to the frame's straight edges before clipShape rounds the corners.
+        // The image lives entirely in .overlay so it overflows the layout frame
+        // freely — the one and only clip boundary is the final clipShape below.
+        return Color.black
+            .frame(width: w, height: h)
+            .overlay {
+                if let img = bannerImage {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .allowsHitTesting(false)
+                } else if bannerImageFailed {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 48, weight: .thin))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ShimmerView()
+                }
             }
-        }
-        .id(g.id)
-        .frame(width: w, height: h)
-        // ── overlays first, then ONE clip for everything ──────────────────
-        .overlay {
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.75)],
-                startPoint: .init(x: 0.5, y: 0.3),
-                endPoint: .bottom
-            )
-            .allowsHitTesting(false)
-        }
-        .overlay {
-            HeroLogoImage(
-                urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
-                fallbackName: g.name
-            )
-            .padding(.leading, GameDetailMetrics.horizontalPadding)
-            .padding(.trailing, 24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .id(g.id)
-            .allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            HStack(alignment: .bottom, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    if g.playtimeMinutes > 0 {
-                        Text(g.playtimeFormatted + " played")
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.85))
-                            .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                HStack(spacing: 8) {
-                    Button {
-                        library.toggleFavorite(appID: g.id)
-                    } label: {
-                        Image(systemName: library.isFavorite(appID: g.id) ? "heart.fill" : "heart")
-                            .font(.title3)
-                            .foregroundStyle(library.isFavorite(appID: g.id) ? .pink : .white.opacity(0.85))
-                    }
-                    .buttonStyle(.borderless)
-                    .help(library.isFavorite(appID: g.id) ? "Remove from Favorites" : "Add to Favorites")
-
-                    Button { showInfoPopover.toggle() } label: {
-                        Image(systemName: "info.circle")
-                            .font(.title3)
-                            .foregroundStyle(.white.opacity(0.85))
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Game info and logs")
-                    .popover(isPresented: $showInfoPopover, arrowEdge: .bottom) {
-                        infoPopoverContent
-                    }
+            // ── overlays first, then ONE clip for everything ──────────────
+            .overlay {
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.75)],
+                    startPoint: .init(x: 0.5, y: 0.3),
+                    endPoint: .bottom
+                )
+                .allowsHitTesting(false)
+            }
+            .overlay {
+                HeroLogoImage(
+                    urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
+                    fallbackName: g.name
+                )
+                .padding(.leading, GameDetailMetrics.horizontalPadding)
+                .padding(.trailing, 24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .id(g.id)
+                .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottomLeading) {
+                if g.playtimeMinutes > 0 {
+                    Text(g.playtimeFormatted + " played")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                        .padding(.horizontal, GameDetailMetrics.horizontalPadding)
+                        .padding(.bottom, 16)
+                        .allowsHitTesting(false)
                 }
             }
-            .padding(.horizontal, GameDetailMetrics.horizontalPadding)
-            .padding(.bottom, 16)
-            .frame(width: w)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
     }
 
     // MARK: - Banner image loading
@@ -285,85 +320,6 @@ struct GameDetailView: View {
         bannerImageFailed = true
     }
 
-    // MARK: - Info Popover
-
-    private var infoPopoverContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            infoPopoverRow("App ID", value: String(currentGame.id), monospaced: true)
-
-            if currentGame.windowsOnly {
-                Divider().padding(.leading, 12)
-                HStack {
-                    Text("Compatibility")
-                        .foregroundStyle(.secondary)
-                        .font(.subheadline)
-                    Spacer()
-                    WindowsBadge()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-            }
-
-            Divider().padding(.leading, 12)
-
-            Button {
-                showInfoPopover = false
-                openWindow(id: "launch-log")
-            } label: {
-                Label("View Launch Logs", systemImage: "terminal")
-            }
-            .buttonStyle(.borderless)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-
-            Divider().padding(.leading, 12)
-
-            Button {
-                showInfoPopover = false
-                try? steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
-            } label: {
-                Label("Show Steam", systemImage: "gamecontroller")
-            }
-            .buttonStyle(.borderless)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-
-            if currentGame.isInstalled {
-                Divider().padding(.leading, 12)
-
-                Button(role: .destructive) {
-                    showInfoPopover = false
-                    launcher.uninstall(
-                        game: currentGame,
-                        engine: engine,
-                        steamManager: steamManager,
-                        library: library
-                    )
-                } label: {
-                    Label("Uninstall", systemImage: "trash")
-                }
-                .buttonStyle(.borderless)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-            }
-        }
-        .frame(width: 240)
-        .padding(.vertical, 4)
-    }
-
-    private func infoPopoverRow(_ label: String, value: String, monospaced: Bool = false) -> some View {
-        HStack {
-            Text(label)
-                .foregroundStyle(.secondary)
-                .font(.subheadline)
-            Spacer()
-            Text(value)
-                .font(monospaced ? .subheadline.monospaced() : .subheadline)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-    }
-
     // MARK: - Launch section
 
     @ViewBuilder
@@ -384,7 +340,7 @@ struct GameDetailView: View {
     private var statsSection: some View {
         // Short description from store API
         if let desc = appDetails?.shortDescription, !desc.isEmpty {
-            Text(desc)
+            Text(desc.decodingHTMLEntities)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -420,10 +376,13 @@ struct GameDetailView: View {
 
     @ViewBuilder
     private var gameInfoCard: some View {
-        let genres = appDetails?.genres?.compactMap(\.description).filter { !$0.isEmpty } ?? []
-        let developer = appDetails?.developers?.first
-        let publisher = appDetails?.publishers?.first
-        let hasAnyInfo = !genres.isEmpty || developer != nil || publisher != nil || currentGame.windowsOnly
+        let genres     = appDetails?.genres?.compactMap(\.description).filter { !$0.isEmpty } ?? []
+        let developer  = appDetails?.developers?.first
+        let publisher  = appDetails?.publishers?.first
+        let metacritic = appDetails?.metacritic?.score
+        let releaseStr = appDetails?.releaseDate?.date.flatMap { $0.isEmpty ? nil : $0 }
+        let hasAnyInfo = !genres.isEmpty || developer != nil || publisher != nil
+            || currentGame.windowsOnly || metacritic != nil || releaseStr != nil
 
         if hasAnyInfo {
             VStack(spacing: 0) {
@@ -444,6 +403,26 @@ struct GameDetailView: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                         WindowsBadge()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                }
+
+                // Release date
+                if let date = releaseStr {
+                    DetailDivider()
+                    DetailRow(icon: "calendar", label: "Released", value: date)
+                }
+
+                // Metacritic score
+                if let score = metacritic {
+                    DetailDivider()
+                    HStack {
+                        Label("Metacritic", systemImage: "star.circle")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        MetacriticBadge(score: score)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
@@ -492,6 +471,141 @@ struct GameDetailView: View {
         }
         .buttonStyle(.plain)
         .modifier(GlassRoundedBackground(cornerRadius: 10))
+    }
+
+    // MARK: - Achievements card
+
+    @ViewBuilder
+    private func achievementsCard(radius: CGFloat) -> some View {
+        let storeTotal = appDetails?.achievementsSummary?.total ?? 0
+        let unlocked   = achievements.filter { $0.achieved }
+        let recentUnlocked = Array(
+            unlocked.sorted { ($0.unlockDate ?? .distantPast) > ($1.unlockDate ?? .distantPast) }
+                .prefix(5)
+        )
+
+        VStack(alignment: .leading, spacing: 14) {
+
+            // Header row
+            HStack {
+                Label("Achievements", systemImage: "trophy.fill")
+                    .font(.headline)
+                if !achievementsLoading, storeTotal > 0 {
+                    Spacer()
+                    Text("\(unlocked.count) / \(storeTotal)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if achievementsLoading {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.7)
+                    Text("Loading…")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            } else if achievementsUnavailable || (achievements.isEmpty && storeTotal == 0) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(achievementsUnavailable ? "Achievements unavailable" : "No achievements")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Text(achievementsUnavailable
+                         ? "Your Steam profile may be set to private, or this game has no stats."
+                         : "This game has no achievement system.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+
+                // Progress bar (only when we have a known total)
+                if storeTotal > 0 {
+                    let progress = Double(unlocked.count) / Double(storeTotal)
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(.accentColor)
+                        Text(unlocked.count == 0
+                             ? "None unlocked yet — keep playing!"
+                             : "\(unlocked.count) of \(storeTotal) unlocked")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // Recent unlocked list
+                if recentUnlocked.isEmpty {
+                    Text("None unlocked yet — keep playing!")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(recentUnlocked.enumerated()), id: \.element.id) { idx, ach in
+                            if idx > 0 { Divider().padding(.leading, 54) }
+                            AchievementRow(achievement: ach)
+                        }
+                    }
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+                }
+            }
+
+            // Steam achievements link
+            if !achievementsUnavailable {
+                Button {
+                    if let url = URL(string: "https://steamcommunity.com/stats/\(currentGame.id)/achievements") {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    HStack {
+                        Label("View all on Steam", systemImage: "arrow.up.right.square")
+                            .font(.subheadline)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 11)
+                }
+                .buttonStyle(.plain)
+                .modifier(GlassRoundedBackground(cornerRadius: 10))
+            }
+        }
+        .padding(GameDetailMetrics.horizontalPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(.separator, lineWidth: 0.5)
+        )
+    }
+
+    // MARK: - Achievement loading
+
+    private func loadAchievements() async {
+        let key = steamAuth.apiKey
+        let sid = steamAuth.steamID
+        guard !key.isEmpty, !sid.isEmpty else { return }
+        achievementsLoading = true
+        achievementsUnavailable = false
+        defer { achievementsLoading = false }
+        do {
+            let result = try await SteamAPIService.shared.fetchPlayerAchievements(
+                steamID: sid,
+                apiKey: key,
+                appID: game.id
+            )
+            achievements = result
+            // Empty result is valid (game has no achievement system); not an error.
+        } catch {
+            achievements = []
+            achievementsUnavailable = true
+        }
     }
 
     // MARK: - Per-game gating
@@ -903,6 +1017,87 @@ struct ShimmerView: View {
     }
 }
 
+// MARK: - Achievement Row
+
+private struct AchievementRow: View {
+    let achievement: GameAchievement
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AchievementIcon(
+                url:     achievement.iconURL,
+                grayURL: achievement.iconGrayURL,
+                achieved: achievement.achieved
+            )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(achievement.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+
+                if let date = achievement.unlockDate {
+                    Text(date, style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct AchievementIcon: View {
+    let url: URL?
+    let grayURL: URL?
+    let achieved: Bool
+
+    var body: some View {
+        CachedAsyncImage(url: achieved ? url : (grayURL ?? url)) { phase in
+            switch phase {
+            case .success(let image):
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 32, height: 32)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .opacity(achieved ? 1 : 0.45)
+            default:
+                Image(systemName: "trophy.fill")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(.yellow.opacity(achieved ? 0.8 : 0.3))
+                    .frame(width: 32, height: 32)
+            }
+        }
+    }
+}
+
+// MARK: - Metacritic Badge
+
+private struct MetacriticBadge: View {
+    let score: Int
+
+    private var color: Color {
+        switch score {
+        case 75...: return .green
+        case 50..<75: return Color(hue: 0.12, saturation: 0.9, brightness: 0.85)
+        default: return .red
+        }
+    }
+
+    var body: some View {
+        Text("\(score)")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+}
+
 // MARK: - Launch Log Window
 
 struct LaunchLogWindow: View {
@@ -974,5 +1169,32 @@ struct LaunchLogWindow: View {
                 proxy.scrollTo(n - 1, anchor: .bottom)
             }
         }
+    }
+}
+
+// MARK: - HTML entity decoding
+
+private extension String {
+    /// Decodes the HTML character entities that Steam's store API sometimes
+    /// embeds in short descriptions (e.g. &quot; → ", &amp; → &).
+    var decodingHTMLEntities: String {
+        guard contains("&") else { return self }
+        // Named entities ordered so &amp; is decoded last to avoid
+        // converting &amp;quot; → &quot; → " (double-decode).
+        let named: [(String, String)] = [
+            ("&quot;",  "\""),
+            ("&apos;",  "'"),
+            ("&#39;",   "'"),
+            ("&#x27;",  "'"),
+            ("&lt;",    "<"),
+            ("&gt;",    ">"),
+            ("&nbsp;",  " "),
+            ("&amp;",   "&"),   // last — must not run before the others
+        ]
+        var result = self
+        for (entity, replacement) in named {
+            result = result.replacingOccurrences(of: entity, with: replacement)
+        }
+        return result
     }
 }
