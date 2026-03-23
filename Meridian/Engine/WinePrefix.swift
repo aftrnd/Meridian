@@ -117,18 +117,32 @@ struct WinePrefix: Sendable {
             prefix: self
         )
 
-        do {
-            try FileManager.default.removeItem(at: tempFile)
-        } catch {
-            log.warning("[installSteam] failed to clean up SteamSetup.exe: \(error.localizedDescription)")
+        try? FileManager.default.removeItem(at: tempFile)
+
+        let exitCode = process.terminationStatus
+        log.info("[installSteam] installer exited with code \(exitCode)")
+
+        // Windows silent installers (/S) commonly return exit code 1 even on success.
+        // SteamSetup.exe also spawns a child process that completes the actual file
+        // extraction after the parent exits — so steam.exe may not exist yet when
+        // the Wine process returns. Poll until it appears (up to 90 seconds).
+        if !isSteamInstalled {
+            log.info("[installSteam] steam.exe not yet present — waiting for child installer (up to 90s)")
+            var elapsed = 0
+            while elapsed < 90 {
+                try await Task.sleep(for: .seconds(2))
+                elapsed += 2
+                if isSteamInstalled {
+                    log.info("[installSteam] steam.exe appeared after ~\(elapsed)s ✓")
+                    break
+                }
+                log.debug("[installSteam] waiting… \(elapsed)s elapsed")
+            }
         }
 
-        let steamExists = isSteamInstalled
-        log.info("[installSteam] installer exit=\(process.terminationStatus) | steam.exe present=\(steamExists)")
-
-        guard process.terminationStatus == 0 || steamExists else {
-            log.error("[installSteam] FAILED: exit=\(process.terminationStatus) and steam.exe not found at \(steamExePath.path(percentEncoded: false))")
-            throw PrefixError.steamInstallFailed(exitCode: process.terminationStatus)
+        guard isSteamInstalled else {
+            log.error("[installSteam] FAILED: steam.exe not found after 90s | exit=\(exitCode) | path=\(steamExePath.path(percentEncoded: false))")
+            throw PrefixError.steamInstallFailed(exitCode: exitCode)
         }
 
         log.info("[installSteam] Steam install complete ✓")
