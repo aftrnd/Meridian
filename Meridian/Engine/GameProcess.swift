@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "GameProcess")
+private let log = MeridianLog(category: "GameProcess")
 
 /// Monitors a game launched through Wine/Steam.
 ///

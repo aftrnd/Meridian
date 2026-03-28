@@ -3,7 +3,7 @@ import Security
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "SteamAuth")
+private let log = MeridianLog(category: "SteamAuth")
 
 /// Handles Steam OpenID authentication via ASWebAuthenticationSession.
 ///
@@ -38,10 +38,10 @@ final class SteamAuthService: NSObject {
     }
 
     /// Set to true when the user explicitly skips the API key prompt.
-    /// Persisted in UserDefaults so it survives across launches.
-    var apiKeyPromptDismissed: Bool {
-        get { UserDefaults.standard.bool(forKey: "apiKeyPromptDismissed") }
-        set { UserDefaults.standard.set(newValue, forKey: "apiKeyPromptDismissed") }
+    /// Stored as an @Observable tracked property so SwiftUI bindings on `needsAPIKey`
+    /// update immediately when this changes. Persisted to UserDefaults via didSet.
+    var apiKeyPromptDismissed: Bool = UserDefaults.standard.bool(forKey: "apiKeyPromptDismissed") {
+        didSet { UserDefaults.standard.set(apiKeyPromptDismissed, forKey: "apiKeyPromptDismissed") }
     }
 
     /// Dismisses the API key prompt without saving a key.
@@ -185,6 +185,19 @@ final class SteamAuthService: NSObject {
         }
     }
 
+    /// Called after successful credential auth in onboarding (before bootstrap/prefix exists).
+    /// Stores the SteamID in Keychain and marks the session as authenticated so the
+    /// app can proceed to the API key step and then bootstrap.
+    /// The displayName defaults to accountName until the profile is fetched post-API-key-entry.
+    func setAuthenticatedFromCredentialFlow(steamID: String, accountName: String) {
+        log.info("[setAuthenticated] credential auth: steamID=\(steamID) accountName=\(accountName)")
+        self.steamID = steamID
+        self.displayName = accountName
+        saveSecret(steamID, key: KeychainKey.steamID)
+        isAuthenticated = true
+        log.info("[setAuthenticated] session established ✓")
+    }
+
     func signOut() {
         log.info("[signOut] signing out steamID=\(self.steamID)")
         isAuthenticated = false
@@ -279,6 +292,16 @@ final class SteamAuthService: NSObject {
         log.info("[restoreSession] restored steamID=\(savedID)")
         steamID = savedID
         isAuthenticated = true
+
+        // If there is no API key in the keychain, the API key prompt was never
+        // legitimately completed — reset the dismissed flag so the user is prompted
+        // on the next launch. This prevents apiKeyPromptDismissed=true (persisted
+        // in UserDefaults from a partial onboarding run) from permanently hiding
+        // the API key step even when no key is actually stored.
+        if (loadSecret(key: KeychainKey.apiKey) ?? "").isEmpty {
+            apiKeyPromptDismissed = false
+        }
+
         Task {
             await refreshProfile(steamID: savedID)
         }

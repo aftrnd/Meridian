@@ -2,18 +2,23 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "SteamSessionBridge")
+private let log = MeridianLog(category: "SteamSessionBridge")
 
 /// Bridges the macOS Steam client's session data into the Wine prefix.
 ///
 /// Strategy (in priority order):
 ///
-/// 1. **Session file copy** — if Steam for Mac is installed, its
+/// 1. **Credential auth tokens** — if the user authenticated via Meridian's
+///    native credential auth flow, the resulting refresh token is stored here
+///    and written to the prefix automatically during bootstrap. This is the
+///    primary path for new users who authenticate through Meridian's onboarding.
+///
+/// 2. **Session file copy** — if Steam for Mac is installed, its
 ///    `loginusers.vdf`, `config/`, and `ssfn*` tokens are copied directly
 ///    into the Wine prefix's Steam directory. This achieves auto-login
 ///    without credentials. Same approach used by Whisky and CrossOver.
 ///
-/// 2. **No session available** — the user will need to sign into Steam once
+/// 3. **No session available** — the user will need to sign into Steam once
 ///    inside the Wine Steam window. After that, Steam's own remember-me
 ///    tokens persist in the prefix.
 @Observable
@@ -28,6 +33,28 @@ final class SteamSessionBridge {
     /// Populated from loginusers.vdf when macOS Steam is detected.
     private(set) var detectedAccountName: String?
 
+    /// Pending credential-auth tokens written by onboarding before prefix exists.
+    /// Bootstrap writes these into the prefix during syncingSession and clears them.
+    private(set) var pendingSteamID: String = ""
+    private(set) var pendingAccountName: String = ""
+    private(set) var pendingRefreshToken: String = ""
+
+    /// Called from AuthView after successful credential auth, before bootstrap.
+    func setPendingTokens(steamID: String, accountName: String, refreshToken: String) {
+        pendingSteamID = steamID
+        pendingAccountName = accountName
+        pendingRefreshToken = refreshToken
+        log.info("[setPendingTokens] stored pending session for steamID=\(steamID) accountName=\(accountName)")
+    }
+
+    func clearPendingTokens() {
+        pendingSteamID = ""
+        pendingAccountName = ""
+        pendingRefreshToken = ""
+    }
+
+    var hasPendingTokens: Bool { !pendingRefreshToken.isEmpty }
+
     // MARK: - Public API
 
     /// Prepares the Wine prefix with session data before launching Steam.
@@ -35,6 +62,29 @@ final class SteamSessionBridge {
     func prepare(prefix: WinePrefix) async -> SessionStrategy {
         hasMacSteamSession = false
         detectedAccountName = nil
+
+        // Priority 1: Use pending credential-auth tokens from onboarding
+        if hasPendingTokens {
+            log.info("[prepare] strategy=credentialAuth — writing pending tokens to prefix")
+            do {
+                try prefix.writeLoginUsers(
+                    steamID: pendingSteamID,
+                    accountName: pendingAccountName,
+                    personaName: pendingAccountName
+                )
+                try prefix.writeConnectCache(
+                    steamID: pendingSteamID,
+                    refreshToken: pendingRefreshToken,
+                    accountName: pendingAccountName
+                )
+                clearPendingTokens()
+                log.info("[prepare] strategy=credentialAuth ✓")
+                return .credentialAuth
+            } catch {
+                log.error("[prepare] failed to write credential-auth tokens: \(error.localizedDescription)")
+                clearPendingTokens()
+            }
+        }
 
         log.info("[prepare] checking for macOS Steam install")
 
@@ -66,6 +116,7 @@ final class SteamSessionBridge {
     // MARK: - Session strategy
 
     enum SessionStrategy {
+        case credentialAuth
         case sessionFileCopy
         case none
     }

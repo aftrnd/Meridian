@@ -2,16 +2,17 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "WineEngine")
+private let log = MeridianLog(category: "WineEngine")
 
 /// Manages the Wine runtime used to execute Windows games.
 ///
-/// Detection: bundled engine only — downloaded from GitHub releases to
+/// Meridian is fully standalone. The only supported backend is the bundled engine
+/// downloaded from GitHub releases to:
 ///   ~/Library/Application Support/com.meridian.app/engine/
 ///
-/// Meridian is fully standalone. No third-party app (CrossOver, etc.) is
-/// required or consulted at runtime. State is .notInstalled until the user
-/// downloads the engine via EngineSetupView or Settings → Engine.
+/// Detection validates both executables and required Wine data files (NLS tables).
+/// If the engine is absent or incomplete, state is `.notInstalled` or `.error` and
+/// the bootstrap pipeline will auto-download the correct release from GitHub.
 ///
 /// All runtime components are open source:
 ///   - Wine (LGPL), DXMT (open source), DXVK (open source), MoltenVK (Apache 2.0)
@@ -34,7 +35,7 @@ final class WineEngine {
 
     /// The Meridian engine release tag bundled with the installed engine, e.g. `v1.2.0-engine`.
     /// Read from `wine/meridian-engine-version.txt` written by `release-engine.sh`.
-    /// Nil when the engine was installed without a version file (older releases).
+    /// Nil when the engine was installed without a version file (older releases or CrossOver).
     private(set) var engineVersion: String?
 
     // MARK: - Detected Paths
@@ -48,7 +49,9 @@ final class WineEngine {
     /// Library search path for DYLD_FALLBACK_LIBRARY_PATH.
     private(set) var libraryPath: String?
 
-    /// Path to DXMT DLLs (DirectX -> Metal, best renderer for macOS).
+    /// Whether DXMT builtin DLLs are present (DirectX -> Metal, best renderer for macOS).
+    /// With the builtin layout, DXMT DLLs live alongside Wine's own DLLs in
+    /// lib/wine/x86_64-windows/ — no separate WINEDLLPATH entry needed.
     private(set) var dxmtPath: String?
 
     /// Path to DXVK DLLs (DirectX -> Vulkan -> Metal via MoltenVK).
@@ -67,7 +70,7 @@ final class WineEngine {
 
     // MARK: - Known Paths
 
-    static let engineDir: URL = {
+    nonisolated(unsafe) static let engineDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appending(path: "com.meridian.app/engine", directoryHint: .isDirectory)
     }()
@@ -80,49 +83,88 @@ final class WineEngine {
 
     // MARK: - Detection
 
-    /// Detects the best available Wine backend.
+    /// Detects the bundled Wine engine under Application Support.
+    ///
+    /// Meridian is fully standalone — CrossOver.app is not a supported runtime.
+    /// If the engine is absent or incomplete, state is set to `.notInstalled` or
+    /// `.error` so the bootstrap pipeline can trigger an automatic download.
     func detect() {
         let fm = FileManager.default
         let engineBase = Self.engineDir.path(percentEncoded: false)
 
-        // 1. Try bundled engine (primary — standalone, no third-party app needed)
-        let bundledWine = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
+        let bundledWine   = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
         let bundledServer = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
 
-        if fm.isExecutableFile(atPath: bundledWine),
-           fm.isExecutableFile(atPath: bundledServer) {
-
-            wineExecutableURL = URL(filePath: bundledWine)
-            wineserverExecutableURL = URL(filePath: bundledServer)
-            libraryPath = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
-
-            let bundledDxmt = Self.engineDir.appending(path: "wine/lib/dxmt").path(percentEncoded: false)
-            if fm.fileExists(atPath: bundledDxmt) { dxmtPath = bundledDxmt }
-
-            let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
-            if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
-
-            backendName = "Meridian"
-            engineVersion = readEngineVersion()
-            state = .ready
-
-            log.info("[detect] Bundled engine found at \(engineBase)")
-            log.info("[detect]   wine64=\(bundledWine)")
-            log.info("[detect]   wineserver=\(bundledServer)")
-            log.info("[detect]   lib=\(self.libraryPath ?? "none")")
-            log.info("[detect]   dxmt=\(self.dxmtPath ?? "none")")
-            log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
-            log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
-            log.info("[detect] backend=Meridian ✓")
+        guard fm.isExecutableFile(atPath: bundledWine),
+              fm.isExecutableFile(atPath: bundledServer) else {
+            log.warning("[detect] Bundled engine not found at \(engineBase)")
+            state = .notInstalled
+            backendName = "None"
+            engineVersion = nil
+            wineExecutableURL = nil
+            wineserverExecutableURL = nil
+            libraryPath = nil
+            dxmtPath = nil
+            dxvkPath = nil
             return
         }
 
-        // 2. Nothing found — bundled engine is the only supported runtime.
-        log.warning("[detect] No Wine backend found")
-        log.warning("[detect]   Bundled: \(engineBase) exists=\(fm.fileExists(atPath: engineBase))")
-        state = .notInstalled
-        backendName = "None"
-        engineVersion = nil
+        // Validate that required Wine data files are present. Wine's wineserver
+        // resolves NLS tables as ../share/wine/nls/ relative to lib/, so they must
+        // be in the engine package or wineboot will abort before the prefix is created.
+        let nlsDir = Self.engineDir.appending(path: "wine/share/wine/nls").path(percentEncoded: false)
+        let requiredNLS = ["l_intl.nls", "locale.nls", "normnfc.nls"]
+        let missingNLS = requiredNLS.filter { !fm.fileExists(atPath: "\(nlsDir)/\($0)") }
+
+        guard missingNLS.isEmpty else {
+            log.error("[detect] Engine incomplete — missing NLS files: \(missingNLS.joined(separator: ", "))")
+            state = .error("Engine incomplete — NLS data files missing (\(missingNLS.joined(separator: ", "))). Re-download the engine from Settings.")
+            backendName = "None"
+            engineVersion = nil
+            wineExecutableURL = nil
+            wineserverExecutableURL = nil
+            libraryPath = nil
+            dxmtPath = nil
+            dxvkPath = nil
+            return
+        }
+
+        wineExecutableURL    = URL(filePath: bundledWine)
+        wineserverExecutableURL = URL(filePath: bundledServer)
+        libraryPath = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
+
+        // DXMT builtin layout: DLLs live in lib/wine/x86_64-windows/ alongside Wine's own DLLs.
+        // Detect presence by checking for the winemetal.so companion (unix-side library).
+        let dxmtUnixSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/winemetal.so").path(percentEncoded: false)
+        let dxmtWinDll = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows/d3d11.dll").path(percentEncoded: false)
+        if fm.fileExists(atPath: dxmtUnixSo) && fm.fileExists(atPath: dxmtWinDll) {
+            // Store the wine DLL directory as the dxmt path for display in Settings
+            dxmtPath = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows").path(percentEncoded: false)
+        } else {
+            // Legacy layout: separate lib/dxmt/ directory (v1.0.2 and older)
+            let legacyDxmt = Self.engineDir.appending(path: "wine/lib/dxmt").path(percentEncoded: false)
+            if fm.fileExists(atPath: legacyDxmt) { dxmtPath = legacyDxmt }
+        }
+
+        let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
+        if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
+
+        backendName   = "Meridian"
+        engineVersion = readEngineVersion()
+        state         = .ready
+
+        let dxmtMode: String = {
+            guard let p = self.dxmtPath else { return "none" }
+            return p.hasSuffix("dxmt") ? "\(p) (legacy override)" : "\(p) (builtin)"
+        }()
+        log.info("[detect] Bundled engine found at \(engineBase)")
+        log.info("[detect]   wine64=\(bundledWine)")
+        log.info("[detect]   wineserver=\(bundledServer)")
+        log.info("[detect]   lib=\(self.libraryPath ?? "none")")
+        log.info("[detect]   dxmt=\(dxmtMode)")
+        log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
+        log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
+        log.info("[detect] backend=Meridian ✓")
     }
 
     /// Reads the engine release tag from the version file written by `release-engine.sh`.
@@ -131,6 +173,34 @@ final class WineEngine {
         return try? String(contentsOf: versionFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty
+    }
+
+    // MARK: - Reset
+
+    /// Kills all Wine processes and wipes the engine directory completely.
+    /// The next bootstrap run will auto-download a fresh engine from GitHub.
+    func resetEngine() {
+        let fm = FileManager.default
+        let enginePath = Self.engineDir.path(percentEncoded: false)
+        log.info("[resetEngine] removing engine at \(enginePath)")
+
+        if fm.fileExists(atPath: enginePath) {
+            do {
+                try fm.removeItem(at: Self.engineDir)
+                log.info("[resetEngine] engine directory removed ✓")
+            } catch {
+                log.error("[resetEngine] failed: \(error.localizedDescription)")
+            }
+        }
+
+        state         = .notInstalled
+        backendName   = "None"
+        engineVersion = nil
+        wineExecutableURL       = nil
+        wineserverExecutableURL = nil
+        libraryPath  = nil
+        dxmtPath     = nil
+        dxvkPath     = nil
     }
 
     // MARK: - Environment
@@ -144,7 +214,12 @@ final class WineEngine {
         ]
 
         if let lib = libraryPath {
-            env["DYLD_FALLBACK_LIBRARY_PATH"] = lib
+            // Include x86_64-unix alongside lib so dlopen() can resolve @rpath dependencies
+            // (ntdll.so, win32u.so) that Wine's Mac display driver depends on. Without this,
+            // winemac.so fails to load its .so dependencies via @rpath resolution,
+            // causing nodrv_CreateWindow for any GUI application.
+            let unixDir = "\(lib)/wine/x86_64-unix"
+            env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
         }
 
         if let wineExe = wineExecutableURL {
@@ -154,20 +229,41 @@ final class WineEngine {
             env["WINESERVER"] = wineServer.path(percentEncoded: false)
         }
 
-        // Build WINEDLLPATH: DXMT first (best renderer), then base Wine DLLs.
-        // Wine searches WINEDLLPATH left-to-right, so DXMT's d3d11.dll/dxgi.dll
-        // take priority, giving us Direct3D -> Metal translation.
+        // DXMT builtin layout (v1.0.3+): DLLs live in lib/wine/x86_64-windows/ alongside
+        // Wine's own DLLs. Wine finds and loads them automatically — no WINEDLLPATH or
+        // WINEDLLOVERRIDES needed. The DLLs are registered as builtins.
+        //
+        // Legacy layout (v1.0.2 and older): DXMT DLLs were in a separate lib/dxmt/
+        // directory and required WINEDLLOVERRIDES=n,b to force Wine to prefer them.
+        let fm = FileManager.default
+        let isBuiltinDXMT: Bool = {
+            guard let lib = libraryPath else { return false }
+            return fm.fileExists(atPath: "\(lib)/wine/x86_64-unix/winemetal.so")
+        }()
+        let hasLegacyDxmt: Bool = {
+            guard let dxmt = dxmtPath else { return false }
+            return dxmt.hasSuffix("dxmt") && fm.fileExists(atPath: "\(dxmt)/x86_64-windows")
+        }()
+
+        // Build WINEDLLPATH from Wine's own lib/wine directory.
+        // Only needed for legacy DXMT layout where we must prepend the override dirs.
         var dllPaths: [String] = []
 
-        if let dxmt = dxmtPath {
+        if hasLegacyDxmt, let dxmt = dxmtPath {
+            // Legacy: DXMT as native override — must appear before Wine's own DLLs
             dllPaths.append("\(dxmt)/x86_64-windows")
             dllPaths.append("\(dxmt)/i386-windows")
-            log.debug("[env] DXMT enabled: \(dxmt)")
+            log.debug("[env] DXMT enabled (legacy override): \(dxmt)")
+            // Legacy DXMT needs explicit overrides so Wine picks them over its own builtins
+            env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,dxgi=n,b"
+        } else if isBuiltinDXMT {
+            log.debug("[env] DXMT enabled (builtin): winemetal.so present")
+            // Builtin DXMT: no overrides needed — Wine loads them automatically
         }
 
         if let lib = libraryPath {
             let wineDllPath = "\(lib)/wine"
-            if FileManager.default.fileExists(atPath: wineDllPath) {
+            if fm.fileExists(atPath: wineDllPath) {
                 dllPaths.append(wineDllPath)
             }
         }
@@ -176,18 +272,18 @@ final class WineEngine {
             env["WINEDLLPATH"] = dllPaths.joined(separator: ":")
         }
 
-        // DXMT replaces both D3D11 (rendering) and DXGI (swap chain/presentation).
-        // Both must be overridden together — using DXMT's d3d11 with Wine's
-        // builtin dxgi causes solid-color frames because the Metal textures
-        // created by DXMT's d3d11 can't be presented by Wine's dxgi.
-        env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,dxgi=n,b"
-
         log.debug("[env] full environment: \(env.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " | "))")
 
         return env
     }
 
     /// Runs a Wine command and waits for it to finish. Captures stdout+stderr.
+    ///
+    /// Uses `terminationHandler` + `CheckedContinuation` so the main thread is
+    /// never blocked. The previous implementation used `process.waitUntilExit()`
+    /// which is a synchronous blocking call — on `@MainActor` this freezes the
+    /// entire app (spinning beach ball) if the Wine process takes more than a
+    /// fraction of a second (e.g. `wineboot --update` showing a GUI dialog).
     @discardableResult
     func run(
         args: [String],
@@ -215,17 +311,26 @@ final class WineEngine {
         log.info("[run] \(cmdString)")
         log.debug("[run] WINEPREFIX=\(prefix.path.path(percentEncoded: false))")
 
-        do {
-            try process.run()
-        } catch {
-            log.error("[run] failed to launch: \(error.localizedDescription) | cmd=\(cmdString)")
-            throw error
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in cont.resume() }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                cont.resume(throwing: error)
+            }
         }
 
-        process.waitUntilExit()
-
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Process has exited. Read whatever is buffered in the pipes RIGHT NOW
+        // using availableData (non-blocking). Do NOT use readDataToEndOfFile() —
+        // Wine child processes (wineserver, services.exe, winedevice.exe) inherit
+        // the pipe file descriptors and stay alive indefinitely. readDataToEndOfFile
+        // blocks until ALL holders of the write end close it, causing a deadlock
+        // that freezes the app forever (e.g. wineboot --update never "returns").
+        let stdout = String(data: stdoutPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stderrPipe.fileHandleForReading.close()
 
         log.info("[run] exit=\(process.terminationStatus) | cmd=\(cmdString)")
         if !stdout.isEmpty {

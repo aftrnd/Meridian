@@ -1,7 +1,7 @@
 import Foundation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "WinePrefix")
+private let log = MeridianLog(category: "WinePrefix")
 
 /// Manages a Wine prefix (bottle) on disk.
 ///
@@ -33,12 +33,41 @@ struct WinePrefix: Sendable {
         path.appending(path: "drive_c")
     }
 
+    /// The directory where Steam is installed inside this prefix.
+    ///
+    /// Valve's SteamSetup.exe historically installed to `Program Files (x86)\Steam`
+    /// via WoW64 filesystem redirection (32-bit apps redirected from `Program Files`).
+    /// With wine-staging 11.5 that redirection is no longer applied, so the installer
+    /// writes to the native `Program Files\Steam` instead.
+    ///
+    /// This property detects the actual install path at runtime by checking which
+    /// location contains a Steam executable. Falls back to the x86 path when Steam
+    /// is not yet installed (used for pre-install writes like steam.cfg).
     var steamInstallDir: URL {
-        driveC.appending(path: "Program Files (x86)/Steam")
+        let x64 = driveC.appending(path: "Program Files/Steam")
+        let x86 = driveC.appending(path: "Program Files (x86)/Steam")
+        // macOS APFS is case-insensitive, so this matches both "steam.exe" and "Steam.exe"
+        if FileManager.default.fileExists(atPath: x64.appending(path: "steam.exe").path(percentEncoded: false)) {
+            return x64
+        }
+        return x86
     }
 
     var steamExePath: URL {
         steamInstallDir.appending(path: "steam.exe")
+    }
+
+    /// The Windows path to steam.exe as seen inside Wine (C:\ drive).
+    ///
+    /// Derived from the actual install location detected by `steamInstallDir`. Must use
+    /// a Windows-style path — explorer.exe does not translate Unix paths for child
+    /// processes, so Steam would receive a macOS path as argv[0] and exit immediately.
+    var steamExeWindowsPath: String {
+        let isX86 = steamInstallDir.path(percentEncoded: false).contains("Program Files (x86)")
+        if isX86 {
+            return "C:\\Program Files (x86)\\Steam\\steam.exe"
+        }
+        return "C:\\Program Files\\Steam\\steam.exe"
     }
 
     var steamConfigDir: URL {
@@ -51,42 +80,274 @@ struct WinePrefix: Sendable {
         let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
         let result = FileManager.default.fileExists(atPath: regPath)
         log.debug("[exists] system.reg at \(regPath) → \(result)")
+        if result {
+            let prefixRoot = path.path(percentEncoded: false)
+            let topLevel = (try? FileManager.default.contentsOfDirectory(atPath: prefixRoot)) ?? []
+            log.debug("[exists] prefix root contents: \(topLevel.sorted().joined(separator: ", "))")
+        }
         return result
     }
 
     var isSteamInstalled: Bool {
         let exePath = steamExePath.path(percentEncoded: false)
         let result = FileManager.default.fileExists(atPath: exePath)
-        log.debug("[isSteamInstalled] \(exePath) → \(result)")
+        log.debug("[isSteamInstalled] steam.exe → \(result)")
+        // Also log steamui.dll presence — its absence means bootstrap is incomplete
+        let dllPath = steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        let hasDLL  = FileManager.default.fileExists(atPath: dllPath)
+        log.debug("[isSteamInstalled] steamui.dll → \(hasDLL) (bootstrap complete=\(hasDLL))")
         return result
+    }
+
+    /// Returns `true` when the Wine prefix's Steam install has an authenticated user
+    /// with `MostRecent "1"` recorded in `config/loginusers.vdf`.
+    ///
+    /// Steam writes this entry after a successful login and it persists across
+    /// restarts. A missing or empty `loginusers.vdf` — or one with no
+    /// `"MostRecent" "1"` block — means the user has never logged into the
+    /// Windows Steam client inside this prefix.
+    func hasSteamLoginSession() -> Bool {
+        let vdfURL = steamConfigDir.appending(path: "loginusers.vdf")
+        let vdfPath = vdfURL.path(percentEncoded: false)
+        guard let content = try? String(contentsOfFile: vdfPath, encoding: .utf8) else {
+            log.debug("[hasSteamLoginSession] loginusers.vdf not found at \(vdfPath)")
+            return false
+        }
+        // Steam VDF: look for a user block that has MostRecent "1".
+        // A minimal logged-in block looks like:
+        //   "76561198XXXXXXXXX"
+        //   {
+        //       "AccountName"  "username"
+        //       "MostRecent"   "1"
+        //   }
+        let hasMostRecent = content.contains("\"MostRecent\"") && content.contains("\"1\"")
+        log.debug("[hasSteamLoginSession] loginusers.vdf found, hasMostRecent=\(hasMostRecent)")
+        return hasMostRecent
     }
 
     // MARK: - Prefix Lifecycle
 
-    /// Initializes a new Wine prefix by running `wineboot`.
+    /// Creates a new Wine prefix.
+    ///
+    /// If the engine archive includes a `prefix-template/` directory (produced by
+    /// `release-engine.sh` running `wineboot --init` on the build machine), the
+    /// prefix is created by **copying the template** — an instant file operation.
+    /// The template is complete: DLLs, registry, and driver stubs are all baked in.
+    /// Wine auto-detects the Mac display driver at runtime from winemac.so in the
+    /// engine's WINEDLLPATH — no `wineboot --update` is needed on the user's machine.
+    /// This matches how CrossOver creates bottles: instant template copy, zero Wine
+    /// process overhead.
+    ///
+    /// Falls back to `wineboot --init` if no template is found (backwards compatibility
+    /// with older engine releases that predate the template packaging).
     func create(engine: WineEngine) async throws {
         let fm = FileManager.default
-        log.info("[create] prefix path=\(path.path(percentEncoded: false))")
+        let prefixPath = path.path(percentEncoded: false)
+        log.info("[create] prefix path=\(prefixPath)")
 
-        do {
+        // Prefer the pre-built template if the engine ships one.
+        let templateURL = WineEngine.engineDir.appending(path: "prefix-template")
+        if fm.fileExists(atPath: templateURL.path(percentEncoded: false)) {
+            log.info("[create] pre-built template found — copying (fast path)")
+            do {
+                // Ensure the parent directory (e.g. .../bottles/) exists before copying.
+                // FileManager.copyItem does not create intermediate directories.
+                try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.copyItem(at: templateURL, to: path)
+                // Recreate the dosdevices directory with the correct symlinks for this machine.
+                // The template ships without dosdevices (they point to the build machine's paths).
+                let dosdev = path.appending(path: "dosdevices")
+                try? fm.removeItem(at: dosdev)
+                try fm.createDirectory(at: dosdev, withIntermediateDirectories: true)
+                // c: → ../drive_c (relative symlink, portable across machines)
+                try fm.createSymbolicLink(
+                    atPath: dosdev.appending(path: "c:").path(percentEncoded: false),
+                    withDestinationPath: "../drive_c"
+                )
+                // z: → / maps the entire Unix filesystem as the Z: drive.
+                // This is REQUIRED — without it Wine cannot resolve host-filesystem
+                // paths (e.g. /var/folders/.../SteamSetup.exe) and crashes with SIGSEGV
+                // on startup. Every standard Wine prefix has this mapping.
+                try fm.createSymbolicLink(
+                    atPath: dosdev.appending(path: "z:").path(percentEncoded: false),
+                    withDestinationPath: "/"
+                )
+                // Populate syswow64 with 32-bit DLLs from the engine.
+                //
+                // The Gcenx arm64 Wine build leaves syswow64 empty after wineboot --init —
+                // it copies 64-bit builtins to system32 but skips the 32-bit syswow64
+                // population. Without these DLLs, Wine's WoW64 layer cannot load 32-bit
+                // Windows executables (like SteamSetup.exe) and crashes with
+                // STATUS_DLL_NOT_FOUND (c0000135) when trying to find kernel32.dll.
+                //
+                // We copy directly from the engine's i386-windows directory rather than
+                // relying on syswow64 symlinks, matching what wineboot does on platforms
+                // that correctly support 32-bit prefix setup.
+                //
+                // ALL PE file types must be copied — not just .dll. Critical drivers
+                // like winemac.drv (Mac display driver) are .drv files. If they are
+                // missing from syswow64, 32-bit processes cannot create windows and
+                // exit with code 152 ("nodrv_CreateWindow").
+                let i386Src = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
+                let syswow64 = path.appending(path: "drive_c/windows/syswow64")
+                if fm.fileExists(atPath: i386Src.path(percentEncoded: false)),
+                   fm.fileExists(atPath: syswow64.path(percentEncoded: false)) {
+                    let i386Files = (try? fm.contentsOfDirectory(atPath: i386Src.path(percentEncoded: false))) ?? []
+                    var wow64Copied = 0
+                    for file in i386Files where Self.isWoW64FileType(file) {
+                        let dest = syswow64.appending(path: file)
+                        guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
+                        try? fm.copyItem(at: i386Src.appending(path: file), to: dest)
+                        wow64Copied += 1
+                    }
+                    log.info("[create] populated syswow64 with \(wow64Copied) 32-bit files for WoW64")
+                } else {
+                    log.warning("[create] i386-windows or syswow64 not found — WoW64 (32-bit apps) may fail")
+                }
+
+                let dllCount = (try? fm.contentsOfDirectory(atPath: path.appending(path: "drive_c/windows/system32").path(percentEncoded: false)))?.filter { $0.hasSuffix(".dll") }.count ?? 0
+                log.info("[create] prefix created from template ✓ | DLLs in system32=\(dllCount)")
+                // No wineboot --update here. The template built by release-engine.sh is
+                // complete (DLLs, registry, driver stubs). Wine auto-detects the Mac
+                // display driver at runtime from winemac.so in the engine's WINEDLLPATH.
+                // CrossOver also creates bottles from templates without running wineboot
+                // on the user's machine — instant bottle creation.
+            } catch {
+                log.error("[create] template copy failed: \(error.localizedDescription) — falling back to wineboot --init")
+                try? fm.removeItem(at: path)
+                // Recreate the prefix directory so wineboot can chdir into WINEPREFIX.
+                try fm.createDirectory(at: path, withIntermediateDirectories: true)
+                try await createViaWineboot(engine: engine, fm: fm)
+            }
+        } else {
+            log.warning("[create] no prefix template in engine — falling back to wineboot --init (slow, may take minutes)")
             try fm.createDirectory(at: path, withIntermediateDirectories: true)
-            log.info("[create] directory created")
-        } catch {
-            log.error("[create] failed to create directory: \(error.localizedDescription)")
-            throw error
+            try await createViaWineboot(engine: engine, fm: fm)
         }
+    }
 
+    private func createViaWineboot(engine: WineEngine, fm: FileManager) async throws {
         let process = try await engine.run(args: ["wineboot", "--init"], prefix: self)
-
         guard process.terminationStatus == 0 else {
             log.error("[create] wineboot --init failed with exit \(process.terminationStatus)")
             throw PrefixError.createFailed(exitCode: process.terminationStatus)
         }
-
-        log.info("[create] prefix created ✓ | system.reg exists=\(fm.fileExists(atPath: path.appending(path: "system.reg").path(percentEncoded: false)))")
+        log.info("[create] prefix created via wineboot --init ✓")
     }
 
-    /// Downloads SteamSetup.exe from Valve and installs it into the prefix.
+    /// Resets the prefix system files to the new engine's pre-built template, preserving
+    /// Steam user configuration (login session, library paths).
+    ///
+    /// This replaces the slow `wineboot --update` path for engine upgrades. The template
+    /// already has all the correct DLLs for the new Wine version, so no Wine process
+    /// needs to run during the reset. The operation is a file copy — instant and atomic.
+    ///
+    /// Files preserved across the reset (saved before, restored after):
+    ///   - `drive_c/Program Files/Steam/config/loginusers.vdf` (or `Program Files (x86)/Steam` on older installs)
+    ///   - `drive_c/Program Files/Steam/config/config.vdf`
+    func resetToEngineTemplate(engine: WineEngine) async throws {
+        let fm = FileManager.default
+        let templateURL = WineEngine.engineDir.appending(path: "prefix-template")
+
+        guard fm.fileExists(atPath: templateURL.path(percentEncoded: false)) else {
+            // No template available — fall back to wineboot --update
+            log.warning("[resetToTemplate] no template found — falling back to wineboot --update")
+            try await refreshSystemDLLs(engine: engine, engineTag: engine.engineVersion ?? "unknown")
+            return
+        }
+
+        log.info("[resetToTemplate] saving Steam config before prefix reset")
+
+        // Save important Steam config files so login session survives the reset.
+        // Capture the full URL for each file so the restore step can write back to
+        // the exact same path in the new prefix (prefix URL doesn't change).
+        let configFilesToPreserve: [URL] = [
+            steamInstallDir.appending(path: "config/loginusers.vdf"),
+            steamInstallDir.appending(path: "config/config.vdf"),
+        ]
+        let savedConfigs: [(dest: URL, data: Data)] = configFilesToPreserve.compactMap { url in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return (dest: url, data: data)
+        }
+        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)")
+
+        // Remove the existing prefix and copy the new template
+        log.info("[resetToTemplate] removing existing prefix")
+        try fm.removeItem(at: path)
+
+        log.info("[resetToTemplate] copying new engine template")
+        try fm.copyItem(at: templateURL, to: path)
+
+        // Recreate dosdevices with correct machine-local symlinks.
+        // The template ships without dosdevices (they point to the build machine's paths).
+        // Both c: and z: are required — z: maps the entire Unix filesystem so Wine can
+        // resolve host paths (e.g. for SteamSetup.exe passed as an absolute Unix path).
+        let dosdev = path.appending(path: "dosdevices")
+        try? fm.removeItem(at: dosdev)
+        try fm.createDirectory(at: dosdev, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(
+            atPath: dosdev.appending(path: "c:").path(percentEncoded: false),
+            withDestinationPath: "../drive_c"
+        )
+        try fm.createSymbolicLink(
+            atPath: dosdev.appending(path: "z:").path(percentEncoded: false),
+            withDestinationPath: "/"
+        )
+
+        // Populate syswow64 with all 32-bit PE files from the engine.
+        // The Gcenx Wine builds leave syswow64 empty after wineboot --init, so the
+        // prefix template also has an empty syswow64. Without these files, Wine's WoW64
+        // layer cannot load 32-bit Windows executables such as SteamSetup.exe, and
+        // missing .drv files (winemac.drv) cause "nodrv_CreateWindow" failures.
+        let i386Src  = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
+        let syswow64 = path.appending(path: "drive_c/windows/syswow64")
+        if fm.fileExists(atPath: i386Src.path(percentEncoded: false)),
+           fm.fileExists(atPath: syswow64.path(percentEncoded: false)) {
+            let i386Files = (try? fm.contentsOfDirectory(atPath: i386Src.path(percentEncoded: false))) ?? []
+            var wow64Copied = 0
+            for file in i386Files where Self.isWoW64FileType(file) {
+                let dest = syswow64.appending(path: file)
+                guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
+                try? fm.copyItem(at: i386Src.appending(path: file), to: dest)
+                wow64Copied += 1
+            }
+            log.info("[resetToTemplate] populated syswow64 with \(wow64Copied) 32-bit files for WoW64")
+        } else {
+            log.warning("[resetToTemplate] i386-windows or syswow64 not found — WoW64 (32-bit apps) may fail")
+        }
+
+        // Restore saved Steam config files to their original paths.
+        // Writing back to the captured URL is correct because the prefix URL hasn't changed —
+        // only its contents were replaced by the template copy above.
+        for (dest, data) in savedConfigs {
+            try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: dest)
+        }
+        log.info("[resetToTemplate] restored \(savedConfigs.count) Steam config file(s)")
+
+        log.info("[resetToTemplate] prefix reset to new engine template ✓")
+    }
+
+    /// Refreshes system DLL symlinks in an existing prefix after a Wine engine upgrade.
+    ///
+    /// Runs `wineboot --update`, which reads `wine/share/wine/wine.inf` from the engine
+    /// package and refreshes all `C:\windows\system32\` DLL entries and registry keys
+    /// without touching installed apps or user data.
+    ///
+    /// **Engine requirement:** The engine tarball must contain `wine/share/wine/wine.inf`.
+    /// `release-engine.sh` is responsible for including this file. The app does not work
+    /// around its absence — if `wineboot --update` fails, the caller receives a clear error.
+    func refreshSystemDLLs(engine: WineEngine, engineTag: String) async throws {
+        log.info("[refreshSystemDLLs] running wineboot --update for engine \(engineTag)")
+        let process = try await engine.run(args: ["wineboot", "--update"], prefix: self)
+        guard process.terminationStatus == 0 else {
+            log.error("[refreshSystemDLLs] wineboot --update failed exit=\(process.terminationStatus) — check engine contains wine/share/wine/wine.inf")
+            throw PrefixError.updateFailed(exitCode: process.terminationStatus)
+        }
+        log.info("[refreshSystemDLLs] DLL symlinks refreshed ✓")
+    }
+
+        /// Downloads SteamSetup.exe from Valve and installs it into the prefix.
     func installSteam(engine: WineEngine) async throws {
         let setupURL = URL(string: "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe")!
         let tempFile = FileManager.default.temporaryDirectory.appending(path: "SteamSetup.exe")
@@ -117,32 +378,18 @@ struct WinePrefix: Sendable {
             prefix: self
         )
 
-        try? FileManager.default.removeItem(at: tempFile)
-
-        let exitCode = process.terminationStatus
-        log.info("[installSteam] installer exited with code \(exitCode)")
-
-        // Windows silent installers (/S) commonly return exit code 1 even on success.
-        // SteamSetup.exe also spawns a child process that completes the actual file
-        // extraction after the parent exits — so steam.exe may not exist yet when
-        // the Wine process returns. Poll until it appears (up to 90 seconds).
-        if !isSteamInstalled {
-            log.info("[installSteam] steam.exe not yet present — waiting for child installer (up to 90s)")
-            var elapsed = 0
-            while elapsed < 90 {
-                try await Task.sleep(for: .seconds(2))
-                elapsed += 2
-                if isSteamInstalled {
-                    log.info("[installSteam] steam.exe appeared after ~\(elapsed)s ✓")
-                    break
-                }
-                log.debug("[installSteam] waiting… \(elapsed)s elapsed")
-            }
+        do {
+            try FileManager.default.removeItem(at: tempFile)
+        } catch {
+            log.warning("[installSteam] failed to clean up SteamSetup.exe: \(error.localizedDescription)")
         }
 
-        guard isSteamInstalled else {
-            log.error("[installSteam] FAILED: steam.exe not found after 90s | exit=\(exitCode) | path=\(steamExePath.path(percentEncoded: false))")
-            throw PrefixError.steamInstallFailed(exitCode: exitCode)
+        let steamExists = isSteamInstalled
+        log.info("[installSteam] installer exit=\(process.terminationStatus) | steam.exe present=\(steamExists)")
+
+        guard process.terminationStatus == 0 || steamExists else {
+            log.error("[installSteam] FAILED: exit=\(process.terminationStatus) and steam.exe not found at \(steamExePath.path(percentEncoded: false))")
+            throw PrefixError.steamInstallFailed(exitCode: process.terminationStatus)
         }
 
         log.info("[installSteam] Steam install complete ✓")
@@ -211,6 +458,185 @@ struct WinePrefix: Sendable {
         return copiedCount > 0 || ssfnCount > 0
     }
 
+    // MARK: - Session File Writing (native auth)
+
+    /// Writes `config/loginusers.vdf` for `steamID` so the Wine Steam client
+    /// recognises an authenticated user and auto-selects it on next start.
+    ///
+    /// Called after a successful native IAuthenticationService login, immediately
+    /// before (re)starting the persistent Steam process.
+    func writeLoginUsers(steamID: String, accountName: String, personaName: String) throws {
+        let fm = FileManager.default
+        let configDir = steamConfigDir
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let vdf = """
+        "users"
+        {
+        \t"\(steamID)"
+        \t{
+        \t\t"AccountName"\t\t"\(accountName)"
+        \t\t"PersonaName"\t\t"\(personaName)"
+        \t\t"RememberPassword"\t\t"1"
+        \t\t"MostRecent"\t\t"1"
+        \t\t"Timestamp"\t\t"\(timestamp)"
+        \t}
+        }
+        """
+
+        let dest = configDir.appending(path: "loginusers.vdf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
+    }
+
+    /// Writes `config/config.vdf` with a `ConnectCache` entry containing the
+    /// IAuthenticationService refresh token, enabling auto-login for `steamID`.
+    ///
+    /// Any pre-existing `config.vdf` is replaced. At first-login time the file
+    /// is either absent or minimal (no library-folder settings have been saved
+    /// yet), so overwriting it is safe. Steam regenerates all other settings
+    /// on first authenticated start.
+    func writeConnectCache(steamID: String, refreshToken: String, accountName: String) throws {
+        let fm = FileManager.default
+        let configDir = steamConfigDir
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        let vdf = """
+        "InstallConfigStore"
+        {
+        \t"Software"
+        \t{
+        \t\t"Valve"
+        \t\t{
+        \t\t\t"Steam"
+        \t\t\t{
+        \t\t\t\t"ConnectCache"
+        \t\t\t\t{
+        \t\t\t\t\t"\(steamID)"\t\t"\(refreshToken)"
+        \t\t\t\t}
+        \t\t\t\t"Accounts"
+        \t\t\t\t{
+        \t\t\t\t\t"\(accountName)"
+        \t\t\t\t\t{
+        \t\t\t\t\t\t"SteamID"\t\t"\(steamID)"
+        \t\t\t\t\t}
+        \t\t\t\t}
+        \t\t\t}
+        \t\t}
+        \t}
+        }
+        """
+
+        let dest = configDir.appending(path: "config.vdf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writeConnectCache] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
+    }
+
+    // MARK: - Webhelper Configuration
+
+    /// Writes `steam.cfg` in the Steam install directory to disable the CEF sandbox.
+    ///
+    /// Steam's webhelper process (steamwebhelper.exe) is a Chromium-based binary that
+    /// renders the entire Steam UI — including game install dialogs. Under Wine, Chrome's
+    /// sandbox fails to initialise because Wine does not fully implement the Windows kernel
+    /// security primitives (job objects, token impersonation) that Chromium's sandbox
+    /// relies on. Without the sandbox bypass the webhelper crashes on every launch, leaving
+    /// Steam without any UI:
+    ///   - Install dialogs cannot be displayed
+    ///   - Steam cannot complete its authenticated login handshake
+    ///   - All IPC commands that trigger UI (e.g. `steam://install/`) silently fail
+    ///
+    /// `SteamNoSandbox=1` instructs Steam to spawn the webhelper with `--no-sandbox
+    /// --no-zygote`, bypassing the sandbox entirely. CPU-based (software) rendering
+    /// continues to work, so the full Steam UI renders correctly.
+    ///
+    /// Safe to call repeatedly: it is a no-op when the file already contains the
+    /// required setting.
+    func ensureSteamCFG() throws {
+        let fm = FileManager.default
+        let cfgURL = steamInstallDir.appending(path: "steam.cfg")
+
+        if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
+           existing.contains("SteamNoSandbox=1") {
+            log.debug("[ensureSteamCFG] steam.cfg already configured — skipping")
+            return
+        }
+
+        try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
+
+        let cfg = """
+        SteamNoSandbox=1
+        """
+        try cfg.write(to: cfgURL, atomically: true, encoding: .utf8)
+        log.info("[ensureSteamCFG] steam.cfg written with SteamNoSandbox=1 → \(cfgURL.path(percentEncoded: false))")
+    }
+
+    // MARK: - Library Setup
+
+    /// Ensures the default Steam library exists on disk and is registered in
+    /// `libraryfolders.vdf` so install IPC can proceed without showing
+    /// an "Install Game" dialog asking where to put files.
+    ///
+    /// Steam creates this file only after a user first logs in interactively.
+    /// Our bootstrap runs Steam anonymously, so the directory and VDF file are
+    /// absent until this method is called. Without them, Steam renders an
+    /// install-location picker that our window suppressor hides — making every
+    /// install appear to hang indefinitely.
+    ///
+    /// Safe to call repeatedly: it is a no-op when the directory and file already
+    /// contain a valid default-library entry.
+    func ensureDefaultLibrary() throws {
+        let fm = FileManager.default
+        let steamappsDir = steamInstallDir.appending(path: "steamapps")
+        let vdfURL = steamappsDir.appending(path: "libraryfolders.vdf")
+
+        // Create steamapps/ if absent.
+        if !fm.fileExists(atPath: steamappsDir.path(percentEncoded: false)) {
+            try fm.createDirectory(at: steamappsDir, withIntermediateDirectories: true)
+            log.info("[ensureDefaultLibrary] created steamapps/ at \(steamappsDir.path(percentEncoded: false))")
+        }
+
+        // Determine the Windows path matching the actual Steam install location.
+        // The installer writes to Program Files\Steam (64-bit path) under wine-staging 11.5
+        // and to Program Files (x86)\Steam (32-bit path) under older Wine builds.
+        let isX86Install = steamInstallDir.path(percentEncoded: false).contains("Program Files (x86)")
+        let defaultWinPath = isX86Install
+            ? "C:\\\\Program Files (x86)\\\\Steam"
+            : "C:\\\\Program Files\\\\Steam"
+
+        // Skip write if the VDF already mentions the correct default path.
+        if let existing = try? String(contentsOf: vdfURL, encoding: .utf8),
+           existing.contains(defaultWinPath) {
+            log.debug("[ensureDefaultLibrary] libraryfolders.vdf already configured — skipping")
+            return
+        }
+
+        // Write a minimal libraryfolders.vdf that declares the default library.
+        // Steam reads this on startup and uses it for all installs; with exactly
+        // one library configured it auto-selects it without showing a dialog.
+        let vdf = """
+        "libraryfolders"
+        {
+        \t"0"
+        \t{
+        \t\t"path"\t\t"\(defaultWinPath)"
+        \t\t"label"\t\t""
+        \t\t"contentid"\t\t"0"
+        \t\t"totalsize"\t\t"0"
+        \t\t"update_clean_bytes_tally"\t\t"0"
+        \t\t"time_last_update_corruption"\t\t"0"
+        \t\t"apps"
+        \t\t{
+        \t\t}
+        \t}
+        }
+        """
+
+        try vdf.write(to: vdfURL, atomically: true, encoding: .utf8)
+        log.info("[ensureDefaultLibrary] libraryfolders.vdf written → \(vdfURL.path(percentEncoded: false))")
+    }
+
     // MARK: - Steam Library Folders
 
     /// All Steam library folders configured in this prefix, including the default one.
@@ -269,6 +695,49 @@ struct WinePrefix: Sendable {
         let result = acfURL(for: appID) != nil
         log.debug("[isGameInstalled] appID=\(appID) → \(result)")
         return result
+    }
+
+    /// Returns true only when the ACF exists AND `StateFlags` equals `"4"` (fully installed).
+    ///
+    /// Steam creates the ACF as soon as the user confirms the install dialog
+    /// (`StateFlags` ≈ 1026 while queued/downloading). `StateFlags "4"` is written
+    /// only when every depot has been staged and verified — i.e. the game is playable.
+    /// Use this instead of `isGameInstalled` when you must not launch a partial download.
+    func isGameFullyInstalled(appID: Int) -> Bool {
+        guard let manifest = acfURL(for: appID),
+              let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
+        else { return false }
+        for line in contents.components(separatedBy: "\n") {
+            guard let (key, value) = vdfKeyValue(from: line), key == "StateFlags" else { continue }
+            let fullyInstalled = value == "4"
+            log.debug("[isGameFullyInstalled] appID=\(appID) StateFlags=\(value) → \(fullyInstalled)")
+            return fullyInstalled
+        }
+        return false
+    }
+
+    /// Reads download progress from the ACF manifest.
+    /// Returns (bytesDownloaded, bytesToDownload, stateFlags) or nil if the ACF is missing.
+    func gameDownloadProgress(appID: Int) -> (downloaded: Int64, total: Int64, stateFlags: String)? {
+        guard let manifest = acfURL(for: appID),
+              let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
+        else { return nil }
+
+        var bytesDownloaded: Int64 = 0
+        var bytesToDownload: Int64 = 0
+        var stateFlags = ""
+
+        for line in contents.components(separatedBy: "\n") {
+            guard let (key, value) = vdfKeyValue(from: line) else { continue }
+            switch key {
+            case "BytesDownloaded": bytesDownloaded = Int64(value) ?? 0
+            case "BytesToDownload": bytesToDownload = Int64(value) ?? 0
+            case "StateFlags": stateFlags = value
+            default: break
+            }
+        }
+
+        return (bytesDownloaded, bytesToDownload, stateFlags)
     }
 
     /// Reads the Steam appmanifest for a game and returns the `installdir` value.
@@ -388,10 +857,33 @@ struct WinePrefix: Sendable {
         }
     }
 
+    // MARK: - WoW64 File Type Filter
+
+    /// Windows PE file extensions that must be copied into `syswow64` for 32-bit
+    /// process support under Wine's WoW64 layer.
+    ///
+    /// The previous filter only included `.dll`, which missed critical files:
+    /// - `.drv` — display drivers (winemac.drv, winspool.drv) — without these,
+    ///   32-bit processes cannot create windows (exit 152, "nodrv_CreateWindow")
+    /// - `.exe` — system executables (explorer.exe)
+    /// - `.sys`, `.cpl`, `.ocx`, `.acm`, `.ax` — various PE modules
+    private static let wow64Extensions: Set<String> = [
+        "dll", "drv", "exe", "sys", "cpl", "ocx", "acm", "ax", "com",
+    ]
+
+    /// Returns true if the filename has an extension that should be copied
+    /// from `i386-windows/` into the prefix's `syswow64/` directory.
+    static func isWoW64FileType(_ filename: String) -> Bool {
+        guard let dot = filename.lastIndex(of: ".") else { return false }
+        let ext = String(filename[filename.index(after: dot)...]).lowercased()
+        return wow64Extensions.contains(ext)
+    }
+
     // MARK: - Errors
 
     enum PrefixError: LocalizedError {
         case createFailed(exitCode: Int32)
+        case updateFailed(exitCode: Int32)
         case steamDownloadFailed(statusCode: Int)
         case steamInstallFailed(exitCode: Int32)
 
@@ -399,6 +891,8 @@ struct WinePrefix: Sendable {
             switch self {
             case .createFailed(let code):
                 return "Failed to create Wine prefix (wineboot exit \(code))."
+            case .updateFailed(let code):
+                return "Failed to refresh Wine DLL symlinks (wineboot --update exit \(code)). Try resetting the Wine environment in Settings."
             case .steamDownloadFailed(let code):
                 return "Failed to download SteamSetup.exe (HTTP \(code))."
             case .steamInstallFailed(let code):

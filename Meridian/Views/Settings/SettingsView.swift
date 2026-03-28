@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SettingsView: View {
     @Environment(SteamAuthService.self) private var steamAuth
@@ -146,8 +147,10 @@ private struct SteamSettingsTab: View {
 
 private struct EngineSettingsTab: View {
     @Environment(WineEngine.self) private var engine
+    @Environment(WineSteamManager.self) private var steamManager
     private let settings = AppSettings.shared
     @State private var showAdvanced = false
+    @State private var showResetConfirm = false
 
     var body: some View {
         Form {
@@ -208,8 +211,35 @@ private struct EngineSettingsTab: View {
                     .padding(.top, 4)
                 }
             }
+
+            Section {
+                Button("Reset Meridian…", role: .destructive) {
+                    showResetConfirm = true
+                }
+                .buttonStyle(.bordered)
+            } header: {
+                Text("Troubleshooting")
+            } footer: {
+                Text("Removes the Wine engine and Steam prefix. The next launch will download a fresh engine and reinstall Steam automatically.")
+                    .font(.caption)
+            }
         }
         .formStyle(.grouped)
+        .confirmationDialog(
+            "Reset Meridian?",
+            isPresented: $showResetConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Everything", role: .destructive) {
+                let prefix = WinePrefix.defaultPrefix
+                steamManager.killAll(engine: engine, prefix: prefix)
+                prefix.reset()
+                engine.resetEngine()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will delete the Wine engine and Steam installation. All settings are preserved. The next app launch will download a fresh engine and reinstall Steam.")
+        }
     }
 }
 
@@ -267,6 +297,7 @@ private struct PermissionsSettingsTab: View {
 private struct UpdatesSettingsTab: View {
     @Environment(WineEngine.self) private var engine
     @Environment(AppUpdateChecker.self) private var updateChecker
+    @Environment(EngineDownloader.self) private var engineDownloader
     private let settings = AppSettings.shared
 
     var body: some View {
@@ -291,6 +322,7 @@ private struct UpdatesSettingsTab: View {
                     updateStatusLabel
                     Spacer()
                     Button(updateChecker.state == .checking ? "Checking…" : "Check for Updates") {
+                        updateChecker.installedEngineTag = engine.engineVersion
                         updateChecker.checkNow()
                     }
                     .disabled(updateChecker.state == .checking)
@@ -310,6 +342,7 @@ private struct UpdatesSettingsTab: View {
                     .font(.caption)
             }
 
+            // App update section
             if case .updateAvailable(let version) = updateChecker.state {
                 Section {
                     HStack(alignment: .top, spacing: 12) {
@@ -318,7 +351,7 @@ private struct UpdatesSettingsTab: View {
                             .foregroundStyle(.blue)
 
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Version \(cleanTag(version))")
+                            Text("Meridian \(cleanTag(version))")
                                 .fontWeight(.semibold)
 
                             if let notes = updateChecker.releaseNotes, !notes.isEmpty {
@@ -332,16 +365,51 @@ private struct UpdatesSettingsTab: View {
                         Spacer()
                     }
 
-                    Button {
-                        updateChecker.openReleasePage()
-                    } label: {
-                        Label("Download Meridian \(cleanTag(version))", systemImage: "safari")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+                    appUpdateButton(version: version)
                 } header: {
-                    Text("What's New")
+                    Text("New App Version")
                 }
+            }
+
+            // Engine update section — shown independently of app updates
+            if let engineTag = updateChecker.availableEngineTag {
+                EngineUpdateSection(
+                    engineTag: engineTag,
+                    engineDownloader: engineDownloader,
+                    engine: engine
+                )
+            }
+
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Diagnostic Log")
+                            .fontWeight(.medium)
+                        Text(LogFileWriter.currentLogURL.path(percentEncoded: false))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer()
+                    Button("Open Log") {
+                        NSWorkspace.shared.open(LogFileWriter.currentLogURL)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                Button("Open Previous Session Log") {
+                    NSWorkspace.shared.open(LogFileWriter.previousLogURL)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .disabled(!FileManager.default.fileExists(atPath: LogFileWriter.previousLogURL.path(percentEncoded: false)))
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Logs are written to Application Support and rotate each launch. Share these files when reporting issues.")
+                    .font(.caption)
             }
         }
         .formStyle(.grouped)
@@ -356,9 +424,7 @@ private struct UpdatesSettingsTab: View {
     }
 
     private var engineVersionString: String {
-        if let v = engine.engineVersion {
-            return v
-        }
+        if let v = engine.engineVersion { return v }
         return engine.isReady ? engine.backendName : "Not installed"
     }
 
@@ -373,7 +439,8 @@ private struct UpdatesSettingsTab: View {
                 Text("Checking…").foregroundStyle(.secondary)
             }
         case .upToDate:
-            Label("Up to date", systemImage: "checkmark.circle.fill")
+            let label = updateChecker.hasEngineUpdate ? "App is up to date" : "Up to date"
+            Label(label, systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
         case .updateAvailable(let version):
             Label("\(cleanTag(version)) available", systemImage: "arrow.down.circle.fill")
@@ -386,8 +453,165 @@ private struct UpdatesSettingsTab: View {
         }
     }
 
+    @ViewBuilder
+    private func appUpdateButton(version: String) -> some View {
+        switch updateChecker.appUpdateState {
+        case .downloading(let progress):
+            VStack(spacing: 6) {
+                ProgressView(value: progress)
+                Text("Downloading Meridian… \(Int(progress * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .installing:
+            HStack(spacing: 8) {
+                ProgressView().scaleEffect(0.7)
+                Text("Installing update…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .readyToRelaunch:
+            Label("Relaunching…", systemImage: "arrow.clockwise")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+        case .failed(let msg):
+            VStack(alignment: .leading, spacing: 6) {
+                Label(msg, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+                HStack {
+                    Button {
+                        updateChecker.downloadAndInstallUpdate()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Open in Browser") {
+                        updateChecker.openReleasePage()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+        case .idle:
+            if updateChecker.dmgDownloadURL != nil {
+                Button {
+                    updateChecker.downloadAndInstallUpdate()
+                } label: {
+                    Label("Download & Install \(cleanTag(version))", systemImage: "arrow.down.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Button {
+                    updateChecker.openReleasePage()
+                } label: {
+                    Label("Download Meridian \(cleanTag(version))", systemImage: "safari")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
     private func cleanTag(_ tag: String) -> String {
         tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+    }
+}
+
+// MARK: - Engine update section
+
+private struct EngineUpdateSection: View {
+    let engineTag: String
+    let engineDownloader: EngineDownloader
+    let engine: WineEngine
+    @Environment(AppUpdateChecker.self) private var updateChecker
+
+    var body: some View {
+        Section {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "cpu.fill")
+                    .font(.title2)
+                    .foregroundStyle(.orange)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Wine Engine \(cleanTag(engineTag))")
+                        .fontWeight(.semibold)
+                    Text("A newer Wine runtime is available. The update improves game compatibility, performance, and DirectX support.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+
+            engineDownloadButton
+        } header: {
+            Text("New Engine Version")
+        }
+    }
+
+    @ViewBuilder
+    private var engineDownloadButton: some View {
+        switch engineDownloader.state {
+        case .downloading(let progress):
+            VStack(spacing: 6) {
+                ProgressView(value: progress)
+                Text("Downloading engine… \(Int(progress * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .extracting:
+            HStack(spacing: 8) {
+                ProgressView().scaleEffect(0.7)
+                Text("Installing engine…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .failed(let msg):
+            VStack(alignment: .leading, spacing: 6) {
+                Label(msg, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+
+                Button {
+                    engineDownloader.download {
+                        engine.detect()
+                        updateChecker.clearEngineUpdate(newTag: engine.engineVersion)
+                    }
+                } label: {
+                    Label("Retry Download", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+        default:
+            Button {
+                engineDownloader.download {
+                    engine.detect()
+                    updateChecker.clearEngineUpdate(newTag: engine.engineVersion)
+                }
+            } label: {
+                Label("Download Engine \(cleanTag(engineTag))", systemImage: "arrow.down.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+        }
+    }
+
+    private func cleanTag(_ tag: String) -> String {
+        var t = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        if t.hasSuffix("-engine") { t = String(t.dropLast(7)) }
+        return t
     }
 }
 

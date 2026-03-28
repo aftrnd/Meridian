@@ -131,6 +131,17 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "lastLaunchAppVersion") }
     }
 
+    /// The engine release tag (e.g. `v1.0.3-engine`) that was active when the Wine
+    /// prefix was last initialized via `wineboot`. Used by `BootstrapManager` to
+    /// detect engine upgrades that require `wineboot --update` to refresh system DLL
+    /// symlinks in the prefix. Without this, updating the engine produces missing-DLL
+    /// errors (e.g. `coml2.dll not found`) because the prefix's system32 still has
+    /// symlinks pointing into the old engine's DLL directory.
+    var lastPrefixEngineTag: String {
+        get { UserDefaults.standard.string(forKey: "lastPrefixEngineTag") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "lastPrefixEngineTag") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

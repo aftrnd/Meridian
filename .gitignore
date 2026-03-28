@@ -18,6 +18,9 @@ DerivedData/
 *.swp
 *~
 
+# Cursor AI (local development rules and state)
+.cursor/
+
 # Meridian runtime data (downloaded at runtime, not checked in)
 /engine/
 /bottles/

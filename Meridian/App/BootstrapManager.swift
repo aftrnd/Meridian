@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "BootstrapManager")
+private let log = MeridianLog(category: "BootstrapManager")
 
 /// Orchestrates the full app initialization pipeline at launch.
 ///
@@ -21,6 +21,7 @@ final class BootstrapManager {
         case idle
         case awaitingPermission
         case detectingEngine
+        case downloadingEngine
         case creatingPrefix
         case installingSteam
         case bootstrappingSteam
@@ -52,12 +53,17 @@ final class BootstrapManager {
     /// after `startPersistent` completes and after automatic Steam restarts.
     var windowSuppressor: SteamWindowSuppressor?
 
+    /// Mirrors `EngineDownloader.state` during the `.downloadingEngine` phase so
+    /// `SplashView` can show a progress bar without holding a direct downloader ref.
+    private(set) var engineDownloadState: EngineDownloader.DownloadState = .idle
+
     // MARK: - Public API
 
     func start(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge
+        sessionBridge: SteamSessionBridge,
+        engineDownloader: EngineDownloader
     ) {
         guard phase == .idle || isFailed else { return }
 
@@ -66,9 +72,22 @@ final class BootstrapManager {
             await self?.runPipeline(
                 engine: engine,
                 steamManager: steamManager,
-                sessionBridge: sessionBridge
+                sessionBridge: sessionBridge,
+                engineDownloader: engineDownloader
             )
         }
+    }
+
+    /// Cancels the bootstrap pipeline immediately.
+    ///
+    /// Called during app termination so Wine commands spawned by the pipeline are
+    /// not left running concurrently with the termination cleanup. Without this,
+    /// the bootstrap Task keeps launching Wine processes while `TerminationCleanup`
+    /// is simultaneously killing them — causing race conditions and partial state.
+    func cancelForTermination() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        log.info("[bootstrap] pipeline cancelled for termination")
     }
 
     /// Called by the SplashView "Continue Without" button.
@@ -86,7 +105,8 @@ final class BootstrapManager {
     func retry(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge
+        sessionBridge: SteamSessionBridge,
+        engineDownloader: EngineDownloader
     ) {
         let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam, .waitingForSteam]
         if let failed = lastFailedPhase, cleanupPhases.contains(failed) {
@@ -97,18 +117,30 @@ final class BootstrapManager {
         lastFailedPhase = nil
         phase = .idle
         statusMessage = ""
-        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge)
+        engineDownloadState = .idle
+        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader)
     }
 
     // MARK: - Pipeline
 
     private let prefix = WinePrefix.defaultPrefix
+    private let settings = AppSettings.shared
 
     private func runPipeline(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge
+        sessionBridge: SteamSessionBridge,
+        engineDownloader: EngineDownloader
     ) async {
+        let pipelineStart = ContinuousClock.now
+
+        // Pre-flight: kill any orphaned Wine processes from a previous session that
+        // didn't shut down cleanly. Without this, leftover wineserver/steam.exe
+        // processes hold locks that prevent the new bootstrap from succeeding.
+        await Task.detached(priority: .userInitiated) {
+            TerminationCleanup.killAllWineProcesses()
+        }.value
+
         log.info("╔══════════════════════════════════════════════════")
         log.info("║ BOOTSTRAP PIPELINE START")
         log.info("║ engine ready=\(engine.isReady)")
@@ -117,13 +149,49 @@ final class BootstrapManager {
         log.info("║ needs bootstrap=\(steamManager.needsBootstrap(prefix: self.prefix))")
         log.info("╚══════════════════════════════════════════════════")
 
-        // 1. Detect engine
+        // 1. Detect engine — auto-download if not installed or incomplete
         transition(to: .detectingEngine, message: "Detecting Wine engine…")
 
-        guard engine.isReady else {
-            fail("Wine engine not installed. Open Settings to download it.")
-            return
+        if !engine.isReady {
+            log.info("[bootstrap] engine not ready (state=\(String(describing: engine.state))) — starting auto-download")
+            transition(to: .downloadingEngine, message: "Downloading Wine engine…")
+            engineDownloadState = .fetching
+
+            // Start the download — onComplete fires only on success.
+            // Poll the downloader state every 100 ms to forward progress to SplashView
+            // and detect failure (state == .failed) since there is no error callback.
+            engineDownloader.download { /* completion handled below via polling */ }
+
+            pollLoop: while true {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled else { return }
+                let current = engineDownloader.state
+                engineDownloadState = current
+                switch current {
+                case .complete:
+                    log.info("[bootstrap] engine download reported complete")
+                    break pollLoop
+                case .failed(let msg):
+                    fail("Engine download failed: \(msg)")
+                    return
+                default:
+                    continue
+                }
+            }
+
+            engine.detect()
+
+            guard engine.isReady else {
+                let detail: String
+                if case .error(let msg) = engine.state { detail = msg }
+                else { detail = "Engine could not be verified after download." }
+                fail(detail)
+                return
+            }
+
+            log.info("[bootstrap] engine downloaded and ready ✓")
         }
+
         log.info("[bootstrap] engine OK — \(engine.backendName)")
 
         // Populate TerminationCleanup context as soon as we have the engine and prefix.
@@ -131,7 +199,9 @@ final class BootstrapManager {
         // before startPersistent has a chance to set it.
         TerminationCleanup.context = TerminationCleanup.Context(
             wineserverPath: engine.wineserverURL.path(percentEncoded: false),
-            winePrefix: prefix.path.path(percentEncoded: false)
+            winePrefix: prefix.path.path(percentEncoded: false),
+            engineDirPath: WineEngine.engineDir.path(percentEncoded: false),
+            libraryPath: engine.libraryPath
         )
 
         guard !Task.isCancelled else { return }
@@ -159,22 +229,56 @@ final class BootstrapManager {
             }
         }
 
-        // Engage all suppression layers NOW, before any Wine process is launched.
-        // The 0.5s polling timer will catch the bootstrap Wine process within its first tick.
-        windowSuppressor?.beginSession()
+        // Window suppression is NOT engaged here — prefix operations (wineboot --init,
+        // wineboot --update, SteamSetup.exe) may show transient Wine GUI windows that
+        // the user doesn't need to interact with but that must be allowed to render so
+        // the process can complete. Suppression begins later, right before starting
+        // the persistent Steam process (step 6).
 
         guard !Task.isCancelled else { return }
 
         // 2. Create prefix if needed
         if !prefix.exists {
             transition(to: .creatingPrefix, message: "Creating Wine environment…")
+            let t = ContinuousClock.now
             do {
                 try await prefix.create(engine: engine)
-                log.info("[bootstrap] prefix created")
+                log.info("[bootstrap] prefix created in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
             } catch {
                 fail("Failed to create Wine environment: \(error.localizedDescription)")
                 return
             }
+            // Record the engine tag used to create this prefix so we can detect
+            // future engine upgrades that require a DLL symlink refresh.
+            settings.lastPrefixEngineTag = engine.engineVersion ?? ""
+        }
+
+        guard !Task.isCancelled else { return }
+
+        // 2b. Handle engine upgrades.
+        //
+        //     When the engine version changes, the prefix's system32 DLLs may be
+        //     outdated. The preferred path (when the engine ships a prefix template)
+        //     is to reset the prefix from the new template — instant file copy, no
+        //     Wine processes. Steam config (loginusers.vdf, config.vdf) is preserved
+        //     across the reset so auto-login continues to work.
+        //
+        //     Falls back to `wineboot --update` for engines without a template.
+        let storedTag = settings.lastPrefixEngineTag
+        let currentTag = engine.engineVersion ?? ""
+        if prefix.exists && !currentTag.isEmpty && storedTag != currentTag {
+            log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix to new engine template")
+            transition(to: .creatingPrefix, message: "Applying new Wine engine…")
+            let t = ContinuousClock.now
+            do {
+                try await prefix.resetToEngineTemplate(engine: engine)
+                settings.lastPrefixEngineTag = currentTag
+                log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
+            } catch {
+                log.error("[bootstrap] prefix reset failed (non-fatal): \(error.localizedDescription) — continuing with existing prefix")
+            }
+        } else if storedTag == currentTag {
+            log.info("[bootstrap] engine tag unchanged (\(currentTag)) — no prefix update needed")
         }
 
         guard !Task.isCancelled else { return }
@@ -182,9 +286,10 @@ final class BootstrapManager {
         // 3. Install Steam if needed
         if !prefix.isSteamInstalled {
             transition(to: .installingSteam, message: "Downloading and installing Steam…")
+            let t = ContinuousClock.now
             do {
                 try await prefix.installSteam(engine: engine)
-                log.info("[bootstrap] Steam installed")
+                log.info("[bootstrap] Steam installed in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
             } catch {
                 fail("Failed to install Steam: \(error.localizedDescription)")
                 return
@@ -193,12 +298,34 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
+        // 3b. Write steam.cfg (SteamNoSandbox=1) BEFORE bootstrap.
+        //
+        // Steam's webhelper (steamwebhelper.exe) renders the entire Steam UI — including
+        // the update dialog and login screen. Under Wine, Chrome's sandbox fails to
+        // initialise because Wine does not implement the required Windows kernel security
+        // primitives. Without SteamNoSandbox=1, the webhelper crashes immediately, leaving
+        // Steam headless — no update UI, no login window, no install dialogs.
+        //
+        // This must be written before the bootstrap step because the bootstrapper may
+        // transition directly into the full client during its first run, immediately
+        // trying to start the webhelper. Without this file in place at that moment,
+        // the webhelper crashes and Steam appears to silently fail.
+        //
+        // Also ensure libraryfolders.vdf is present so Steam's install IPC works without
+        // showing a hidden library-location picker on first game install.
+        //
+        // Both calls are idempotent: no-op if the files already contain the correct content.
+        try? prefix.ensureSteamCFG()
+        try? prefix.ensureDefaultLibrary()
+        log.info("[bootstrap] steam.cfg and libraryfolders.vdf pre-written before bootstrap")
+
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
             transition(to: .bootstrappingSteam, message: "Steam is updating — first launch takes a few minutes…")
+            let t = ContinuousClock.now
             do {
                 try await steamManager.bootstrap(engine: engine, prefix: prefix)
-                log.info("[bootstrap] Steam client bootstrapped")
+                log.info("[bootstrap] Steam client bootstrapped in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
             } catch {
                 fail("Steam update failed: \(error.localizedDescription)")
                 return
@@ -207,19 +334,41 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
+        // 4b. Ensure steam.cfg and libraryfolders.vdf are still correct after bootstrap
+        // (idempotent — no-op if already written above, but defensive in case bootstrap
+        // replaced the Steam install directory).
+        try? prefix.ensureSteamCFG()
+        try? prefix.ensureDefaultLibrary()
+
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
         let strategy = await sessionBridge.prepare(prefix: prefix)
         switch strategy {
+        case .credentialAuth:
+            log.info("[bootstrap] session written from credential-auth tokens ✓")
         case .sessionFileCopy:
-            log.info("[bootstrap] session files copied for auto-login")
+            log.info("[bootstrap] session files copied from macOS Steam ✓")
         case .none:
-            log.info("[bootstrap] no macOS Steam session — manual login may be needed")
+            log.info("[bootstrap] no session available — Wine Steam login required")
         }
+
+        // Record login state. credentialAuth strategy means the user already
+        // authenticated through onboarding — mark as logged in immediately.
+        // sessionFileCopy also sets up a session. Only .none requires interactive login.
+        let hasLogin = strategy == .credentialAuth || prefix.hasSteamLoginSession()
+        steamManager.isSteamLoggedIn = hasLogin
+        log.info("[bootstrap] Steam login session present=\(hasLogin) strategy=\(String(describing: strategy))")
 
         guard !Task.isCancelled else { return }
 
-        // 6. Start persistent Steam process
+        // 6. Engage window suppression now that all prefix operations are complete.
+        // This must happen BEFORE starting persistent Steam so its windows are hidden.
+        // It must NOT happen earlier — prefix operations (wineboot --init, wineboot --update,
+        // SteamSetup.exe) spawn transient Wine GUI windows that must be allowed to render
+        // and exit naturally.
+        windowSuppressor?.beginSession()
+
+        // Start persistent Steam process
         transition(to: .startingSteam, message: "Starting Steam…")
         do {
             try await steamManager.startPersistent(engine: engine, prefix: prefix)
@@ -229,10 +378,6 @@ final class BootstrapManager {
             return
         }
 
-        // Engage window suppression immediately after Steam starts.
-        // beginSession() was already called earlier (before bootstrap phases), so the
-        // polling timer is already running. resumeSuppressing gives an immediate focus
-        // on the new persistent Steam PID.
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }
@@ -251,8 +396,6 @@ final class BootstrapManager {
         transition(to: .waitingForSteam, message: "Waiting for Steam to initialize…")
         do {
             try await steamManager.waitUntilReady(prefix: prefix) { [weak self] message in
-                // Called back when waitUntilReady detects a Steam self-update in progress.
-                // Update the splash status message so the user knows what's happening.
                 self?.statusMessage = message
                 log.info("[bootstrap] waitUntilReady status: \(message)")
             }
@@ -262,10 +405,16 @@ final class BootstrapManager {
             return
         }
 
+        // Steam is confirmed ready — NOW start the health monitor.
+        // Starting it before waitUntilReady would cause the monitor to fight the
+        // readiness-polling loop (both detect dead Steam and try to restart it).
+        steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
+
         lastFailedPhase = nil
         transition(to: .ready, message: "Ready")
+        let totalSec = String(format: "%.1f", Double((ContinuousClock.now - pipelineStart).components.seconds))
         log.info("╔══════════════════════════════════════════════════")
-        log.info("║ BOOTSTRAP COMPLETE — Steam is running")
+        log.info("║ BOOTSTRAP COMPLETE — Steam is running (\(totalSec)s total)")
         log.info("╚══════════════════════════════════════════════════")
     }
 

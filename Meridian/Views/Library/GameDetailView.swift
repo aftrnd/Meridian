@@ -618,7 +618,7 @@ struct GameDetailView: View {
         guard isThisGame else { return false }
         switch launcher.launchState {
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .installing, .launching, .running, .stopping, .uninstalling:
+             .awaitingInstallConfirmation, .installing, .launching, .running, .stopping, .uninstalling:
             return true
         default:
             return false
@@ -652,6 +652,18 @@ struct GameDetailView: View {
             HStack(spacing: 8) {
                 ProgressButton("Updating Steam…")
                 cancelButton
+            }
+
+        case .awaitingInstallConfirmation:
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    ProgressButton(launcher.currentActivity ?? "Confirm in Steam window…")
+                    cancelButton
+                }
+                Text("Steam is asking where to install this game. Complete the prompt in the Steam window to begin downloading.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
         case .installing:

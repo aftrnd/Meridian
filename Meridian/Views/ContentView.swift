@@ -21,29 +21,37 @@ struct ContentView: View {
     @Environment(GameLauncher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
-
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var sidebarDestination: SidebarDestination = .home
     @State private var hasAnimatedToFullSize = false
     @State private var splashVisible = true
+    /// Starts false so SwiftUI observes the false→true transition that triggers
+    /// sheet presentation. Set to true from `.onAppear` on mainContent.
+    @State private var showSetupSheet = false
 
     var body: some View {
         Group {
+            // Bootstrap always runs first — engine download, prefix creation,
+            // Steam installation. No pre-screen for new users; Meridian's splash
+            // is the first thing they see.
             if splashVisible {
                 SplashView()
-            } else if !steamAuth.isAuthenticated {
-                AuthView()
             } else {
                 mainContent
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
-                    .sheet(isPresented: Binding(
-                        get: { steamAuth.needsAPIKey },
-                        set: { _ in }
-                    )) {
-                        APIKeySetupSheet()
+                    .onAppear {
+                        // Evaluate AFTER mainContent is mounted so SwiftUI sees
+                        // the false→true transition and actually presents the sheet.
+                        if !steamManager.isSteamLoggedIn || steamAuth.needsAPIKey {
+                            showSetupSheet = true
+                        }
+                    }
+                    .sheet(isPresented: $showSetupSheet) {
+                        SetupSheet()
+                            .interactiveDismissDisabled()
                     }
             }
         }
@@ -406,6 +414,48 @@ struct GlassCapsuleBackground: ViewModifier {
     }
 }
 
+// MARK: - Update Available Banner
+
+struct UpdateAvailableBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+    let onViewUpdate: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .foregroundStyle(.orange)
+                .font(.body)
+
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+
+            Button("View Update") {
+                onViewUpdate()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .modifier(GlassRoundedBackground(cornerRadius: 10))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+    }
+}
+
 struct GlassRoundedBackground: ViewModifier {
     var cornerRadius: CGFloat = 10
 
@@ -430,4 +480,5 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(GameLauncher())
         .environment(BootstrapManager())
         .environment(CategoryStore())
+        .environment(AppUpdateChecker())
 }

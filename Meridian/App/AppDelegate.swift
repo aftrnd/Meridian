@@ -1,7 +1,7 @@
 import AppKit
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "AppDelegate")
+private let log = MeridianLog(category: "AppDelegate")
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -13,6 +13,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Set by MeridianApp so suppression observers are torn down at termination.
     var suppressor: SteamWindowSuppressor?
+
+    /// Set by MeridianApp so the health monitor is cancelled before Wine cleanup runs.
+    var steamManager: WineSteamManager?
+
+    /// Set by MeridianApp so the bootstrap pipeline is cancelled before Wine cleanup.
+    var bootstrap: BootstrapManager?
+
+    /// Prevents `killAllWineProcesses` from running concurrently or twice.
+    private var cleanupDone = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -50,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Calling center() here as well gives an early best-effort position.
         window.center()
 
-        log.debug("Main window locked to splash size \(Self.splashSize.width, privacy: .public)x\(Self.splashSize.height, privacy: .public)")
+        log.debug("Main window locked to splash size \(Self.splashSize.width)x\(Self.splashSize.height)")
     }
 
     private func animateToFullSize() {
@@ -89,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         })
 
-        log.debug("Animating window to full frame \(Self.fullFrameSize.width, privacy: .public)x\(Self.fullFrameSize.height, privacy: .public)")
+        log.debug("Animating window to full frame \(Self.fullFrameSize.width)x\(Self.fullFrameSize.height)")
     }
 
     private func setTrafficLights(hidden: Bool, in window: NSWindow) {
@@ -104,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         suppressor?.stopSuppressing()
+        runCleanupOnce()
         if let observer = readyObserver {
             NotificationCenter.default.removeObserver(observer)
             readyObserver = nil
@@ -115,24 +125,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        log.info("Termination requested — killing Wine/Steam on background thread")
+        log.info("[AppDelegate] termination requested — running Wine/Steam cleanup on background thread")
 
-        // Safety valve: always terminate within 3s even if cleanup hangs
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            log.warning("Termination cleanup timed out — forcing quit")
+        // Cancel the bootstrap pipeline so it stops launching Wine processes
+        // before the cleanup kills them — prevents race conditions with partial state.
+        bootstrap?.cancelForTermination()
+
+        // Stop the health monitor immediately so it cannot detect a dead Steam
+        // process mid-cleanup and restart it, leaving a new orphaned process.
+        steamManager?.stopHealthMonitor()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            log.warning("[AppDelegate] cleanup timed out — forcing quit")
             sender.reply(toApplicationShouldTerminate: true)
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            TerminationCleanup.killAllWineProcesses()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.runCleanupOnce()
             DispatchQueue.main.async {
                 sender.reply(toApplicationShouldTerminate: true)
             }
         }
 
-        // Return .terminateLater so the main thread stays unblocked while
-        // cleanup runs. The app exits when reply(toApplicationShouldTerminate:)
-        // is called above (or the 3s timeout fires).
         return .terminateLater
+    }
+
+    private func runCleanupOnce() {
+        guard !cleanupDone else {
+            log.info("[AppDelegate] cleanup already ran — skipping")
+            return
+        }
+        cleanupDone = true
+        TerminationCleanup.killAllWineProcesses()
     }
 }

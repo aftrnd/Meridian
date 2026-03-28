@@ -7,105 +7,117 @@ alwaysApply: true
 
 Meridian uses a single update flow. One app version = one Wine engine snapshot. Users never deal with separate app and engine updates.
 
-## End-User Experience (fully automatic)
+## CRITICAL: Engine/App Separation Principle
 
-Users download Meridian.app and open it. The app handles everything:
-1. First launch: engine downloads automatically with an inline progress bar in `SplashView` — no button, no sheet, no user action required.
-2. Engine installed → bootstrap pipeline runs (Wine prefix → Steam install → Steam start).
-3. Subsequent launches: engine already present → bootstrap starts immediately.
-4. On version bump: `MeridianApp.task` silently refreshes the engine in the background.
+**The app NEVER compensates for engine deficiencies. The engine NEVER compensates for app deficiencies.**
 
-**CrossOver is never used at runtime.** `WineEngine.detect()` only checks the bundled engine in Application Support. There is no CrossOver fallback.
+Every time a bug is found that involves the engine or app working around each other's problems:
 
-## How the Update System Works
+1. **Fix the root layer.** If the engine is broken (missing file, wrong layout, bad DLL), fix `release-engine.sh` and publish a new engine release. If the app is broken, fix the app.
+2. **Publish the fixed engine immediately.** Run `bash Scripts/release-engine.sh` to push the corrected engine to GitHub Releases.
+3. **Clear the broken installed engine.** Delete `~/Library/Application Support/com.meridian.app/engine/` so the app is forced to download the fresh, correct engine.
+4. **Verify end-to-end** with the new engine before closing the issue.
 
-- `AppUpdateChecker` (`Meridian/Engine/AppUpdateChecker.swift`) queries `/releases?per_page=20`, **skips** `-engine` tagged releases and drafts, and compares the first remaining tag to `CFBundleShortVersionString`.
-- `EngineDownloader` (`Meridian/Engine/EngineDownloader.swift`) queries `/releases?per_page=20`, **picks** the first release tagged with `-engine`, and downloads its `.tar.gz` asset. This ensures the correct engine tarball is found even when a newer app release exists.
-- On every launch, `MeridianApp` compares `AppSettings.lastLaunchAppVersion` to the current version. If changed and `engine.isReady`, triggers `EngineDownloader` in the background.
-- Settings → Updates tab shows current Meridian version, installed engine tag, update status, release notes, and a "Download →" button.
+**Never:**
+- Add app-level workarounds for missing engine files (e.g. manually copying DLLs when `wineboot --update` fails because `wine.inf` is absent)
+- Suppress engine errors to make the app appear to work
+- Patch around a known engine packaging defect without also fixing the packaging
 
-## Engine Isolation
+**Always:**
+- When a packaging defect is identified in the engine, fix `release-engine.sh` first
+- Add a validation `die()` in `release-engine.sh` so the same defect cannot ship again
+- Publish a new engine release before verifying any app-side fix
+- Test against the published engine, not a locally-patched state
 
-- `WineEngine.detect()` checks only `~/Library/Application Support/com.meridian.app/engine/wine/bin/wine64`.
-- No CrossOver paths, no `CX_ROOT`, no `CX_BOTTLE` — ever.
-- `backendName` is always `"Meridian"` or `"None"`.
-- If engine not found at launch, `SplashView` auto-downloads it immediately.
+### Engine Release Checklist (run every time a packaging fix is made)
+
+```bash
+# 1. Fix the root issue in Scripts/release-engine.sh
+# 2. Publish the new engine
+bash Scripts/release-engine.sh            # auto-increments version (e.g. v1.0.4-engine)
+
+# 3. Clear the broken installed engine on the dev machine
+rm -rf ~/Library/Application\ Support/com.meridian.app/engine/
+defaults delete com.meridian.app lastPrefixEngineTag 2>/dev/null || true
+
+# 4. Clean build and run the app — it will auto-download the new engine on launch
+```
+
+---
+
+## How It Works
+
+- `AppUpdateChecker` (`Meridian/Engine/AppUpdateChecker.swift`) queries `https://api.github.com/repos/{engineRepoSlug}/releases`, filters by tag suffix to separate app vs engine releases, and compares against installed versions.
+- On every launch, `MeridianApp` compares `AppSettings.lastLaunchAppVersion` to the current version. If changed and the engine is already installed, it silently triggers `EngineDownloader` in the background.
+- Settings → Updates tab shows current Meridian version, installed engine tag, update status, release notes, and download controls.
+
+## In-App Update Flows
+
+### Engine update (Settings → Updates → "Download Engine vX.Y.Z")
+- `EngineDownloader.download(onComplete:)` fetches the latest `-engine` tagged release from the GitHub API, downloads the `.tar.gz`, and extracts it to `~/Library/Application Support/com.meridian.app/engine/`.
+- On completion, the `onComplete` closure runs `engine.detect()` then `updateChecker.clearEngineUpdate(newTag:)` to sync the installed tag and dismiss the update UI.
+- `EngineDownloader.state` drives the button UI: `.downloading(progress:)`, `.extracting`, `.complete`, `.failed`.
+
+### App update (Settings → Updates → "Download & Install vX.Y.Z")
+- `AppUpdateChecker.downloadAndInstallUpdate()` downloads the `.dmg` asset from the release, mounts it via `hdiutil attach`, copies the `.app` bundle over the running app, then relaunches via `open -n -a` and calls `NSApp.terminate`.
+- Falls back to opening the browser release page if no `.dmg` asset is attached.
+- `AppUpdateChecker.appUpdateState` drives button UI: `.downloading(progress:)`, `.installing`, `.readyToRelaunch`, `.failed`.
+
+## End users vs maintainers
+
+- **End users** do **not** need CrossOver. The only supported runtime is the bundled engine downloaded from GitHub Releases. There is no CrossOver fallback in `WineEngine.detect()`.
+- **Maintainers** may use CrossOver.app on their machine only as a *source* when running `release-engine.sh` to produce a newer Wine tree for the public engine tarball.
 
 ## Developer Release Workflow
 
 ```
-1. Engine release (open-source, redistributable):
-   Option A (CI — preferred): GitHub repo → Actions → "Engine Release" → Run workflow
-   Option B (local): brew tap gcenx/wine && brew install --cask wine-crossover
-                     bash Scripts/release-engine.sh        # publishes vX.Y.Z-engine tag
-
-2. App release:
-   bash Scripts/release-app.sh          # builds, signs, notarizes, publishes draft .dmg
-   # Then edit and publish the draft at github.com/aftrnd/meridian/releases
+1. Fix Scripts/release-engine.sh if there is a packaging issue
+2. bash Scripts/release-engine.sh        # publishes vX.Y.Z-engine tag
+3. Clear installed engine: rm -rf ~/Library/Application Support/com.meridian.app/engine/
+4. Clean build the app and run — verify end-to-end with the published engine
+5. Bump MARKETING_VERSION in Xcode
+6. Build → sign → notarize → publish .dmg to GitHub Releases as vX.Y.Z
 ```
 
-Engine releases are tagged `vX.Y.Z-engine` with a `.tar.gz` asset.
-App releases are tagged `vX.Y.Z` with a `.dmg` asset.
-
-`release-engine.sh` uses the **Gcenx open-source Wine cask** as the primary source (LGPL, freely redistributable). CrossOver is a local-only fallback that triggers a mandatory redistribution warning and confirmation — never for public releases.
+Engine releases are tagged `vX.Y.Z-engine`. App releases are tagged `vX.Y.Z`. The update checker uses the `-engine` suffix to distinguish them.
 
 `release-engine.sh` writes `wine/meridian-engine-version.txt` into the archive. `WineEngine.engineVersion` reads this file and surfaces it in Settings → Updates.
+
+## Engine Package Requirements
+
+The engine tarball (`meridian-engine-arm64.tar.gz`) MUST contain:
+
+| Path | Purpose | Missing causes |
+|------|---------|----------------|
+| `wine/bin/wine64` | Wine loader | Engine not detected |
+| `wine/bin/wineserver` | Wine IPC server | All Wine operations fail |
+| `wine/share/wine/nls/*.nls` | NLS locale tables | Wineserver aborts |
+| `wine/share/wine/wine.inf` | Prefix creation/update spec | `wineboot --init` and `wineboot --update` fail — DLL symlinks in prefix become stale after engine upgrade, causing `STATUS_DLL_NOT_FOUND` (exit 53) |
+| `wine/lib/wine/x86_64-unix/winemetal.so` | DXMT Metal bridge | DirectX 11 → Metal path broken |
+| `wine/lib/wine/x86_64-windows/d3d11.dll` | DXMT D3D11 | DirectX 11 → Metal path broken |
+| `wine/meridian-engine-version.txt` | Version tag | Engine version undetectable in Settings |
+
+`release-engine.sh` validates all of the above with `die()` checks. If a new required file is identified, add both the copy step AND the validation check to the script.
+
+**CRITICAL: The engine MUST be built from `wine-crossover` (Gcenx/winecx), NOT `wine-staging`.** CrossOver Wine includes CodeWeavers' macOS TLS patches required for Steam HTTPS. Using `wine-staging` causes silent TLS failures ("Steam needs to be online to update").
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `Meridian/Engine/WineEngine.swift` | Engine detection — bundled only, no CrossOver fallback |
-| `Meridian/Engine/AppUpdateChecker.swift` | `@Observable @MainActor` app update checker |
-| `Meridian/Engine/EngineDownloader.swift` | Downloads engine tarball from latest `-engine` release |
-| `Meridian/Views/SplashView.swift` | Auto-downloads engine on first launch, then runs bootstrap |
-| `Meridian/App/MeridianApp.swift` | Injects deps; triggers background engine refresh on version change |
-| `Meridian/App/BootstrapManager.swift` | Wine prefix → Steam install → Steam start pipeline |
-| `Meridian/Models/AppSettings.swift` | `lastUpdateCheck` (rate-limit) + `lastLaunchAppVersion` (upgrade detection) |
-| `Meridian/Views/Settings/SettingsView.swift` | Updates tab — `UpdatesSettingsTab` struct |
-| `Scripts/release-engine.sh` | Packages Wine tarball + publishes engine release (Gcenx-first) |
-| `Scripts/release-app.sh` | Builds, signs, notarizes, publishes app .dmg |
-| `.github/workflows/engine-release.yml` | CI workflow — Gcenx cask on macOS runner, workflow_dispatch |
-
-## Redistribution Legality
-
-Engine releases MUST be built only from the Gcenx open-source Wine cask. CrossOver binaries are from a paid commercial product and violate CodeWeavers' EULA if redistributed publicly — even though the underlying Wine source is LGPL.
-
-| Component | Source | License | Public release OK |
-|-----------|--------|---------|:-----------------:|
-| Wine binaries | Gcenx `wine-crossover` cask (built from CodeWeavers OSS fork) | LGPL 2.1 | Yes |
-| DXMT | Gcenx cask | MIT | Yes |
-| DXVK | Gcenx cask | Zlib | Yes |
-| MoltenVK | Gcenx cask | Apache 2.0 | Yes |
-| CrossOver binaries | CrossOver.app (paid commercial product) | CodeWeavers EULA | **No — never ship** |
-
-Wine source code: https://github.com/Gcenx/wine (CodeWeavers open-source fork, compiled clean).
-
-## Tag Conventions
-
-| Tag | Asset | Picked up by |
-|-----|-------|-------------|
-| `vX.Y.Z` | `.dmg` app installer | `AppUpdateChecker` |
-| `vX.Y.Z-engine` | `.tar.gz` Wine tarball | `EngineDownloader` |
-| Anything with `-` suffix (`-base`, `-beta`, `-rc`) | — | Skipped by both |
-
-`AppUpdateChecker` only accepts tags where the version part (after stripping `v`) contains no hyphens and at least one dot.
+| `Meridian/Engine/AppUpdateChecker.swift` | `@Observable @MainActor` update checker + app DMG installer |
+| `Meridian/Engine/EngineDownloader.swift` | Downloads and extracts engine archives |
+| `Meridian/App/MeridianApp.swift` | Injects `updateChecker`; triggers background engine refresh on version change |
+| `Meridian/Models/AppSettings.swift` | `lastUpdateCheck` (rate-limit) + `lastLaunchAppVersion` + `lastPrefixEngineTag` (upgrade detection) |
+| `Meridian/Views/Settings/SettingsView.swift` | Updates tab — `UpdatesSettingsTab`, `EngineUpdateSection`, diagnostics section |
+| `Meridian/Engine/WinePrefix.swift` | `refreshSystemDLLs(engine:engineTag:)` — runs `wineboot --update` on engine version change |
+| `Scripts/release-engine.sh` | Developer script — packages Wine + embeds version file + validates all required files |
 
 ## Important Constraints
 
-- Do NOT add a CrossOver fallback back to `WineEngine.detect()`. Isolation is intentional — CrossOver's runtime state would be corrupted by Meridian's Wine usage.
-- Do NOT add separate "engine update" and "app update" buttons. The update model is intentionally unified.
-- `EngineDownloader` MUST use `/releases?per_page=20` with `-engine` tag filter — NOT `/releases/latest` (which returns the app DMG when it's newer than the engine release).
-- `AppUpdateChecker` has no external package dependencies — consistent with the rest of the codebase.
-- The rate limit for background update checks is 86,400 seconds (24 hours).
-- Engine auto-refresh only fires when `engine.isReady` is true. Fresh installs auto-download via `SplashView`.
-- Engine releases built from CrossOver binaries MUST NOT be published to public GitHub Releases (CodeWeavers EULA violation). Use Gcenx cask only.
-
-## Development Reset (clean test)
-
-```bash
-rm -rf ~/Library/Application\ Support/com.meridian.app
-defaults delete com.meridian.app
-security delete-generic-password -s "com.meridian.app" -a "meridian.steam.steamid" 2>/dev/null
-security delete-generic-password -s "com.meridian.app" -a "meridian.steam.apikey" 2>/dev/null
-```
+- Do NOT add separate "engine update" and "app update" buttons that break the unified model. They may appear separately in Settings, but both are driven by a single `checkNow()` call.
+- `AppUpdateChecker` has no external package dependencies — consistent with the rest of the codebase (`dependencies: []`).
+- The rate limit for background checks is 86,400 seconds (24 hours), stored in `AppSettings.lastUpdateCheck`.
+- Engine auto-refresh only fires when `engine.isReady` is true (engine already installed). It never interferes with a fresh install going through `EngineSetupView`.
+- After a successful engine download, ALWAYS call `updateChecker.clearEngineUpdate(newTag: engine.engineVersion)` in the `onComplete` closure to dismiss the update UI. Omitting this causes the "update available" banner to persist after installation.
+- `WinePrefix.refreshSystemDLLs()` uses only `wineboot --update` — NO app-level DLL copying fallbacks. If `wineboot --update` fails, the error surfaces clearly so the engine packaging is fixed, not masked.

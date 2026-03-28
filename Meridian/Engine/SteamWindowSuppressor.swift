@@ -3,7 +3,7 @@ import ApplicationServices
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "SteamWindowSuppressor")
+private let log = MeridianLog(category: "SteamWindowSuppressor")
 
 // C-compatible AXObserver callback — bridges to the Swift handler stored in the box.
 // Must be file-scope; Swift requires @convention(c) callables to be global.
@@ -36,10 +36,9 @@ private final class _AXCallbackBox: @unchecked Sendable {
 ///
 /// ## Process Detection
 /// Uses `NSRunningApplication.executableURL` (the actual binary path) rather than
-/// `localizedName`. CrossOver's wineloader runs steam.exe and the process registers
+/// `localizedName`. Wine's wineloader runs steam.exe and the process registers
 /// with macOS as "Steam" — the name-based filter matches zero processes. The path
-/// always contains "wineloader", "wine64", "/wine/", or "crossover" regardless of
-/// display name.
+/// always contains "wineloader", "wine64", or "/wine/" regardless of display name.
 ///
 /// ## Permission
 /// Requires a one-time Accessibility grant (System Settings → Privacy & Security →
@@ -84,6 +83,8 @@ final class SteamWindowSuppressor {
     private var pollingTimer: Timer?
     private var workspaceObserver: NSObjectProtocol?
     private var pollingTickCount: Int = 0
+    private var lastLoggedObservedCount: Int = -1
+    private var lastLoggedMatchCount: Int = -1
 
     /// Coalesces AX-driven hide sweeps so we don't hammer Steam every few ms — that
     /// fight causes Steam to restore windows repeatedly ("reopens and reopens").
@@ -174,15 +175,77 @@ final class SteamWindowSuppressor {
         suppressionActive = false
         isSuppressing = false
         log.info("[suppressor] suppression paused — game window will appear")
+        restoreAllObservedWindows()
     }
 
     /// Call before `steam.exe -activate` so the window can appear. Suppression turns
     /// back on when Meridian becomes the active app again (user finished with Steam).
+    ///
+    /// This does two things: it pauses future suppression AND it un-hides any Steam
+    /// windows that are currently minimized / positioned off-screen at (-32000,-32000).
+    /// Without the restore step, Steam windows remain invisible even after suppression
+    /// pauses, and `-activate` cannot surface them from that state.
     func allowSteamUITemporarily() {
         reengageSuppressionWhenMeridianActivates = true
         suppressionActive = false
         isSuppressing = false
-        log.info("[suppressor] paused for explicit Show Steam — will resume when Meridian activates")
+        log.info("[suppressor] paused for explicit Show Steam — restoring windows and will resume when Meridian activates")
+        restoreAllObservedWindows()
+    }
+
+    /// Reverse the hide operation for all Wine/Steam PIDs.
+    ///
+    /// Scans ALL currently-running Wine processes, not only the ones that have
+    /// active AXObserver entries. The process that owns the Steam UI window
+    /// (typically a `wine64-preloader` that was never independently registered)
+    /// may not appear in `observerEntries`, so limiting the restore to observer
+    /// keys would leave the window invisible even after suppression pauses.
+    func restoreAllObservedWindows() {
+        // Union of observer-tracked PIDs and live Wine PIDs discovered right now.
+        let observedPIDs = Set(observerEntries.keys)
+        let livePIDs = Set(currentWinePIDs())
+        let allPIDs = Array(observedPIDs.union(livePIDs))
+        log.info("[suppressor] restoreAllObservedWindows — restoring \(allPIDs.count) PID(s) (observed=\(observedPIDs.count) live=\(livePIDs.count))")
+        for pid in allPIDs { restoreWindows(for: pid) }
+    }
+
+    /// Un-minimize and reposition all windows for `pid` so they are visible on screen.
+    private func restoreWindows(for pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        var val: CFTypeRef?
+        let fetchResult = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &val)
+        guard fetchResult == .success,
+              let windows = val as? [AXUIElement], !windows.isEmpty else {
+            log.debug("[suppressor] restoreWindows pid=\(pid) — no windows (fetchResult=\(fetchResult.rawValue))")
+            return
+        }
+
+        // Place windows near the center of the main display.
+        let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1280, height: 800)
+        let targetX = screenFrame.midX - 480   // 960px wide window centered
+        let targetY = screenFrame.midY - 300   // 600px tall window centered
+        var onScreen = CGPoint(
+            x: max(screenFrame.minX + 20, targetX),
+            y: max(screenFrame.minY + 20, targetY)
+        )
+        let posValue = AXValueCreate(.cgPoint, &onScreen)
+
+        var restoredCount = 0
+        for window in windows {
+            // Step 1: Un-minimize first so the window is a real on-screen window again.
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, false as CFTypeRef)
+            // Step 2: Move to a visible position.
+            if let pos = posValue {
+                AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, pos)
+            }
+            // Step 3: Raise to the front.
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            restoredCount += 1
+        }
+
+        if restoredCount > 0 {
+            log.info("[suppressor] restored \(restoredCount) window(s) for pid=\(pid)")
+        }
     }
 
     /// Invoke from `NSApplication.didBecomeActiveNotification` for Meridian.
@@ -331,11 +394,19 @@ final class SteamWindowSuppressor {
             throttledHideAllObservedWindows()
         }
 
-        // Periodic diagnostic: log process counts every 10 ticks (~5s).
-        if pollingTickCount % 10 == 0 {
-            let allApps = NSWorkspace.shared.runningApplications
-            let matched = allApps.filter { isWineProcess($0) }
-            log.info("[suppressor] poll#\(self.pollingTickCount) — observed=\(self.observerEntries.count) Wine matches=\(matched.count)/\(allApps.count) active=\(self.suppressionActive)")
+        // Diagnostic: log process counts only when something changed or every 120 ticks (~60s).
+        // This avoids flooding the log file with no-change polls during idle sessions.
+        let allApps = NSWorkspace.shared.runningApplications
+        let matched = allApps.filter { isWineProcess($0) }
+        let observedCount = observerEntries.count
+        let matchCount    = matched.count
+        let countChanged  = observedCount != lastLoggedObservedCount || matchCount != lastLoggedMatchCount
+        let periodicDump  = pollingTickCount % 120 == 0
+
+        if countChanged || periodicDump {
+            lastLoggedObservedCount = observedCount
+            lastLoggedMatchCount    = matchCount
+            log.info("[suppressor] poll#\(self.pollingTickCount) — observed=\(observedCount) Wine matches=\(matchCount)/\(allApps.count) active=\(self.suppressionActive)")
             for app in matched {
                 log.info("[suppressor]   pid=\(app.processIdentifier) name='\(app.localizedName ?? "?")' exe='\(app.executableURL?.lastPathComponent ?? "?")'")
             }
@@ -359,10 +430,9 @@ final class SteamWindowSuppressor {
             let name = app.localizedName ?? "?"
             let exePath = app.executableURL?.path ?? ""
 
-            // Check using the same path-based filter as pollingTick.
             let lowerPath = exePath.lowercased()
             let isWine = lowerPath.contains("wineloader") || lowerPath.contains("wine64")
-                      || lowerPath.contains("/wine/") || lowerPath.contains("crossover")
+                      || lowerPath.contains("/wine/")
             guard isWine else { return }
 
             MainActor.assumeIsolated {
@@ -387,18 +457,12 @@ final class SteamWindowSuppressor {
             .map(\.processIdentifier)
     }
 
-    /// Identifies a Wine process by its executable path rather than display name.
-    ///
-    /// CrossOver's wineloader hosts Windows processes (Steam, games) which register
-    /// with macOS using the Windows app's name ("Steam", game titles, etc.), not
-    /// "wine" or "wineloader". Checking the executable path is the only reliable
-    /// way to identify Wine processes regardless of backend (CrossOver or bundled).
+    /// Identifies a Wine process by its executable path.
     private func isWineProcess(_ app: NSRunningApplication) -> Bool {
         guard let path = app.executableURL?.path.lowercased() else { return false }
         return path.contains("wineloader")
             || path.contains("wine64")
             || path.contains("/wine/")
-            || path.contains("crossover")
     }
 
     private func isProcessAlive(_ pid: pid_t) -> Bool {
@@ -424,7 +488,56 @@ final class SteamWindowSuppressor {
         hideAllObservedWindows()
     }
 
+    // MARK: - Window Classification
+
+    enum WindowClassification {
+        case essential   // Must be shown: install dialogs, EULAs, updates, Steam Guard
+        case suppressible // Main Steam UI: store, library, friends, community
+        case unknown     // No title or unrecognized — suppress by default
+    }
+
+    private static let essentialTitlePatterns: [String] = [
+        "install", "uninstall", "update", "updating",
+        "eula", "license", "agreement",
+        "steam guard", "verification", "confirm", "warning", "error",
+        "sign in", "log in", "login", "activate", "redeem",
+        "extracting", "validating", "downloading", "preparing", "completing",
+        "first-time setup", "setup", "requires restart",
+    ]
+
+    private static let suppressibleTitlePatterns: [String] = [
+        "friends", "community", "store", "news", "screenshot",
+        "chat", "voice", "broadcast", "music player",
+    ]
+
+    private func classifyWindow(_ window: AXUIElement) -> WindowClassification {
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+        guard let title = titleRef as? String, !title.isEmpty else {
+            return .unknown
+        }
+
+        let lower = title.lowercased()
+
+        for pattern in Self.essentialTitlePatterns {
+            if lower.contains(pattern) { return .essential }
+        }
+
+        for pattern in Self.suppressibleTitlePatterns {
+            if lower.contains(pattern) { return .suppressible }
+        }
+
+        // "Steam" alone is the main client window — suppress it.
+        // But "Steam - Installing..." or similar should be essential.
+        if lower == "steam" || lower == "steam client" {
+            return .suppressible
+        }
+
+        return .unknown
+    }
+
     /// Two-step hide: move off-screen first (instant, no animation), then minimize.
+    /// Essential windows (install dialogs, EULAs, Steam Guard, etc.) are allowed through.
     private func hideWindows(for pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         var val: CFTypeRef?
@@ -441,23 +554,28 @@ final class SteamWindowSuppressor {
         let posValue = AXValueCreate(.cgPoint, &offScreen)
 
         var hiddenCount = 0
+        var allowedCount = 0
         for window in windows {
-            // Step 1: Move off-screen instantly — no animation, user never sees it.
+            let classification = classifyWindow(window)
+            if classification == .essential {
+                allowedCount += 1
+                continue
+            }
+
             if let pos = posValue {
                 let posResult = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, pos)
                 if posResult != .success {
                     log.debug("[suppressor] kAXPositionAttribute set failed pid=\(pid) code=\(posResult.rawValue)")
                 }
             }
-            // Step 2: Minimize — keeps it hidden if Steam repositions it.
             let minResult = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, true as CFTypeRef)
             if minResult != .success {
                 log.debug("[suppressor] kAXMinimizedAttribute set failed pid=\(pid) code=\(minResult.rawValue)")
             }
             hiddenCount += 1
         }
-        if hiddenCount > 0 {
-            log.info("[suppressor] hid \(hiddenCount) window(s) for pid=\(pid)")
+        if hiddenCount > 0 || allowedCount > 0 {
+            log.info("[suppressor] pid=\(pid): hid \(hiddenCount), allowed \(allowedCount) essential window(s)")
         }
     }
 }

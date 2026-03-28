@@ -15,5 +15,10 @@ let package = Package(
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
+        .testTarget(
+            name: "MeridianTests",
+            dependencies: [],
+            path: "MeridianTests"
+        ),
     ]
 )

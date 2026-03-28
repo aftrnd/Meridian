@@ -3,7 +3,7 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "GameLauncher")
+private let log = MeridianLog(category: "GameLauncher")
 
 /// Orchestrates game launches via Wine + Steam.
 ///
@@ -25,7 +25,8 @@ final class GameLauncher {
         case preparingEngine
         case preparingPrefix
         case bootstrappingSteam
-        case installing   // waiting for Steam to download + write the ACF manifest
+        case awaitingInstallConfirmation // Steam dialog visible; waiting for user to confirm
+        case installing   // ACF confirmed on disk; waiting for full download (StateFlags == 4)
         case launching
         case running(appID: Int)
         case stopping(appID: Int)
@@ -80,7 +81,7 @@ final class GameLauncher {
     ) async {
         switch launchState {
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .installing, .launching, .stopping, .uninstalling:
+             .awaitingInstallConfirmation, .installing, .launching, .stopping, .uninstalling:
             log.warning("[launch] ignoring — already in state \(String(describing: self.launchState))")
             return
         case .running:
@@ -108,9 +109,9 @@ final class GameLauncher {
         launchTask?.cancel()
         launchTask = nil
 
+        steamManager.gameIsRunning = false
         await cleanupProcesses(engine: engine, steamManager: steamManager)
 
-        // Re-engage suppression in case it was paused for a game that never completed.
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }
@@ -139,13 +140,13 @@ final class GameLauncher {
         log.info("[stopGame] stopping appID=\(appID)")
         launchState = .stopping(appID: appID)
         currentActivity = "Stopping game..."
+        steamManager.gameIsRunning = false
         await gameProcess.stopGame(engine: engine, prefix: prefix)
         runningSince = nil
         pipelineStartDate = nil
         processesConfirmed = false
         launchState = .exited(appID: appID)
         currentActivity = nil
-        // Re-engage suppression so Steam cannot surface its window after game exit.
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }
@@ -271,11 +272,11 @@ final class GameLauncher {
             do {
                 try await steamManager.startPersistent(engine: engine, prefix: prefix)
                 try await steamManager.waitUntilReady(prefix: prefix)
+                steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
             } catch {
                 fail("Failed to restart Steam: \(error.localizedDescription)", error: error)
                 return
             }
-            // Re-engage suppression for the new Steam PID.
             if let pid = steamManager.persistentProcessIdentifier {
                 windowSuppressor?.resumeSuppressing(pid: pid)
             }
@@ -285,37 +286,119 @@ final class GameLauncher {
 
         guard !Task.isCancelled else { return }
 
-        // If the game isn't installed yet, queue a silent install and wait for
-        // Steam to write the ACF manifest before proceeding to launch.
+        // If the game isn't installed yet, surface Steam's install dialog for the user
+        // to confirm, then wait for the full download to complete.
         if !prefix.isGameInstalled(appID: game.id) {
-            // Suppression is already active from bootstrap; the AXObserver will
-            // minimize Steam's download progress window the moment it appears.
-            transition(to: .installing, activity: "Installing \(game.name)…")
-            appendLog("Queuing silent install for appID=\(game.id)")
+            // Ensure both steam.cfg (SteamNoSandbox=1) and libraryfolders.vdf are present.
+            // steam.cfg fixes the webhelper crash so Steam has a UI to render the install
+            // dialog. libraryfolders.vdf ensures Steam auto-selects a library rather than
+            // showing a hidden location picker.
+            try? prefix.ensureSteamCFG()
+            try? prefix.ensureDefaultLibrary()
+
+            // Phase 1: pause suppression so the Steam install dialog is visible.
+            // `installGame` sends -activate then steam://install/<appID>, both of which
+            // go through regular IPC (not the Steam Service). While suppressionActive=true
+            // the dialog would be hidden the instant it appears — we must pause suppression
+            // BEFORE dispatching the install URL.
+            windowSuppressor?.stopSuppressingNewWindows()
+            transition(to: .awaitingInstallConfirmation,
+                       activity: "Confirm installation in Steam…")
+            appendLog("Paused suppression — Steam will show install dialog for appID=\(game.id)")
+
             do {
                 try await steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
             } catch {
+                // Re-engage suppression before failing so Steam windows don't remain visible.
+                if let pid = steamManager.persistentProcessIdentifier {
+                    windowSuppressor?.resumeSuppressing(pid: pid)
+                }
                 fail("Failed to queue install: \(error.localizedDescription)", error: error)
                 return
             }
 
-            // Poll for appmanifest_<appID>.acf — Steam writes it when the game is ready.
-            // The AXObserver on the suppressor handles any new windows during this wait.
-            // 4-hour hard cap; user can always Cancel.
-            let installDeadline = ContinuousClock.now + .seconds(4 * 3600)
+            // Poll for the ACF to appear — Steam writes it when the user clicks Install.
+            // 10-minute cap: if the user hasn't confirmed in 10 min they probably missed it.
+            let confirmDeadline = ContinuousClock.now + .seconds(600)
+            let confirmStart = ContinuousClock.now
+            var emittedConfirmHint = false
+
             while !prefix.isGameInstalled(appID: game.id) {
+                guard !Task.isCancelled else {
+                    if let pid = steamManager.persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
+                    }
+                    return
+                }
+                guard ContinuousClock.now < confirmDeadline else {
+                    if let pid = steamManager.persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
+                    }
+                    fail("Install dialog not confirmed within 10 minutes. Click Install in the Steam window to continue.")
+                    return
+                }
+
+                let elapsed = ContinuousClock.now - confirmStart
+                if elapsed >= .seconds(120) && !emittedConfirmHint {
+                    emittedConfirmHint = true
+                    appendLog("Still waiting — look for a Steam install dialog and click Install.")
+                    log.warning("[launch] confirm stalled — elapsed=2min appID=\(game.id)")
+                }
+
+                try? await Task.sleep(for: .seconds(2))
+            }
+
+            // ACF created — user confirmed. Re-engage suppression for the download phase.
+            if let pid = steamManager.persistentProcessIdentifier {
+                windowSuppressor?.resumeSuppressing(pid: pid)
+            }
+            transition(to: .installing, activity: "Downloading \(game.name)…")
+            appendLog("Install confirmed — ACF found, suppression re-engaged, waiting for download")
+
+            // Phase 2: wait for full download (StateFlags == 4 in the ACF).
+            let installDeadline = ContinuousClock.now + .seconds(4 * 3600)
+            let installStart = ContinuousClock.now
+            var lastLoggedProgress: Int64 = -1
+
+            while !prefix.isGameFullyInstalled(appID: game.id) {
                 guard !Task.isCancelled else { return }
                 guard ContinuousClock.now < installDeadline else {
-                    fail("Installation timed out. Check the Steam client for progress details.")
+                    fail("Installation timed out after 4 hours. Check the Steam client for progress details.")
                     return
                 }
                 try? await Task.sleep(for: .seconds(3))
+
+                let elapsed = ContinuousClock.now - installStart
+                let elapsedSec = Int(elapsed.components.seconds)
+
+                if let progress = prefix.gameDownloadProgress(appID: game.id) {
+                    let pct = progress.total > 0
+                        ? Int(Double(progress.downloaded) / Double(progress.total) * 100)
+                        : 0
+                    // Log download progress every ~10% change or every 30s
+                    let progressMB = progress.downloaded / (1024 * 1024)
+                    if progressMB != lastLoggedProgress && (progressMB - lastLoggedProgress > 50 || elapsedSec % 30 < 4) {
+                        lastLoggedProgress = progressMB
+                        let totalMB = progress.total / (1024 * 1024)
+                        log.info("[launch] download progress appID=\(game.id): \(progressMB)MB/\(totalMB)MB (\(pct)%) StateFlags=\(progress.stateFlags) elapsed=\(elapsedSec)s")
+                        if progress.total > 0 {
+                            currentActivity = "Downloading \(game.name)… \(pct)%"
+                        }
+                    }
+                } else if elapsedSec > 120 && elapsedSec % 60 < 4 {
+                    log.warning("[launch] ACF not readable during install polling — elapsed=\(elapsedSec)s appID=\(game.id)")
+                    appendLog("Download is taking a while. Steam may be updating or allocating disk space.")
+                }
             }
-            appendLog("Game installed — ACF manifest found")
+
+            appendLog("Download complete — StateFlags=4 confirmed")
             library?.setInstalled(true, for: game.id)
         }
 
         guard !Task.isCancelled else { return }
+
+        // Tell the health monitor to defer restarts while the game is active.
+        steamManager.gameIsRunning = true
 
         // Send steam.exe -applaunch — stays in .launching until processes confirmed
         transition(to: .launching, activity: "Launching \(game.name)…")
@@ -388,8 +471,9 @@ final class GameLauncher {
             return
         }
 
-        // Game has exited — re-engage suppression so Steam cannot surface its
-        // window when it detects the game process exiting.
+        // Game has exited — allow health monitor restarts again and re-engage
+        // suppression so Steam cannot surface its window on game exit.
+        steamManager.gameIsRunning = false
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }

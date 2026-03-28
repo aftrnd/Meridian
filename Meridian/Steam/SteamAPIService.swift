@@ -1,7 +1,7 @@
 import Foundation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "SteamAPI")
+private let log = MeridianLog(category: "SteamAPI")
 
 /// Direct Steam Web API client.
 ///
@@ -406,9 +406,29 @@ actor SteamAPIService {
               let resp  = json["response"] as? [String: Any],
               let items = resp["store_items"] as? [[String: Any]] else { return [:] }
 
+        // Log the first item's raw shape on every call to make API format changes visible.
+        if let firstItem = items.first {
+            let keys = firstItem.keys.sorted().joined(separator: ", ")
+            log.debug("[extractHashesFromRaw] first item keys: [\(keys)]")
+            if let assets = firstItem["assets"] as? [String: Any] {
+                let assetKeys = assets.keys.sorted().joined(separator: ", ")
+                log.debug("[extractHashesFromRaw] first item assets keys: [\(assetKeys)]")
+                // Log every string value inside assets so we can see the path format.
+                for (k, v) in assets {
+                    if let str = v as? String { log.debug("[extractHashesFromRaw]   assets.\(k)=\(str)") }
+                }
+            }
+        }
+
         var out: [Int: GameCDNHashes] = [:]
         for item in items {
-            guard let appID = (item["appid"] as? Int) ?? (item["id"] as? Int) else { continue }
+            // Steam may return appid/id as Int or as a JSON string; try both.
+            let appID: Int? = (item["appid"] as? Int)
+                ?? (item["id"] as? Int)
+                ?? (item["appid"] as? String).flatMap(Int.init)
+                ?? (item["id"] as? String).flatMap(Int.init)
+            guard let appID else { continue }
+
             let target: Any = (item["assets"] as? [String: Any]) ?? item
             // Eagerly compute both capsule naming variants before combining with ??
             // so `target` (non-Sendable Any) is not captured lazily across the operator.
@@ -610,10 +630,18 @@ private struct StoreBrowseAssets: Decodable {
         return nil
     }
 
+    /// Scans ALL path components for a 40-char lowercase hex SHA-1 content hash.
+    ///
+    /// Steam's new CDN returns asset paths in the form:
+    ///   store_item_assets/steam/apps/{appid}/{HASH}/library_600x900.jpg
+    /// The hash is a middle component — checking only `parts.first` always fails
+    /// for any path that includes a prefix before the hash segment.
     private func extractHash(from path: String) -> String? {
         let parts = path.components(separatedBy: "/")
-        if let hash = parts.first, hash.count == 40, hash.allSatisfy(\.isHexDigit) {
-            return hash
+        for part in parts {
+            if part.count == 40, part.allSatisfy(\.isHexDigit) {
+                return part
+            }
         }
         return nil
     }

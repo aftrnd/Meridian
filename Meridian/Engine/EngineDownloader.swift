@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "EngineDownloader")
+private let log = MeridianLog(category: "EngineDownloader")
 
 /// Downloads and installs a pre-built Wine + DXMT engine from GitHub Releases.
 ///
@@ -10,7 +10,7 @@ private let log = Logger(subsystem: "com.meridian.app", category: "EngineDownloa
 ///   - `bin/wine64`, `bin/wineserver`
 ///   - `lib/wine/`, `lib/dxmt/`, `lib/dxvk/` (optional)
 ///
-/// Wine (LGPL), DXMT (MIT), DXVK (Zlib), MoltenVK (Apache 2.0)
+/// Wine (LGPL), DXMT (open source), DXVK (open source), MoltenVK (Apache 2.0)
 /// are all freely redistributable open-source components.
 @Observable
 @MainActor
@@ -61,13 +61,13 @@ final class EngineDownloader {
         log.info("[cancel] download cancelled")
     }
 
-    // MARK: - Pipeline
+    // MARK: - Private
 
     private func executeDownload(onComplete: @escaping () -> Void) async {
         let repoSlug = settings.engineRepoSlug
 
         state = .fetching
-        log.info("[download] fetching latest engine release from \(repoSlug)")
+        log.info("[download] fetching latest release from \(repoSlug)")
 
         do {
             let asset = try await fetchLatestAsset(repoSlug: repoSlug)
@@ -112,10 +112,9 @@ final class EngineDownloader {
     }
 
     private func fetchLatestAsset(repoSlug: String) async throws -> ReleaseAsset {
-        // Use the releases list (not /releases/latest) so we can filter specifically
-        // for engine-tagged releases. GitHub's "latest" endpoint resolves to the
-        // most-recently-published release regardless of tag, which may be an app
-        // DMG release with no tarball asset when an app release follows an engine release.
+        // Use the paginated releases list so we can filter by the -engine tag suffix.
+        // /releases/latest returns whatever GitHub marks as "latest" which may be an
+        // app release or base image with no engine tarball.
         let urlString = "https://api.github.com/repos/\(repoSlug)/releases?per_page=20"
         guard let url = URL(string: urlString) else {
             throw DownloadError.badURL(urlString)
@@ -139,46 +138,38 @@ final class EngineDownloader {
             throw DownloadError.parseError("Could not parse releases JSON")
         }
 
-        log.info("[fetchLatestAsset] received \(releases.count) release(s)")
+        log.info("[fetchLatestAsset] fetched \(releases.count) release(s)")
 
-        // Iterate newest-first (GitHub default). Pick the first release whose tag
-        // contains "-engine" — these are engine snapshots, not app releases.
+        // Walk releases in order (newest first) and find the latest -engine tagged release
+        // that has a .tar.gz or .tar.xz asset attached.
         for release in releases {
-            guard
-                let tagName = release["tag_name"] as? String,
-                tagName.contains("-engine"),
-                let assets = release["assets"] as? [[String: Any]]
-            else { continue }
+            let tagName = release["tag_name"] as? String ?? ""
+            let isDraft = release["draft"] as? Bool ?? false
+            let isPrerelease = release["prerelease"] as? Bool ?? false
 
-            if let isDraft = release["draft"] as? Bool, isDraft { continue }
+            guard tagName.hasSuffix("-engine"), !isDraft, !isPrerelease else { continue }
+            guard let assets = release["assets"] as? [[String: Any]] else { continue }
 
-            log.info("[fetchLatestAsset] engine release: \(tagName), \(assets.count) asset(s)")
+            log.info("[fetchLatestAsset] checking engine release: \(tagName), \(assets.count) asset(s)")
 
             for asset in assets {
-                guard
-                    let name = asset["name"] as? String,
-                    let downloadURL = asset["browser_download_url"] as? String,
-                    let size = asset["size"] as? Int64
-                else { continue }
+                guard let name = asset["name"] as? String,
+                      let downloadURL = asset["browser_download_url"] as? String,
+                      let size = asset["size"] as? Int64 else { continue }
 
                 if name.hasSuffix(".tar.gz") || name.hasSuffix(".tar.xz") {
-                    log.info("[fetchLatestAsset] matched: \(name) (\(size) bytes)")
+                    log.info("[fetchLatestAsset] matched: \(name) from \(tagName)")
                     return ReleaseAsset(name: name, downloadURL: downloadURL, size: size)
                 }
             }
 
-            log.warning("[fetchLatestAsset] engine release \(tagName) has no .tar.gz/.tar.xz asset")
+            log.warning("[fetchLatestAsset] engine release \(tagName) has no .tar.gz asset — skipping")
         }
 
         throw DownloadError.noAssetFound("No engine release with a .tar.gz asset found in \(repoSlug)")
     }
 
     // MARK: - Download
-    //
-    // Uses URLSessionDownloadTask + delegate so the OS networking stack handles
-    // the transfer at full speed. The old URLSession.bytes(from:) approach iterated
-    // one byte at a time through an async loop (133M suspensions for a 127 MB file),
-    // which throttled real-world throughput to ~200 KB/s regardless of bandwidth.
 
     private func downloadAsset(_ asset: ReleaseAsset) async throws -> URL {
         guard let url = URL(string: asset.downloadURL) else {
@@ -192,34 +183,45 @@ final class EngineDownloader {
         let destPath = FileManager.default.temporaryDirectory.appending(path: asset.name)
         try? FileManager.default.removeItem(at: destPath)
 
-        log.info("[downloadAsset] starting URLSessionDownloadTask → \(destPath.lastPathComponent)")
-
-        return try await withCheckedThrowingContinuation { continuation in
-            let delegate = DownloadProgressDelegate(
-                expectedBytes: asset.size,
-                destination: destPath,
-                onProgress: { [weak self] received, total in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.downloadedBytes = received
-                        self.totalBytes = max(total, self.totalBytes)
-                        let progress = total > 0 ? Double(received) / Double(total) : 0
-                        self.state = .downloading(progress: min(progress, 1.0))
-                    }
-                },
-                continuation: continuation
-            )
-
-            let session = URLSession(
-                configuration: .default,
-                delegate: delegate,
-                delegateQueue: nil   // URLSession manages its own background queue
-            )
-            let task = session.downloadTask(with: url)
-            delegate.sessionRef = session  // Keep session alive until delegate fires
-            task.resume()
-            log.info("[downloadAsset] task resumed")
+        // Use URLSession.downloadTask which downloads natively at full network speed,
+        // writing directly to disk via OS-level buffering. The previous approach
+        // (URLSession.bytes + for-await-byte loop) iterated one byte at a time through
+        // Swift's async runtime, bottlenecking a 300MB file to ~1 MB/s regardless of
+        // connection speed.
+        let delegate = DownloadTaskDelegate { [weak self] totalWritten, totalExpected in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.downloadedBytes = totalWritten
+                let total = totalExpected > 0 ? totalExpected : self.totalBytes
+                let progress = total > 0 ? Double(totalWritten) / Double(total) : 0
+                self.state = .downloading(progress: min(progress, 1.0))
+            }
         }
+
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+
+        let tempURL = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+                delegate.continuation = cont
+                session.downloadTask(with: url).resume()
+            }
+        } onCancel: {
+            session.invalidateAndCancel()
+        }
+
+        session.finishTasksAndInvalidate()
+
+        // Move the temp file URLSession created to our chosen destination path.
+        do {
+            try? FileManager.default.removeItem(at: destPath)
+            try FileManager.default.moveItem(at: tempURL, to: destPath)
+        } catch {
+            throw DownloadError.networkError("Failed to save download: \(error.localizedDescription)")
+        }
+
+        log.info("[downloadAsset] downloaded \(self.downloadedBytes) bytes to \(destPath.path(percentEncoded: false))")
+        state = .downloading(progress: 1.0)
+        return destPath
     }
 
     // MARK: - Extraction
@@ -291,77 +293,69 @@ final class EngineDownloader {
     }
 }
 
-// MARK: - Download progress delegate
+// MARK: - Download delegate
 
-/// Bridges URLSessionDownloadTask callbacks into a Swift checked continuation.
-/// All delegate methods are called on URLSession's internal serial queue, so
-/// the `resumed` guard is sufficient to prevent double-continuation-resume.
-private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+/// URLSession delegate that receives native OS download progress callbacks and
+/// bridges the final result back into Swift structured concurrency via a continuation.
+private final class DownloadTaskDelegate: NSObject, URLSessionDownloadDelegate {
 
-    private let expectedBytes: Int64
-    private let destination: URL
-    private let onProgress: (Int64, Int64) -> Void
-    private var continuation: CheckedContinuation<URL, Error>?
-    private var resumed = false
+    nonisolated(unsafe) var continuation: CheckedContinuation<URL, Error>?
+    // nonisolated(unsafe): closure is set once at init and only called from URLSession
+    // delegate queue callbacks — no concurrent mutation.
+    nonisolated(unsafe) private let onProgress: (Int64, Int64) -> Void
 
-    /// Held strongly so the session (and delegate) survive until the transfer completes.
-    var sessionRef: URLSession?
-
-    init(
-        expectedBytes: Int64,
-        destination: URL,
-        onProgress: @escaping (Int64, Int64) -> Void,
-        continuation: CheckedContinuation<URL, Error>
-    ) {
-        self.expectedBytes = expectedBytes
-        self.destination = destination
+    init(onProgress: @escaping (Int64, Int64) -> Void) {
         self.onProgress = onProgress
-        self.continuation = continuation
     }
 
-    // Progress updates — called frequently on the session queue.
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
-        didWriteData _: Int64,
+        didWriteData bytesWritten: Int64,
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
-        onProgress(totalBytesWritten, total)
+        onProgress(totalBytesWritten, totalBytesExpectedToWrite)
     }
 
-    // Download complete — move temp file then resume the continuation.
     func urlSession(
         _ session: URLSession,
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
+        // location is only valid until this method returns, so copy it to a stable temp path.
+        let stable = FileManager.default.temporaryDirectory
+            .appending(path: "meridian-dl-\(UUID().uuidString).tmp")
         do {
-            // location is only valid inside this callback; move it immediately.
-            if FileManager.default.fileExists(atPath: destination.path(percentEncoded: false)) {
-                try FileManager.default.removeItem(at: destination)
-            }
-            try FileManager.default.moveItem(at: location, to: destination)
-            resume(with: .success(destination))
+            try FileManager.default.moveItem(at: location, to: stable)
+            continuation?.resume(returning: stable)
         } catch {
-            resume(with: .failure(error))
+            continuation?.resume(throwing: error)
         }
-    }
-
-    // Called after didFinishDownloadingTo (error == nil) or on failure (error != nil).
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error {
-            resume(with: .failure(error))
-        }
-        sessionRef?.finishTasksAndInvalidate()
-        sessionRef = nil
-    }
-
-    private func resume(with result: Result<URL, Error>) {
-        guard !resumed else { return }
-        resumed = true
-        continuation?.resume(with: result)
         continuation = nil
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        guard let error else { return }
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
+}
+
+// MARK: - Architecture helper
+
+private extension ProcessInfo {
+    var machineArchitecture: String {
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        return withUnsafePointer(to: &sysinfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+                String(cString: $0)
+            }
+        }
     }
 }

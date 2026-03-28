@@ -2,7 +2,7 @@ import Observation
 import Foundation
 import os.log
 
-private let log = Logger(subsystem: "com.meridian.app", category: "SteamLibrary")
+private let log = MeridianLog(category: "SteamLibrary")
 
 /// Owns the fetched game list and drives search/filter/sort.
 @Observable
@@ -116,27 +116,12 @@ final class SteamLibraryStore {
             try? await Task.sleep(for: .seconds(1))
         }
 
-        // Pass 2: individually retry any game that the batch pass missed.
-        // The Steam API occasionally drops items from batched responses; single-item
-        // calls are more reliable for edge cases. Capped at 100 retries to avoid
-        // excessive API traffic for large libraries where most games use the legacy CDN.
-        let missing = games.filter { $0.libraryCapsuleHash == nil }.map(\.id)
-        if !missing.isEmpty {
-            log.info("[prefetchLibraryCapsuleHashes] retrying \(min(missing.count, 100)) games individually")
-            for appID in missing.prefix(100) {
-                let hashes = await SteamAPIService.shared.fetchLibraryCapsuleHashes(
-                    appIDs: [appID], apiKey: apiKey
-                )
-                applyHashes(hashes)
-                try? await Task.sleep(for: .milliseconds(300))
-            }
-        }
+        let resolvedCount = games.filter { $0.libraryCapsuleHash != nil }.count
+        log.info("[prefetchLibraryCapsuleHashes] batch pass resolved \(resolvedCount)/\(appIDs.count) hashes — games without hashes use legacy CDN fallback")
 
-        // Pass 3: for recently-played games that still lack a logo hash, run the
-        // targeted appdetails probe. Previously gated on libraryCapsuleHash != nil,
-        // which meant a game with no capsule hash was never probed for its logo either.
-        // Also previously capped at 3; now covers all recently played games so the
-        // hero carousel always has logo art regardless of library position.
+        // Pass 2: for recently-played games that still lack a logo hash, run the
+        // targeted appdetails probe. Covers all recently played games so the hero
+        // carousel always has logo art regardless of library position.
         let logoMissing = recentlyPlayedGames
             .filter { $0.logoHash == nil }
             .map(\.id)
@@ -155,7 +140,7 @@ final class SteamLibraryStore {
             }
         }
 
-        // Pass 4: recently-played games still missing a 600x900 capsule hash after
+        // Pass 3: recently-played games still missing a 600x900 capsule hash after
         // passes 1 & 2 (e.g. very new games the batch call missed). Probe individually.
         let capsuleMissing = recentlyPlayedGames
             .filter { $0.libraryCapsuleHash == nil }

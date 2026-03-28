@@ -5,12 +5,14 @@ struct HomeView: View {
     @Environment(SteamLibraryStore.self) private var library
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(GameLauncher.self) private var launcher
+    @Environment(AppUpdateChecker.self) private var updateChecker
     @Binding var selectedGame: Game?
 
     @Environment(\.controlActiveState) private var controlActiveState
 
     @State private var carouselIndex: Int = 0
     @State private var carouselTimer: Timer?
+    @State private var updateBannerDismissed = false
     /// Measured on homeContent so all fixed-position elements share the same
     /// leading inset as the GameScrollRow section titles and cards.
     @State private var contentWidth: CGFloat = 0
@@ -40,6 +42,15 @@ struct HomeView: View {
         .onChange(of: library.games.count) { _, _ in
             restartCarouselTimer()
         }
+        .onChange(of: updateBannerKey) { _, _ in
+            updateBannerDismissed = false
+        }
+    }
+
+    /// Stable key that changes only when the set of available updates changes,
+    /// used to reset the dismissed state so the card re-appears for new versions.
+    private var updateBannerKey: String {
+        "\(updateChecker.availableVersion ?? "")-\(updateChecker.availableEngineTag ?? "")"
     }
 
     // MARK: - Content
@@ -49,6 +60,22 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: Self.sectionSpacing) {
                 if !carouselGames.isEmpty {
                     heroCarousel
+                }
+
+                // Inline update notification — sits naturally within the scroll flow
+                // at the top of the content area, below the hero carousel.
+                if (updateChecker.hasUpdate || updateChecker.hasEngineUpdate) && !updateBannerDismissed {
+                    UpdateAvailableBanner(
+                        message: updateBannerMessage,
+                        onDismiss: { updateBannerDismissed = true },
+                        onViewUpdate: {
+                            updateBannerDismissed = true
+                            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                        }
+                    )
+                    .padding(.horizontal, leadingInset)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .animation(.spring(duration: 0.35), value: updateChecker.hasUpdate || updateChecker.hasEngineUpdate)
                 }
 
                 if !library.recentlyPlayedGames.isEmpty {
@@ -86,6 +113,24 @@ struct HomeView: View {
         .ignoresSafeArea(edges: [.top, .bottom])
         .scrollIndicators(.hidden)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+    }
+
+    // MARK: - Update Banner
+
+    private var updateBannerMessage: String {
+        if updateChecker.hasUpdate, let v = updateChecker.availableVersion {
+            let clean = v.hasPrefix("v") ? String(v.dropFirst()) : v
+            if updateChecker.hasEngineUpdate {
+                return "Meridian \(clean) + a new Wine engine are available."
+            }
+            return "Meridian \(clean) is available."
+        }
+        if updateChecker.hasEngineUpdate, let e = updateChecker.availableEngineTag {
+            var clean = e.hasPrefix("v") ? String(e.dropFirst()) : e
+            if clean.hasSuffix("-engine") { clean = String(clean.dropLast(7)) }
+            return "Wine Engine \(clean) is available."
+        }
+        return "An update is available."
     }
 
     // MARK: - Loading
@@ -293,7 +338,8 @@ struct HomeView: View {
             return game.isInstalled ? .idle : .notInstalled
         }
         switch launcher.launchState {
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching:
+        case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
+             .awaitingInstallConfirmation, .installing, .launching:
             return .launching
         case .running:
             return .running
@@ -703,5 +749,6 @@ private struct FriendCard: View {
         .environment(SteamAuthService())
         .environment(SteamLibraryStore())
         .environment(GameLauncher())
+        .environment(AppUpdateChecker())
         .frame(width: 900, height: 800)
 }

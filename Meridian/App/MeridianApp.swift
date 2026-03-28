@@ -15,7 +15,7 @@ struct MeridianApp: App {
     @State private var categories        = CategoryStore()
     @State private var suppressor        = SteamWindowSuppressor()
     @State private var updateChecker     = AppUpdateChecker()
-    @State private var engineRefresher   = EngineDownloader()
+    @State private var engineDownloader  = EngineDownloader()
 
     private let settings = AppSettings.shared
 
@@ -23,10 +23,12 @@ struct MeridianApp: App {
         // Wire cross-object dependencies. These assignments are idempotent —
         // they run on every body evaluation but always set the same references.
         let _ = {
-            bootstrap.windowSuppressor = suppressor
-            launcher.windowSuppressor  = suppressor
+            bootstrap.windowSuppressor    = suppressor
+            launcher.windowSuppressor     = suppressor
             steamManager.windowSuppressor = suppressor
-            appDelegate.suppressor     = suppressor
+            appDelegate.suppressor        = suppressor
+            appDelegate.steamManager      = steamManager
+            appDelegate.bootstrap         = bootstrap
         }()
 
         WindowGroup {
@@ -41,6 +43,7 @@ struct MeridianApp: App {
                 .environment(categories)
                 .environment(suppressor)
                 .environment(updateChecker)
+                .environment(engineDownloader)
                 // Refresh permission state when Meridian becomes active (user may
                 // have just granted Accessibility access in System Preferences).
                 .onReceive(NotificationCenter.default.publisher(
@@ -52,17 +55,24 @@ struct MeridianApp: App {
                     )
                 }
                 .task {
+                    // Tell the update checker which engine is installed so it can
+                    // compare against the latest engine release on GitHub.
+                    updateChecker.installedEngineTag = engine.engineVersion
+
                     // Rate-limited background update check (once per 24 hours).
                     updateChecker.checkIfStale()
 
                     // Silently refresh the Wine engine when the app version changes.
-                    // Only runs when the engine is already installed; fresh installs
-                    // download the engine automatically via SplashView on first launch.
+                    // Only runs when the engine is already installed, so it never
+                    // interferes with a fresh bootstrap.
                     let current = AppUpdateChecker.currentVersion
                     let previous = settings.lastLaunchAppVersion
                     settings.lastLaunchAppVersion = current
                     if !previous.isEmpty && previous != current && engine.isReady {
-                        engineRefresher.download { engine.detect() }
+                        engineDownloader.download {
+                            engine.detect()
+                            updateChecker.clearEngineUpdate(newTag: engine.engineVersion)
+                        }
                     }
                 }
         }
@@ -92,6 +102,8 @@ struct MeridianApp: App {
                 .environment(library)
                 .environment(suppressor)
                 .environment(updateChecker)
+                .environment(engineDownloader)
+                .environment(steamManager)
         }
     }
 }
