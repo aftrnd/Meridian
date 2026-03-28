@@ -290,30 +290,29 @@ final class GameLauncher {
         // to confirm, then wait for the full download to complete.
         if !prefix.isGameInstalled(appID: game.id) {
             // Ensure both steam.cfg (SteamNoSandbox=1) and libraryfolders.vdf are present.
-            // steam.cfg fixes the webhelper crash so Steam has a UI to render the install
-            // dialog. libraryfolders.vdf ensures Steam auto-selects a library rather than
-            // showing a hidden location picker.
+            // steam.cfg enables the webhelper to start. libraryfolders.vdf ensures Steam
+            // auto-selects a library rather than showing a hidden location picker.
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
 
-            // Phase 1: pause suppression so the Steam install dialog is visible.
-            // `installGame` sends -activate then steam://install/<appID>, both of which
-            // go through regular IPC (not the Steam Service). While suppressionActive=true
-            // the dialog would be hidden the instant it appears — we must pause suppression
-            // BEFORE dispatching the install URL.
+            // Phase 1: pause suppression and dispatch the install URL via IPC to the
+            // running persistent Steam. Persistent Steam stays alive — no kill/restart.
+            //
+            // installGameVisible waits for steamwebhelper.exe to appear before sending
+            // the URL so Steam's CEF UI layer is ready to render the install dialog.
             windowSuppressor?.stopSuppressingNewWindows()
             transition(to: .awaitingInstallConfirmation,
                        activity: "Confirm installation in Steam…")
             appendLog("Paused suppression — Steam will show install dialog for appID=\(game.id)")
 
             do {
-                try await steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
+                try await steamManager.installGameVisible(appID: game.id, engine: engine, prefix: prefix)
             } catch {
                 // Re-engage suppression before failing so Steam windows don't remain visible.
                 if let pid = steamManager.persistentProcessIdentifier {
                     windowSuppressor?.resumeSuppressing(pid: pid)
                 }
-                fail("Failed to queue install: \(error.localizedDescription)", error: error)
+                fail("Failed to dispatch install command: \(error.localizedDescription)", error: error)
                 return
             }
 
@@ -348,12 +347,17 @@ final class GameLauncher {
                 try? await Task.sleep(for: .seconds(2))
             }
 
-            // ACF created — user confirmed. Re-engage suppression for the download phase.
+            // ACF confirmed — user clicked Install. Persistent Steam is still alive
+            // (it was never killed). Re-engage suppression and move to download phase.
+            appendLog("Install confirmed — ACF found, monitoring download")
+            log.info("[launch] install confirmed for appID=\(game.id) — persistent Steam still running")
+
             if let pid = steamManager.persistentProcessIdentifier {
                 windowSuppressor?.resumeSuppressing(pid: pid)
             }
+
             transition(to: .installing, activity: "Downloading \(game.name)…")
-            appendLog("Install confirmed — ACF found, suppression re-engaged, waiting for download")
+            appendLog("Install confirmed — suppression re-engaged, waiting for download")
 
             // Phase 2: wait for full download (StateFlags == 4 in the ACF).
             let installDeadline = ContinuousClock.now + .seconds(4 * 3600)

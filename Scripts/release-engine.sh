@@ -14,16 +14,17 @@
 #   - curl (standard on macOS)
 #
 # What it does:
-#   1. Downloads Wine 11 from Gcenx/macOS_Wine_builds (latest stable staging)
+#   1. Uses wine-crossover FOSS from Gcenx/winecx (local Homebrew or downloaded)
 #   2. Downloads DXMT (builtin) from 3Shain/dxmt (DirectX → Metal)
 #   3. Downloads DXVK from doitsujin/dxvk (DirectX → Vulkan fallback)
 #   4. Assembles wine/bin, wine/lib, wine/share/wine/{nls,fonts}
 #      Installs DXMT builtin DLLs into wine/lib/wine/x86_64-{unix,windows}
 #      Installs DXVK DLLs into wine/lib/dxvk/
-#   5. Validates binaries and NLS data
-#   6. Creates a .tar.gz archive and uploads to aftrnd/meridian
+#   5. Builds a pre-initialized prefix template via wineboot --init
+#   6. Validates binaries, NLS data, syswow64, and prefix template
+#   7. Creates a .tar.gz archive and uploads to aftrnd/meridian
 #
-# No local Wine installation required — all sources are downloaded from GitHub.
+# Install wine-crossover locally for fastest builds: brew install --cask wine-crossover
 #
 set -euo pipefail
 
@@ -55,23 +56,30 @@ gh auth status >/dev/null 2>&1   || die "gh CLI not authenticated. Run: gh auth 
 
 yellow "Resolving latest component versions..."
 
-# Wine: Gcenx/winecx — CrossOver Wine (CodeWeavers' fork with macOS-specific patches)
+# Wine: Gcenx/winecx — CrossOver Wine FOSS (CodeWeavers' open-source macOS fork)
 #
-# CRITICAL: Must use wine-crossover, NOT wine-staging. CrossOver Wine includes:
-#   - macOS Security.framework TLS integration (Steam HTTPS works out of the box)
+# CRITICAL: Must use wine-crossover FOSS from Gcenx/winecx, NOT wine-staging and
+# NOT CrossOver Preview/commercial binaries. CrossOver Wine FOSS includes:
+#   - macOS Security.framework TLS integration (Steam HTTPS works standalone)
 #   - Battle-tested Steam compatibility (same Wine base that Valve uses for Proton)
 #   - Proper WoW64 32-bit support on macOS
 #
-# wine-staging (Gcenx/macOS_Wine_builds) is community Wine with experimental patches.
-# It is missing CodeWeavers' TLS patches and causes "Steam needs to be online to
-# update" — http error 0 from Steam's bootstrapper because HTTPS fails silently.
-# wine-staging is also deprecated on macOS Homebrew (disabled 2026-09-01).
+# NEVER use wine-staging (Gcenx/macOS_Wine_builds). It is community Wine without
+# CodeWeavers' macOS TLS patches. It causes "Steam needs to be online to update"
+# failures because HTTPS silently fails. Deprecated on Homebrew (2026-09-01).
 #
-# If wine-crossover is installed locally via Homebrew, use that directly (fastest).
+# NEVER use CrossOver Preview.app or CrossOver.app binaries (wineloader, wine).
+# These are commercial application components that depend on CrossOver's full
+# environment (CX_ROOT, Perl launcher, etc.) for TLS to function. When extracted
+# and used standalone, HTTPS certificate validation fails silently — same symptom
+# as wine-staging. This was proven in the v1.0.9/v1.0.10 engine regression
+# (March 2026): "Crypto API failed certificate check, error flags 0x00000028".
+#
+# If wine-crossover FOSS is installed locally via Homebrew, use that directly.
 # Otherwise download from Gcenx/winecx GitHub releases.
 WINE_REPO="Gcenx/winecx"
 
-# Prefer locally installed wine-crossover (brew install --cask wine-crossover)
+# Prefer locally installed wine-crossover FOSS (brew install --cask wine-crossover)
 WINE_LOCAL_APP="/opt/homebrew/Caskroom/wine-crossover"
 if [ -d "${WINE_LOCAL_APP}" ]; then
     # Find the latest installed version
@@ -99,7 +107,7 @@ if [ -z "${WINE_URL:-}" ] && [ "${WINE_LOCAL:-false}" != "true" ]; then
         -q ".assets[] | select(.name == \"${WINE_ASSET}\") | .url" 2>/dev/null)
     [ -n "${WINE_URL}" ] || die "Could not find asset '${WINE_ASSET}' in ${WINE_REPO}@${WINE_TAG}"
     WINE_LOCAL=false
-    info "Wine:    ${WINE_TAG} (${WINE_ASSET}) [wine-crossover — CodeWeavers macOS build]"
+    info "Wine:    ${WINE_TAG} (${WINE_ASSET}) [wine-crossover FOSS — CodeWeavers macOS build]"
 fi
 
 # DXMT: 3Shain/dxmt — builtin variant (DLLs go into lib/wine/ — no override needed)
@@ -399,8 +407,11 @@ rm -rf "${PREFIX_TEMPLATE}"
 mkdir -p "${PREFIX_TEMPLATE}"
 
 info "Running wineboot --init (this may take 1-3 minutes on the build machine)..."
+# Wine 11+ (CrossOver Preview): DYLD_FALLBACK_LIBRARY_PATH needs lib/ for dylibs
+# and lib/wine/x86_64-unix for .so modules. The wine64 binary is an alias of wine.
+# wineboot is a Windows PE (lib/wine/x86_64-windows/wineboot.exe) invoked via Wine.
 WINEPREFIX="${PREFIX_TEMPLATE}" \
-DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib" \
+DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix" \
 WINEDLLPATH="${STAGING}/wine/lib/wine" \
 WINELOADER="${STAGING}/wine/bin/wine64" \
 WINESERVER="${STAGING}/wine/bin/wineserver" \
@@ -424,6 +435,16 @@ sleep 1
 TEMPLATE_DLL_COUNT=$(find "${PREFIX_TEMPLATE}/drive_c/windows/system32" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
 [ "${TEMPLATE_DLL_COUNT}" -gt 100 ] || die "prefix template has too few DLLs (${TEMPLATE_DLL_COUNT}) — wineboot --init incomplete"
 info "Prefix template: ${TEMPLATE_DLL_COUNT} DLLs in system32"
+
+# Ensure syswow64/ exists in the template.
+#
+# Wine 8.x (Gcenx) created an empty syswow64/ after wineboot --init. Wine 11.x
+# (CrossOver 27) does not create the directory at all. The app's WinePrefix.create()
+# and resetToEngineTemplate() populate syswow64 from i386-windows/, but they must
+# find the directory already existing — so we guarantee it here.
+# Without this, SteamSetup.exe (32-bit PE) exits 53 (STATUS_DLL_NOT_FOUND / kernel32).
+mkdir -p "${PREFIX_TEMPLATE}/drive_c/windows/syswow64"
+info "Prefix template: syswow64/ guaranteed ✓"
 
 # Strip user-specific and volatile files that should not be in the template
 rm -f "${PREFIX_TEMPLATE}/dosdevices/z:"  # Z: drive points to build machine's root
@@ -461,8 +482,9 @@ info "NLS files verified ✓"
 [ -f "${STAGING}/wine/share/wine/wine.inf" ] || die "wine.inf missing from engine — prefix creation and updates will fail. Check that the Wine archive contains share/wine/wine.inf."
 info "wine.inf verified ✓"
 
-# Prefix template — must exist and contain system.reg
+# Prefix template — must exist and contain system.reg and syswow64/
 [ -f "${STAGING}/prefix-template/system.reg" ] || die "prefix-template/system.reg missing — wineboot --init did not complete during packaging"
+[ -d "${STAGING}/prefix-template/drive_c/windows/syswow64" ] || die "prefix-template syswow64/ missing — 32-bit apps (SteamSetup.exe) will fail with exit 53"
 info "prefix-template verified ✓"
 
 # DXMT critical files

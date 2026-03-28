@@ -174,15 +174,12 @@ struct WinePrefix: Sendable {
                 )
                 // Populate syswow64 with 32-bit DLLs from the engine.
                 //
-                // The Gcenx arm64 Wine build leaves syswow64 empty after wineboot --init —
-                // it copies 64-bit builtins to system32 but skips the 32-bit syswow64
-                // population. Without these DLLs, Wine's WoW64 layer cannot load 32-bit
+                // Wine 8.x (Gcenx) left syswow64 empty after wineboot --init; Wine 11.x
+                // (CrossOver 27) does not create the directory at all. Either way we must
+                // create it and fill it ourselves from the engine's i386-windows/ directory.
+                // Without the 32-bit builtins, Wine's WoW64 layer cannot load 32-bit
                 // Windows executables (like SteamSetup.exe) and crashes with
-                // STATUS_DLL_NOT_FOUND (c0000135) when trying to find kernel32.dll.
-                //
-                // We copy directly from the engine's i386-windows directory rather than
-                // relying on syswow64 symlinks, matching what wineboot does on platforms
-                // that correctly support 32-bit prefix setup.
+                // STATUS_DLL_NOT_FOUND (c0000135 / exit 53) when trying to find kernel32.dll.
                 //
                 // ALL PE file types must be copied — not just .dll. Critical drivers
                 // like winemac.drv (Mac display driver) are .drv files. If they are
@@ -190,8 +187,8 @@ struct WinePrefix: Sendable {
                 // exit with code 152 ("nodrv_CreateWindow").
                 let i386Src = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
                 let syswow64 = path.appending(path: "drive_c/windows/syswow64")
-                if fm.fileExists(atPath: i386Src.path(percentEncoded: false)),
-                   fm.fileExists(atPath: syswow64.path(percentEncoded: false)) {
+                if fm.fileExists(atPath: i386Src.path(percentEncoded: false)) {
+                    try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
                     let i386Files = (try? fm.contentsOfDirectory(atPath: i386Src.path(percentEncoded: false))) ?? []
                     var wow64Copied = 0
                     for file in i386Files where Self.isWoW64FileType(file) {
@@ -202,7 +199,7 @@ struct WinePrefix: Sendable {
                     }
                     log.info("[create] populated syswow64 with \(wow64Copied) 32-bit files for WoW64")
                 } else {
-                    log.warning("[create] i386-windows or syswow64 not found — WoW64 (32-bit apps) may fail")
+                    log.warning("[create] i386-windows not found in engine — WoW64 (32-bit apps) may fail")
                 }
 
                 let dllCount = (try? fm.contentsOfDirectory(atPath: path.appending(path: "drive_c/windows/system32").path(percentEncoded: false)))?.filter { $0.hasSuffix(".dll") }.count ?? 0
@@ -295,14 +292,13 @@ struct WinePrefix: Sendable {
         )
 
         // Populate syswow64 with all 32-bit PE files from the engine.
-        // The Gcenx Wine builds leave syswow64 empty after wineboot --init, so the
-        // prefix template also has an empty syswow64. Without these files, Wine's WoW64
-        // layer cannot load 32-bit Windows executables such as SteamSetup.exe, and
-        // missing .drv files (winemac.drv) cause "nodrv_CreateWindow" failures.
+        // Wine 8.x left syswow64 empty; Wine 11.x does not create it at all.
+        // Always create the directory and populate it from i386-windows/ so that
+        // 32-bit executables (SteamSetup.exe) can find kernel32.dll via WoW64.
         let i386Src  = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
         let syswow64 = path.appending(path: "drive_c/windows/syswow64")
-        if fm.fileExists(atPath: i386Src.path(percentEncoded: false)),
-           fm.fileExists(atPath: syswow64.path(percentEncoded: false)) {
+        if fm.fileExists(atPath: i386Src.path(percentEncoded: false)) {
+            try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
             let i386Files = (try? fm.contentsOfDirectory(atPath: i386Src.path(percentEncoded: false))) ?? []
             var wow64Copied = 0
             for file in i386Files where Self.isWoW64FileType(file) {
@@ -313,7 +309,7 @@ struct WinePrefix: Sendable {
             }
             log.info("[resetToTemplate] populated syswow64 with \(wow64Copied) 32-bit files for WoW64")
         } else {
-            log.warning("[resetToTemplate] i386-windows or syswow64 not found — WoW64 (32-bit apps) may fail")
+            log.warning("[resetToTemplate] i386-windows not found in engine — WoW64 (32-bit apps) may fail")
         }
 
         // Restore saved Steam config files to their original paths.
