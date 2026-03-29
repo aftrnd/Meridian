@@ -48,6 +48,7 @@
 		B00E00B0 /* AppUpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00B1 /* AppUpdateChecker.swift */; };
 		B00E00C0 /* HeroArtViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00C1 /* HeroArtViews.swift */; };
 		D1D8B7DD549091BB2876CCA0 /* MeridianLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE30B92B1C3871B6B2870750 /* MeridianLog.swift */; };
+		AA00000001000001 /* GameCompatibilityDB.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000001000002 /* GameCompatibilityDB.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -96,6 +97,7 @@
 		B00E00C1 /* HeroArtViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeroArtViews.swift; sourceTree = "<group>"; };
 		EE30B92B1C3871B6B2870750 /* MeridianLog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianLog.swift; sourceTree = "<group>"; };
 		EE9307949871471AB0E85285 /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
+		AA00000001000002 /* GameCompatibilityDB.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameCompatibilityDB.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -251,6 +253,7 @@
 				B00E0006 /* WineSteamManager.swift */,
 				B00E00A1 /* SteamWindowSuppressor.swift */,
 				B00E0008 /* GameProcess.swift */,
+				AA00000001000002 /* GameCompatibilityDB.swift */,
 				B00E0041 /* TerminationCleanup.swift */,
 			);
 			path = Engine;
@@ -358,6 +361,7 @@
 				B00E0005 /* WineSteamManager.swift in Sources */,
 				B00E00A0 /* SteamWindowSuppressor.swift in Sources */,
 				B00E0007 /* GameProcess.swift in Sources */,
+				AA00000001000001 /* GameCompatibilityDB.swift in Sources */,
 				B0010022 /* GameLauncher.swift in Sources */,
 				B0010024 /* ContentView.swift in Sources */,
 				B0010026 /* LibraryView.swift in Sources */,
