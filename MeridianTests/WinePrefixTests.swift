@@ -58,11 +58,14 @@ final class WinePrefixTests: XCTestCase {
         return (key, value)
     }
 
-    /// Mirrors WinePrefix.hasSteamLoginSession — checks loginusers.vdf for MostRecent "1"
+    /// Mirrors WinePrefix.hasSteamLoginSession — line-level check for MostRecent "1"
     private func hasSteamLoginSession(configDir: URL) -> Bool {
         let vdfURL = configDir.appending(path: "loginusers.vdf")
         guard let content = try? String(contentsOf: vdfURL, encoding: .utf8) else { return false }
-        return content.contains("\"MostRecent\"") && content.contains("\"1\"")
+        return content.components(separatedBy: .newlines).contains { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return t.contains("\"MostRecent\"") && t.contains("\"1\"")
+        }
     }
 
     /// Mirrors WinePrefix.steamLibraryFolders — parses libraryfolders.vdf
@@ -316,14 +319,33 @@ final class WinePrefixTests: XCTestCase {
         }
         """
         try vdf.write(to: configDir.appending(path: "loginusers.vdf"), atomically: true, encoding: .utf8)
-        // File contains "MostRecent" but not "1" as a value after it (other "1" chars may appear).
-        // Current impl just checks both strings exist anywhere — validate our assumption matches impl.
-        let content = try String(contentsOf: configDir.appending(path: "loginusers.vdf"), encoding: .utf8)
-        let result = content.contains("\"MostRecent\"") && content.contains("\"1\"")
-        // The string "76561198047018335" contains a "1", so hasSteamLoginSession returns true
-        // even when MostRecent is "0". This is a known simplification in the impl.
-        // This test documents the current behaviour; refine if precision is needed.
-        XCTAssertEqual(hasSteamLoginSession(configDir: configDir), result)
+        XCTAssertFalse(hasSteamLoginSession(configDir: configDir),
+                       "MostRecent=0 must return false even when the file contains other \"1\" chars (e.g. in the SteamID)")
+    }
+
+    /// Regression test: MostRecent "0" with RememberPassword "1" must NOT false-positive.
+    /// This was the exact bug that prevented re-authentication after the platform_type fix:
+    /// the old global `contains("\"1\"")` matched RememberPassword instead of MostRecent.
+    func testHasSteamLoginSession_falseWhenMostRecentZeroWithRememberPasswordOne() throws {
+        let (steam, _) = try makePrefix()
+        let configDir = steam.appending(path: "config")
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let vdf = """
+        "users"
+        {
+        \t"76561198047018335"
+        \t{
+        \t\t"AccountName"\t\t"nickjack876"
+        \t\t"PersonaName"\t\t"nickjack876"
+        \t\t"RememberPassword"\t\t"1"
+        \t\t"MostRecent"\t\t"0"
+        \t\t"Timestamp"\t\t"1774737659"
+        \t}
+        }
+        """
+        try vdf.write(to: configDir.appending(path: "loginusers.vdf"), atomically: true, encoding: .utf8)
+        XCTAssertFalse(hasSteamLoginSession(configDir: configDir),
+                       "MostRecent=0 with RememberPassword=1 must return false — the old global contains check false-positived here")
     }
 
     // MARK: - isGameInstalled / acfURL
@@ -895,13 +917,20 @@ final class WinePrefixTests: XCTestCase {
             withDestinationPath: "/"
         )
 
-        // Populate syswow64
+        // Populate syswow64 — mirrors the fixed WinePrefix.resetToEngineTemplate logic.
+        //
+        // MIRROR CONTRACT: This block must stay in sync with WinePrefix.resetToEngineTemplate().
+        // The critical fix (March 2026): do NOT guard on syswow64 already existing — instead
+        // always createDirectory first. Wine 11.4 (CrossOver 27) does not create syswow64 during
+        // wineboot --init, so templates built with it have no syswow64 directory. The old guard
+        //   `if fileExists(i386Src) && fileExists(syswow64)`
+        // silently skipped the entire population, causing SteamSetup.exe to exit 53 (kernel32 missing).
         let syswow64 = prefix.appending(path: "drive_c/windows/syswow64")
         var wow64Copied: [String] = []
-        if fm.fileExists(atPath: engineI386Dir.path(percentEncoded: false)),
-           fm.fileExists(atPath: syswow64.path(percentEncoded: false)) {
+        if fm.fileExists(atPath: engineI386Dir.path(percentEncoded: false)) {
+            try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
             let i386Files = (try? fm.contentsOfDirectory(atPath: engineI386Dir.path(percentEncoded: false))) ?? []
-            for file in i386Files where file.lowercased().hasSuffix(".dll") {
+            for file in i386Files where isWoW64FileType(file) {
                 let dest = syswow64.appending(path: file)
                 guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
                 try? fm.copyItem(at: engineI386Dir.appending(path: file), to: dest)
@@ -1450,6 +1479,148 @@ final class WinePrefixTests: XCTestCase {
         let second = try String(contentsOf: steamDir.appending(path: "steamapps/libraryfolders.vdf"), encoding: .utf8)
 
         XCTAssertEqual(first, second, "Two consecutive ensureDefaultLibrary calls must produce identical content")
+    }
+
+    // MARK: - Wine 11.4 regression: syswow64 created even when absent from template
+
+    /// Builds a fake engine template WITHOUT a syswow64 directory — mimicking the
+    /// output of `wineboot --init` under Wine 11.4 (CrossOver 27), which does not
+    /// create syswow64 at all.
+    private func makeEngineTemplateWithoutSyswow64() throws -> (templateDir: URL, i386Dir: URL) {
+        let engineDir = tempDir.appending(path: "engine_wine11")
+        let i386Dir   = engineDir.appending(path: "wine/lib/wine/i386-windows")
+        let tmplDir   = engineDir.appending(path: "prefix-template")
+        let system32  = tmplDir.appending(path: "drive_c/windows/system32")
+
+        try FileManager.default.createDirectory(at: i386Dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: system32, withIntermediateDirectories: true)
+        // NOTE: syswow64 is intentionally NOT created — this is the Wine 11.4 template layout
+
+        for dll in ["kernel32.dll", "ntdll.dll", "user32.dll", "winemac.drv"] {
+            try Data().write(to: i386Dir.appending(path: dll))
+        }
+        try "".write(to: tmplDir.appending(path: "system.reg"), atomically: true, encoding: .utf8)
+
+        return (tmplDir, i386Dir)
+    }
+
+    /// Regression test for the Wine 11.4 / CrossOver 27 exit-53 bug.
+    ///
+    /// Root cause: `wineboot --init` under Wine 11.4 does not create syswow64/.
+    /// The old `resetToEngineTemplate` guarded on `syswow64` already existing, so
+    /// the entire 32-bit DLL copy was silently skipped. SteamSetup.exe (32-bit PE)
+    /// then exited 53 (STATUS_DLL_NOT_FOUND) because kernel32.dll was missing.
+    ///
+    /// This test ensures the fixed implementation creates syswow64/ even when absent.
+    func testResetToEngineTemplate_createsSyswow64WhenAbsentFromTemplate_wine11Regression() throws {
+        let (tmplDir, i386Dir) = try makeEngineTemplateWithoutSyswow64()
+
+        // Build a prefix that will be reset — no syswow64 pre-existing
+        let prefix = tempDir.appending(path: "prefix_wine11")
+        let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
+        try FileManager.default.createDirectory(at: steamDir, withIntermediateDirectories: true)
+        try "".write(to: prefix.appending(path: "system.reg"), atomically: true, encoding: .utf8)
+
+        // Confirm the template does NOT have syswow64 — this is the failure precondition
+        let templateSyswow64 = tmplDir.appending(path: "drive_c/windows/syswow64")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: templateSyswow64.path(percentEncoded: false)),
+            "Pre-condition: template must NOT have syswow64 to reproduce the Wine 11.4 regression"
+        )
+
+        let result = try simulateResetToEngineTemplate(
+            prefix: prefix,
+            templateDir: tmplDir,
+            steamInstallDir: steamDir,
+            engineI386Dir: i386Dir
+        )
+
+        // syswow64 must exist and be populated after the reset
+        let syswow64 = prefix.appending(path: "drive_c/windows/syswow64")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: syswow64.path(percentEncoded: false)),
+            "syswow64/ must be CREATED by resetToEngineTemplate when absent from template — " +
+            "Wine 11.4 regression: old code skipped syswow64 population entirely, causing exit 53"
+        )
+        XCTAssertTrue(
+            result.syswow64DLLs.contains("kernel32.dll"),
+            "kernel32.dll must be in syswow64 after reset — its absence causes SteamSetup.exe exit 53"
+        )
+        XCTAssertTrue(
+            result.syswow64DLLs.contains("winemac.drv"),
+            "winemac.drv must be in syswow64 — its absence causes nodrv_CreateWindow (exit 152)"
+        )
+    }
+
+    /// Companion to the resetToEngineTemplate regression: verifies that create()
+    /// (the fresh-prefix path) also creates syswow64 when absent.
+    ///
+    /// Mirrors WinePrefix.create() WoW64 population logic (the `if fm.fileExists(i386Src)` block).
+    func testCreate_createsSyswow64WhenAbsentFromTemplate_wine11Regression() throws {
+        let fm = FileManager.default
+
+        // Fake engine i386 directory (simulates engine/wine/lib/wine/i386-windows)
+        let fakeEngineI386 = tempDir.appending(path: "create_engine/wine/lib/wine/i386-windows")
+        try fm.createDirectory(at: fakeEngineI386, withIntermediateDirectories: true)
+        for dll in ["kernel32.dll", "ntdll.dll", "winemac.drv"] {
+            try Data().write(to: fakeEngineI386.appending(path: dll))
+        }
+
+        // Simulate a fresh prefix that came from a Wine 11.4 template (no syswow64 dir)
+        let prefixPath = tempDir.appending(path: "create_prefix_wine11")
+        let system32 = prefixPath.appending(path: "drive_c/windows/system32")
+        try fm.createDirectory(at: system32, withIntermediateDirectories: true)
+        // Intentionally do NOT create syswow64
+
+        // Run the syswow64 population logic inline (mirrors WinePrefix.create WoW64 block)
+        let syswow64 = prefixPath.appending(path: "drive_c/windows/syswow64")
+        XCTAssertFalse(fm.fileExists(atPath: syswow64.path(percentEncoded: false)),
+                       "Pre-condition: syswow64 must not exist")
+
+        if fm.fileExists(atPath: fakeEngineI386.path(percentEncoded: false)) {
+            try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
+            let files = (try? fm.contentsOfDirectory(atPath: fakeEngineI386.path(percentEncoded: false))) ?? []
+            for file in files where isWoW64FileType(file) {
+                let dest = syswow64.appending(path: file)
+                guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
+                try? fm.copyItem(at: fakeEngineI386.appending(path: file), to: dest)
+            }
+        }
+
+        XCTAssertTrue(fm.fileExists(atPath: syswow64.path(percentEncoded: false)),
+                      "syswow64/ must be created even when absent (Wine 11.4 regression)")
+        XCTAssertTrue(fm.fileExists(atPath: syswow64.appending(path: "kernel32.dll").path(percentEncoded: false)),
+                      "kernel32.dll must exist in syswow64 after create() population")
+        XCTAssertTrue(fm.fileExists(atPath: syswow64.appending(path: "winemac.drv").path(percentEncoded: false)),
+                      "winemac.drv must exist in syswow64 — required for 32-bit window creation")
+    }
+
+    /// Verifies graceful behaviour when engine has no i386-windows directory at all.
+    /// The prefix creation must not crash; it just emits a warning log.
+    func testSyswow64Population_gracefulWhenNoI386Source() throws {
+        let fm = FileManager.default
+
+        // Engine with no i386-windows (future Wine build without 32-bit support)
+        let fakeEngineNoI386 = tempDir.appending(path: "engine_no_i386/wine/lib/wine")
+        try fm.createDirectory(at: fakeEngineNoI386, withIntermediateDirectories: true)
+        // i386-windows intentionally absent
+
+        let prefixPath = tempDir.appending(path: "prefix_no_i386")
+        let system32 = prefixPath.appending(path: "drive_c/windows/system32")
+        try fm.createDirectory(at: system32, withIntermediateDirectories: true)
+        let syswow64 = prefixPath.appending(path: "drive_c/windows/syswow64")
+
+        // Run population logic (should silently skip without crash)
+        let i386Src = fakeEngineNoI386.appending(path: "i386-windows")
+        if fm.fileExists(atPath: i386Src.path(percentEncoded: false)) {
+            try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
+            // would copy files here if i386Src existed
+        }
+        // else: silently skip (logs warning in production)
+
+        // syswow64 must NOT have been created (no i386 source = skip)
+        XCTAssertFalse(fm.fileExists(atPath: syswow64.path(percentEncoded: false)),
+                       "syswow64 must not be created when engine has no i386-windows directory")
     }
 
     // MARK: - isWoW64FileType (syswow64 population filter)

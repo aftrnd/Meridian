@@ -99,7 +99,7 @@ The engine tarball (`meridian-engine-arm64.tar.gz`) MUST contain:
 
 `release-engine.sh` validates all of the above with `die()` checks. If a new required file is identified, add both the copy step AND the validation check to the script.
 
-**CRITICAL: The engine MUST be built from `wine-crossover` (Gcenx/winecx), NOT `wine-staging`.** CrossOver Wine includes CodeWeavers' macOS TLS patches required for Steam HTTPS. Using `wine-staging` causes silent TLS failures ("Steam needs to be online to update").
+**CRITICAL: The engine MUST be built from `wine-crossover` FOSS (Gcenx/winecx), NOT `wine-staging` and NOT CrossOver Preview/commercial binaries.** CrossOver Wine FOSS includes CodeWeavers' macOS Security.framework TLS patches baked into the standalone binary. Using `wine-staging` or CrossOver commercial binaries (`wineloader` from CrossOver.app/Preview.app) causes silent TLS failures ("Steam needs to be online to update") because those binaries require `CX_ROOT` and the CrossOver Perl launcher context to function.
 
 ## Key Files
 

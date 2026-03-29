@@ -264,9 +264,10 @@ final class GameLauncher {
         }
 
         // If the persistent Steam process has died since bootstrap (crash, OOM, etc.)
-        // restart it silently before proceeding. Without this, launchGame would spawn
-        // a fresh Steam from scratch which can surface its main window.
-        if !steamManager.isSteamProcessAlive {
+        // restart it silently before proceeding — but ONLY when not using the CX engine.
+        // With CX engine, we don't use persistent Steam at all (SteamCMD for downloads,
+        // direct Wine launch for games).
+        if engine.cxPreviewLibPath == nil && !steamManager.isSteamProcessAlive {
             log.warning("[launch] persistent Steam not alive — restarting before launch")
             transition(to: .bootstrappingSteam, activity: "Reconnecting to Steam…")
             do {
@@ -286,112 +287,74 @@ final class GameLauncher {
 
         guard !Task.isCancelled else { return }
 
-        // If the game isn't installed yet, surface Steam's install dialog for the user
-        // to confirm, then wait for the full download to complete.
+        // Apply game-specific compatibility fixes before install or launch.
+        let compat = GameCompatibilityDB.shared
+        let gameProfile = compat.profile(for: game.id)
+        if let profile = gameProfile {
+            appendLog("Applying compatibility profile: \(compat.fixSummary(for: game.id))")
+            log.info("[launch] game profile appID=\(game.id): \(compat.fixSummary(for: game.id))")
+
+            // Install DXMT DLLs into system32 if required (CX engine + D3D11 game).
+            // CX's wineloader loads DLLs from its own lib path before WINEDLLPATH,
+            // so DXMT must be physically in system32 to take priority.
+            if profile.requiresDXMTInSystem32 && engine.cxPreviewLibPath != nil {
+                do {
+                    try prefix.installDXMTInSystem32(engine: engine)
+                    appendLog("DXMT DLLs installed to system32 (Metal renderer ready)")
+                } catch {
+                    log.warning("[launch] DXMT system32 install failed: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        // If the game isn't installed yet, download it via SteamCMD.
+        // SteamCMD is the only reliable headless installer under Wine 8.0.1 because
+        // steam.exe cannot authenticate (webhelper crash-loops, ConnectCache ignored).
+        // SteamCMD uses cached credentials after the first manual login.
         if !prefix.isGameInstalled(appID: game.id) {
-            // Ensure both steam.cfg (SteamNoSandbox=1) and libraryfolders.vdf are present.
-            // steam.cfg fixes the webhelper crash so Steam has a UI to render the install
-            // dialog. libraryfolders.vdf ensures Steam auto-selects a library rather than
-            // showing a hidden location picker.
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
 
-            // Phase 1: pause suppression so the Steam install dialog is visible.
-            // `installGame` sends -activate then steam://install/<appID>, both of which
-            // go through regular IPC (not the Steam Service). While suppressionActive=true
-            // the dialog would be hidden the instant it appears — we must pause suppression
-            // BEFORE dispatching the install URL.
-            windowSuppressor?.stopSuppressingNewWindows()
             transition(to: .awaitingInstallConfirmation,
-                       activity: "Confirm installation in Steam…")
-            appendLog("Paused suppression — Steam will show install dialog for appID=\(game.id)")
+                       activity: "Preparing download for \(game.name)…")
+            appendLog("Starting SteamCMD download for appID=\(game.id)")
+            log.info("[launch] beginning SteamCMD install appID=\(game.id)")
 
-            do {
-                try await steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
-            } catch {
-                // Re-engage suppression before failing so Steam windows don't remain visible.
-                if let pid = steamManager.persistentProcessIdentifier {
-                    windowSuppressor?.resumeSuppressing(pid: pid)
-                }
-                fail("Failed to queue install: \(error.localizedDescription)", error: error)
+            // Get the Steam account username for SteamCMD login.
+            // SteamCMD uses cached credentials — no password needed after first login.
+            let username = AppSettings.shared.steamCredentialAccountName
+            guard !username.isEmpty else {
+                fail("Steam account username not found. Please sign in again through Settings.")
                 return
             }
 
-            // Poll for the ACF to appear — Steam writes it when the user clicks Install.
-            // 10-minute cap: if the user hasn't confirmed in 10 min they probably missed it.
-            let confirmDeadline = ContinuousClock.now + .seconds(600)
-            let confirmStart = ContinuousClock.now
-            var emittedConfirmHint = false
-
-            while !prefix.isGameInstalled(appID: game.id) {
-                guard !Task.isCancelled else {
-                    if let pid = steamManager.persistentProcessIdentifier {
-                        windowSuppressor?.resumeSuppressing(pid: pid)
-                    }
-                    return
-                }
-                guard ContinuousClock.now < confirmDeadline else {
-                    if let pid = steamManager.persistentProcessIdentifier {
-                        windowSuppressor?.resumeSuppressing(pid: pid)
-                    }
-                    fail("Install dialog not confirmed within 10 minutes. Click Install in the Steam window to continue.")
-                    return
-                }
-
-                let elapsed = ContinuousClock.now - confirmStart
-                if elapsed >= .seconds(120) && !emittedConfirmHint {
-                    emittedConfirmHint = true
-                    appendLog("Still waiting — look for a Steam install dialog and click Install.")
-                    log.warning("[launch] confirm stalled — elapsed=2min appID=\(game.id)")
-                }
-
-                try? await Task.sleep(for: .seconds(2))
-            }
-
-            // ACF created — user confirmed. Re-engage suppression for the download phase.
-            if let pid = steamManager.persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
-            }
-            transition(to: .installing, activity: "Downloading \(game.name)…")
-            appendLog("Install confirmed — ACF found, suppression re-engaged, waiting for download")
-
-            // Phase 2: wait for full download (StateFlags == 4 in the ACF).
-            let installDeadline = ContinuousClock.now + .seconds(4 * 3600)
-            let installStart = ContinuousClock.now
-            var lastLoggedProgress: Int64 = -1
-
-            while !prefix.isGameFullyInstalled(appID: game.id) {
-                guard !Task.isCancelled else { return }
-                guard ContinuousClock.now < installDeadline else {
-                    fail("Installation timed out after 4 hours. Check the Steam client for progress details.")
-                    return
-                }
-                try? await Task.sleep(for: .seconds(3))
-
-                let elapsed = ContinuousClock.now - installStart
-                let elapsedSec = Int(elapsed.components.seconds)
-
-                if let progress = prefix.gameDownloadProgress(appID: game.id) {
-                    let pct = progress.total > 0
-                        ? Int(Double(progress.downloaded) / Double(progress.total) * 100)
-                        : 0
-                    // Log download progress every ~10% change or every 30s
-                    let progressMB = progress.downloaded / (1024 * 1024)
-                    if progressMB != lastLoggedProgress && (progressMB - lastLoggedProgress > 50 || elapsedSec % 30 < 4) {
-                        lastLoggedProgress = progressMB
-                        let totalMB = progress.total / (1024 * 1024)
-                        log.info("[launch] download progress appID=\(game.id): \(progressMB)MB/\(totalMB)MB (\(pct)%) StateFlags=\(progress.stateFlags) elapsed=\(elapsedSec)s")
-                        if progress.total > 0 {
-                            currentActivity = "Downloading \(game.name)… \(pct)%"
+            do {
+                try await steamManager.installWithSteamCMD(
+                    appID: game.id,
+                    username: username,
+                    engine: engine,
+                    prefix: prefix,
+                    onProgress: { [weak self] line in
+                        self?.appendLog(line)
+                        // Parse percentage from SteamCMD output for currentActivity
+                        if let pctRange = line.range(of: #"\d+\.\d+(?= \()"#, options: .regularExpression) {
+                            let pct = String(line[pctRange])
+                            self?.currentActivity = "Downloading \(game.name)… \(pct)%"
                         }
                     }
-                } else if elapsedSec > 120 && elapsedSec % 60 < 4 {
-                    log.warning("[launch] ACF not readable during install polling — elapsed=\(elapsedSec)s appID=\(game.id)")
-                    appendLog("Download is taking a while. Steam may be updating or allocating disk space.")
-                }
+                )
+            } catch {
+                fail("Download failed: \(error.localizedDescription)", error: error)
+                return
             }
 
-            appendLog("Download complete — StateFlags=4 confirmed")
+            // Verify the ACF was created with StateFlags == 4 (fully installed).
+            guard prefix.isGameFullyInstalled(appID: game.id) else {
+                fail("Download appeared to complete but game files are incomplete. Try again.")
+                return
+            }
+
+            appendLog("Download complete — game installed ✓")
             library?.setInstalled(true, for: game.id)
         }
 
@@ -400,13 +363,16 @@ final class GameLauncher {
         // Tell the health monitor to defer restarts while the game is active.
         steamManager.gameIsRunning = true
 
-        // Send steam.exe -applaunch — stays in .launching until processes confirmed
+        // Launch the game directly via Wine, bypassing steam.exe.
+        // steam.exe -applaunch shows a Steam login window because Steam's client
+        // needs its own authenticated session. Since we use SteamCMD for downloads
+        // and the CX engine for running, there's no need for steam.exe at all.
         transition(to: .launching, activity: "Launching \(game.name)…")
-        appendLog("Launching steam.exe -applaunch \(game.id)")
+        appendLog("Launching \(game.name) directly via Wine")
 
         let launchedPID: Int32
         do {
-            launchedPID = try await steamManager.launchGame(
+            launchedPID = try await steamManager.launchGameDirectly(
                 appID: game.id,
                 engine: engine,
                 prefix: prefix

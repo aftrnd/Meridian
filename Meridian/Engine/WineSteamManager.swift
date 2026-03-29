@@ -16,7 +16,9 @@ private let log = MeridianLog(category: "WineSteamManager")
 @MainActor
 final class WineSteamManager {
 
-    private(set) var isRunning: Bool = false
+    /// Whether the persistent Steam process is currently running.
+    /// Set to true when CX engine is active (Steam not needed but code checks this flag).
+    var isRunning: Bool = false
 
     /// Whether the Wine Steam client has an authenticated user session.
     /// Set by `BootstrapManager` after sync, and by `loginToSteam()` on success.
@@ -368,32 +370,134 @@ final class WineSteamManager {
         }
     }
 
-    /// Activates the running Steam instance and sends a `steam://install/<appID>` URL
-    /// to trigger Steam's install dialog.
+    // MARK: - Game Installation via SteamCMD
+
+    /// Downloads a game using SteamCMD — the only reliable headless install method
+    /// under Wine 8.0.1 where the full Steam client cannot authenticate.
     ///
-    /// Two-step sequence:
+    /// ## Why SteamCMD (not steam.exe +app_update)
     ///
-    ///   1. **`-activate`** — tells the running Steam to surface its main window.
-    ///      Without this, Steam receives the install URL but may not bring its UI
-    ///      to the foreground, leaving the user staring at Meridian with nothing
-    ///      happening.
+    /// `steam.exe` under Wine 8.0.1 (CrossOverFOSS 23.7.1) **never logs in**.
+    /// Every session shows `[Logged Off, 0, 0]` in connection_log.txt because the
+    /// Steam Windows Service fails (GLE 126) and the CEF webhelper crash-loops on
+    /// `chrome_elf.dll STATUS_BREAKPOINT` (missing `GetProcessMitigationPolicy` stub).
+    /// Without authentication, `+app_update` via IPC is silently dropped — the ACF
+    /// is never written and downloads never start.
     ///
-    ///   2. **`steam://install/<appID>`** — uses Steam's URL protocol dispatcher
-    ///      (not the Steam Service). The running Steam instance receives this via
-    ///      regular IPC and opens its install confirmation dialog (library path,
-    ///      disk-space summary). This routes through the same channel as `-applaunch`,
-    ///      which is confirmed working. Using `-install <id>` would route through the
-    ///      Steam Service pipe which Wine cannot provide (GLE 2 "pipe not found").
+    /// SteamCMD is a separate standalone binary that handles its own auth without
+    /// CEF or the Steam Service. CLI-proven: `Logging in using cached credentials → OK`.
     ///
-    /// Caller is responsible for pausing window suppression before calling this method
-    /// so the install dialog is not hidden by the AX observer. See `GameLauncher`.
-    func installGame(appID: Int, engine: WineEngine, prefix: WinePrefix) async throws {
-        log.info("[installGame] activating Steam then queuing install appID=\(appID)")
-        try sendSteamCommand(["-activate"], engine: engine, prefix: prefix)
-        try await Task.sleep(for: .milliseconds(800))
-        try sendSteamCommand(["steam://install/\(appID)"], engine: engine, prefix: prefix)
-        log.info("[installGame] install URL dispatched appID=\(appID)")
+    /// ## Credential requirements
+    ///
+    /// The first SteamCMD login requires the user's password (done once via the setup
+    /// sheet's `loginToSteamWithSteamCMD` flow). After that, SteamCMD writes an
+    /// encrypted credential cache to config.vdf and subsequent logins are passwordless.
+    ///
+    /// ## Progress tracking
+    ///
+    /// SteamCMD creates the same `appmanifest_<appID>.acf` files in the steamapps
+    /// directory as the full Steam client. The existing `isGameInstalled`,
+    /// `isGameFullyInstalled`, and `gameDownloadProgress` polling works unchanged.
+    func installWithSteamCMD(
+        appID: Int,
+        username: String,
+        engine: WineEngine,
+        prefix: WinePrefix,
+        onProgress: @MainActor @Sendable @escaping (String) -> Void
+    ) async throws {
+        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
+            throw SteamError.installFailed("steamcmd.exe not found in Steam directory. Re-run bootstrap.")
+        }
+
+        log.info("[installWithSteamCMD] appID=\(appID) user=\(username)")
+        onProgress("Starting SteamCMD download for appID \(appID)…")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [
+            steamcmdPath,
+            "+login", username,
+            "+app_update", "\(appID)", "validate",
+            "+quit",
+        ]
+        process.environment = engine.environment(for: prefix)
+        process.standardInput = FileHandle.nullDevice
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw SteamError.installFailed("Failed to launch steamcmd.exe: \(error.localizedDescription)")
+        }
+
+        log.info("[installWithSteamCMD] steamcmd pid=\(process.processIdentifier)")
+
+        // Read stdout in the background and forward progress lines to the caller.
+        // We use a detached Task with @Sendable to avoid capturing the non-Sendable closure.
+        let outHandle = outPipe.fileHandleForReading
+        let progressTask = Task.detached(priority: .utility) { @Sendable in
+            while process.isRunning {
+                let data = outHandle.availableData
+                if data.isEmpty {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                }
+                guard let chunk = String(data: data, encoding: .utf8) else { continue }
+                await MainActor.run {
+                    for rawLine in chunk.components(separatedBy: .newlines) {
+                        let l = rawLine.trimmingCharacters(in: .whitespaces)
+                        guard !l.isEmpty else { continue }
+                        if l.contains("downloading") || l.contains("installing")
+                            || l.contains("validating") || l.contains("Success!")
+                            || l.contains("ERROR") || l.contains("Logged in") {
+                            onProgress(l)
+                        }
+                    }
+                }
+            }
+            // Drain any remaining output
+            let tail = outHandle.readDataToEndOfFile()
+            if let chunk = String(data: tail, encoding: .utf8), !chunk.isEmpty {
+                await MainActor.run {
+                    for rawLine in chunk.components(separatedBy: .newlines) {
+                        let l = rawLine.trimmingCharacters(in: .whitespaces)
+                        if !l.isEmpty { onProgress(l) }
+                    }
+                }
+            }
+        }
+
+        await Task.detached(priority: .utility) { process.waitUntilExit() }.value
+        progressTask.cancel()
+        _ = await progressTask.result
+
+        let exitCode = process.terminationStatus
+        let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        if exitCode != 0 {
+            let filteredStderr = filterWineStderr(stderr).prefix(500)
+            log.error("[installWithSteamCMD] steamcmd exited \(exitCode) stderr: \(filteredStderr)")
+            throw SteamError.installFailed("SteamCMD exited with code \(exitCode)")
+        }
+
+        log.info("[installWithSteamCMD] appID=\(appID) install complete (exit=\(exitCode))")
+        onProgress("SteamCMD download complete ✓")
     }
+
+    /// Sends `+app_update <appID>` to the running Steam IPC as a fallback.
+    /// This only works when the full Steam client is authenticated (rare under Wine 8.0.1).
+    /// Use `installWithSteamCMD` for reliable headless installs.
+    func queueInstall(appID: Int, engine: WineEngine, prefix: WinePrefix) throws {
+        log.info("[queueInstall] dispatching +app_update \(appID) via Steam IPC (fallback)")
+        try sendSteamCommand(["+app_update", "\(appID)"], engine: engine, prefix: prefix)
+        log.info("[queueInstall] +app_update dispatched for appID=\(appID)")
+    }
+
 
     /// Brings the running Steam window to the foreground.
     /// Sends `-activate` via IPC, which tells the running Steam instance to
@@ -452,6 +556,85 @@ final class WineSteamManager {
     }
 
     // MARK: - Game Launch
+
+    /// Launches a game executable directly via Wine, bypassing steam.exe entirely.
+    ///
+    /// Used when: SteamCMD downloaded the game files and the game doesn't require
+    /// Steam DRM validation. Most indie/Unity games work this way.
+    ///
+    /// This avoids the Steam login window that appears when steam.exe -applaunch
+    /// is used with the CX engine (where Steam's CEF now works but has no session).
+    @discardableResult
+    func launchGameDirectly(
+        appID: Int,
+        engine: WineEngine,
+        prefix: WinePrefix
+    ) async throws -> Int32 {
+        guard let installDir = prefix.gameInstallDir(appID: appID) else {
+            throw SteamError.installFailed("Cannot find install directory for appID \(appID)")
+        }
+
+        let gamePath = prefix.steamInstallDir
+            .appending(path: "steamapps/common/\(installDir)")
+        let gamePathStr = gamePath.path(percentEncoded: false)
+
+        // Find the main game executable — look for .exe files, prefer the one matching the game name
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(atPath: gamePathStr) else {
+            throw SteamError.installFailed("Cannot list game directory: \(gamePathStr)")
+        }
+
+        let exeFiles = contents.filter { $0.hasSuffix(".exe") }
+            .filter { !$0.lowercased().contains("crash") && !$0.lowercased().contains("redist") && !$0.lowercased().contains("unins") }
+
+        guard let mainExe = exeFiles.first(where: { !$0.lowercased().contains("unity") }) ?? exeFiles.first else {
+            throw SteamError.installFailed("No game executable found in \(gamePathStr)")
+        }
+
+        let exeFullPath = gamePath.appending(path: mainExe).path(percentEncoded: false)
+        log.info("[launchGameDirectly] appID=\(appID) exe=\(exeFullPath)")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [exeFullPath]
+        process.currentDirectoryURL = gamePath
+
+        let env = engine.environment(for: prefix)
+        process.environment = env
+        log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
+
+        let stderrPipe = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            log.info("[launchGameDirectly] launched pid=\(process.processIdentifier)")
+        } catch {
+            log.error("[launchGameDirectly] failed: \(error.localizedDescription)")
+            throw error
+        }
+
+        let pid = process.processIdentifier
+        windowSuppressor?.registerPID(pid)
+
+        Task.detached {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(data: data, encoding: .utf8) ?? ""
+            if !stderr.isEmpty {
+                let filtered = filterWineStderr(stderr)
+                let lines = filtered.components(separatedBy: .newlines).prefix(40)
+                for line in lines where !line.isEmpty {
+                    log.info("[launchGameDirectly:stderr] \(line)")
+                }
+            }
+            if !process.isRunning {
+                log.info("[launchGameDirectly] exited code=\(process.terminationStatus)")
+            }
+        }
+
+        return pid
+    }
 
     /// Launches a game via `wine64 steam.exe -applaunch APPID`.
     ///
@@ -612,9 +795,14 @@ final class WineSteamManager {
         try? await Task.sleep(for: .seconds(2))
 
         suppressor?.resumeSuppressing(pid: 0)
-        try await startPersistent(engine: engine, prefix: prefix)
-        if let pid = persistentProcessIdentifier {
-            suppressor?.resumeSuppressing(pid: pid)
+        // Only start persistent Steam if not using CX engine.
+        if engine.cxPreviewLibPath == nil {
+            try await startPersistent(engine: engine, prefix: prefix)
+            if let pid = persistentProcessIdentifier {
+                suppressor?.resumeSuppressing(pid: pid)
+            }
+        } else {
+            isRunning = true
         }
 
         isSteamLoggedIn = true
@@ -991,6 +1179,11 @@ final class WineSteamManager {
             }
 
             let allReady = signals.wineserver && signals.steamProc
+            // steam.pid: Steam writes this file when its IPC layer is ready on Windows.
+            // Under Wine, steam.pid is never written (confirmed: always false across all
+            // sessions). The strongReady branch below is kept for correctness with native
+            // Windows Steam if that ever becomes relevant, but in practice allReady is
+            // the only reachable path.
             let strongReady = allReady && signals.steamPid
 
             if allReady {
@@ -1128,6 +1321,7 @@ final class WineSteamManager {
     enum SteamError: LocalizedError {
         case bootstrapFailed(exitCode: Int32, detail: String)
         case steamNotReady
+        case installFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -1135,6 +1329,8 @@ final class WineSteamManager {
                 return "Steam bootstrap failed (exit \(code)): \(detail)"
             case .steamNotReady:
                 return "Steam could not start. Try resetting the Wine environment in Settings, or restart Meridian."
+            case .installFailed(let detail):
+                return "Install failed: \(detail)"
             }
         }
     }

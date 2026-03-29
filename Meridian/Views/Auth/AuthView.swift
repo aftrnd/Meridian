@@ -449,9 +449,16 @@ private struct SteamLoginStepContent: View {
             try? await Task.sleep(for: .seconds(2))
             try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
             try? prefix.writeConnectCache(steamID: steamID, refreshToken: refreshToken, accountName: accountName)
-            try? await mgr.startPersistent(engine: eng, prefix: prefix)
-            if let pid = mgr.persistentProcessIdentifier { sup.resumeSuppressing(pid: pid) }
-            mgr.enableHealthMonitor(engine: eng, prefix: prefix)
+            // Only start persistent Steam if NOT using CX engine.
+            // With CX engine, steam.exe shows a login window we don't want.
+            // SteamCMD handles downloads and games launch directly via Wine.
+            if eng.cxPreviewLibPath == nil {
+                try? await mgr.startPersistent(engine: eng, prefix: prefix)
+                if let pid = mgr.persistentProcessIdentifier { sup.resumeSuppressing(pid: pid) }
+                mgr.enableHealthMonitor(engine: eng, prefix: prefix)
+            } else {
+                mgr.isRunning = true
+            }
             // Mark as authenticated so needsAPIKey returns true when advance() runs.
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true

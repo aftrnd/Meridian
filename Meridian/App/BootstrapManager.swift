@@ -343,6 +343,8 @@ final class BootstrapManager {
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
         let strategy = await sessionBridge.prepare(prefix: prefix)
+        // Sync account username from prefix if not already in AppSettings (migration for existing users).
+        sessionBridge.syncAccountNameIfNeeded(prefix: prefix)
         switch strategy {
         case .credentialAuth:
             log.info("[bootstrap] session written from credential-auth tokens ✓")
@@ -368,53 +370,61 @@ final class BootstrapManager {
         // and exit naturally.
         windowSuppressor?.beginSession()
 
-        // Start persistent Steam process
-        transition(to: .startingSteam, message: "Starting Steam…")
-        do {
-            try await steamManager.startPersistent(engine: engine, prefix: prefix)
-            log.info("[bootstrap] persistent Steam process launched")
-        } catch {
-            fail("Failed to start Steam: \(error.localizedDescription)")
-            return
-        }
-
-        if let pid = steamManager.persistentProcessIdentifier {
-            windowSuppressor?.resumeSuppressing(pid: pid)
-        }
-
-        // Wire up the health monitor callback so automatic Steam restarts re-engage
-        // suppression with the new process PID.
-        steamManager.onSteamRevived = { [weak self, weak steamManager] in
-            guard let pid = steamManager?.persistentProcessIdentifier else { return }
-            self?.windowSuppressor?.resumeSuppressing(pid: pid)
-            log.info("[bootstrap] suppressor re-engaged after Steam revival (pid=\(pid))")
-        }
-
-        guard !Task.isCancelled else { return }
-
-        // 7. Wait for Steam to be fully ready (including any post-boot self-update).
-        transition(to: .waitingForSteam, message: "Waiting for Steam to initialize…")
-        do {
-            try await steamManager.waitUntilReady(prefix: prefix) { [weak self] message in
-                self?.statusMessage = message
-                log.info("[bootstrap] waitUntilReady status: \(message)")
+        // 7. Start persistent Steam — but SKIP when the CX engine is active.
+        //
+        // With the CX engine, Steam's CEF/webhelper works correctly (1,131 stubs fixed),
+        // which means steam.exe -silent still shows its login window (QR code) because
+        // Steam isn't authenticated. We don't need persistent Steam at all:
+        // - Downloads use SteamCMD (separate binary, own auth)
+        // - Game launch uses direct exe via Wine (no steam.exe -applaunch)
+        //
+        // Without the CX engine (Gcenx-only), persistent Steam is started as before
+        // for backward compatibility with the old +app_update IPC flow.
+        if engine.cxPreviewLibPath != nil {
+            log.info("[bootstrap] CX engine active — skipping persistent Steam (not needed for SteamCMD + direct launch)")
+            steamManager.isRunning = true
+        } else {
+            transition(to: .startingSteam, message: "Starting Steam…")
+            do {
+                try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                log.info("[bootstrap] persistent Steam process launched")
+            } catch {
+                fail("Failed to start Steam: \(error.localizedDescription)")
+                return
             }
-            log.info("[bootstrap] Steam is ready ✓")
-        } catch {
-            fail("Steam failed to start: \(error.localizedDescription)")
-            return
-        }
 
-        // Steam is confirmed ready — NOW start the health monitor.
-        // Starting it before waitUntilReady would cause the monitor to fight the
-        // readiness-polling loop (both detect dead Steam and try to restart it).
-        steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
+            if let pid = steamManager.persistentProcessIdentifier {
+                windowSuppressor?.resumeSuppressing(pid: pid)
+            }
+
+            steamManager.onSteamRevived = { [weak self, weak steamManager] in
+                guard let pid = steamManager?.persistentProcessIdentifier else { return }
+                self?.windowSuppressor?.resumeSuppressing(pid: pid)
+                log.info("[bootstrap] suppressor re-engaged after Steam revival (pid=\(pid))")
+            }
+
+            guard !Task.isCancelled else { return }
+
+            transition(to: .waitingForSteam, message: "Waiting for Steam to initialize…")
+            do {
+                try await steamManager.waitUntilReady(prefix: prefix) { [weak self] message in
+                    self?.statusMessage = message
+                    log.info("[bootstrap] waitUntilReady status: \(message)")
+                }
+                log.info("[bootstrap] Steam is ready ✓")
+            } catch {
+                fail("Steam failed to start: \(error.localizedDescription)")
+                return
+            }
+
+            steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
+        }
 
         lastFailedPhase = nil
         transition(to: .ready, message: "Ready")
         let totalSec = String(format: "%.1f", Double((ContinuousClock.now - pipelineStart).components.seconds))
         log.info("╔══════════════════════════════════════════════════")
-        log.info("║ BOOTSTRAP COMPLETE — Steam is running (\(totalSec)s total)")
+        log.info("║ BOOTSTRAP COMPLETE (\(totalSec)s total)")
         log.info("╚══════════════════════════════════════════════════")
     }
 

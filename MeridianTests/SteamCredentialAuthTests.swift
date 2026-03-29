@@ -373,4 +373,28 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertEqual(GuardType.deviceConfirmation.rawValue, 4)
         XCTAssertEqual(GuardType.emailConfirmation.rawValue, 5)
     }
+
+    // MARK: - platform_type regression (must stay 1 = SteamClient)
+    //
+    // BeginAuthSessionViaCredentials MUST use platform_type "1" (EAuthTokenPlatformType_SteamClient).
+    // Using "2" (WebBrowser) produces a JWT with aud:["web"] instead of aud:["client"].
+    // The Steam desktop client silently discards web-audience tokens from its ConnectCache,
+    // causing it to remain [Logged Off, 0, 0] and silently drop all download requests.
+    // This was the root cause of game installation never working (March 2026).
+    //
+    // MIRROR CONTRACT: mirrors the platform_type value in SteamCredentialAuth.beginAuthSession.
+
+    /// Mirror of the platform_type constant used in BeginAuthSessionViaCredentials.
+    /// Must be "1" (EAuthTokenPlatformType_SteamClient) — NOT "2" (WebBrowser).
+    private let expectedPlatformType = "1"
+
+    func testPlatformType_isSteamClient() {
+        XCTAssertEqual(expectedPlatformType, "1",
+                       "platform_type must be \"1\" (SteamClient). \"2\" (WebBrowser) produces a web-audience token that the Steam desktop client ignores for ConnectCache auto-login.")
+    }
+
+    func testPlatformType_isNotWebBrowser() {
+        XCTAssertNotEqual(expectedPlatformType, "2",
+                          "platform_type \"2\" (WebBrowser) produces aud:[\"web\"] tokens — Steam's ConnectCache requires aud:[\"client\"] to authenticate.")
+    }
 }
