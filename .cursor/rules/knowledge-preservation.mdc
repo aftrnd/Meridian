@@ -1,0 +1,36 @@
+# Knowledge Preservation
+
+Every discovery, root cause analysis, CLI test result, and behavioral finding MUST be documented before the session ends. Information loss has caused repeated debugging of the same issues.
+
+## Where to Document
+
+| Finding type | Where to record |
+|---|---|
+| Game-specific fix (crash, DLL override, env var) | `GameCompatibilityDB.swift` — add a `GameProfile` entry with `notes:` explaining the root cause |
+| Wine engine behavior (stub crashes, DLL coupling, version requirements) | `Scripts/cx-engine-research.md` (gitignored, local only) |
+| Steam client behavior (auth, ConnectCache, SteamCMD, webhelper) | Commit message + code comments in the relevant Swift file |
+| Bug root cause chain | Commit message — include the full chain, not just the fix |
+| CLI test results | Code comments in the function that was fixed, citing the exact command and output |
+| API behavior (Steam Web API, platform_type, JWT audience) | Code comments + regression test |
+
+## Rules
+
+1. **Never close a session without documenting findings.** If you discovered something — even a dead end — write it down. Dead ends prevent future wasted effort.
+
+2. **Regression tests for every root cause.** If a bug was found, add a test that would have caught it. The test name should describe the scenario, not the implementation detail.
+
+3. **Commit messages tell the full story.** Include: what was broken, why it was broken (root cause chain), what the fix is, and what CLI evidence confirmed it. Future sessions read commit messages first.
+
+4. **GameCompatibilityDB is the single source of truth for game fixes.** Every game tested gets an entry — even if no fix is needed (document that it works out of the box). The `notes` field is the most important part.
+
+5. **Local research files are gitignored but never deleted.** `Scripts/cx-engine-research.md` contains proprietary findings about CrossOver internals that cannot be reconstructed. Back it up.
+
+6. **Code comments cite evidence, not assumptions.** Instead of "this should work because X", write "CLI-verified: command Y produced output Z on date D". 
+
+7. **Cursor rules are living documentation.** When a new subsystem is added or a pattern is established, update the relevant `.mdc` rule file so future sessions have the context.
+
+## What NOT to Document in Code
+
+- Passwords, API keys, or refresh tokens (these go in Keychain/UserDefaults at runtime)
+- CrossOver Preview binary paths in committed code comments (the CX integration is personal-use)
+- Decompilation results or proprietary CodeWeavers internals beyond what PE export tables show
