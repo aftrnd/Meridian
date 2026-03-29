@@ -212,11 +212,17 @@ final class SteamSessionBridge {
     ///   2. Deletes loginusers.vdf entirely so hasSteamLoginSession() returns false,
     ///      which causes ContentView to present the re-auth sheet.
     private func clearStaleConnectCache(prefix: WinePrefix) {
-        guard !AppSettings.shared.hasSteamCredentials else { return }
+        // Only run this migration ONCE. After the first re-auth with platform_type=1,
+        // we set this flag so subsequent launches don't wipe the session every time.
+        guard !UserDefaults.standard.bool(forKey: "didMigratePlatformType1") else { return }
 
         let fm = FileManager.default
         let loginPath = prefix.steamConfigDir.appending(path: "loginusers.vdf").path(percentEncoded: false)
-        guard fm.fileExists(atPath: loginPath) else { return }
+        guard fm.fileExists(atPath: loginPath) else {
+            // No loginusers.vdf — nothing to migrate, mark as done
+            UserDefaults.standard.set(true, forKey: "didMigratePlatformType1")
+            return
+        }
 
         log.warning("[clearStaleConnectCache] stale session detected (no stored credentials) — clearing to force re-auth with correct platform_type=1 (SteamClient)")
 
@@ -240,6 +246,9 @@ final class SteamSessionBridge {
 
         try? fm.removeItem(atPath: loginPath)
         log.info("[clearStaleConnectCache] loginusers.vdf deleted ✓")
+
+        UserDefaults.standard.set(true, forKey: "didMigratePlatformType1")
+        log.info("[clearStaleConnectCache] migration flag set — will not run again")
     }
 
     private func parseAccountName(from steamDir: URL) -> String? {
