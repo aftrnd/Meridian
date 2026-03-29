@@ -1,0 +1,139 @@
+---
+description: Meridian development standards — no guessing, log-first debugging, root-cause-only fixes, regression guard, CLI validation before code
+alwaysApply: true
+---
+
+# Development Standards
+
+These are strict rules that apply to ALL changes in the Meridian codebase. Violations cause regressions — enforce them without exception.
+
+## No Guessing — Facts Only
+
+**NEVER guess about Wine, Steam, or macOS behavior.** Every behavioral assumption must be backed by:
+
+1. **Official documentation** (WineHQ wiki, Valve developer docs, Apple developer docs)
+2. **Source code** (Wine source, Steam client decompilation, macOS headers)
+3. **Manual CLI testing** with `wine64` on the actual engine before writing Swift code
+4. **Log evidence** from `meridian.log` (always read the log before forming hypotheses)
+
+If you cannot find authoritative documentation, say so and ask for more information. Do not fabricate behavior based on assumptions about how Wine or Steam "should" work.
+
+### Date Awareness
+
+The current date matters. Always use the **latest stable versions** of all dependencies — Wine CrossOver, DXMT, DXVK, macOS APIs. Do not reference deprecated APIs, removed features, or old behavior without verifying it still applies.
+
+### Latest Stable Versions — Always
+
+**ALWAYS use the latest stable release of every component.** Never pin to old versions unless there is a documented, tested regression in the newer version.
+
+| Component | Source | Why |
+|-----------|--------|-----|
+| Wine | `wine-crossover` via Gcenx/winecx (NOT `wine-staging`) | CodeWeavers' macOS fork — TLS, Steam compat, WoW64. Same base as Proton. |
+| DXMT | `3Shain/dxmt` latest stable | DirectX 11 → Metal translation |
+| DXVK | `doitsujin/dxvk` latest stable | DirectX → Vulkan fallback |
+| macOS | Target latest stable (currently macOS 26) | Apple Silicon + Metal 3 |
+
+**CRITICAL: Never use `wine-staging` (Gcenx/macOS_Wine_builds).** It is community Wine without CodeWeavers' macOS TLS patches. It causes "Steam needs to be online" failures because HTTPS silently fails. It is also deprecated on Homebrew (disabled 2026-09-01).
+
+**CRITICAL: Never use CrossOver Preview.app or CrossOver.app binaries (`wineloader`, the Perl `wine` script, etc.) as standalone engine components.** These are commercial application binaries that depend on CrossOver's full environment (`CX_ROOT`, Perl launcher context, CodeWeavers' compatibility database) for TLS to function. When extracted and run outside CrossOver, HTTPS certificate validation fails silently — producing the exact same "Steam needs to be online" symptom as `wine-staging`. This was proven in the v1.0.9/v1.0.10 engine regression (March 2026): `Crypto API failed certificate check, error flags 0x00000028`. The ONLY acceptable Wine source is `wine-crossover` FOSS from `Gcenx/winecx` — the standalone build with macOS Security.framework TLS baked directly into the binary.
+
+### CLI Validation Before Code
+
+Before implementing any Wine/Steam behavior change in Swift:
+
+```bash
+# Test the change manually first
+export WINEPREFIX="$HOME/Library/Application Support/com.meridian.app/bottles/steam/"
+export WINESERVER="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wineserver"
+WINE64="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wine64"
+
+# Example: verify steam.exe runs without virtual desktop
+"$WINE64" "$WINEPREFIX/drive_c/Program Files/Steam/steam.exe"
+```
+
+Only after confirming the behavior in the terminal should the Swift code be updated.
+
+## Log-First Debugging
+
+**ALWAYS read `meridian.log` before forming any hypothesis about a bug.** The log contains:
+
+- Timestamped phase transitions for every bootstrap step
+- Wine process exit codes and stderr
+- Steam's own `bootstrap_log.txt` contents
+- Window suppressor state changes
+- Health monitor events
+
+```bash
+# Quick read
+cat ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+
+# Tail live
+tail -f ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+```
+
+Do NOT speculate about what "might" have happened. The log tells you exactly what happened.
+
+## Root Cause Only — No Workarounds
+
+This matches the existing update-system rule but applies globally:
+
+- **Fix the broken layer.** If Wine is broken, fix the Wine integration. If the engine is broken, fix `release-engine.sh`. If Steam's behavior changed, adapt to the real behavior.
+- **Never add app-level workarounds** for engine or Wine deficiencies.
+- **Never suppress errors** to make the app appear to work.
+- **Never add retry loops** to mask flaky behavior — fix the root cause.
+
+## Regression Guard
+
+**Every fix to bootstrap, auth, window surfacing, or game launch MUST include a corresponding test** in `MeridianTests/`. Changes without tests will eventually regress — this has been proven repeatedly.
+
+Before submitting any logic change:
+1. Run `swift test` — all tests must pass
+2. If the change touches bootstrap logic, also run `bash Scripts/verify-bootstrap.sh --no-wipe`
+3. If the change touches window classification, verify the new patterns in `WindowClassificationTests.swift`
+
+## Engine/App Separation
+
+Reiterated from the update-system rule for emphasis:
+
+- The app NEVER compensates for engine deficiencies
+- The engine NEVER compensates for app deficiencies
+- Fix the root layer, publish the fix, verify end-to-end
+
+## Wine 8.0.1 Limitations (v0.9.5 findings, March 2026)
+
+Wine 8.0.1 (CrossOverFOSS 23.7.1) — the current distributable engine — has critical limitations that affect game install and launch. These are ENGINE issues, documented here so future sessions don't re-discover them.
+
+### steam.exe Cannot Authenticate
+
+Steam's Windows client under Wine 8.0.1 **never logs in**. Every session shows `[Logged Off, 0, 0]` in `connection_log.txt`. Root causes:
+- `chrome_elf.dll` DllMain calls `GetProcessMitigationPolicy` → abort (Wine 8.x has no stub)
+- Steam Service fails with GLE 126
+- CEF webhelper crash-loops, preventing Steam's authentication flow
+
+**Consequence:** `steam.exe +app_update` and `steam.exe -applaunch` are both non-functional. All game downloads use SteamCMD; all game launches use direct Wine exe invocation.
+
+### 1,516 Abort Stubs
+
+Wine 8.0.1 has 1,516 functions across user32, kernel32, kernelbase, ntdll, and win32u that call `abort()` when invoked. Modern games (especially Unity) hit these stubs and crash immediately. The most common: `IsMouseInPointerEnabled` in user32/win32u.
+
+### CrossOver Preview Engine Path (Personal Use)
+
+When CrossOver Preview 27 is installed locally, `WineEngine.detect()` uses its `wineloader` and `wineserver` instead of the Gcenx binaries. This eliminates 1,131 of the 1,516 abort stubs. The CX DLLs are a matched version set — individual DLLs CANNOT be mixed across Wine versions (causes `NtdllDefWindowProc_W` not found crashes).
+
+When CX engine is active:
+- `steam.exe` is NEVER started (it shows a login window because CEF now works)
+- Downloads use SteamCMD (separate binary, own credential cache)
+- Game launch uses direct Wine exe (`launchGameDirectly`)
+- DXMT DLLs must be in prefix system32 (CX wineloader ignores WINEDLLPATH for d3d11)
+
+### SteamCMD Authentication
+
+SteamCMD requires an interactive first login (password + Steam Guard). After that, it caches credentials in `config.vdf` and subsequent logins are passwordless (`+login username` without password). The credential cache persists across wineserver restarts.
+
+### Game Compatibility Database
+
+`Meridian/Engine/GameCompatibilityDB.swift` stores per-game fixes. Each entry documents the root cause and the exact fix applied. When testing a new game, add an entry even if it works out of the box — this documents which games have been verified.
+
+### platform_type in SteamCredentialAuth
+
+`BeginAuthSessionViaCredentials` MUST use `platform_type: "1"` (SteamClient), NOT `"2"` (WebBrowser). Using `"2"` produces a JWT with `aud: ["web"]` — the Steam desktop client silently discards this for ConnectCache auto-login. The regression test `testPlatformType_isSteamClient` guards this.
