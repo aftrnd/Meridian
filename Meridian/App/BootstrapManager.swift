@@ -367,6 +367,13 @@ final class BootstrapManager {
             log.debug("[bootstrap] SteamCMD already present ✓")
         }
 
+        // 4c. Restore SteamCMD credential cache from backup.
+        // If the prefix was recreated (reset or engine upgrade), the credential
+        // cache is gone. We back it up in WinePrefix.reset() and
+        // resetToEngineTemplate() — restore it here so game installs don't
+        // require Steam Guard re-confirmation.
+        prefix.restoreSteamCMDConfig()
+
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
         let strategy = await sessionBridge.prepare(prefix: prefix)

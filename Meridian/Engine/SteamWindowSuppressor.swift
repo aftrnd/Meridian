@@ -170,12 +170,17 @@ final class SteamWindowSuppressor {
 
     /// Pause new-window minimization so the game's own window can appear on screen.
     /// The polling timer and observers remain active; call `resumeSuppressing` to re-enable.
+    ///
+    /// This intentionally does NOT call `restoreAllObservedWindows()`. Game windows start
+    /// fresh and have never been moved by us — calling restore would reposition them from
+    /// their native full-screen layout to a fixed centered point, causing the window to
+    /// jump off-screen. Only `allowSteamUITemporarily()` needs the restore step, to
+    /// un-hide Steam windows that we moved to (-32000, -32000) during suppression.
     func stopSuppressingNewWindows() {
         reengageSuppressionWhenMeridianActivates = false
         suppressionActive = false
         isSuppressing = false
         log.info("[suppressor] suppression paused — game window will appear")
-        restoreAllObservedWindows()
     }
 
     /// Call before `steam.exe -activate` so the window can appear. Suppression turns

@@ -384,16 +384,19 @@ final class WineSteamManager {
     ///
     /// Steam Guard: SteamCMD will request mobile app confirmation. The user
     /// gets one extra phone notification during onboarding.
+    ///
+    /// - Returns: `true` if SteamCMD authenticated successfully (exit 0).
+    @discardableResult
     func authenticateSteamCMD(
         username: String,
         password: String,
         engine: WineEngine,
         prefix: WinePrefix
-    ) async {
+    ) async -> Bool {
         let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
         guard FileManager.default.fileExists(atPath: steamcmdPath) else {
             log.warning("[authenticateSteamCMD] steamcmd.exe not found — skipping")
-            return
+            return false
         }
 
         log.info("[authenticateSteamCMD] authenticating SteamCMD for user=\(username)")
@@ -415,7 +418,7 @@ final class WineSteamManager {
             try process.run()
         } catch {
             log.error("[authenticateSteamCMD] failed to launch: \(error.localizedDescription)")
-            return
+            return false
         }
 
         log.info("[authenticateSteamCMD] steamcmd pid=\(process.processIdentifier)")
@@ -443,8 +446,14 @@ final class WineSteamManager {
         let exitCode = process.terminationStatus
         if exitCode == 0 {
             log.info("[authenticateSteamCMD] SteamCMD authenticated ✓ (exit=0)")
+            // Immediately back up the new credential cache outside the prefix.
+            // This survives any subsequent prefix reset or wineserver kill so
+            // future installs won't require Steam Guard re-confirmation.
+            prefix.backupSteamCMDConfig()
+            return true
         } else {
-            log.warning("[authenticateSteamCMD] SteamCMD auth exited \(exitCode) — may need manual re-auth via Terminal")
+            log.warning("[authenticateSteamCMD] SteamCMD auth exited \(exitCode) — credential cache may not have been written")
+            return false
         }
     }
 
@@ -491,6 +500,14 @@ final class WineSteamManager {
 
         log.info("[installWithSteamCMD] appID=\(appID) user=\(username)")
         onProgress("Starting SteamCMD download for appID \(appID)…")
+
+        // Always restore the credential cache from backup before launching SteamCMD.
+        // Checking for file existence is NOT enough — SteamCMD's self-update replaces
+        // config.vdf with a fresh file containing no credentials (the file exists but
+        // the credential section is empty). Always overwriting from backup guarantees
+        // valid credentials are present regardless of what SteamCMD did to the file.
+        log.info("[installWithSteamCMD] restoring SteamCMD credential cache from backup")
+        prefix.restoreSteamCMDConfig()
 
         // SteamCMD MUST use Gcenx wine64, not CX wineloader.
         // CLI-verified: SteamCMD works with Gcenx, fails with CX (version mismatch).
@@ -550,18 +567,23 @@ final class WineSteamManager {
         let exitCode = process.terminationStatus
 
         if (exitCode == 7 || exitCode == 5), let auth = steamAuth, let password = auth.loadSteamPassword() {
-            // SteamCMD credential cache was wiped (prefix reset). Auto-recover by
-            // re-authenticating with the password stored in Keychain during sign-in.
             log.warning("[installWithSteamCMD] login failed (exit=\(exitCode)) — auto-recovering with Keychain password")
-            await MainActor.run { onProgress("Re-authenticating SteamCMD…") }
+            await MainActor.run { onProgress("Re-authenticating SteamCMD — approve Steam Guard on your phone if prompted…") }
 
-            await authenticateSteamCMD(username: username, password: password, engine: engine, prefix: prefix)
+            let authOK = await authenticateSteamCMD(username: username, password: password, engine: engine, prefix: prefix)
 
-            // Retry the install now that credentials are restored
-            log.info("[installWithSteamCMD] retrying install after re-auth")
-            await MainActor.run { onProgress("Retrying download…") }
-            try await installWithSteamCMD(appID: appID, username: username, engine: engine, prefix: prefix, onProgress: onProgress)
-            return
+            if authOK {
+                log.info("[installWithSteamCMD] re-auth succeeded — retrying install")
+                await MainActor.run { onProgress("Retrying download…") }
+                try await installWithSteamCMD(appID: appID, username: username, engine: engine, prefix: prefix, steamAuth: steamAuth, onProgress: onProgress)
+                return
+            } else {
+                log.error("[installWithSteamCMD] re-auth failed — Steam Guard may have timed out")
+                throw SteamError.installFailed(
+                    "SteamCMD login failed — Steam Guard confirmation may have timed out. "
+                    + "Please try again and approve the Steam Guard notification on your phone."
+                )
+            }
         }
 
         if exitCode == 7 || exitCode == 5 {
@@ -588,15 +610,64 @@ final class WineSteamManager {
     }
 
 
-    /// Brings the running Steam window to the foreground.
-    /// Sends `-activate` via IPC, which tells the running Steam instance to
-    /// surface its main window without launching a second Steam process.
-    func showSteamUI(engine: WineEngine, prefix: WinePrefix) throws {
-        log.info("[showSteamUI] activating Steam window")
-        // Pause suppression first — otherwise the 0.5s poll + AX observers minimize Steam
-        // as fast as it appears. Re-engages when Meridian becomes active again.
+    /// Brings the Steam window to the foreground.
+    ///
+    /// When a persistent Steam process is already running, sends `-activate` via IPC
+    /// to surface its main window.
+    ///
+    /// In CX engine mode no persistent Steam is running (bootstrap skips it deliberately).
+    /// In this case Steam is started in visible, non-silent mode so the user can interact
+    /// with it. The suppressor is paused first so Steam's windows are not hidden.
+    func showSteamUI(engine: WineEngine, prefix: WinePrefix) async {
+        log.info("[showSteamUI] showing Steam UI")
+        // Pause suppression before doing anything — the polling timer runs every 0.5s and
+        // will re-hide Steam windows if suppressionActive is still true.
         windowSuppressor?.allowSteamUITemporarily()
-        try sendSteamCommand(["-activate"], engine: engine, prefix: prefix)
+
+        if isSteamProcessAlive {
+            // Persistent Steam is running — use IPC to surface its window.
+            log.info("[showSteamUI] persistent Steam alive — sending -activate IPC")
+            try? sendSteamCommand(["-activate"], engine: engine, prefix: prefix)
+            return
+        }
+
+        // No running Steam (CX engine mode skips persistent Steam).
+        // Start steam.exe visibly so the user can see and interact with the UI.
+        // Use -noreactlogin to suppress the React login dialog; the ConnectCache
+        // session from onboarding auto-logs in without any user interaction.
+        let steamExe = prefix.steamExePath.path(percentEncoded: false)
+        let args = [steamExe, "-noreactlogin"]
+        log.info("[showSteamUI] no persistent Steam — starting: wine64 \(args.joined(separator: " "))")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = args
+        process.environment = engine.environment(for: prefix)
+        process.standardOutput = FileHandle.nullDevice
+
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        nonisolated(unsafe) let pipeSafe = errPipe
+        Task.detached {
+            let data = pipeSafe.fileHandleForReading.readDataToEndOfFile()
+            if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+                let filtered = filterWineStderr(str)
+                if !filtered.isEmpty {
+                    log.debug("[showSteamUI] stderr: \(filtered.prefix(500))")
+                }
+            }
+        }
+
+        do {
+            try process.run()
+            let pid = process.processIdentifier
+            log.info("[showSteamUI] Steam started pid=\(pid)")
+            // Register with suppressor as a Steam process so its sub-windows are
+            // tracked, but suppression is already paused so they won't be hidden.
+            windowSuppressor?.registerPID(pid)
+        } catch {
+            log.error("[showSteamUI] failed to start Steam: \(error.localizedDescription)")
+        }
     }
 
     /// Uninstalls a game by deleting its files directly on disk (no Steam IPC).
@@ -688,9 +759,46 @@ final class WineSteamManager {
         process.arguments = [exeFullPath]
         process.currentDirectoryURL = gamePath
 
-        let env = engine.environment(for: prefix)
+        var env = engine.environment(for: prefix)
+
+        let compat = GameCompatibilityDB.shared
+        let gameExtraEnv = compat.extraEnv(for: appID)
+        for (key, value) in gameExtraEnv {
+            env[key] = value
+        }
+        if let gameOverrides = compat.dllOverrides(for: appID) {
+            if let existing = env["WINEDLLOVERRIDES"], !existing.isEmpty {
+                env["WINEDLLOVERRIDES"] = existing + ";" + gameOverrides
+            } else {
+                env["WINEDLLOVERRIDES"] = gameOverrides
+            }
+        }
+
+        if let profile = compat.profile(for: appID) {
+            switch profile.dxmtMode {
+            case .disabled:
+                let disableOverride = "d3d11,dxgi=b"
+                if let existing = env["WINEDLLOVERRIDES"], !existing.isEmpty {
+                    env["WINEDLLOVERRIDES"] = existing + ";" + disableOverride
+                } else {
+                    env["WINEDLLOVERRIDES"] = disableOverride
+                }
+                log.info("[launchGameDirectly] dxmtMode=disabled — forcing Wine builtin d3d11")
+            case .required:
+                if engine.dxmtPath == nil {
+                    log.warning("[launchGameDirectly] dxmtMode=required but DXMT not available")
+                }
+            case .auto:
+                break
+            }
+            log.info("[launchGameDirectly] graphicsAPI=\(profile.graphicsAPI.rawValue) engine=\(profile.gameEngine.rawValue) status=\(profile.status.rawValue)")
+        }
+
         process.environment = env
         log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
+        if !gameExtraEnv.isEmpty {
+            log.info("[launchGameDirectly] game extraEnv: \(gameExtraEnv)")
+        }
 
         let stderrPipe = Pipe()
         process.standardOutput = FileHandle.nullDevice
@@ -705,7 +813,10 @@ final class WineSteamManager {
         }
 
         let pid = process.processIdentifier
-        windowSuppressor?.registerPID(pid)
+        // Do NOT register the game PID with the window suppressor.
+        // The suppressor is for hiding Steam/Wine helper windows — registering the
+        // game exe here immediately hides the game window before suppression is
+        // paused, making it invisible and impossible to bring back via the Dock.
 
         Task.detached {
             let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
@@ -840,6 +951,65 @@ final class WineSteamManager {
         let pid = process.processIdentifier
         log.info("[startSteamForLogin] pid=\(pid)")
         return pid
+    }
+
+    // MARK: - Steam DRM Background Host
+
+    /// Starts `steam.exe -silent` to provide the Steam IPC socket for games that
+    /// use `steam_api64.dll` (Steam DRM). Without a running Steam client, those
+    /// games call `SteamAPI_Init()`, get a failure, and exit silently.
+    ///
+    /// The process is NOT tracked in `persistentProcess` — it is a disposable
+    /// background host. The caller is responsible for killing it via `killAll`
+    /// after the game exits.
+    ///
+    /// Steam auto-logs in using the ConnectCache / loginusers.vdf session written
+    /// during onboarding. The `SteamWindowSuppressor` hides any transient windows.
+    func startSteamForDRM(
+        engine: WineEngine,
+        prefix: WinePrefix,
+        windowSuppressor: SteamWindowSuppressor?
+    ) throws {
+        let steamExe = prefix.steamExePath.path(percentEncoded: false)
+        // -silent: start in tray-only mode (no main window)
+        // -nofriendsui: suppress the friends overlay
+        // -noreactlogin: skip the React-based login dialog if session is missing
+        let args = [steamExe, "-silent", "-nofriendsui", "-noreactlogin"]
+        log.info("[startSteamForDRM] launching: wine64 \(args.joined(separator: " "))")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = args
+        process.environment = engine.environment(for: prefix)
+        process.standardOutput = FileHandle.nullDevice
+
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        nonisolated(unsafe) let pipeSafe = errPipe
+        Task.detached {
+            let data = pipeSafe.fileHandleForReading.readDataToEndOfFile()
+            if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+                let filtered = filterWineStderr(str)
+                if !filtered.isEmpty {
+                    log.debug("[startSteamForDRM] stderr: \(filtered.prefix(500))")
+                }
+            }
+        }
+
+        try process.run()
+        let pid = process.processIdentifier
+        log.info("[startSteamForDRM] pid=\(pid)")
+
+        // Register with suppressor so any Steam UI windows are hidden immediately.
+        windowSuppressor?.registerPID(pid)
+
+        // Update TerminationCleanup context so wineserver -k works at app quit.
+        TerminationCleanup.context = TerminationCleanup.Context(
+            wineserverPath: engine.wineserverURL.path(percentEncoded: false),
+            winePrefix: prefix.path.path(percentEncoded: false),
+            engineDirPath: WineEngine.engineDir.path(percentEncoded: false),
+            libraryPath: engine.libraryPath
+        )
     }
 
     // MARK: - Interactive Login (advanced fallback)

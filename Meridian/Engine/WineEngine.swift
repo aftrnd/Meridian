@@ -284,6 +284,8 @@ final class WineEngine {
             "WINEPREFIX": prefix.path.path(percentEncoded: false),
             "WINE_LARGE_ADDRESS_AWARE": "1",
             "MTL_HUD_ENABLED": settings.metalHUD ? "1" : "0",
+            "ROSETTA_ADVERTISE_AVX": "1",
+            "DOTNET_EnableWriteXorExecute": "0",
         ]
 
         // When CrossOver Preview is available, its libs take priority for DLL loading.
@@ -293,15 +295,34 @@ final class WineEngine {
         let gcenxLib = libraryPath  // Gcenx engine lib path
 
         if let cxLib = cxPreviewLibPath, let gcenxLib {
-            // CX Preview mode: CX unix libs + Gcenx unix libs (for DXMT winemetal.so)
+            // CX root is two levels up from cxPreviewLibPath ($CX_ROOT/lib/wine → $CX_ROOT)
+            let cxRoot = URL(filePath: cxLib).deletingLastPathComponent().deletingLastPathComponent().path(percentEncoded: false)
+
+            // Apple GPTK D3DMetal paths (D3D12 → Metal 3 via libd3dshared / D3DMetal.framework)
+            // CLI-verified: GPTK d3d12.dll fixes blue-flashing-screen on D3D12 games (Animal Well).
+            let gptkWinDlls  = "\(cxRoot)/lib64/apple_gptk/wine/x86_64-windows"
+            let gptkUnixDlls = "\(cxRoot)/lib64/apple_gptk/wine/x86_64-unix"
+            let gptkExternal = "\(cxRoot)/lib64/apple_gptk/external"
+            let cxLib64      = "\(cxRoot)/lib64"
+            let libd3dshared = "\(gptkExternal)/libd3dshared.dylib"
+
+            // CX Preview mode: build DYLD path with GPTK dirs for libd3dshared + D3DMetal resolution
             let cxUnix    = "\(cxLib)/x86_64-unix"
             let gcenxUnix = "\(gcenxLib)/wine/x86_64-unix"
-            env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(cxLib):\(cxUnix):\(gcenxUnix):\(gcenxLib)"
+            env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(cxLib):\(cxUnix):\(gptkUnixDlls):\(gptkExternal):\(cxLib64):\(gcenxUnix):\(gcenxLib)"
 
-            // WINEDLLPATH: Gcenx x86_64-windows first (for DXMT d3d11/dxgi override),
-            // then CX lib (for better stubs on everything else)
+            // WINEDLLPATH order:
+            //   1. Gcenx x86_64-windows (DXMT d3d11/dxgi — Metal renderer for DX11)
+            //   2. GPTK x86_64-windows  (d3d12 via D3DMetal — correct renderer for DX12)
+            //   3. CX lib/wine          (CX's modern stubs for everything else)
+            //   4. Gcenx lib/wine       (NLS, fallback)
             let gcenxWinDlls = "\(gcenxLib)/wine/x86_64-windows"
-            env["WINEDLLPATH"] = "\(gcenxWinDlls):\(cxLib):\(gcenxLib)/wine"
+            env["WINEDLLPATH"] = "\(gcenxWinDlls):\(gptkWinDlls):\(cxLib):\(gcenxLib)/wine"
+
+            // CX Perl launcher sets this so D3DMetal can find libd3dshared.dylib at runtime
+            if FileManager.default.fileExists(atPath: libd3dshared) {
+                env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = libd3dshared
+            }
         } else if let lib = gcenxLib {
             // Gcenx-only mode (original behavior)
             let unixDir = "\(lib)/wine/x86_64-unix"

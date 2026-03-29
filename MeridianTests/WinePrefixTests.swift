@@ -34,6 +34,11 @@ import Foundation
 ///   • isGameInstalled(...)               ← WinePrefix.isGameInstalled()
 ///   • isGameFullyInstalled(...)          ← WinePrefix.isGameFullyInstalled()
 ///   • gameInstallDir(...)                ← WinePrefix.gameInstallDir()
+///   • backupSteamCMDConfig(...)          ← WinePrefix.backupSteamCMDConfig()
+///   • restoreSteamCMDConfig(...)         ← WinePrefix.restoreSteamCMDConfig()
+///   • gameRequiresSteamAPI(...)          ← WinePrefix.gameRequiresSteamAPI()
+///   • writeSteamAppID(...)               ← WinePrefix.writeSteamAppID()
+///   • writeConnectCache(...)             ← WinePrefix.writeConnectCache() (merge behaviour)
 ///   • vdfKeyValue(from:)                 ← WinePrefix.vdfKeyValue(from:)
 ///   • windowsPathToURL(_:driveC:)        ← WinePrefix.windowsPathToURL(_:)
 ///   • simulateResetToEngineTemplate(...) ← WinePrefix.resetToEngineTemplate()
@@ -79,6 +84,7 @@ final class WinePrefixTests: XCTestCase {
             let isPathKey = key == "path"
             let isNumericNonZero = key != "0" && key.allSatisfy(\.isNumber)
             guard isPathKey || isNumericNonZero else { continue }
+            guard value.contains("\\") || value.contains("/") || (value.count >= 3 && value[value.index(value.startIndex, offsetBy: 1)] == ":") else { continue }
 
             if let url = windowsPathToURL(value, driveC: prefixDriveC) {
                 let canonical = url.standardizedFileURL.path(percentEncoded: false)
@@ -478,6 +484,39 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertEqual(folders.count, 2)
         let expected = driveC.appending(path: "Games/SteamLibrary")
         XCTAssertEqual(folders[1].standardizedFileURL, expected.standardizedFileURL)
+    }
+
+    func testSteamLibraryFolders_ignoresAppSizeValuesInAppsSection() throws {
+        // Regression: SteamCMD writes a new-format VDF with an "apps" sub-section
+        // containing "appID" → "sizeBytes" pairs. The parser must not treat these
+        // pure-numeric values as library paths (they produce bogus paths like /39590283).
+        let (steam, driveC) = try makePrefix()
+        let steamapps = steam.appending(path: "steamapps")
+        try FileManager.default.createDirectory(at: steamapps, withIntermediateDirectories: true)
+
+        let vdf = """
+        "libraryfolders"
+        {
+        \t"0"
+        \t{
+        \t\t"path"\t\t"C:\\\\Program Files (x86)\\\\Steam"
+        \t\t"label"\t\t""
+        \t\t"contentid"\t\t"1426138810344184807"
+        \t\t"totalsize"\t\t"0"
+        \t\t"apps"
+        \t\t{
+        \t\t\t"228980"\t\t"39590283"
+        \t\t\t"3180070"\t\t"1324154408"
+        \t\t}
+        \t}
+        }
+        """
+        try vdf.write(to: steamapps.appending(path: "libraryfolders.vdf"), atomically: true, encoding: .utf8)
+
+        let folders = steamLibraryFolders(steamInstallDir: steam, prefixDriveC: driveC)
+        // Must return only the default library — no bogus /39590283 or /1324154408 paths
+        XCTAssertEqual(folders.count, 1, "App size values must not be parsed as library paths")
+        XCTAssertEqual(folders[0].standardizedFileURL, steam.standardizedFileURL)
     }
 
     func testSteamLibraryFolders_doesNotDuplicateDefaultLibrary() throws {
@@ -1378,36 +1417,91 @@ final class WinePrefixTests: XCTestCase {
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
     }
 
-    /// Mirror of WinePrefix.writeConnectCache — writes config.vdf
+    /// Mirror of WinePrefix.writeConnectCache — merges ConnectCache/Accounts into config.vdf
+    ///
+    /// MIRROR CONTRACT: Must stay in sync with WinePrefix.writeConnectCache().
+    /// Key behavior: if config.vdf already has a "Steam" section (written by SteamCMD),
+    /// we upsert only the steamID JWT entry inside ConnectCache and the account entry
+    /// inside Accounts, preserving all other SteamCMD keys (7a611aa1, etc.).
     private func writeConnectCache(configDir: URL, steamID: String, refreshToken: String, accountName: String) throws {
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
-        let vdf = """
-        "InstallConfigStore"
-        {
-        \t"Software"
-        \t{
-        \t\t"Valve"
-        \t\t{
-        \t\t\t"Steam"
-        \t\t\t{
-        \t\t\t\t"ConnectCache"
-        \t\t\t\t{
-        \t\t\t\t\t"\(steamID)"\t\t"\(refreshToken)"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"\(accountName)"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"\(steamID)"
-        \t\t\t\t\t}
-        \t\t\t\t}
-        \t\t\t}
-        \t\t}
-        \t}
-        }
-        """
         let dest = configDir.appending(path: "config.vdf")
+
+        let jwtEntry     = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
+        let accountEntry = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+
+        if let existing = try? String(contentsOf: dest, encoding: .utf8),
+           existing.contains("\"Steam\"") {
+            var updated = upsertVDFKeyInSection(in: existing, sectionKey: "\"ConnectCache\"",
+                                                newKeyLine: jwtEntry, matchPrefix: "\"\(steamID)\"")
+            updated = upsertVDFKeyInSection(in: updated, sectionKey: "\"Accounts\"",
+                                            newKeyLine: accountEntry, matchPrefix: "\"\(accountName)\"")
+            try updated.write(to: dest, atomically: true, encoding: .utf8)
+            return
+        }
+        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\t\t\t\t}"
+        let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
+        let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
+    }
+
+    // Helpers mirroring WinePrefix's private merge helpers.
+    private func upsertVDFKeyInSection(in text: String, sectionKey: String,
+                                       newKeyLine: String, matchPrefix: String) -> String {
+        guard let keyRange = text.range(of: sectionKey) else {
+            return insertBeforeSteamClose(in: text,
+                                          text: "\(sectionKey)\n\t\t\t\t{\n\(newKeyLine)\n\t\t\t\t}")
+        }
+        var searchStart = keyRange.upperBound
+        while searchStart < text.endIndex && text[searchStart].isWhitespace { searchStart = text.index(after: searchStart) }
+        guard searchStart < text.endIndex, text[searchStart] == "{" else { return text }
+        var depth = 0; var idx = searchStart
+        while idx < text.endIndex {
+            switch text[idx] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    let blockRange = searchStart...idx
+                    var block = String(text[blockRange])
+                    let lines = block.components(separatedBy: "\n")
+                    if let existingIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(matchPrefix) }) {
+                        var newLines = lines; newLines[existingIdx] = newKeyLine
+                        block = newLines.joined(separator: "\n")
+                    } else {
+                        let closingBrace = block.lastIndex(of: "}")!
+                        block.insert(contentsOf: "\n" + newKeyLine, at: closingBrace)
+                    }
+                    let prefixText = text[text.startIndex..<searchStart]
+                    let suffixText = text[text.index(after: idx)...]
+                    return prefixText + block + suffixText
+                }
+            default: break
+            }
+            idx = text.index(after: idx)
+        }
+        return text
+    }
+
+    private func insertBeforeSteamClose(in vdf: String, text: String) -> String {
+        guard let steamKeyRange = vdf.range(of: "\"Steam\"") else { return vdf }
+        var searchStart = steamKeyRange.upperBound
+        while searchStart < vdf.endIndex && vdf[searchStart].isWhitespace { searchStart = vdf.index(after: searchStart) }
+        guard searchStart < vdf.endIndex, vdf[searchStart] == "{" else { return vdf }
+        var depth = 0; var idx = searchStart
+        while idx < vdf.endIndex {
+            switch vdf[idx] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    var result = vdf; result.insert(contentsOf: "\n" + text + "\n\t\t\t", at: idx); return result
+                }
+            default: break
+            }
+            idx = vdf.index(after: idx)
+        }
+        return vdf
     }
 
     func testWriteLoginUsers_createsMostRecentEntry() throws {
@@ -1437,6 +1531,97 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertTrue(content.contains(token))
         XCTAssertTrue(content.contains("\"76561198000000000\""))
         XCTAssertTrue(content.contains("\"testuser\""))
+    }
+
+    func testWriteConnectCache_mergesIntoExistingSteamCMDConfigVDF() throws {
+        // SteamCMD writes additional sections (CMWebSocket, AutoUpdateWindowEnabled, etc.)
+        // that must survive writeConnectCache. Previously writeConnectCache replaced the
+        // entire file, destroying those sections and forcing Steam Guard re-confirmation.
+        let configDir = tempDir.appending(path: "merge_test/config")
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        // Simulate a config.vdf written by SteamCMD with extra sections.
+        let steamcmdVDF = """
+        "InstallConfigStore"
+        {
+        \t"Software"
+        \t{
+        \t\t"Valve"
+        \t\t{
+        \t\t\t"Steam"
+        \t\t\t{
+        \t\t\t\t"ConnectCache"
+        \t\t\t\t{
+        \t\t\t\t\t"76561198000000000"\t\t"old_token"
+        \t\t\t\t\t"7a611aa1"\t\t"encrypted_credential_cache_data"
+        \t\t\t\t}
+        \t\t\t\t"Accounts"
+        \t\t\t\t{
+        \t\t\t\t\t"olduser"
+        \t\t\t\t\t{
+        \t\t\t\t\t\t"SteamID"\t\t"76561198000000000"
+        \t\t\t\t\t}
+        \t\t\t\t}
+        \t\t\t\t"AutoUpdateWindowEnabled"\t\t"0"
+        \t\t\t\t"ipv6check_http_state"\t\t"bad"
+        \t\t\t}
+        \t\t}
+        \t}
+        }
+        """
+        let dest = configDir.appending(path: "config.vdf")
+        try steamcmdVDF.write(to: dest, atomically: true, encoding: .utf8)
+
+        // Use the same steamID and accountName as in the existing file — simulates
+        // a token refresh after re-authentication.
+        let newToken = "eyJ_new_jwt_token"
+        try writeConnectCache(configDir: configDir, steamID: "76561198000000000",
+                              refreshToken: newToken, accountName: "olduser")
+
+        let updated = try String(contentsOf: dest, encoding: .utf8)
+
+        // New credentials written.
+        XCTAssertTrue(updated.contains(newToken), "New refresh token must be present")
+        XCTAssertTrue(updated.contains("\"olduser\""), "Account name must be present")
+        XCTAssertTrue(updated.contains("\"76561198000000000\""), "SteamID must be present")
+
+        // Old SteamCMD-specific data preserved — this is the key regression guard.
+        XCTAssertTrue(updated.contains("encrypted_credential_cache_data"),
+                      "SteamCMD encrypted credential cache (7a611aa1 key) must be preserved")
+        XCTAssertTrue(updated.contains("\"AutoUpdateWindowEnabled\""),
+                      "SteamCMD extra sections must be preserved")
+        XCTAssertTrue(updated.contains("\"ipv6check_http_state\""),
+                      "SteamCMD extra sections must be preserved")
+
+        // Old JWT token replaced by new one.
+        XCTAssertFalse(updated.contains("old_token"), "Old token must be replaced by new token")
+    }
+
+    func testWriteConnectCache_writesMinimalVDFWhenNoFileExists() throws {
+        let configDir = tempDir.appending(path: "fresh_cache_test/config")
+        let token = "eyJhbGciOiJFZERTQSJ9.test"
+        try writeConnectCache(configDir: configDir, steamID: "76561198000000001",
+                              refreshToken: token, accountName: "freshuser")
+
+        let content = try String(contentsOf: configDir.appending(path: "config.vdf"), encoding: .utf8)
+        XCTAssertTrue(content.contains(token))
+        XCTAssertTrue(content.contains("\"freshuser\""))
+        XCTAssertTrue(content.contains("\"InstallConfigStore\""))
+    }
+
+    func testWriteConnectCache_idempotentOnRepeatedCalls() throws {
+        // Calling writeConnectCache twice should produce the same token without duplication.
+        let configDir = tempDir.appending(path: "idempotent_cache_test/config")
+        let token = "eyJ_repeat_token"
+        try writeConnectCache(configDir: configDir, steamID: "76561198047018335",
+                              refreshToken: token, accountName: "user1")
+        try writeConnectCache(configDir: configDir, steamID: "76561198047018335",
+                              refreshToken: token, accountName: "user1")
+
+        let content = try String(contentsOf: configDir.appending(path: "config.vdf"), encoding: .utf8)
+        // Token should appear exactly once (not duplicated).
+        let occurrences = content.components(separatedBy: token).count - 1
+        XCTAssertEqual(occurrences, 1, "Token must not be duplicated on repeated writeConnectCache calls")
     }
 
     func testWriteLoginUsers_thenHasSteamLoginSession_roundTrip() throws {
@@ -1684,5 +1869,142 @@ final class WinePrefixTests: XCTestCase {
     func testIsWoW64FileType_caseInsensitive() {
         XCTAssertTrue(isWoW64FileType("WINEMAC.DRV"))
         XCTAssertTrue(isWoW64FileType("Kernel32.Dll"))
+    }
+
+    // MARK: - SteamCMD Config Backup / Restore
+
+    /// Mirror of WinePrefix.backupSteamCMDConfig / restoreSteamCMDConfig
+    private func backupSteamCMDConfig(steamInstallDir: URL, backupURL: URL) {
+        let configVDF = steamInstallDir.appending(path: "config/config.vdf")
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: configVDF.path(percentEncoded: false)) else { return }
+        try? fm.removeItem(at: backupURL)
+        try? fm.copyItem(at: configVDF, to: backupURL)
+    }
+
+    /// Mirror of WinePrefix.restoreSteamCMDConfig
+    private func restoreSteamCMDConfig(steamInstallDir: URL, backupURL: URL) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: backupURL.path(percentEncoded: false)) else { return }
+        let configDir = steamInstallDir.appending(path: "config")
+        let configVDF = configDir.appending(path: "config.vdf")
+        try? fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try? fm.removeItem(at: configVDF)
+        try? fm.copyItem(at: backupURL, to: configVDF)
+    }
+
+    func testSteamCMDConfigBackup_preservesCredentialCache() throws {
+        let fm = FileManager.default
+        let prefix = tempDir.appending(path: "prefix")
+        let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
+        let configDir = steamDir.appending(path: "config")
+        let configVDF = configDir.appending(path: "config.vdf")
+        let backupURL = tempDir.appending(path: "steamcmd-config-backup.vdf")
+
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let credentialData = "\"InstallConfigStore\" { \"Software\" { \"Valve\" { \"Steam\" { \"Accounts\" { \"nickjack876\" { \"SteamID\" \"76561198047018335\" } } } } } }"
+        try credentialData.write(to: configVDF, atomically: true, encoding: .utf8)
+
+        // Backup
+        backupSteamCMDConfig(steamInstallDir: steamDir, backupURL: backupURL)
+        XCTAssertTrue(fm.fileExists(atPath: backupURL.path(percentEncoded: false)))
+
+        // Simulate prefix wipe
+        try fm.removeItem(at: prefix)
+        XCTAssertFalse(fm.fileExists(atPath: configVDF.path(percentEncoded: false)))
+
+        // Recreate prefix structure (like bootstrap would)
+        try fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
+
+        // Restore
+        restoreSteamCMDConfig(steamInstallDir: steamDir, backupURL: backupURL)
+        XCTAssertTrue(fm.fileExists(atPath: configVDF.path(percentEncoded: false)))
+
+        let restored = try String(contentsOf: configVDF, encoding: .utf8)
+        XCTAssertEqual(restored, credentialData)
+    }
+
+    func testSteamCMDConfigRestore_noopWhenNoBackup() throws {
+        let fm = FileManager.default
+        let steamDir = tempDir.appending(path: "drive_c/Program Files (x86)/Steam")
+        let configVDF = steamDir.appending(path: "config/config.vdf")
+        let backupURL = tempDir.appending(path: "steamcmd-config-backup.vdf")
+
+        try fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
+
+        restoreSteamCMDConfig(steamInstallDir: steamDir, backupURL: backupURL)
+        XCTAssertFalse(fm.fileExists(atPath: configVDF.path(percentEncoded: false)))
+    }
+
+    func testSteamCMDConfigBackup_noopWhenNoConfigVDF() {
+        let fm = FileManager.default
+        let steamDir = tempDir.appending(path: "drive_c/Program Files (x86)/Steam")
+        let backupURL = tempDir.appending(path: "steamcmd-config-backup.vdf")
+
+        try? fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
+
+        backupSteamCMDConfig(steamInstallDir: steamDir, backupURL: backupURL)
+        XCTAssertFalse(fm.fileExists(atPath: backupURL.path(percentEncoded: false)))
+    }
+
+    // MARK: - gameRequiresSteamAPI / writeSteamAppID
+
+    /// Mirror of WinePrefix.gameRequiresSteamAPI — checks for steam_api64.dll or steam_api.dll
+    private func gameRequiresSteamAPI(gameDir: URL) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: gameDir.appending(path: "steam_api64.dll").path(percentEncoded: false))
+            || fm.fileExists(atPath: gameDir.appending(path: "steam_api.dll").path(percentEncoded: false))
+    }
+
+    func testGameRequiresSteamAPI_trueWhenSteamApi64Present() throws {
+        let fm = FileManager.default
+        let gameDir = tempDir.appending(path: "Animal Well")
+        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        try "".write(to: gameDir.appending(path: "steam_api64.dll"), atomically: true, encoding: .utf8)
+        try "".write(to: gameDir.appending(path: "Animal Well.exe"), atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir))
+    }
+
+    func testGameRequiresSteamAPI_trueWhenSteamApi32Present() throws {
+        let fm = FileManager.default
+        let gameDir = tempDir.appending(path: "Game32")
+        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        try "".write(to: gameDir.appending(path: "steam_api.dll"), atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir))
+    }
+
+    func testGameRequiresSteamAPI_falseWhenNoDRM() throws {
+        let fm = FileManager.default
+        let gameDir = tempDir.appending(path: "NoDRM")
+        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        try "".write(to: gameDir.appending(path: "game.exe"), atomically: true, encoding: .utf8)
+        try "".write(to: gameDir.appending(path: "GameAssembly.dll"), atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(gameRequiresSteamAPI(gameDir: gameDir))
+    }
+
+    func testWriteSteamAppID_writesCorrectContent() throws {
+        let gameDir = tempDir.appending(path: "Animal Well")
+        try FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        let appIDFile = gameDir.appending(path: "steam_appid.txt")
+
+        try "813230".write(to: appIDFile, atomically: true, encoding: .utf8)
+
+        let content = try String(contentsOf: appIDFile, encoding: .utf8)
+        XCTAssertEqual(content, "813230")
+    }
+
+    func testWriteSteamAppID_isOverwriteSafe() throws {
+        let gameDir = tempDir.appending(path: "GameOverwrite")
+        try FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        let appIDFile = gameDir.appending(path: "steam_appid.txt")
+
+        try "111111".write(to: appIDFile, atomically: true, encoding: .utf8)
+        try "813230".write(to: appIDFile, atomically: true, encoding: .utf8)
+
+        let content = try String(contentsOf: appIDFile, encoding: .utf8)
+        XCTAssertEqual(content, "813230")
     }
 }

@@ -24,6 +24,8 @@ struct GameDetailView: View {
     @Environment(SteamAuthService.self)   private var steamAuth
     @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(GameLauncher.self)       private var launcher
+    @Environment(BootstrapManager.self)   private var bootstrap
+    @Environment(EngineDownloader.self)   private var engineDownloader
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
@@ -160,7 +162,9 @@ struct GameDetailView: View {
                     }
 
                     Button {
-                        try? steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
+                        Task {
+                            await steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
+                        }
                     } label: {
                         Label("Show Steam", systemImage: "gamecontroller")
                     }
@@ -216,6 +220,15 @@ struct GameDetailView: View {
                 Task {
                     await launcher.cleanupProcesses(engine: engine, steamManager: steamManager)
                     WinePrefix.defaultPrefix.reset()
+                    // Re-run the full bootstrap pipeline so the app recovers immediately
+                    // without requiring a restart. ContentView watches bootstrap.isReady
+                    // and shows SplashView while the pipeline runs.
+                    bootstrap.retry(
+                        engine: engine,
+                        steamManager: steamManager,
+                        sessionBridge: sessionBridge,
+                        engineDownloader: engineDownloader
+                    )
                 }
             }
         } message: {
@@ -655,9 +668,29 @@ struct GameDetailView: View {
             }
 
         case .awaitingInstallConfirmation:
-            HStack(spacing: 8) {
-                ProgressButton(launcher.currentActivity ?? "Queuing download…")
-                cancelButton
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    ProgressButton("Downloading…")
+                    cancelButton
+                }
+                if let progress = launcher.downloadProgress {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(.accentColor)
+                        if let activity = launcher.currentActivity {
+                            Text(activity)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        } else {
+                            Text("\(Int(progress * 100))%")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+                }
             }
 
         case .installing:
@@ -962,6 +995,8 @@ private struct StatusCard: View {
             return launcher.currentActivity ?? "Preparing Wine environment…"
         case .bootstrappingSteam:
             return "Updating Steam — first launch takes a few minutes"
+        case .awaitingInstallConfirmation:
+            return launcher.currentActivity ?? "Preparing download…"
         case .launching:
             if let last = launcher.logs.last, !last.isEmpty {
                 return last

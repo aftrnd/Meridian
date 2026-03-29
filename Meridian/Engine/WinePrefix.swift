@@ -253,6 +253,10 @@ struct WinePrefix: Sendable {
 
         log.info("[resetToTemplate] saving Steam config before prefix reset")
 
+        // Also write a disk-based backup of the SteamCMD credential cache
+        // as a safety net in case the in-memory restore below fails.
+        backupSteamCMDConfig()
+
         // Save important Steam config files so login session survives the reset.
         // Capture the full URL for each file so the restore step can write back to
         // the exact same path in the new prefix (prefix URL doesn't change).
@@ -484,47 +488,148 @@ struct WinePrefix: Sendable {
         log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
     }
 
-    /// Writes `config/config.vdf` with a `ConnectCache` entry containing the
-    /// IAuthenticationService refresh token, enabling auto-login for `steamID`.
+    /// Merges `ConnectCache` and `Accounts` into `config/config.vdf`.
     ///
-    /// Any pre-existing `config.vdf` is replaced. At first-login time the file
-    /// is either absent or minimal (no library-folder settings have been saved
-    /// yet), so overwriting it is safe. Steam regenerates all other settings
-    /// on first authenticated start.
+    /// SteamCMD stores its encrypted credential cache (auth tokens, server
+    /// timing info, WebSocket preferences) in the same `config/config.vdf` file
+    /// under `InstallConfigStore > Software > Valve > Steam`. If we overwrite
+    /// the file we destroy those credentials, forcing Steam Guard re-confirmation
+    /// on every subsequent SteamCMD launch.
+    ///
+    /// Instead we MERGE:
+    /// - If a `ConnectCache` block already exists, inject/update just the
+    ///   steamID key-value entry inside it, leaving `7a611aa1` and other
+    ///   SteamCMD-specific entries untouched.
+    /// - If no `ConnectCache` block exists, append one inside the `Steam` section.
+    /// - Same for `Accounts` — update the entry for this account, preserve others.
+    /// - If no config.vdf exists yet, write the minimal VDF as before.
     func writeConnectCache(steamID: String, refreshToken: String, accountName: String) throws {
         let fm = FileManager.default
         let configDir = steamConfigDir
         try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
 
-        let vdf = """
-        "InstallConfigStore"
-        {
-        \t"Software"
-        \t{
-        \t\t"Valve"
-        \t\t{
-        \t\t\t"Steam"
-        \t\t\t{
-        \t\t\t\t"ConnectCache"
-        \t\t\t\t{
-        \t\t\t\t\t"\(steamID)"\t\t"\(refreshToken)"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"\(accountName)"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"\(steamID)"
-        \t\t\t\t\t}
-        \t\t\t\t}
-        \t\t\t}
-        \t\t}
-        \t}
-        }
-        """
-
         let dest = configDir.appending(path: "config.vdf")
+
+        let jwtEntry      = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
+        let accountEntry  = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+
+        // Try to merge into an existing file that has a Steam section.
+        if let existing = try? String(contentsOf: dest, encoding: .utf8),
+           existing.contains("\"Steam\"") {
+
+            var updated = existing
+
+            // Update or insert the steamID JWT entry inside the ConnectCache block.
+            updated = upsertVDFKeyInSection(in: updated,
+                                            sectionKey: "\"ConnectCache\"",
+                                            newKeyLine: jwtEntry,
+                                            matchPrefix: "\"\(steamID)\"")
+
+            // Update or insert the Accounts entry.
+            updated = upsertVDFKeyInSection(in: updated,
+                                            sectionKey: "\"Accounts\"",
+                                            newKeyLine: accountEntry,
+                                            matchPrefix: "\"\(accountName)\"")
+
+            try updated.write(to: dest, atomically: true, encoding: .utf8)
+            log.info("[writeConnectCache] merged into existing config.vdf steamID=\(steamID)")
+            return
+        }
+
+        // No existing file (or no Steam section) — write a minimal VDF.
+        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\t\t\t\t}"
+        let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
+        let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
+
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
-        log.info("[writeConnectCache] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
+        log.info("[writeConnectCache] written new config.vdf steamID=\(steamID) → \(dest.path(percentEncoded: false))")
+    }
+
+    /// Finds the named VDF section by key, then updates or inserts a key-value
+    /// line inside its brace block. If the section doesn't exist, appends it
+    /// before the closing brace of the parent `"Steam"` section.
+    ///
+    /// - `matchPrefix`: the beginning of an existing line to replace (e.g. `"\"steamID\""`)
+    /// - `newKeyLine`:  the replacement or new line to insert
+    private func upsertVDFKeyInSection(in text: String, sectionKey: String,
+                                       newKeyLine: String, matchPrefix: String) -> String {
+        guard let keyRange = text.range(of: sectionKey) else {
+            // Section not found — append a new section before Steam's closing brace.
+            return insertBeforeSteamClose(in: text,
+                                          text: "\(sectionKey)\n\t\t\t\t{\n\(newKeyLine)\n\t\t\t\t}")
+        }
+
+        // Find the opening brace of this section's value block.
+        var searchStart = keyRange.upperBound
+        while searchStart < text.endIndex && text[searchStart].isWhitespace {
+            searchStart = text.index(after: searchStart)
+        }
+        guard searchStart < text.endIndex, text[searchStart] == "{" else { return text }
+
+        // Walk to the closing brace, collecting the block range.
+        var depth = 0
+        var idx = searchStart
+        while idx < text.endIndex {
+            switch text[idx] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    // `blockOpenIdx...idx` is the `{ ... }` range for this section.
+                    let blockRange = searchStart...idx
+                    var block = String(text[blockRange])
+
+                    // Look for an existing line that starts with matchPrefix inside the block.
+                    let lines = block.components(separatedBy: "\n")
+                    if let existingIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(matchPrefix) }) {
+                        // Replace that line.
+                        var newLines = lines
+                        newLines[existingIdx] = newKeyLine
+                        block = newLines.joined(separator: "\n")
+                    } else {
+                        // Insert the new line before the closing `}`.
+                        let closingBrace = block.lastIndex(of: "}")!
+                        block.insert(contentsOf: "\n" + newKeyLine, at: closingBrace)
+                    }
+
+                    // Reconstruct the full text with the updated block.
+                    let prefixText = text[text.startIndex..<searchStart]
+                    let suffixText = text[text.index(after: idx)...]
+                    return prefixText + block + suffixText
+                }
+            default: break
+            }
+            idx = text.index(after: idx)
+        }
+        return text
+    }
+
+    /// Inserts `text` just before the closing brace of the innermost `"Steam"` section.
+    private func insertBeforeSteamClose(in vdf: String, text: String) -> String {
+        guard let steamKeyRange = vdf.range(of: "\"Steam\"") else { return vdf }
+        var searchStart = steamKeyRange.upperBound
+        while searchStart < vdf.endIndex && vdf[searchStart].isWhitespace {
+            searchStart = vdf.index(after: searchStart)
+        }
+        guard searchStart < vdf.endIndex, vdf[searchStart] == "{" else { return vdf }
+
+        var depth = 0
+        var idx = searchStart
+        while idx < vdf.endIndex {
+            switch vdf[idx] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    var result = vdf
+                    result.insert(contentsOf: "\n" + text + "\n\t\t\t", at: idx)
+                    return result
+                }
+            default: break
+            }
+            idx = vdf.index(after: idx)
+        }
+        return vdf
     }
 
     // MARK: - DXMT System32 Deployment
@@ -696,10 +801,16 @@ struct WinePrefix: Sendable {
         for line in contents.components(separatedBy: .newlines) {
             guard let (key, value) = vdfKeyValue(from: line), !value.isEmpty else { continue }
 
-            // Accept both: "path" "<winpath>" (new) and "1" "<winpath>" (legacy numeric key)
+            // Accept both: "path" "<winpath>" (new nested format) and "1" "<winpath>" (legacy)
+            // Legacy format: "1" "C:\\some\\path" — numeric key, value is a Windows/Unix path
+            // New format: nested section with "path" key, plus "apps" { "appID" "sizeBytes" }
+            //
+            // Guard: reject pure-numeric values — those are app sizes (e.g. "39590283"),
+            // not paths. A real path always contains a path separator or a drive letter.
             let isPathKey = key == "path"
             let isNumericNonZero = key != "0" && key.allSatisfy(\.isNumber)
             guard isPathKey || isNumericNonZero else { continue }
+            guard value.contains("\\") || value.contains("/") || (value.count >= 3 && value[value.index(value.startIndex, offsetBy: 1)] == ":") else { continue }
 
             // Value is a Windows path (e.g. "C:\\Program Files (x86)\\Steam") or
             // a Unix path on some configurations. Convert to a macOS URL.
@@ -807,6 +918,63 @@ struct WinePrefix: Sendable {
         return nil
     }
 
+    /// Returns true when the game's install directory contains `steam_api64.dll`
+    /// or `steam_api.dll` at the top level, indicating it uses Steam DRM.
+    ///
+    /// Games with Steam DRM call `SteamAPI_Init()` at startup, which connects
+    /// to a running Steam client via IPC. Without a live Steam client the
+    /// game initialises silently and exits within a few seconds. The fix is
+    /// to start `steam.exe -silent` before launching these games.
+    ///
+    /// Checks only the top-level game directory — subdirectory copies of the
+    /// DLL (e.g. in redistributable packages) are intentionally ignored.
+    func gameRequiresSteamAPI(appID: Int) -> Bool {
+        guard let installDirName = gameInstallDir(appID: appID) else { return false }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            let gameDirPath = gameDir.path(percentEncoded: false)
+            guard fm.fileExists(atPath: gameDirPath) else { continue }
+            let steamAPI64 = gameDir.appending(path: "steam_api64.dll").path(percentEncoded: false)
+            let steamAPI32 = gameDir.appending(path: "steam_api.dll").path(percentEncoded: false)
+            let result = fm.fileExists(atPath: steamAPI64) || fm.fileExists(atPath: steamAPI32)
+            log.debug("[gameRequiresSteamAPI] appID=\(appID) → \(result)")
+            return result
+        }
+        log.debug("[gameRequiresSteamAPI] appID=\(appID) → false (game dir not found)")
+        return false
+    }
+
+    /// Writes `steam_appid.txt` into the game's install directory.
+    ///
+    /// `steam_api64.dll` reads this file at startup to determine the application
+    /// ID when it cannot retrieve it from the Steam client shortcut. Writing it
+    /// before launch allows the DLL to complete its initialisation even before
+    /// the Steam client IPC socket is fully ready.
+    ///
+    /// The file contains just the numeric appID (no newline required). Safe to
+    /// call repeatedly — the file is overwritten each time.
+    func writeSteamAppID(_ appID: Int) {
+        guard let installDirName = gameInstallDir(appID: appID) else {
+            log.warning("[writeSteamAppID] cannot find install dir for appID=\(appID)")
+            return
+        }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            guard fm.fileExists(atPath: gameDir.path(percentEncoded: false)) else { continue }
+            let file = gameDir.appending(path: "steam_appid.txt")
+            do {
+                try "\(appID)".write(to: file, atomically: true, encoding: .utf8)
+                log.info("[writeSteamAppID] wrote steam_appid.txt (\(appID)) to \(gameDir.lastPathComponent)")
+            } catch {
+                log.warning("[writeSteamAppID] failed: \(error.localizedDescription)")
+            }
+            return
+        }
+        log.warning("[writeSteamAppID] game dir not found for appID=\(appID)")
+    }
+
     // MARK: - VDF / Path Helpers
 
     /// Parses a single VDF line of the form `"key"\t"value"` and returns the pair.
@@ -880,6 +1048,12 @@ struct WinePrefix: Sendable {
     /// Deletes the entire prefix directory. Use when the prefix is corrupted
     /// or Steam install is in a bad state. A fresh prefix will be created
     /// on the next launch.
+    ///
+    /// Backs up SteamCMD's credential cache (`config.vdf`) before wiping.
+    /// The encrypted auth token in that file survives prefix resets, so game
+    /// installs won't require Steam Guard re-confirmation. Call
+    /// `restoreSteamCMDConfig()` after the prefix is recreated and SteamCMD
+    /// is re-installed.
     func reset() {
         let prefixPath = path.path(percentEncoded: false)
         log.info("[reset] removing prefix at \(prefixPath)")
@@ -889,11 +1063,61 @@ struct WinePrefix: Sendable {
             return
         }
 
+        backupSteamCMDConfig()
+
         do {
             try FileManager.default.removeItem(at: path)
             log.info("[reset] prefix removed")
         } catch {
             log.error("[reset] failed to remove prefix: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - SteamCMD Credential Cache Backup
+
+    private static var steamcmdConfigBackupURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appending(path: "com.meridian.app/steamcmd-config-backup.vdf")
+    }
+
+    /// Copies SteamCMD's `config/config.vdf` to a safe location outside the
+    /// prefix. This file contains an encrypted credential token that lets
+    /// SteamCMD log in without a password or Steam Guard confirmation.
+    func backupSteamCMDConfig() {
+        let configVDF = steamInstallDir.appending(path: "config/config.vdf")
+        let backup = Self.steamcmdConfigBackupURL
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: configVDF.path(percentEncoded: false)) else {
+            log.info("[backupSteamCMD] no config.vdf to backup")
+            return
+        }
+        do {
+            try? fm.removeItem(at: backup)
+            try fm.copyItem(at: configVDF, to: backup)
+            log.info("[backupSteamCMD] config.vdf backed up ✓")
+        } catch {
+            log.warning("[backupSteamCMD] backup failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Restores a previously backed-up SteamCMD `config.vdf` into the prefix.
+    /// Call after the prefix is recreated and SteamCMD is installed.
+    func restoreSteamCMDConfig() {
+        let backup = Self.steamcmdConfigBackupURL
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: backup.path(percentEncoded: false)) else {
+            log.info("[restoreSteamCMD] no backup to restore")
+            return
+        }
+        let configDir = steamInstallDir.appending(path: "config")
+        let configVDF = configDir.appending(path: "config.vdf")
+        do {
+            try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: configVDF)
+            try fm.copyItem(at: backup, to: configVDF)
+            log.info("[restoreSteamCMD] config.vdf restored from backup ✓")
+        } catch {
+            log.warning("[restoreSteamCMD] restore failed: \(error.localizedDescription)")
         }
     }
 
