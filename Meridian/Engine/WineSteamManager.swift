@@ -370,6 +370,81 @@ final class WineSteamManager {
         }
     }
 
+    // MARK: - SteamCMD Authentication
+
+    /// Authenticates SteamCMD by piping the user's password via stdin.
+    ///
+    /// Called during the onboarding credential auth flow — the password is available
+    /// at that moment before being discarded. SteamCMD writes its own encrypted
+    /// credential cache to config.vdf (key "7a611aa1") which is separate from
+    /// the Steam client's ConnectCache JWT.
+    ///
+    /// After this runs once, subsequent SteamCMD calls use cached credentials
+    /// and never need a password again (until the prefix is reset).
+    ///
+    /// Steam Guard: SteamCMD will request mobile app confirmation. The user
+    /// gets one extra phone notification during onboarding.
+    func authenticateSteamCMD(
+        username: String,
+        password: String,
+        engine: WineEngine,
+        prefix: WinePrefix
+    ) async {
+        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
+            log.warning("[authenticateSteamCMD] steamcmd.exe not found — skipping")
+            return
+        }
+
+        log.info("[authenticateSteamCMD] authenticating SteamCMD for user=\(username)")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [steamcmdPath, "+login", username, password, "+quit"]
+        process.environment = engine.environment(for: prefix)
+
+        let combinedPipe = Pipe()
+        process.standardOutput = combinedPipe
+        process.standardError = combinedPipe
+        process.standardInput = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            log.error("[authenticateSteamCMD] failed to launch: \(error.localizedDescription)")
+            return
+        }
+
+        log.info("[authenticateSteamCMD] steamcmd pid=\(process.processIdentifier)")
+
+        // Read output on a background thread
+        let readHandle = combinedPipe.fileHandleForReading
+        let outputThread = Thread {
+            while true {
+                let data = readHandle.availableData
+                if data.isEmpty { break }
+                if let chunk = String(data: data, encoding: .utf8) {
+                    for line in chunk.components(separatedBy: .newlines) {
+                        let l = line.trimmingCharacters(in: .whitespaces)
+                        if l.isEmpty || l.contains("fixme:") || l.contains("err:") { continue }
+                        log.info("[authenticateSteamCMD:output] \(l)")
+                    }
+                }
+            }
+        }
+        outputThread.qualityOfService = .userInitiated
+        outputThread.start()
+
+        await Task.detached(priority: .utility) { process.waitUntilExit() }.value
+
+        let exitCode = process.terminationStatus
+        if exitCode == 0 {
+            log.info("[authenticateSteamCMD] SteamCMD authenticated ✓ (exit=0)")
+        } else {
+            log.warning("[authenticateSteamCMD] SteamCMD auth exited \(exitCode) — may need manual re-auth via Terminal")
+        }
+    }
+
     // MARK: - Game Installation via SteamCMD
 
     /// Downloads a game using SteamCMD — the only reliable headless install method

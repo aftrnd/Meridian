@@ -437,6 +437,7 @@ private struct SteamLoginStepContent: View {
         // This is more reliable than relying on .onChange(of: auth.step)
         // which can race with view lifecycle events.
         let advance  = onSignedIn
+        let savedPassword = password
         auth.authenticate(
             username: username.trimmingCharacters(in: .whitespaces),
             password: password
@@ -449,9 +450,19 @@ private struct SteamLoginStepContent: View {
             try? await Task.sleep(for: .seconds(2))
             try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
             try? prefix.writeConnectCache(steamID: steamID, refreshToken: refreshToken, accountName: accountName)
+
+            // Authenticate SteamCMD with the same credentials.
+            // SteamCMD has its own credential cache separate from steam.exe's ConnectCache.
+            // Passing the password here avoids requiring a separate Terminal login step.
+            // The user may get one additional Steam Guard mobile confirmation.
+            await mgr.authenticateSteamCMD(
+                username: accountName,
+                password: savedPassword,
+                engine: eng,
+                prefix: prefix
+            )
+
             // Only start persistent Steam if NOT using CX engine.
-            // With CX engine, steam.exe shows a login window we don't want.
-            // SteamCMD handles downloads and games launch directly via Wine.
             if eng.cxPreviewLibPath == nil {
                 try? await mgr.startPersistent(engine: eng, prefix: prefix)
                 if let pid = mgr.persistentProcessIdentifier { sup.resumeSuppressing(pid: pid) }
