@@ -472,10 +472,11 @@ final class WineSteamManager {
             // Exit 5 = invalid password
             // This happens after a prefix reset wipes the SteamCMD credential cache.
             // The user needs to re-authenticate SteamCMD from Terminal once.
-            log.error("[installWithSteamCMD] steamcmd login failed (exit=\(exitCode)) — cached credentials missing")
+            log.error("[installWithSteamCMD] steamcmd login failed (exit=\(exitCode)) — cached credentials missing. SteamCMD has its own credential cache separate from Meridian's login. Run the SteamCMD login script in Terminal once to establish it.")
             throw SteamError.installFailed(
-                "Steam login required. Run this in Terminal to re-authenticate:\n\n" +
-                "bash ~/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Scripts/test-steamcmd-login.sh"
+                "SteamCMD needs a one-time login. Open Terminal and run:\n\n" +
+                "bash ~/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Scripts/test-steamcmd-login.sh\n\n" +
+                "This is separate from signing into Meridian — SteamCMD uses its own credential cache for downloads."
             )
         }
 
