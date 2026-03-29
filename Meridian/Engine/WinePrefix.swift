@@ -113,14 +113,12 @@ struct WinePrefix: Sendable {
             log.debug("[hasSteamLoginSession] loginusers.vdf not found at \(vdfPath)")
             return false
         }
-        // Steam VDF: look for a user block that has MostRecent "1".
-        // A minimal logged-in block looks like:
-        //   "76561198XXXXXXXXX"
-        //   {
-        //       "AccountName"  "username"
-        //       "MostRecent"   "1"
-        //   }
-        let hasMostRecent = content.contains("\"MostRecent\"") && content.contains("\"1\"")
+        // Line-level check: "MostRecent" and "1" must appear on the SAME line.
+        // The old global `contains("\"1\"")` check false-positived on RememberPassword "1".
+        let hasMostRecent = content.components(separatedBy: .newlines).contains { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return t.contains("\"MostRecent\"") && t.contains("\"1\"")
+        }
         log.debug("[hasSteamLoginSession] loginusers.vdf found, hasMostRecent=\(hasMostRecent)")
         return hasMostRecent
     }
@@ -527,6 +525,52 @@ struct WinePrefix: Sendable {
         let dest = configDir.appending(path: "config.vdf")
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
         log.info("[writeConnectCache] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
+    }
+
+    // MARK: - DXMT System32 Deployment
+
+    /// Copies DXMT DLLs from the Gcenx engine into the Wine prefix's system32.
+    ///
+    /// When CrossOver's wineloader is active, it loads DLLs from its own lib path
+    /// before checking WINEDLLPATH. Placing DXMT DLLs directly in the prefix's
+    /// Windows system32 ensures they are found first, enabling Metal rendering.
+    ///
+    /// Required when: CX engine is active AND game uses D3D11/DXGI.
+    /// Safe to call repeatedly — skips if already up to date (size check).
+    func installDXMTInSystem32(engine: WineEngine) throws {
+        let fm = FileManager.default
+        let sys32 = path.appending(path: "drive_c/windows/system32")
+        let engineDxmtDir = WineEngine.engineDir.appending(path: "wine/lib/wine/x86_64-windows")
+
+        guard fm.fileExists(atPath: sys32.path(percentEncoded: false)) else {
+            log.warning("[installDXMTInSystem32] system32 not found — prefix not initialized yet")
+            return
+        }
+
+        let dxmtDLLs = ["d3d11.dll", "dxgi.dll", "d3d12.dll"]
+        var installed = 0
+        for dll in dxmtDLLs {
+            let src = engineDxmtDir.appending(path: dll)
+            let dst = sys32.appending(path: dll)
+            let srcPath = src.path(percentEncoded: false)
+            let dstPath = dst.path(percentEncoded: false)
+            guard fm.fileExists(atPath: srcPath) else { continue }
+
+            // Check if source is DXMT (larger than Wine's built-in; d3d11.dll > 1MB = DXMT)
+            guard let srcSize = try? fm.attributesOfItem(atPath: srcPath)[.size] as? Int,
+                  srcSize > 1_000_000 else { continue }
+
+            // Skip if already installed with same size
+            if let dstSize = try? fm.attributesOfItem(atPath: dstPath)[.size] as? Int,
+               dstSize == srcSize { continue }
+
+            try fm.copyItem(at: src, to: dst)
+            installed += 1
+            log.info("[installDXMTInSystem32] installed \(dll) (\(srcSize / 1024)KB) → system32")
+        }
+        if installed == 0 {
+            log.debug("[installDXMTInSystem32] DXMT already up to date in system32")
+        }
     }
 
     // MARK: - Webhelper Configuration

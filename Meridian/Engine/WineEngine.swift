@@ -57,6 +57,11 @@ final class WineEngine {
     /// Path to DXVK DLLs (DirectX -> Vulkan -> Metal via MoltenVK).
     private(set) var dxvkPath: String?
 
+    /// When CrossOver Preview is installed, its lib/wine path.
+    /// Used as the primary DLL source (better stubs) while Gcenx provides DXMT.
+    /// Personal-use only — not redistributable.
+    private(set) var cxPreviewLibPath: String?
+
     var isReady: Bool { state == .ready }
 
     // MARK: - Convenience accessors for compatibility with existing code
@@ -106,6 +111,7 @@ final class WineEngine {
             libraryPath = nil
             dxmtPath = nil
             dxvkPath = nil
+            cxPreviewLibPath = nil
             return
         }
 
@@ -126,11 +132,45 @@ final class WineEngine {
             libraryPath = nil
             dxmtPath = nil
             dxvkPath = nil
+            cxPreviewLibPath = nil
             return
         }
 
-        wineExecutableURL    = URL(filePath: bundledWine)
-        wineserverExecutableURL = URL(filePath: bundledServer)
+        // Detect CrossOver Preview for personal-use engine augmentation.
+        // When CX Preview is installed, use its wineloader/wineserver and DLL set
+        // (which fixes 1,131 abort stubs vs our Gcenx Wine 8.0.1). The Gcenx engine
+        // still provides DXMT (Metal renderer) which CX Preview does not include.
+        //
+        // PERSONAL USE ONLY — CX Preview binaries are not redistributable.
+        // For distributable builds: use the Gcenx engine path only.
+        cxPreviewLibPath = nil
+        let cxPaths = [
+            "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver",
+            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver",
+        ]
+        for cxRoot in cxPaths {
+            let cxLoader = "\(cxRoot)/bin/wineloader"
+            let cxServer = "\(cxRoot)/bin/wineserver"
+            let cxLib    = "\(cxRoot)/lib/wine"
+            let cxNtdll  = "\(cxRoot)/lib/wine/x86_64-unix/ntdll.so"
+            if fm.isExecutableFile(atPath: cxLoader),
+               fm.isExecutableFile(atPath: cxServer),
+               fm.fileExists(atPath: cxNtdll) {
+                // Use CX wineloader and wineserver (better stub coverage)
+                wineExecutableURL    = URL(filePath: cxLoader)
+                wineserverExecutableURL = URL(filePath: cxServer)
+                cxPreviewLibPath = cxLib
+                log.info("[detect] CrossOver engine detected at \(cxRoot) — using for improved stub coverage")
+                break
+            }
+        }
+
+        // Fall back to bundled Gcenx engine binaries if CX not found
+        if wineExecutableURL == nil {
+            wineExecutableURL    = URL(filePath: bundledWine)
+            wineserverExecutableURL = URL(filePath: bundledServer)
+        }
+
         libraryPath = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
 
         // DXMT builtin layout: DLLs live in lib/wine/x86_64-windows/ alongside Wine's own DLLs.
@@ -149,7 +189,7 @@ final class WineEngine {
         let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
         if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
 
-        backendName   = "Meridian"
+        backendName   = cxPreviewLibPath != nil ? "CrossOver Preview + Meridian DXMT" : "Meridian"
         engineVersion = readEngineVersion()
         state         = .ready
 
@@ -158,13 +198,16 @@ final class WineEngine {
             return p.hasSuffix("dxmt") ? "\(p) (legacy override)" : "\(p) (builtin)"
         }()
         log.info("[detect] Bundled engine found at \(engineBase)")
-        log.info("[detect]   wine64=\(bundledWine)")
-        log.info("[detect]   wineserver=\(bundledServer)")
+        log.info("[detect]   wine64=\(wineExecutableURL?.path(percentEncoded: false) ?? "none")")
+        log.info("[detect]   wineserver=\(wineserverExecutableURL?.path(percentEncoded: false) ?? "none")")
         log.info("[detect]   lib=\(self.libraryPath ?? "none")")
         log.info("[detect]   dxmt=\(dxmtMode)")
         log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
-        log.info("[detect] backend=Meridian ✓")
+        if let cx = cxPreviewLibPath {
+            log.info("[detect]   cxPreviewLib=\(cx)")
+        }
+        log.info("[detect] backend=\(backendName) ✓")
     }
 
     /// Reads the engine release tag from the version file written by `release-engine.sh`.
@@ -201,6 +244,7 @@ final class WineEngine {
         libraryPath  = nil
         dxmtPath     = nil
         dxvkPath     = nil
+        cxPreviewLibPath = nil
     }
 
     // MARK: - Environment
@@ -213,11 +257,24 @@ final class WineEngine {
             "MTL_HUD_ENABLED": settings.metalHUD ? "1" : "0",
         ]
 
-        if let lib = libraryPath {
-            // Include x86_64-unix alongside lib so dlopen() can resolve @rpath dependencies
-            // (ntdll.so, win32u.so) that Wine's Mac display driver depends on. Without this,
-            // winemac.so fails to load its .so dependencies via @rpath resolution,
-            // causing nodrv_CreateWindow for any GUI application.
+        // When CrossOver Preview is available, its libs take priority for DLL loading.
+        // This eliminates 1,131 abort stubs vs Wine 8.0.1. The Gcenx engine still
+        // provides DXMT (Metal renderer) which CX Preview does not include.
+        // CX libs are prepended; Gcenx libs follow as fallback for DXMT/NLS/etc.
+        let gcenxLib = libraryPath  // Gcenx engine lib path
+
+        if let cxLib = cxPreviewLibPath, let gcenxLib {
+            // CX Preview mode: CX unix libs + Gcenx unix libs (for DXMT winemetal.so)
+            let cxUnix    = "\(cxLib)/x86_64-unix"
+            let gcenxUnix = "\(gcenxLib)/wine/x86_64-unix"
+            env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(cxLib):\(cxUnix):\(gcenxUnix):\(gcenxLib)"
+
+            // WINEDLLPATH: Gcenx x86_64-windows first (for DXMT d3d11/dxgi override),
+            // then CX lib (for better stubs on everything else)
+            let gcenxWinDlls = "\(gcenxLib)/wine/x86_64-windows"
+            env["WINEDLLPATH"] = "\(gcenxWinDlls):\(cxLib):\(gcenxLib)/wine"
+        } else if let lib = gcenxLib {
+            // Gcenx-only mode (original behavior)
             let unixDir = "\(lib)/wine/x86_64-unix"
             env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
         }
@@ -235,9 +292,13 @@ final class WineEngine {
         //
         // Legacy layout (v1.0.2 and older): DXMT DLLs were in a separate lib/dxmt/
         // directory and required WINEDLLOVERRIDES=n,b to force Wine to prefer them.
+        //
+        // CX Preview mode: DXMT is supplied by Gcenx engine (CX doesn't have winemetal.so).
+        // Since CX's DLL path is prepended, we need explicit overrides so DXMT wins over
+        // CX's own d3d11/dxgi stubs.
         let fm = FileManager.default
         let isBuiltinDXMT: Bool = {
-            guard let lib = libraryPath else { return false }
+            guard let lib = gcenxLib else { return false }
             return fm.fileExists(atPath: "\(lib)/wine/x86_64-unix/winemetal.so")
         }()
         let hasLegacyDxmt: Bool = {
@@ -245,31 +306,22 @@ final class WineEngine {
             return dxmt.hasSuffix("dxmt") && fm.fileExists(atPath: "\(dxmt)/x86_64-windows")
         }()
 
-        // Build WINEDLLPATH from Wine's own lib/wine directory.
-        // Only needed for legacy DXMT layout where we must prepend the override dirs.
-        var dllPaths: [String] = []
-
-        if hasLegacyDxmt, let dxmt = dxmtPath {
-            // Legacy: DXMT as native override — must appear before Wine's own DLLs
-            dllPaths.append("\(dxmt)/x86_64-windows")
-            dllPaths.append("\(dxmt)/i386-windows")
+        if cxPreviewLibPath != nil && isBuiltinDXMT {
+            // CX Preview + builtin DXMT: need explicit override so our DXMT wins over CX's d3d11.
+            // "n" = native (from WINEDLLPATH), "b" = builtin fallback. Since we put Gcenx's
+            // x86_64-windows dir first in WINEDLLPATH, Wine loads DXMT d3d11 from there.
+            env["WINEDLLOVERRIDES"] = "winemetal=b;d3d11,d3d12,dxgi=n,b"
+            log.debug("[env] DXMT enabled (CX+builtin): forcing native override for DXMT d3d11/dxgi")
+        } else if hasLegacyDxmt, let dxmt = dxmtPath {
+            // Legacy: DXMT as native override
+            var dllPaths: [String] = ["\(dxmt)/x86_64-windows", "\(dxmt)/i386-windows"]
+            if let lib = gcenxLib { dllPaths.append("\(lib)/wine") }
+            if cxPreviewLibPath == nil { env["WINEDLLPATH"] = dllPaths.joined(separator: ":") }
             log.debug("[env] DXMT enabled (legacy override): \(dxmt)")
-            // Legacy DXMT needs explicit overrides so Wine picks them over its own builtins
             env["WINEDLLOVERRIDES"] = "d3d11,d3d10core,dxgi=n,b"
         } else if isBuiltinDXMT {
             log.debug("[env] DXMT enabled (builtin): winemetal.so present")
             // Builtin DXMT: no overrides needed — Wine loads them automatically
-        }
-
-        if let lib = libraryPath {
-            let wineDllPath = "\(lib)/wine"
-            if fm.fileExists(atPath: wineDllPath) {
-                dllPaths.append(wineDllPath)
-            }
-        }
-
-        if !dllPaths.isEmpty {
-            env["WINEDLLPATH"] = dllPaths.joined(separator: ":")
         }
 
         log.debug("[env] full environment: \(env.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " | "))")

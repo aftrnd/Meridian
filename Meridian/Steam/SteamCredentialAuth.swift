@@ -281,7 +281,7 @@ final class SteamCredentialAuth {
             "encrypted_password":    encryptedPassword,
             "encryption_timestamp":  encryptionTimestamp,
             "remember_login":        "1",
-            "platform_type":         "2",
+            "platform_type":         "1",
             "persistence":           "1",
             "website_id":            "Client",
         ]).data(using: .utf8)

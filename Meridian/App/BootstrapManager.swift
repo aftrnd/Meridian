@@ -343,6 +343,8 @@ final class BootstrapManager {
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
         let strategy = await sessionBridge.prepare(prefix: prefix)
+        // Sync account username from prefix if not already in AppSettings (migration for existing users).
+        sessionBridge.syncAccountNameIfNeeded(prefix: prefix)
         switch strategy {
         case .credentialAuth:
             log.info("[bootstrap] session written from credential-auth tokens ✓")

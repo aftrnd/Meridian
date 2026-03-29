@@ -24,3 +24,8 @@ DerivedData/
 # Meridian runtime data (downloaded at runtime, not checked in)
 /engine/
 /bottles/
+
+# CrossOver research notes — personal use, never distribute
+Scripts/cx-engine-research.md
+Scripts/test-steamcmd-login.sh
+.cursor/debug-*.log

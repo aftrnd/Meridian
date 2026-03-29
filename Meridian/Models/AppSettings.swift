@@ -170,6 +170,41 @@ final class AppSettings: @unchecked Sendable {
         hiddenAppIDs    = []
         favoriteAppIDs  = []
         UserDefaults.standard.removeObject(forKey: "launchTimestamps")
+        steamCredentialSteamID = ""
+        steamCredentialAccountName = ""
+        steamCredentialRefreshToken = ""
+    }
+
+    // MARK: - Steam Credential Cache
+    //
+    // The Steam ConnectCache refresh token is written to the Wine prefix's config.vdf
+    // during the SteamCredentialAuth flow. Steam's ConnectCache authentication requires
+    // a MINIMAL config.vdf structure to work correctly — Steam's own flushed config
+    // (which adds ipv6 state, shader cache, etc.) does not re-trigger authentication on
+    // subsequent startups. Persisting the token here lets SteamSessionBridge re-write
+    // a clean minimal config.vdf before each persistent Steam session, ensuring the
+    // ConnectCache is always in the expected format when Steam starts.
+    //
+    // The token is already stored in plaintext in the Wine prefix's config.vdf on disk.
+    // Storing it in UserDefaults does not reduce security beyond that baseline.
+
+    var steamCredentialSteamID: String {
+        get { UserDefaults.standard.string(forKey: "steamCredentialSteamID") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "steamCredentialSteamID") }
+    }
+
+    var steamCredentialAccountName: String {
+        get { UserDefaults.standard.string(forKey: "steamCredentialAccountName") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "steamCredentialAccountName") }
+    }
+
+    var steamCredentialRefreshToken: String {
+        get { UserDefaults.standard.string(forKey: "steamCredentialRefreshToken") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "steamCredentialRefreshToken") }
+    }
+
+    var hasSteamCredentials: Bool {
+        !steamCredentialRefreshToken.isEmpty && !steamCredentialSteamID.isEmpty
     }
 
     private init() {}

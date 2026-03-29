@@ -368,91 +368,134 @@ final class WineSteamManager {
         }
     }
 
-    /// Triggers Steam's install dialog for `appID` by sending the install URL via IPC
-    /// to the already-running persistent Steam instance.
-    ///
-    /// The persistent Steam stays alive throughout — no kill/restart cycle. Window
-    /// suppression must be paused by the caller before this is called so the install
-    /// dialog is visible to the user.
-    ///
-    /// **Wait strategy**: The webhelper (`steamwebhelper.exe / libcef.dll`) is the CEF
-    /// process that renders the install dialog. It is spawned by steam.exe after its
-    /// self-restart cycle, typically 20–50 seconds into Steam's lifetime. We poll for it
-    /// with `pgrep -f steamwebhelper.exe` and wait an additional stability window before
-    /// dispatching the install URL, ensuring Steam's UI layer is ready to handle it.
-    ///
-    /// **Wine 8.x note**: Under Wine 8.x (CrossOver 23), `chrome_elf.dll`'s DllMain
-    /// fails with STATUS_BREAKPOINT because Wine lacks `GetProcessMitigationPolicy` stubs
-    /// required by Chrome 100+. The webhelper restarts every ~10 s but cannot fully
-    /// initialize its CEF JS context, so the install dialog does not render. The fix is
-    /// upgrading the engine to Wine 9.x (CrossOver 24+). The install URL is still
-    /// dispatched — once the engine is upgraded, the full flow works without further app
-    /// changes.
-    func installGameVisible(appID: Int, engine: WineEngine, prefix: WinePrefix) async throws {
-        log.info("[installGameVisible] preparing install dialog for appID=\(appID) — persistent Steam stays alive")
+    // MARK: - Game Installation via SteamCMD
 
-        // Update WebProcessCmdLine to remove --disable-gpu so the webhelper can use
-        // GPU-accelerated rendering when it restarts.
-        //
-        // Note: Wine 8.x unconditionally appends "--no-sandbox --in-process-gpu
-        // --disable-gpu" to steamwebhelper.exe via a hard-coded hack
-        // (hack_append_command_line). The registry value is still written for
-        // correctness and compatibility with Wine builds that do not apply this hack.
-        await configureSteamRegistryForVisibleMode(engine: engine, prefix: prefix)
-
-        // Wait for the webhelper process to appear. It spawns after Steam's
-        // self-restart cycle and update check, which takes 20–50 s. Dispatching
-        // the install URL before the webhelper is alive causes the URL to be dropped
-        // — the 0.5 s window the user may have seen was Steam's own startup splash,
-        // not the install dialog.
-        log.info("[installGameVisible] waiting up to 90s for steamwebhelper.exe to start...")
-        let webhelperAlive = await waitForWebhelper(timeout: .seconds(90))
-        if webhelperAlive {
-            // Give the webhelper a stability window after it first appears so its
-            // CEF context has time to initialise before the URL arrives.
-            log.info("[installGameVisible] webhelper alive — waiting 10s for CEF initialisation")
-            try? await Task.sleep(for: .seconds(10))
-        } else {
-            // Webhelper did not appear in time. Still dispatch the URL — with an
-            // engine upgrade to Wine 9.x this wait will succeed and the dialog will
-            // appear. With Wine 8.x the URL will be silently dropped.
-            log.warning("[installGameVisible] webhelper not detected after 90s — dispatching URL anyway (engine upgrade needed for install dialog)")
+    /// Downloads a game using SteamCMD — the only reliable headless install method
+    /// under Wine 8.0.1 where the full Steam client cannot authenticate.
+    ///
+    /// ## Why SteamCMD (not steam.exe +app_update)
+    ///
+    /// `steam.exe` under Wine 8.0.1 (CrossOverFOSS 23.7.1) **never logs in**.
+    /// Every session shows `[Logged Off, 0, 0]` in connection_log.txt because the
+    /// Steam Windows Service fails (GLE 126) and the CEF webhelper crash-loops on
+    /// `chrome_elf.dll STATUS_BREAKPOINT` (missing `GetProcessMitigationPolicy` stub).
+    /// Without authentication, `+app_update` via IPC is silently dropped — the ACF
+    /// is never written and downloads never start.
+    ///
+    /// SteamCMD is a separate standalone binary that handles its own auth without
+    /// CEF or the Steam Service. CLI-proven: `Logging in using cached credentials → OK`.
+    ///
+    /// ## Credential requirements
+    ///
+    /// The first SteamCMD login requires the user's password (done once via the setup
+    /// sheet's `loginToSteamWithSteamCMD` flow). After that, SteamCMD writes an
+    /// encrypted credential cache to config.vdf and subsequent logins are passwordless.
+    ///
+    /// ## Progress tracking
+    ///
+    /// SteamCMD creates the same `appmanifest_<appID>.acf` files in the steamapps
+    /// directory as the full Steam client. The existing `isGameInstalled`,
+    /// `isGameFullyInstalled`, and `gameDownloadProgress` polling works unchanged.
+    func installWithSteamCMD(
+        appID: Int,
+        username: String,
+        engine: WineEngine,
+        prefix: WinePrefix,
+        onProgress: @MainActor @Sendable @escaping (String) -> Void
+    ) async throws {
+        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
+            throw SteamError.installFailed("steamcmd.exe not found in Steam directory. Re-run bootstrap.")
         }
 
-        try sendSteamCommand(["steam://install/\(appID)"], engine: engine, prefix: prefix)
-        log.info("[installGameVisible] install URL dispatched for appID=\(appID)")
-    }
+        log.info("[installWithSteamCMD] appID=\(appID) user=\(username)")
+        onProgress("Starting SteamCMD download for appID \(appID)…")
 
-    /// Polls until `steamwebhelper.exe` appears in the process list or the timeout elapses.
-    ///
-    /// The webhelper (C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe)
-    /// is the CEF browser process that renders all Steam UI. It is spawned by steam.exe
-    /// after its self-restart/update cycle, typically 20–50 s after steam.exe starts.
-    /// `pgrep -f steamwebhelper.exe` matches it because the full path appears in the
-    /// wine64-preloader command line.
-    private func waitForWebhelper(timeout: Duration) async -> Bool {
-        let deadline = ContinuousClock.now + timeout
-        var polls = 0
-        while ContinuousClock.now < deadline {
-            polls += 1
-            let found = await Task.detached {
-                let t = Process()
-                t.executableURL = URL(filePath: "/usr/bin/pgrep")
-                t.arguments = ["-f", "steamwebhelper.exe"]
-                t.standardOutput = FileHandle.nullDevice
-                t.standardError = FileHandle.nullDevice
-                try? t.run(); t.waitUntilExit()
-                return t.terminationStatus == 0
-            }.value
-            if found {
-                log.info("[waitForWebhelper] webhelper detected after \(polls) polls")
-                return true
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [
+            steamcmdPath,
+            "+login", username,
+            "+app_update", "\(appID)", "validate",
+            "+quit",
+        ]
+        process.environment = engine.environment(for: prefix)
+        process.standardInput = FileHandle.nullDevice
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw SteamError.installFailed("Failed to launch steamcmd.exe: \(error.localizedDescription)")
+        }
+
+        log.info("[installWithSteamCMD] steamcmd pid=\(process.processIdentifier)")
+
+        // Read stdout in the background and forward progress lines to the caller.
+        // We use a detached Task with @Sendable to avoid capturing the non-Sendable closure.
+        let outHandle = outPipe.fileHandleForReading
+        let progressTask = Task.detached(priority: .utility) { @Sendable in
+            while process.isRunning {
+                let data = outHandle.availableData
+                if data.isEmpty {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                }
+                guard let chunk = String(data: data, encoding: .utf8) else { continue }
+                await MainActor.run {
+                    for rawLine in chunk.components(separatedBy: .newlines) {
+                        let l = rawLine.trimmingCharacters(in: .whitespaces)
+                        guard !l.isEmpty else { continue }
+                        if l.contains("downloading") || l.contains("installing")
+                            || l.contains("validating") || l.contains("Success!")
+                            || l.contains("ERROR") || l.contains("Logged in") {
+                            onProgress(l)
+                        }
+                    }
+                }
             }
-            try? await Task.sleep(for: .seconds(2))
+            // Drain any remaining output
+            let tail = outHandle.readDataToEndOfFile()
+            if let chunk = String(data: tail, encoding: .utf8), !chunk.isEmpty {
+                await MainActor.run {
+                    for rawLine in chunk.components(separatedBy: .newlines) {
+                        let l = rawLine.trimmingCharacters(in: .whitespaces)
+                        if !l.isEmpty { onProgress(l) }
+                    }
+                }
+            }
         }
-        log.warning("[waitForWebhelper] webhelper not found after \(polls) polls (\(timeout))")
-        return false
+
+        await Task.detached(priority: .utility) { process.waitUntilExit() }.value
+        progressTask.cancel()
+        _ = await progressTask.result
+
+        let exitCode = process.terminationStatus
+        let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        if exitCode != 0 {
+            let filteredStderr = filterWineStderr(stderr).prefix(500)
+            log.error("[installWithSteamCMD] steamcmd exited \(exitCode) stderr: \(filteredStderr)")
+            throw SteamError.installFailed("SteamCMD exited with code \(exitCode)")
+        }
+
+        log.info("[installWithSteamCMD] appID=\(appID) install complete (exit=\(exitCode))")
+        onProgress("SteamCMD download complete ✓")
     }
+
+    /// Sends `+app_update <appID>` to the running Steam IPC as a fallback.
+    /// This only works when the full Steam client is authenticated (rare under Wine 8.0.1).
+    /// Use `installWithSteamCMD` for reliable headless installs.
+    func queueInstall(appID: Int, engine: WineEngine, prefix: WinePrefix) throws {
+        log.info("[queueInstall] dispatching +app_update \(appID) via Steam IPC (fallback)")
+        try sendSteamCommand(["+app_update", "\(appID)"], engine: engine, prefix: prefix)
+        log.info("[queueInstall] +app_update dispatched for appID=\(appID)")
+    }
+
 
     /// Brings the running Steam window to the foreground.
     /// Sends `-activate` via IPC, which tells the running Steam instance to
@@ -816,37 +859,6 @@ final class WineSteamManager {
             try? process.run()
             process.waitUntilExit()
             log.info("[configureSteam] StartMinimized=0 written (exit=\(process.terminationStatus))")
-        }.value
-    }
-
-    /// Writes registry keys for the visible install-dialog Steam instance.
-    ///
-    /// Removes `--disable-gpu` from `WebProcessCmdLine` so the webhelper (CEF)
-    /// can perform GPU-accelerated rendering and show the install dialog.
-    ///
-    /// The persistent silent Steam sets `--disable-gpu` to avoid spawning GPU
-    /// child processes in the background. That flag persists in the registry and
-    /// must be cleared before launching a visible Steam instance, otherwise the
-    /// webhelper renders to an invisible offscreen buffer and the dialog never
-    /// appears. `configureSteamRegistryForSilentMode()` restores it when the
-    /// persistent process is restarted after the install phase.
-    private func configureSteamRegistryForVisibleMode(engine: WineEngine, prefix: WinePrefix) async {
-        let wine64URL = engine.wine64URL
-        let env = engine.environment(for: prefix)
-        await Task.detached(priority: .userInitiated) {
-            let p = Process()
-            p.executableURL = wine64URL
-            p.arguments = [
-                "reg", "add", "HKCU\\Software\\Valve\\Steam",
-                "/v", "WebProcessCmdLine", "/t", "REG_SZ",
-                "/d", "--no-sandbox", "/f"
-            ]
-            p.environment = env
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            try? p.run()
-            p.waitUntilExit()
-            log.info("[configureSteam] WebProcessCmdLine=--no-sandbox (GPU enabled) for visible install dialog (exit=\(p.terminationStatus))")
         }.value
     }
 
@@ -1223,6 +1235,7 @@ final class WineSteamManager {
     enum SteamError: LocalizedError {
         case bootstrapFailed(exitCode: Int32, detail: String)
         case steamNotReady
+        case installFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -1230,6 +1243,8 @@ final class WineSteamManager {
                 return "Steam bootstrap failed (exit \(code)): \(detail)"
             case .steamNotReady:
                 return "Steam could not start. Try resetting the Wine environment in Settings, or restart Meridian."
+            case .installFailed(let detail):
+                return "Install failed: \(detail)"
             }
         }
     }

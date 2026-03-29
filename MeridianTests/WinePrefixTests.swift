@@ -58,11 +58,14 @@ final class WinePrefixTests: XCTestCase {
         return (key, value)
     }
 
-    /// Mirrors WinePrefix.hasSteamLoginSession — checks loginusers.vdf for MostRecent "1"
+    /// Mirrors WinePrefix.hasSteamLoginSession — line-level check for MostRecent "1"
     private func hasSteamLoginSession(configDir: URL) -> Bool {
         let vdfURL = configDir.appending(path: "loginusers.vdf")
         guard let content = try? String(contentsOf: vdfURL, encoding: .utf8) else { return false }
-        return content.contains("\"MostRecent\"") && content.contains("\"1\"")
+        return content.components(separatedBy: .newlines).contains { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return t.contains("\"MostRecent\"") && t.contains("\"1\"")
+        }
     }
 
     /// Mirrors WinePrefix.steamLibraryFolders — parses libraryfolders.vdf
@@ -316,14 +319,33 @@ final class WinePrefixTests: XCTestCase {
         }
         """
         try vdf.write(to: configDir.appending(path: "loginusers.vdf"), atomically: true, encoding: .utf8)
-        // File contains "MostRecent" but not "1" as a value after it (other "1" chars may appear).
-        // Current impl just checks both strings exist anywhere — validate our assumption matches impl.
-        let content = try String(contentsOf: configDir.appending(path: "loginusers.vdf"), encoding: .utf8)
-        let result = content.contains("\"MostRecent\"") && content.contains("\"1\"")
-        // The string "76561198047018335" contains a "1", so hasSteamLoginSession returns true
-        // even when MostRecent is "0". This is a known simplification in the impl.
-        // This test documents the current behaviour; refine if precision is needed.
-        XCTAssertEqual(hasSteamLoginSession(configDir: configDir), result)
+        XCTAssertFalse(hasSteamLoginSession(configDir: configDir),
+                       "MostRecent=0 must return false even when the file contains other \"1\" chars (e.g. in the SteamID)")
+    }
+
+    /// Regression test: MostRecent "0" with RememberPassword "1" must NOT false-positive.
+    /// This was the exact bug that prevented re-authentication after the platform_type fix:
+    /// the old global `contains("\"1\"")` matched RememberPassword instead of MostRecent.
+    func testHasSteamLoginSession_falseWhenMostRecentZeroWithRememberPasswordOne() throws {
+        let (steam, _) = try makePrefix()
+        let configDir = steam.appending(path: "config")
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let vdf = """
+        "users"
+        {
+        \t"76561198047018335"
+        \t{
+        \t\t"AccountName"\t\t"nickjack876"
+        \t\t"PersonaName"\t\t"nickjack876"
+        \t\t"RememberPassword"\t\t"1"
+        \t\t"MostRecent"\t\t"0"
+        \t\t"Timestamp"\t\t"1774737659"
+        \t}
+        }
+        """
+        try vdf.write(to: configDir.appending(path: "loginusers.vdf"), atomically: true, encoding: .utf8)
+        XCTAssertFalse(hasSteamLoginSession(configDir: configDir),
+                       "MostRecent=0 with RememberPassword=1 must return false — the old global contains check false-positived here")
     }
 
     // MARK: - isGameInstalled / acfURL
