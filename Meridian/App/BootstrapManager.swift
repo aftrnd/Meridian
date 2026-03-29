@@ -340,6 +340,33 @@ final class BootstrapManager {
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
 
+        // 4b. Ensure SteamCMD is present (download if missing).
+        // SteamCMD is a ~1.6MB download that self-updates to ~5MB on first run.
+        // It must be in the Steam directory BEFORE any game install is attempted.
+        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        if !FileManager.default.fileExists(atPath: steamcmdPath) {
+            log.info("[bootstrap] SteamCMD not found — downloading")
+            do {
+                let steamcmdURL = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip")!
+                let (data, _) = try await URLSession.shared.data(from: steamcmdURL)
+                let tempZip = FileManager.default.temporaryDirectory.appending(path: "steamcmd.zip")
+                try data.write(to: tempZip)
+                let unzipProcess = Process()
+                unzipProcess.executableURL = URL(filePath: "/usr/bin/unzip")
+                unzipProcess.arguments = ["-o", tempZip.path(percentEncoded: false), "-d", prefix.steamInstallDir.path(percentEncoded: false)]
+                unzipProcess.standardOutput = FileHandle.nullDevice
+                unzipProcess.standardError = FileHandle.nullDevice
+                try unzipProcess.run()
+                unzipProcess.waitUntilExit()
+                try? FileManager.default.removeItem(at: tempZip)
+                log.info("[bootstrap] SteamCMD installed ✓")
+            } catch {
+                log.warning("[bootstrap] SteamCMD download failed: \(error.localizedDescription) — game installs may fail")
+            }
+        } else {
+            log.debug("[bootstrap] SteamCMD already present ✓")
+        }
+
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
         let strategy = await sessionBridge.prepare(prefix: prefix)

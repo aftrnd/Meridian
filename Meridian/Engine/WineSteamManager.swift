@@ -424,10 +424,12 @@ final class WineSteamManager {
         process.environment = engine.environment(for: prefix)
         process.standardInput = FileHandle.nullDevice
 
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
+        // SteamCMD writes ALL output (progress, errors, status) to STDOUT.
+        // Wine fixme/err noise goes to STDERR. We merge both into one pipe so
+        // we capture everything and can filter on the Swift side.
+        let combinedPipe = Pipe()
+        process.standardOutput = combinedPipe
+        process.standardError = combinedPipe
 
         do {
             try process.run()
@@ -437,51 +439,36 @@ final class WineSteamManager {
 
         log.info("[installWithSteamCMD] steamcmd pid=\(process.processIdentifier)")
 
-        // Read stdout in the background and forward progress lines to the caller.
-        // We use a detached Task with @Sendable to avoid capturing the non-Sendable closure.
-        let outHandle = outPipe.fileHandleForReading
-        let progressTask = Task.detached(priority: .utility) { @Sendable in
-            while process.isRunning {
-                let data = outHandle.availableData
-                if data.isEmpty {
-                    try? await Task.sleep(for: .milliseconds(250))
-                    continue
-                }
+        // Read combined output in a background thread (not async — availableData blocks).
+        // Forward meaningful lines to the UI via onProgress on the MainActor.
+        let readHandle = combinedPipe.fileHandleForReading
+        let progressThread = Thread {
+            while true {
+                let data = readHandle.availableData
+                if data.isEmpty { break } // EOF — process exited
                 guard let chunk = String(data: data, encoding: .utf8) else { continue }
-                await MainActor.run {
-                    for rawLine in chunk.components(separatedBy: .newlines) {
-                        let l = rawLine.trimmingCharacters(in: .whitespaces)
-                        guard !l.isEmpty else { continue }
-                        if l.contains("downloading") || l.contains("installing")
-                            || l.contains("validating") || l.contains("Success!")
-                            || l.contains("ERROR") || l.contains("Logged in") {
-                            onProgress(l)
-                        }
-                    }
-                }
-            }
-            // Drain any remaining output
-            let tail = outHandle.readDataToEndOfFile()
-            if let chunk = String(data: tail, encoding: .utf8), !chunk.isEmpty {
-                await MainActor.run {
-                    for rawLine in chunk.components(separatedBy: .newlines) {
-                        let l = rawLine.trimmingCharacters(in: .whitespaces)
-                        if !l.isEmpty { onProgress(l) }
-                    }
+                for rawLine in chunk.components(separatedBy: .newlines) {
+                    let l = rawLine.trimmingCharacters(in: .whitespaces)
+                    guard !l.isEmpty else { continue }
+                    // Skip Wine fixme/err noise
+                    if l.contains("fixme:") || l.contains("err:") || l.contains("mvk-info")
+                        || l.contains("VK_") || l.contains("warn:") { continue }
+                    // Log everything meaningful from SteamCMD
+                    log.info("[installWithSteamCMD:output] \(l)")
+                    // Forward to UI
+                    DispatchQueue.main.async { onProgress(l) }
                 }
             }
         }
+        progressThread.qualityOfService = .userInitiated
+        progressThread.start()
 
         await Task.detached(priority: .utility) { process.waitUntilExit() }.value
-        progressTask.cancel()
-        _ = await progressTask.result
 
         let exitCode = process.terminationStatus
-        let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 
         if exitCode != 0 {
-            let filteredStderr = filterWineStderr(stderr).prefix(500)
-            log.error("[installWithSteamCMD] steamcmd exited \(exitCode) stderr: \(filteredStderr)")
+            log.error("[installWithSteamCMD] steamcmd exited \(exitCode)")
             throw SteamError.installFailed("SteamCMD exited with code \(exitCode)")
         }
 
