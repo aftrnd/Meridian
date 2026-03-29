@@ -467,6 +467,18 @@ final class WineSteamManager {
 
         let exitCode = process.terminationStatus
 
+        if exitCode == 7 || exitCode == 5 {
+            // Exit 7 = login failure (no cached credentials or wrong password)
+            // Exit 5 = invalid password
+            // This happens after a prefix reset wipes the SteamCMD credential cache.
+            // The user needs to re-authenticate SteamCMD from Terminal once.
+            log.error("[installWithSteamCMD] steamcmd login failed (exit=\(exitCode)) — cached credentials missing")
+            throw SteamError.installFailed(
+                "Steam login required. Run this in Terminal to re-authenticate:\n\n" +
+                "bash ~/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Scripts/test-steamcmd-login.sh"
+            )
+        }
+
         if exitCode != 0 {
             log.error("[installWithSteamCMD] steamcmd exited \(exitCode)")
             throw SteamError.installFailed("SteamCMD exited with code \(exitCode)")
