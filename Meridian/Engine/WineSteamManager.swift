@@ -16,7 +16,9 @@ private let log = MeridianLog(category: "WineSteamManager")
 @MainActor
 final class WineSteamManager {
 
-    private(set) var isRunning: Bool = false
+    /// Whether the persistent Steam process is currently running.
+    /// Set to true when CX engine is active (Steam not needed but code checks this flag).
+    var isRunning: Bool = false
 
     /// Whether the Wine Steam client has an authenticated user session.
     /// Set by `BootstrapManager` after sync, and by `loginToSteam()` on success.
