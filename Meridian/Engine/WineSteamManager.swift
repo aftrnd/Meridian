@@ -398,10 +398,13 @@ final class WineSteamManager {
 
         log.info("[authenticateSteamCMD] authenticating SteamCMD for user=\(username)")
 
+        // SteamCMD MUST use Gcenx wine64, not CX wineloader.
+        // CLI-verified: SteamCMD works with Gcenx, fails with CX (version mismatch).
+        let wine64 = engine.gcenxWine64URL ?? engine.wine64URL
         let process = Process()
-        process.executableURL = engine.wine64URL
+        process.executableURL = wine64
         process.arguments = [steamcmdPath, "+login", username, password, "+quit"]
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.gcenxEnvironment(for: prefix)
 
         let combinedPipe = Pipe()
         process.standardOutput = combinedPipe
@@ -489,15 +492,18 @@ final class WineSteamManager {
         log.info("[installWithSteamCMD] appID=\(appID) user=\(username)")
         onProgress("Starting SteamCMD download for appID \(appID)…")
 
+        // SteamCMD MUST use Gcenx wine64, not CX wineloader.
+        // CLI-verified: SteamCMD works with Gcenx, fails with CX (version mismatch).
+        let wine64 = engine.gcenxWine64URL ?? engine.wine64URL
         let process = Process()
-        process.executableURL = engine.wine64URL
+        process.executableURL = wine64
         process.arguments = [
             steamcmdPath,
             "+login", username,
             "+app_update", "\(appID)", "validate",
             "+quit",
         ]
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.gcenxEnvironment(for: prefix)
         process.standardInput = FileHandle.nullDevice
 
         // SteamCMD writes ALL output (progress, errors, status) to STDOUT.

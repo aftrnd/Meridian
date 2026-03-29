@@ -62,6 +62,11 @@ final class WineEngine {
     /// Personal-use only — not redistributable.
     private(set) var cxPreviewLibPath: String?
 
+    /// The Gcenx wine64 binary — always available regardless of CX engine.
+    /// Used for SteamCMD and other tools that don't need CX's improved stubs.
+    /// CLI-verified: SteamCMD works perfectly with Gcenx wine64.
+    private(set) var gcenxWine64URL: URL?
+
     var isReady: Bool { state == .ready }
 
     // MARK: - Convenience accessors for compatibility with existing code
@@ -112,6 +117,7 @@ final class WineEngine {
             dxmtPath = nil
             dxvkPath = nil
             cxPreviewLibPath = nil
+            gcenxWine64URL = nil
             return
         }
 
@@ -133,6 +139,7 @@ final class WineEngine {
             dxmtPath = nil
             dxvkPath = nil
             cxPreviewLibPath = nil
+            gcenxWine64URL = nil
             return
         }
 
@@ -143,6 +150,9 @@ final class WineEngine {
         //
         // PERSONAL USE ONLY — CX Preview binaries are not redistributable.
         // For distributable builds: use the Gcenx engine path only.
+        // Always store the Gcenx wine64 path — SteamCMD uses this exclusively.
+        gcenxWine64URL = URL(filePath: bundledWine)
+
         cxPreviewLibPath = nil
         let cxPaths = [
             "/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver",
@@ -245,9 +255,28 @@ final class WineEngine {
         dxmtPath     = nil
         dxvkPath     = nil
         cxPreviewLibPath = nil
+        gcenxWine64URL = nil
     }
 
     // MARK: - Environment
+
+    /// Builds the Gcenx-only environment for SteamCMD.
+    /// SteamCMD must use the Gcenx wine64 binary — CLI-verified working.
+    /// CX wineloader causes version mismatches with SteamCMD.
+    func gcenxEnvironment(for prefix: WinePrefix) -> [String: String] {
+        guard let lib = libraryPath else { return [:] }
+        let gcenxWine = gcenxWine64URL?.path(percentEncoded: false)
+            ?? Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
+        let gcenxServer = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
+        return [
+            "WINEPREFIX": prefix.path.path(percentEncoded: false),
+            "WINESERVER": gcenxServer,
+            "WINELOADER": gcenxWine,
+            "WINEDLLPATH": "\(lib)/wine",
+            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix",
+            "WINE_LARGE_ADDRESS_AWARE": "1",
+        ]
+    }
 
     /// Builds the environment dictionary for launching a Wine process.
     func environment(for prefix: WinePrefix) -> [String: String] {
