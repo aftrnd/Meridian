@@ -805,6 +805,7 @@ struct GameDetailView: View {
             engine: engine,
             steamManager: steamManager,
             sessionBridge: sessionBridge,
+            steamAuth: steamAuth,
             library: library
         )
     }

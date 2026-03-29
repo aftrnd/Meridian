@@ -64,11 +64,12 @@ final class GameLauncher {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
+        steamAuth: SteamAuthService? = nil,
         library: SteamLibraryStore? = nil
     ) {
         // Must be async for stopGame; run in Task if called from sync context
         Task {
-            await launchImpl(game: game, engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, library: library)
+            await launchImpl(game: game, engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, steamAuth: steamAuth, library: library)
         }
     }
 
@@ -77,6 +78,7 @@ final class GameLauncher {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
+        steamAuth: SteamAuthService?,
         library: SteamLibraryStore?
     ) async {
         switch launchState {
@@ -98,6 +100,7 @@ final class GameLauncher {
                 engine: engine,
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
+                steamAuth: steamAuth,
                 library: library
             )
         }
@@ -236,6 +239,7 @@ final class GameLauncher {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
+        steamAuth: SteamAuthService?,
         library: SteamLibraryStore?
     ) async {
         logs.removeAll()
@@ -334,6 +338,7 @@ final class GameLauncher {
                     username: username,
                     engine: engine,
                     prefix: prefix,
+                    steamAuth: steamAuth,
                     onProgress: { [weak self] line in
                         self?.appendLog(line)
                         // Parse percentage from SteamCMD output for currentActivity

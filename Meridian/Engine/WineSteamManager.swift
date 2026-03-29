@@ -478,6 +478,7 @@ final class WineSteamManager {
         username: String,
         engine: WineEngine,
         prefix: WinePrefix,
+        steamAuth: SteamAuthService? = nil,
         onProgress: @MainActor @Sendable @escaping (String) -> Void
     ) async throws {
         let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
@@ -542,17 +543,24 @@ final class WineSteamManager {
 
         let exitCode = process.terminationStatus
 
+        if (exitCode == 7 || exitCode == 5), let auth = steamAuth, let password = auth.loadSteamPassword() {
+            // SteamCMD credential cache was wiped (prefix reset). Auto-recover by
+            // re-authenticating with the password stored in Keychain during sign-in.
+            log.warning("[installWithSteamCMD] login failed (exit=\(exitCode)) — auto-recovering with Keychain password")
+            await MainActor.run { onProgress("Re-authenticating SteamCMD…") }
+
+            await authenticateSteamCMD(username: username, password: password, engine: engine, prefix: prefix)
+
+            // Retry the install now that credentials are restored
+            log.info("[installWithSteamCMD] retrying install after re-auth")
+            await MainActor.run { onProgress("Retrying download…") }
+            try await installWithSteamCMD(appID: appID, username: username, engine: engine, prefix: prefix, onProgress: onProgress)
+            return
+        }
+
         if exitCode == 7 || exitCode == 5 {
-            // Exit 7 = login failure (no cached credentials or wrong password)
-            // Exit 5 = invalid password
-            // This happens after a prefix reset wipes the SteamCMD credential cache.
-            // The user needs to re-authenticate SteamCMD from Terminal once.
-            log.error("[installWithSteamCMD] steamcmd login failed (exit=\(exitCode)) — cached credentials missing. SteamCMD has its own credential cache separate from Meridian's login. Run the SteamCMD login script in Terminal once to establish it.")
-            throw SteamError.installFailed(
-                "SteamCMD needs a one-time login. Open Terminal and run:\n\n" +
-                "bash ~/Library/CloudStorage/Dropbox/Developer/Cursor/meridian/Scripts/test-steamcmd-login.sh\n\n" +
-                "This is separate from signing into Meridian — SteamCMD uses its own credential cache for downloads."
-            )
+            log.error("[installWithSteamCMD] login failed (exit=\(exitCode)) and no Keychain password available")
+            throw SteamError.installFailed("Steam login expired. Please sign out and sign back in through Settings.")
         }
 
         if exitCode != 0 {

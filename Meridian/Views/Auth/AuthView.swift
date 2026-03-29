@@ -438,6 +438,8 @@ private struct SteamLoginStepContent: View {
         // which can race with view lifecycle events.
         let advance  = onSignedIn
         let savedPassword = password
+        // Store password in Keychain for SteamCMD auto-re-authentication after prefix resets.
+        auth_.saveSteamPassword(password)
         auth.authenticate(
             username: username.trimmingCharacters(in: .whitespaces),
             password: password
