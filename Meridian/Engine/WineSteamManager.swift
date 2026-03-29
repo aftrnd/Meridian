@@ -795,9 +795,14 @@ final class WineSteamManager {
         try? await Task.sleep(for: .seconds(2))
 
         suppressor?.resumeSuppressing(pid: 0)
-        try await startPersistent(engine: engine, prefix: prefix)
-        if let pid = persistentProcessIdentifier {
-            suppressor?.resumeSuppressing(pid: pid)
+        // Only start persistent Steam if not using CX engine.
+        if engine.cxPreviewLibPath == nil {
+            try await startPersistent(engine: engine, prefix: prefix)
+            if let pid = persistentProcessIdentifier {
+                suppressor?.resumeSuppressing(pid: pid)
+            }
+        } else {
+            isRunning = true
         }
 
         isSteamLoggedIn = true

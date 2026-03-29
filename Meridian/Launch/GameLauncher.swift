@@ -264,9 +264,10 @@ final class GameLauncher {
         }
 
         // If the persistent Steam process has died since bootstrap (crash, OOM, etc.)
-        // restart it silently before proceeding. Without this, launchGame would spawn
-        // a fresh Steam from scratch which can surface its main window.
-        if !steamManager.isSteamProcessAlive {
+        // restart it silently before proceeding — but ONLY when not using the CX engine.
+        // With CX engine, we don't use persistent Steam at all (SteamCMD for downloads,
+        // direct Wine launch for games).
+        if engine.cxPreviewLibPath == nil && !steamManager.isSteamProcessAlive {
             log.warning("[launch] persistent Steam not alive — restarting before launch")
             transition(to: .bootstrappingSteam, activity: "Reconnecting to Steam…")
             do {
