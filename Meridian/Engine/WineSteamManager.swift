@@ -555,6 +555,85 @@ final class WineSteamManager {
 
     // MARK: - Game Launch
 
+    /// Launches a game executable directly via Wine, bypassing steam.exe entirely.
+    ///
+    /// Used when: SteamCMD downloaded the game files and the game doesn't require
+    /// Steam DRM validation. Most indie/Unity games work this way.
+    ///
+    /// This avoids the Steam login window that appears when steam.exe -applaunch
+    /// is used with the CX engine (where Steam's CEF now works but has no session).
+    @discardableResult
+    func launchGameDirectly(
+        appID: Int,
+        engine: WineEngine,
+        prefix: WinePrefix
+    ) async throws -> Int32 {
+        guard let installDir = prefix.gameInstallDir(appID: appID) else {
+            throw SteamError.installFailed("Cannot find install directory for appID \(appID)")
+        }
+
+        let gamePath = prefix.steamInstallDir
+            .appending(path: "steamapps/common/\(installDir)")
+        let gamePathStr = gamePath.path(percentEncoded: false)
+
+        // Find the main game executable — look for .exe files, prefer the one matching the game name
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(atPath: gamePathStr) else {
+            throw SteamError.installFailed("Cannot list game directory: \(gamePathStr)")
+        }
+
+        let exeFiles = contents.filter { $0.hasSuffix(".exe") }
+            .filter { !$0.lowercased().contains("crash") && !$0.lowercased().contains("redist") && !$0.lowercased().contains("unins") }
+
+        guard let mainExe = exeFiles.first(where: { !$0.lowercased().contains("unity") }) ?? exeFiles.first else {
+            throw SteamError.installFailed("No game executable found in \(gamePathStr)")
+        }
+
+        let exeFullPath = gamePath.appending(path: mainExe).path(percentEncoded: false)
+        log.info("[launchGameDirectly] appID=\(appID) exe=\(exeFullPath)")
+
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [exeFullPath]
+        process.currentDirectoryURL = gamePath
+
+        let env = engine.environment(for: prefix)
+        process.environment = env
+        log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
+
+        let stderrPipe = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            log.info("[launchGameDirectly] launched pid=\(process.processIdentifier)")
+        } catch {
+            log.error("[launchGameDirectly] failed: \(error.localizedDescription)")
+            throw error
+        }
+
+        let pid = process.processIdentifier
+        windowSuppressor?.registerPID(pid)
+
+        Task.detached {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(data: data, encoding: .utf8) ?? ""
+            if !stderr.isEmpty {
+                let filtered = filterWineStderr(stderr)
+                let lines = filtered.components(separatedBy: .newlines).prefix(40)
+                for line in lines where !line.isEmpty {
+                    log.info("[launchGameDirectly:stderr] \(line)")
+                }
+            }
+            if !process.isRunning {
+                log.info("[launchGameDirectly] exited code=\(process.terminationStatus)")
+            }
+        }
+
+        return pid
+    }
+
     /// Launches a game via `wine64 steam.exe -applaunch APPID`.
     ///
     /// Steam handles its own initialization, login, and game launch in a

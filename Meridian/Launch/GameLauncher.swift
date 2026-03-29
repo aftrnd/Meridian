@@ -362,13 +362,16 @@ final class GameLauncher {
         // Tell the health monitor to defer restarts while the game is active.
         steamManager.gameIsRunning = true
 
-        // Send steam.exe -applaunch — stays in .launching until processes confirmed
+        // Launch the game directly via Wine, bypassing steam.exe.
+        // steam.exe -applaunch shows a Steam login window because Steam's client
+        // needs its own authenticated session. Since we use SteamCMD for downloads
+        // and the CX engine for running, there's no need for steam.exe at all.
         transition(to: .launching, activity: "Launching \(game.name)…")
-        appendLog("Launching steam.exe -applaunch \(game.id)")
+        appendLog("Launching \(game.name) directly via Wine")
 
         let launchedPID: Int32
         do {
-            launchedPID = try await steamManager.launchGame(
+            launchedPID = try await steamManager.launchGameDirectly(
                 appID: game.id,
                 engine: engine,
                 prefix: prefix
