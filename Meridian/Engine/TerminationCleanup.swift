@@ -5,8 +5,9 @@ private let log = MeridianLog(category: "TerminationCleanup")
 
 /// Kills all Wine/Steam processes owned by Meridian.
 ///
-/// Designed to be called from `applicationShouldTerminate` on a background
-/// thread so the main thread never blocks.
+/// Called at both startup (to kill orphans from a previous session) and at
+/// app termination. Uses an aggressive multi-sweep approach to ensure no
+/// Wine processes are left behind.
 ///
 /// Shutdown sequence:
 ///   1. `wineserver -k` with the correct WINEPREFIX — proper Wine shutdown that
@@ -17,6 +18,8 @@ private let log = MeridianLog(category: "TerminationCleanup")
 ///      Wine has replaced argv[0] with a Windows path (e.g. `C:\windows\...`), so
 ///      matching `com.meridian.app/engine` precisely catches our wine64 / wine-preloader
 ///      / wineserver processes without touching Wine processes from other applications.
+///   4. Also kills any processes from `/tmp/meridian-engine/` — build artifacts from
+///      `release-engine.sh` that can persist across reboots.
 enum TerminationCleanup {
 
     /// Paths needed to run `wineserver -k` for our specific prefix at quit time.
@@ -43,29 +46,27 @@ enum TerminationCleanup {
     /// Terminates all Wine/Steam processes for Meridian's prefix.
     ///
     /// Shutdown sequence:
-    ///   1. Kill `steamwebhelper` first — before wineserver shuts down Steam.
-    ///      Steam shows "steamwebhelper is not responding" when its main process
-    ///      detects the helper died. Killing the helper first, before wineserver
-    ///      signals Steam to exit, prevents Steam from ever generating that dialog.
+    ///   1. Kill `steamwebhelper` + `steam.exe` first — prevents "not responding" dialogs.
     ///   2. 100 ms micro-drain — let the kill signal land.
     ///   3. `wineserver -k` — proper Wine shutdown, signals all prefix clients to exit.
     ///   4. 1.5 s drain — time for processes to exit cleanly.
-    ///   5. First pkill sweep — by engine path and bottles path.
+    ///   5. First pkill sweep — by engine path, bottles path, and /tmp/meridian-engine.
     ///   6. 1 s drain — time for late-spawning child processes to appear.
-    ///   7. Second pkill sweep — catches anything that respawned between steps 5 and 6.
+    ///   7. Second sweep — catches anything that respawned between steps 5 and 6.
     static func killAllWineProcesses() {
         let start = Date()
         log.info("[cleanup] starting Wine/Steam process cleanup")
 
-        // 1. Kill steamwebhelper BEFORE wineserver -k.
-        //    Steam's main process (steam.exe) shows "steamwebhelper is not responding"
-        //    when it detects the helper process died while Steam is still running.
-        //    By killing steamwebhelper first, Steam never gets the chance to detect
-        //    the unresponsive helper — we then immediately kill Steam via wineserver.
+        // 1. Kill steamwebhelper and steam.exe BEFORE wineserver -k.
+        //    Killing steamwebhelper first prevents "steamwebhelper is not responding".
+        //    Killing steam.exe prevents the "steamUI is not responding" window that
+        //    appears when steam.exe is still alive after its webhelper dies.
         let swh1 = pkill(["-9", "-f", "steamwebhelper"])
         log.info("[cleanup] steamwebhelper pre-kill exit=\(swh1)")
+        let stm1 = pkill(["-9", "-f", "steam.exe"])
+        log.info("[cleanup] steam.exe pre-kill exit=\(stm1)")
 
-        // 2. Brief pause — let the kill signal land before wineserver tears down Steam.
+        // 2. Brief pause — let the kill signal land before wineserver tears down.
         usleep(100_000) // 100 ms
 
         // 3. Proper Wine shutdown: wineserver -k tells every client process in
@@ -120,6 +121,9 @@ enum TerminationCleanup {
             pkill(["-9", "-f", "com.meridian.app/bottles"])
             log.info("[cleanup] killed by fallback bundle paths")
         }
+        // Also kill any processes from the /tmp staging dir used by release-engine.sh.
+        // These can persist after a build if the script was interrupted.
+        pkill(["-9", "-f", "/tmp/meridian-engine"])
     }
 
     @discardableResult @inline(__always)

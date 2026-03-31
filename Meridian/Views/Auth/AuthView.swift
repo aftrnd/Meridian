@@ -445,33 +445,15 @@ private struct SteamLoginStepContent: View {
             password: password
         ) { steamID, accountName, refreshToken in
             // Prefix exists at this point (bootstrap is done before the sheet appears).
-            // Write session files and restart the persistent Steam process.
-            mgr.stopHealthMonitor()
+            // Write session files into the prefix so SteamCMD auto-logs in.
+            // No steam.exe is started here — it cannot authenticate under Wine 8.0.1.
+            // SteamCMD will authenticate lazily when the first game install begins.
             mgr.killAll(engine: eng, prefix: prefix)
             mgr.clearPersistentProcess()
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: .seconds(1))
             try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
             try? prefix.writeConnectCache(steamID: steamID, refreshToken: refreshToken, accountName: accountName)
-
-            // Authenticate SteamCMD with the same credentials.
-            // SteamCMD has its own credential cache separate from steam.exe's ConnectCache.
-            // Passing the password here avoids requiring a separate Terminal login step.
-            // The user may get one additional Steam Guard mobile confirmation.
-            await mgr.authenticateSteamCMD(
-                username: accountName,
-                password: savedPassword,
-                engine: eng,
-                prefix: prefix
-            )
-
-            // Only start persistent Steam if NOT using CX engine.
-            if eng.cxPreviewLibPath == nil {
-                try? await mgr.startPersistent(engine: eng, prefix: prefix)
-                if let pid = mgr.persistentProcessIdentifier { sup.resumeSuppressing(pid: pid) }
-                mgr.enableHealthMonitor(engine: eng, prefix: prefix)
-            } else {
-                mgr.isRunning = true
-            }
+            prefix.backupSteamCMDConfig()
             // Mark as authenticated so needsAPIKey returns true when advance() runs.
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true

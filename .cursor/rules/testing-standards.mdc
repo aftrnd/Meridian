@@ -57,22 +57,26 @@ private func steamInstallDir(driveC: URL) -> URL { ... }
 
 ### CLI Testing for Game Compatibility
 
-Before adding a game to `GameCompatibilityDB`, test it from CLI:
+Before adding a game to `GameCompatibilityDB`, test it from CLI using the bundled engine only:
 
 ```bash
-CX="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
-GCENX="$HOME/Library/Application Support/com.meridian.app/engine/wine"
+WINE64="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wine64"
+WINESERVER="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wineserver"
 WINEPREFIX="$HOME/Library/Application Support/com.meridian.app/bottles/steam/"
+LIB="$HOME/Library/Application Support/com.meridian.app/engine/wine/lib"
+
+export WINEPREFIX WINESERVER
+export DYLD_FALLBACK_LIBRARY_PATH="$LIB:$LIB/wine/x86_64-unix"
 
 # 1. Install via SteamCMD
-"$GCENX/bin/wine64" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamcmd.exe" \
+"$WINE64" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamcmd.exe" \
   +login USERNAME +app_update APPID validate +quit
 
-# 2. Launch with CX engine
-"$CX/bin/wineloader" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/GAMEDIR/game.exe" 2>&1 | head -50
+# 2. Launch directly
+"$WINE64" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/GAMEDIR/game.exe" 2>&1 | head -50
 
 # 3. Check for abort stubs
-grep "aborting\|unimplemented function" output.txt
+grep "aborting\|unimplemented function" /tmp/game-output.txt
 ```
 
 Document results in GameCompatibilityDB even if the game works — this tracks verified titles.

@@ -133,8 +133,7 @@ struct WinePrefix: Sendable {
     /// The template is complete: DLLs, registry, and driver stubs are all baked in.
     /// Wine auto-detects the Mac display driver at runtime from winemac.so in the
     /// engine's WINEDLLPATH — no `wineboot --update` is needed on the user's machine.
-    /// This matches how CrossOver creates bottles: instant template copy, zero Wine
-    /// process overhead.
+    /// Instant template copy — zero Wine process overhead on first run.
     ///
     /// Falls back to `wineboot --init` if no template is found (backwards compatibility
     /// with older engine releases that predate the template packaging).
@@ -172,8 +171,8 @@ struct WinePrefix: Sendable {
                 )
                 // Populate syswow64 with 32-bit DLLs from the engine.
                 //
-                // Wine 8.x (Gcenx) left syswow64 empty after wineboot --init; Wine 11.x
-                // (CrossOver 27) does not create the directory at all. Either way we must
+                // Some Wine versions leave syswow64 empty after wineboot --init; others
+                // do not create the directory at all. Either way we must
                 // create it and fill it ourselves from the engine's i386-windows/ directory.
                 // Without the 32-bit builtins, Wine's WoW64 layer cannot load 32-bit
                 // Windows executables (like SteamSetup.exe) and crashes with
@@ -205,8 +204,6 @@ struct WinePrefix: Sendable {
                 // No wineboot --update here. The template built by release-engine.sh is
                 // complete (DLLs, registry, driver stubs). Wine auto-detects the Mac
                 // display driver at runtime from winemac.so in the engine's WINEDLLPATH.
-                // CrossOver also creates bottles from templates without running wineboot
-                // on the user's machine — instant bottle creation.
             } catch {
                 log.error("[create] template copy failed: \(error.localizedDescription) — falling back to wineboot --init")
                 try? fm.removeItem(at: path)
@@ -582,9 +579,36 @@ struct WinePrefix: Sendable {
                     // Look for an existing line that starts with matchPrefix inside the block.
                     let lines = block.components(separatedBy: "\n")
                     if let existingIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(matchPrefix) }) {
-                        // Replace that line.
                         var newLines = lines
-                        newLines[existingIdx] = newKeyLine
+                        // Determine the end of this entry. If the value is a { ... } block
+                        // (multi-line entry), we must remove ALL those lines too, not just the
+                        // key line. Replacing only the key line leaves the old block in the
+                        // file, producing duplicate braces and corrupt VDF.
+                        //
+                        // Root cause of sign-in loop (v0.9.2): accountEntry is a multi-line
+                        // string. When upserted by replacing only the key line the old
+                        // { SteamID ... } block was left behind, causing SteamCMD to report
+                        // "KeyValues Error: got } in key in file InstallConfigStore" and hang.
+                        var endIdx = existingIdx
+                        let lookAhead = existingIdx + 1
+                        if lookAhead < newLines.count,
+                           newLines[lookAhead].trimmingCharacters(in: .whitespaces) == "{" {
+                            // Scan forward to the matching closing brace.
+                            var depth = 0
+                            var scanLine = lookAhead
+                            while scanLine < newLines.count {
+                                for ch in newLines[scanLine] {
+                                    if ch == "{" { depth += 1 }
+                                    else if ch == "}" {
+                                        depth -= 1
+                                        if depth == 0 { endIdx = scanLine }
+                                    }
+                                }
+                                if depth == 0 { break }
+                                scanLine += 1
+                            }
+                        }
+                        newLines.replaceSubrange(existingIdx...endIdx, with: [newKeyLine])
                         block = newLines.joined(separator: "\n")
                     } else {
                         // Insert the new line before the closing `}`.
@@ -632,89 +656,50 @@ struct WinePrefix: Sendable {
         return vdf
     }
 
-    // MARK: - DXMT System32 Deployment
-
-    /// Copies DXMT DLLs from the Gcenx engine into the Wine prefix's system32.
-    ///
-    /// When CrossOver's wineloader is active, it loads DLLs from its own lib path
-    /// before checking WINEDLLPATH. Placing DXMT DLLs directly in the prefix's
-    /// Windows system32 ensures they are found first, enabling Metal rendering.
-    ///
-    /// Required when: CX engine is active AND game uses D3D11/DXGI.
-    /// Safe to call repeatedly — skips if already up to date (size check).
-    func installDXMTInSystem32(engine: WineEngine) throws {
-        let fm = FileManager.default
-        let sys32 = path.appending(path: "drive_c/windows/system32")
-        let engineDxmtDir = WineEngine.engineDir.appending(path: "wine/lib/wine/x86_64-windows")
-
-        guard fm.fileExists(atPath: sys32.path(percentEncoded: false)) else {
-            log.warning("[installDXMTInSystem32] system32 not found — prefix not initialized yet")
-            return
-        }
-
-        let dxmtDLLs = ["d3d11.dll", "dxgi.dll", "d3d12.dll"]
-        var installed = 0
-        for dll in dxmtDLLs {
-            let src = engineDxmtDir.appending(path: dll)
-            let dst = sys32.appending(path: dll)
-            let srcPath = src.path(percentEncoded: false)
-            let dstPath = dst.path(percentEncoded: false)
-            guard fm.fileExists(atPath: srcPath) else { continue }
-
-            // Check if source is DXMT (larger than Wine's built-in; d3d11.dll > 1MB = DXMT)
-            guard let srcSize = try? fm.attributesOfItem(atPath: srcPath)[.size] as? Int,
-                  srcSize > 1_000_000 else { continue }
-
-            // Skip if already installed with same size
-            if let dstSize = try? fm.attributesOfItem(atPath: dstPath)[.size] as? Int,
-               dstSize == srcSize { continue }
-
-            try fm.copyItem(at: src, to: dst)
-            installed += 1
-            log.info("[installDXMTInSystem32] installed \(dll) (\(srcSize / 1024)KB) → system32")
-        }
-        if installed == 0 {
-            log.debug("[installDXMTInSystem32] DXMT already up to date in system32")
-        }
-    }
-
     // MARK: - Webhelper Configuration
 
     /// Writes `steam.cfg` in the Steam install directory to disable the CEF sandbox.
     ///
-    /// Steam's webhelper process (steamwebhelper.exe) is a Chromium-based binary that
-    /// renders the entire Steam UI — including game install dialogs. Under Wine, Chrome's
-    /// sandbox fails to initialise because Wine does not fully implement the Windows kernel
-    /// security primitives (job objects, token impersonation) that Chromium's sandbox
-    /// relies on. Without the sandbox bypass the webhelper crashes on every launch, leaving
-    /// Steam without any UI:
-    ///   - Install dialogs cannot be displayed
-    ///   - Steam cannot complete its authenticated login handshake
-    ///   - All IPC commands that trigger UI (e.g. `steam://install/`) silently fail
+    /// Two flags are written:
     ///
-    /// `SteamNoSandbox=1` instructs Steam to spawn the webhelper with `--no-sandbox
-    /// --no-zygote`, bypassing the sandbox entirely. CPU-based (software) rendering
-    /// continues to work, so the full Steam UI renders correctly.
+    /// `SteamNoSandbox=1` — instructs Steam to spawn the webhelper with `--no-sandbox
+    /// --no-zygote`, bypassing Chromium's sandbox which fails under Wine due to missing
+    /// kernel security primitives (job objects, token impersonation). Without this, the
+    /// webhelper crashes on every launch and Steam cannot render any UI.
     ///
-    /// Safe to call repeatedly: it is a no-op when the file already contains the
-    /// required setting.
+    /// `BootStrapperInhibitAll=enable` — prevents Steam's bootstrapper from checking for
+    /// and downloading client updates every time it launches. Without this, every SteamCMD
+    /// batch call starts with a multi-second update check, adding unnecessary latency to
+    /// game installs. This flag is only written once Steam has been fully bootstrapped
+    /// (steamui.dll present), so it never blocks the initial Steam client download.
+    ///
+    /// Safe to call repeatedly — no-op when the file already contains both settings.
     func ensureSteamCFG() throws {
         let fm = FileManager.default
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
 
+        let alreadyBootstrapped = isSteamInstalled  // steamui.dll present = fully bootstrapped
+
+        // Build required settings
+        var required = ["SteamNoSandbox=1"]
+        if alreadyBootstrapped {
+            // Only add BootStrapperInhibitAll after Steam is fully installed.
+            // During first-run bootstrap, this flag must NOT be present or Steam
+            // cannot download its client files.
+            required.append("BootStrapperInhibitAll=enable")
+        }
+
         if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
-           existing.contains("SteamNoSandbox=1") {
+           required.allSatisfy({ existing.contains($0) }) {
             log.debug("[ensureSteamCFG] steam.cfg already configured — skipping")
             return
         }
 
         try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
 
-        let cfg = """
-        SteamNoSandbox=1
-        """
+        let cfg = required.joined(separator: "\n") + "\n"
         try cfg.write(to: cfgURL, atomically: true, encoding: .utf8)
-        log.info("[ensureSteamCFG] steam.cfg written with SteamNoSandbox=1 → \(cfgURL.path(percentEncoded: false))")
+        log.info("[ensureSteamCFG] steam.cfg written: \(required.joined(separator: ", ")) → \(cfgURL.path(percentEncoded: false))")
     }
 
     // MARK: - Library Setup

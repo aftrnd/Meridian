@@ -14,11 +14,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by MeridianApp so suppression observers are torn down at termination.
     var suppressor: SteamWindowSuppressor?
 
-    /// Set by MeridianApp so the health monitor is cancelled before Wine cleanup runs.
+    /// Set by MeridianApp for process cleanup on termination.
     var steamManager: WineSteamManager?
 
     /// Set by MeridianApp so the bootstrap pipeline is cancelled before Wine cleanup.
     var bootstrap: BootstrapManager?
+
+    /// Set by MeridianApp so the persistent SteamCMD session is shut down at termination.
+    var steamCMDService: SteamCMDService?
 
     /// Prevents `killAllWineProcesses` from running concurrently or twice.
     private var cleanupDone = false
@@ -131,9 +134,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before the cleanup kills them — prevents race conditions with partial state.
         bootstrap?.cancelForTermination()
 
-        // Stop the health monitor immediately so it cannot detect a dead Steam
-        // process mid-cleanup and restart it, leaving a new orphaned process.
-        steamManager?.stopHealthMonitor()
+        // Shut down the persistent SteamCMD session cleanly (sends "quit" to the process).
+        steamCMDService?.shutdown()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             log.warning("[AppDelegate] cleanup timed out — forcing quit")

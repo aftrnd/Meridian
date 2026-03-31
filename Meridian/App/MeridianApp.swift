@@ -16,6 +16,7 @@ struct MeridianApp: App {
     @State private var suppressor        = SteamWindowSuppressor()
     @State private var updateChecker     = AppUpdateChecker()
     @State private var engineDownloader  = EngineDownloader()
+    @State private var steamCMDService   = SteamCMDService()
 
     private let settings = AppSettings.shared
 
@@ -25,10 +26,12 @@ struct MeridianApp: App {
         let _ = {
             bootstrap.windowSuppressor    = suppressor
             launcher.windowSuppressor     = suppressor
+            launcher.steamCMDService      = steamCMDService
             steamManager.windowSuppressor = suppressor
             appDelegate.suppressor        = suppressor
             appDelegate.steamManager      = steamManager
             appDelegate.bootstrap         = bootstrap
+            appDelegate.steamCMDService   = steamCMDService
         }()
 
         WindowGroup {
@@ -44,6 +47,7 @@ struct MeridianApp: App {
                 .environment(suppressor)
                 .environment(updateChecker)
                 .environment(engineDownloader)
+                .environment(steamCMDService)
                 // Refresh permission state when Meridian becomes active (user may
                 // have just granted Accessibility access in System Preferences).
                 .onReceive(NotificationCenter.default.publisher(

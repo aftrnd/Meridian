@@ -52,6 +52,7 @@
 		B00E00C0 /* HeroArtViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00C1 /* HeroArtViews.swift */; };
 		B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */; };
 		D1D8B7DD549091BB2876CCA0 /* MeridianLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE30B92B1C3871B6B2870750 /* MeridianLog.swift */; };
+		B00E00D0 /* SteamCMDService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00D1 /* SteamCMDService.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -104,6 +105,7 @@
 		D4965BA889D288764428E3E5 /* GameProfile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GameProfile.swift; sourceTree = "<group>"; };
 		EE30B92B1C3871B6B2870750 /* MeridianLog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianLog.swift; sourceTree = "<group>"; };
 		EE9307949871471AB0E85285 /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
+		B00E00D1 /* SteamCMDService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCMDService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -257,6 +259,7 @@
 				B00E00B1 /* AppUpdateChecker.swift */,
 				B00E0004 /* WinePrefix.swift */,
 				B00E0006 /* WineSteamManager.swift */,
+				B00E00D1 /* SteamCMDService.swift */,
 				B00E00A1 /* SteamWindowSuppressor.swift */,
 				B00E0008 /* GameProcess.swift */,
 				AA00000001000002 /* GameCompatibilityDB.swift */,
@@ -368,6 +371,7 @@
 				B00E0001 /* WineEngine.swift in Sources */,
 				B00E0003 /* WinePrefix.swift in Sources */,
 				B00E0005 /* WineSteamManager.swift in Sources */,
+				B00E00D0 /* SteamCMDService.swift in Sources */,
 				B00E00A0 /* SteamWindowSuppressor.swift in Sources */,
 				B00E0007 /* GameProcess.swift in Sources */,
 				AA00000001000001 /* GameCompatibilityDB.swift in Sources */,

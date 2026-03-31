@@ -9,44 +9,34 @@ private let log = MeridianLog(category: "WineSteamManager")
 ///
 /// Responsible for:
 ///   - Bootstrapping Steam on first run (downloading the full client)
-///   - Running a persistent Steam process for near-instant game launches
-///   - Launching games via steam.exe -applaunch (IPC to running instance)
+///   - Launching games directly via wine64 (bypassing steam.exe -applaunch)
+///   - Starting steam.exe on-demand for DRM games (startSteamForDRM)
 ///   - Stopping Steam / killing Wine processes
+///
+/// steam.exe is NOT started at app launch. It is started only
+/// on-demand when a game ships steam_api64.dll and needs a live Steam IPC socket for DRM.
 @Observable
 @MainActor
 final class WineSteamManager {
 
-    /// Whether the persistent Steam process is currently running.
-    /// Set to true when CX engine is active (Steam not needed but code checks this flag).
+    /// Whether a persistent Steam process is currently running.
+    /// True only when steam.exe has been started (DRM game launch or showSteamUI).
     var isRunning: Bool = false
 
     /// Whether the Wine Steam client has an authenticated user session.
-    /// Set by `BootstrapManager` after sync, and by `loginToSteam()` on success.
-    /// The `SetupSheet` gates on this to show the Steam login step.
-    var isSteamLoggedIn: Bool = false
+    /// Persisted to UserDefaults so the setup sheet doesn't re-appear after
+    /// view lifecycle events (game exit, navigation changes).
+    var isSteamLoggedIn: Bool = UserDefaults.standard.bool(forKey: "isSteamLoggedIn") {
+        didSet { UserDefaults.standard.set(isSteamLoggedIn, forKey: "isSteamLoggedIn") }
+    }
 
-    /// The long-lived Steam process started at app launch.
+    /// The Steam process started on-demand for DRM games or showSteamUI.
     private var persistentProcess: Process?
 
-    /// When the persistent process was last launched (for uptime-based crash classification).
+    /// When the persistent process was last launched.
     private var persistentLaunchDate: Date?
 
-    /// Called after the health monitor automatically restarts a dead Steam process.
-    /// Set by `BootstrapManager` so `SteamWindowSuppressor` can re-engage.
-    var onSteamRevived: (@MainActor () -> Void)?
-
-    /// Background task that polls process liveness and restarts Steam if it dies.
-    private var healthMonitorTask: Task<Void, Never>?
-
-    /// Consecutive health-monitor restart attempts without Steam staying alive for >60s.
-    private var healthMonitorRetryCount: Int = 0
-
-    /// True when the health monitor has exhausted its retry budget.
-    /// Surfaced to the UI so the user can take manual action (reset prefix, etc.).
-    private(set) var healthMonitorExhausted: Bool = false
-
-    /// Set by `GameLauncher` while a game is actively running. The health monitor
-    /// defers restarts to avoid wineserver conflicts with the game process.
+    /// Set by `GameLauncher` while a game is actively running.
     var gameIsRunning: Bool = false
 
     /// Set by `MeridianApp` so every Wine process launched here can be registered
@@ -401,13 +391,10 @@ final class WineSteamManager {
 
         log.info("[authenticateSteamCMD] authenticating SteamCMD for user=\(username)")
 
-        // SteamCMD MUST use Gcenx wine64, not CX wineloader.
-        // CLI-verified: SteamCMD works with Gcenx, fails with CX (version mismatch).
-        let wine64 = engine.gcenxWine64URL ?? engine.wine64URL
         let process = Process()
-        process.executableURL = wine64
+        process.executableURL = engine.wine64URL
         process.arguments = [steamcmdPath, "+login", username, password, "+quit"]
-        process.environment = engine.gcenxEnvironment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
 
         let combinedPipe = Pipe()
         process.standardOutput = combinedPipe
@@ -460,11 +447,11 @@ final class WineSteamManager {
     // MARK: - Game Installation via SteamCMD
 
     /// Downloads a game using SteamCMD — the only reliable headless install method
-    /// under Wine 8.0.1 where the full Steam client cannot authenticate.
+    /// in cases where the Steam client session is not active.
     ///
     /// ## Why SteamCMD (not steam.exe +app_update)
     ///
-    /// `steam.exe` under Wine 8.0.1 (CrossOverFOSS 23.7.1) **never logs in**.
+    /// Steam's `-silent` flag suppresses most UI, but the client may not fully authenticate.
     /// Every session shows `[Logged Off, 0, 0]` in connection_log.txt because the
     /// Steam Windows Service fails (GLE 126) and the CEF webhelper crash-loops on
     /// `chrome_elf.dll STATUS_BREAKPOINT` (missing `GetProcessMitigationPolicy` stub).
@@ -494,8 +481,33 @@ final class WineSteamManager {
         onProgress: @MainActor @Sendable @escaping (String) -> Void
     ) async throws {
         let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
-        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
-            throw SteamError.installFailed("steamcmd.exe not found in Steam directory. Re-run bootstrap.")
+
+        // Self-healing: if steamcmd.exe is missing (prefix was reset, or first
+        // install after a partial bootstrap), download it on the fly rather than
+        // failing with a confusing "not found" error.
+        if !FileManager.default.fileExists(atPath: steamcmdPath) {
+            log.warning("[installWithSteamCMD] steamcmd.exe missing — downloading on the fly")
+            await MainActor.run { onProgress("Installing game tools…") }
+            do {
+                let zipURL = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip")!
+                let (data, _) = try await URLSession.shared.data(from: zipURL)
+                let tempZip = FileManager.default.temporaryDirectory.appending(path: "steamcmd.zip")
+                try data.write(to: tempZip)
+                let unzip = Process()
+                unzip.executableURL = URL(filePath: "/usr/bin/unzip")
+                unzip.arguments = ["-o", tempZip.path(percentEncoded: false), "-d", prefix.steamInstallDir.path(percentEncoded: false)]
+                unzip.standardOutput = FileHandle.nullDevice
+                unzip.standardError = FileHandle.nullDevice
+                try unzip.run()
+                unzip.waitUntilExit()
+                try? FileManager.default.removeItem(at: tempZip)
+                log.info("[installWithSteamCMD] steamcmd.exe downloaded ✓")
+            } catch {
+                throw SteamError.installFailed("Failed to download SteamCMD: \(error.localizedDescription)")
+            }
+            guard FileManager.default.fileExists(atPath: steamcmdPath) else {
+                throw SteamError.installFailed("steamcmd.exe still missing after download attempt.")
+            }
         }
 
         log.info("[installWithSteamCMD] appID=\(appID) user=\(username)")
@@ -509,18 +521,15 @@ final class WineSteamManager {
         log.info("[installWithSteamCMD] restoring SteamCMD credential cache from backup")
         prefix.restoreSteamCMDConfig()
 
-        // SteamCMD MUST use Gcenx wine64, not CX wineloader.
-        // CLI-verified: SteamCMD works with Gcenx, fails with CX (version mismatch).
-        let wine64 = engine.gcenxWine64URL ?? engine.wine64URL
         let process = Process()
-        process.executableURL = wine64
+        process.executableURL = engine.wine64URL
         process.arguments = [
             steamcmdPath,
             "+login", username,
             "+app_update", "\(appID)", "validate",
             "+quit",
         ]
-        process.environment = engine.gcenxEnvironment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardInput = FileHandle.nullDevice
 
         // SteamCMD writes ALL output (progress, errors, status) to STDOUT.
@@ -601,7 +610,7 @@ final class WineSteamManager {
     }
 
     /// Sends `+app_update <appID>` to the running Steam IPC as a fallback.
-    /// This only works when the full Steam client is authenticated (rare under Wine 8.0.1).
+    /// This works when the Steam client is running in the background.
     /// Use `installWithSteamCMD` for reliable headless installs.
     func queueInstall(appID: Int, engine: WineEngine, prefix: WinePrefix) throws {
         log.info("[queueInstall] dispatching +app_update \(appID) via Steam IPC (fallback)")
@@ -613,11 +622,8 @@ final class WineSteamManager {
     /// Brings the Steam window to the foreground.
     ///
     /// When a persistent Steam process is already running, sends `-activate` via IPC
-    /// to surface its main window.
-    ///
-    /// In CX engine mode no persistent Steam is running (bootstrap skips it deliberately).
-    /// In this case Steam is started in visible, non-silent mode so the user can interact
-    /// with it. The suppressor is paused first so Steam's windows are not hidden.
+    /// to surface its main window. If Steam is not running, starts it in visible mode.
+    /// The suppressor is paused first so Steam's windows are not hidden.
     func showSteamUI(engine: WineEngine, prefix: WinePrefix) async {
         log.info("[showSteamUI] showing Steam UI")
         // Pause suppression before doing anything — the polling timer runs every 0.5s and
@@ -631,8 +637,7 @@ final class WineSteamManager {
             return
         }
 
-        // No running Steam (CX engine mode skips persistent Steam).
-        // Start steam.exe visibly so the user can see and interact with the UI.
+        // No running Steam — start it visibly so the user can see and interact with the UI.
         // Use -noreactlogin to suppress the React login dialog; the ConnectCache
         // session from onboarding auto-logs in without any user interaction.
         let steamExe = prefix.steamExePath.path(percentEncoded: false)
@@ -721,9 +726,6 @@ final class WineSteamManager {
     ///
     /// Used when: SteamCMD downloaded the game files and the game doesn't require
     /// Steam DRM validation. Most indie/Unity games work this way.
-    ///
-    /// This avoids the Steam login window that appears when steam.exe -applaunch
-    /// is used with the CX engine (where Steam's CEF now works but has no session).
     @discardableResult
     func launchGameDirectly(
         appID: Int,
@@ -1054,14 +1056,9 @@ final class WineSteamManager {
         try? await Task.sleep(for: .seconds(2))
 
         suppressor?.resumeSuppressing(pid: 0)
-        // Only start persistent Steam if not using CX engine.
-        if engine.cxPreviewLibPath == nil {
-            try await startPersistent(engine: engine, prefix: prefix)
-            if let pid = persistentProcessIdentifier {
-                suppressor?.resumeSuppressing(pid: pid)
-            }
-        } else {
-            isRunning = true
+        try await startPersistent(engine: engine, prefix: prefix)
+        if let pid = persistentProcessIdentifier {
+            suppressor?.resumeSuppressing(pid: pid)
         }
 
         isSteamLoggedIn = true
@@ -1080,9 +1077,8 @@ final class WineSteamManager {
     /// `steam.exe -applaunch` invocations use IPC to the running instance
     /// instead of cold-starting a new one.
     ///
-    /// The health monitor is NOT started automatically. Callers must call
-    /// `enableHealthMonitor(engine:prefix:)` after confirming Steam is ready
-    /// (typically after `waitUntilReady` succeeds).
+    /// Used on-demand for DRM games (`startSteamForDRM`) and `showSteamUI`.
+    /// Used on-demand for DRM games or showSteamUI.
     func startPersistent(engine: WineEngine, prefix: WinePrefix) async throws {
         guard persistentProcess == nil || !(persistentProcess?.isRunning ?? false) else {
             log.info("[startPersistent] Steam already running — skipping")
@@ -1219,110 +1215,15 @@ final class WineSteamManager {
         return persistentProcess?.processIdentifier
     }
 
-    // MARK: - Health Monitor
-
-    private static let healthMonitorMaxRetries = 5
-    private static let healthMonitorBaseInterval: TimeInterval = 10
-    private static let healthMonitorStableThreshold: TimeInterval = 60
-
-    /// Starts the health monitor. Call this AFTER `waitUntilReady` succeeds,
-    /// not from `startPersistent` — this prevents the monitor from fighting
-    /// with the readiness-polling loop.
-    func enableHealthMonitor(engine: WineEngine, prefix: WinePrefix) {
-        healthMonitorRetryCount = 0
-        healthMonitorExhausted = false
-        startHealthMonitor(engine: engine, prefix: prefix)
-    }
+    // MARK: - Persistent Process Helpers
 
     /// Clears the persistent process reference after an intentional kill.
     /// Without this, `startPersistent` sees the dead process still referenced
-    /// and skips the launch with "Steam already running".
+    /// and skips the launch.
     func clearPersistentProcess() {
         persistentProcess = nil
         isRunning = false
         log.debug("[startPersistent] process reference cleared")
-    }
-
-    /// Polls the persistent Steam process and silently restarts it if it dies.
-    ///
-    /// Uses exponential backoff (10s, 20s, 40s, 80s, 120s) with a max of 5
-    /// consecutive retries. The counter resets when Steam stays alive for >60s.
-    /// Defers restarts while `gameIsRunning` is true to avoid wineserver conflicts.
-    private func startHealthMonitor(engine: WineEngine, prefix: WinePrefix) {
-        healthMonitorTask?.cancel()
-        healthMonitorTask = Task { [weak self] in
-            var lastAliveAt: Date = .now
-
-            while !Task.isCancelled {
-                let backoffInterval = Self.healthMonitorBaseInterval * pow(2.0, Double(min(self?.healthMonitorRetryCount ?? 0, 4)))
-                let sleepDuration = min(backoffInterval, 120)
-                try? await Task.sleep(for: .seconds(sleepDuration))
-                guard !Task.isCancelled, let self else { break }
-
-                if isSteamProcessAlive {
-                    let uptime = Date().timeIntervalSince(persistentLaunchDate ?? .now)
-                    if uptime >= Self.healthMonitorStableThreshold && healthMonitorRetryCount > 0 {
-                        log.info("[healthMonitor] Steam stable for \(Int(uptime))s — resetting retry counter (was \(self.healthMonitorRetryCount))")
-                        healthMonitorRetryCount = 0
-                        healthMonitorExhausted = false
-                    }
-                    lastAliveAt = .now
-                    continue
-                }
-
-                // Steam is dead — classify the exit
-                let uptime = persistentLaunchDate.map { Date().timeIntervalSince($0) } ?? 0
-                let exitCode = persistentProcess?.terminationStatus ?? -1
-                let reason: String = {
-                    switch persistentProcess?.terminationReason {
-                    case .exit:   return "normal-exit"
-                    case .uncaughtSignal: return "signal"
-                    default:      return "unknown"
-                    }
-                }()
-                log.warning("[healthMonitor] Steam died — uptime=\(Int(uptime))s exitCode=\(exitCode) reason=\(reason) retry=\(self.healthMonitorRetryCount)/\(Self.healthMonitorMaxRetries)")
-
-                // Defer restart while a game is actively running
-                if gameIsRunning {
-                    log.info("[healthMonitor] game is running — deferring Steam restart")
-                    continue
-                }
-
-                // Check retry budget
-                if healthMonitorRetryCount >= Self.healthMonitorMaxRetries {
-                    log.error("[healthMonitor] retry budget exhausted (\(Self.healthMonitorMaxRetries) attempts) — giving up")
-                    healthMonitorExhausted = true
-                    isRunning = false
-                    break
-                }
-
-                healthMonitorRetryCount += 1
-                log.info("[healthMonitor] restarting Steam (attempt \(self.healthMonitorRetryCount)/\(Self.healthMonitorMaxRetries), backoff=\(Int(sleepDuration))s)")
-
-                do {
-                    try await self.startPersistent(engine: engine, prefix: prefix)
-                    log.info("[healthMonitor] Steam restarted (pid=\(self.persistentProcessIdentifier.map(String.init) ?? "nil"))")
-                    onSteamRevived?()
-                } catch {
-                    log.error("[healthMonitor] restart failed: \(error.localizedDescription)")
-                }
-            }
-            log.info("[healthMonitor] stopped")
-        }
-        log.info("[healthMonitor] started")
-    }
-
-    /// Cancels the health monitor immediately.
-    ///
-    /// Cancels the health monitor task.
-    ///
-    /// Call before any intentional Steam kill — either at app termination (from
-    /// `AppDelegate`) or during the auth session-write flow — to prevent the monitor
-    /// from race-restarting Steam before the caller is ready.
-    func stopHealthMonitor() {
-        healthMonitorTask?.cancel()
-        healthMonitorTask = nil
-        log.info("[healthMonitor] stopped")
     }
 
     /// Polls until Steam is confirmed ready using multiple signals.
@@ -1491,9 +1392,6 @@ final class WineSteamManager {
 
     /// Gracefully shuts down the persistent Steam process.
     func stopPersistent(engine: WineEngine, prefix: WinePrefix) async {
-        healthMonitorTask?.cancel()
-        healthMonitorTask = nil
-
         guard persistentProcess?.isRunning ?? false else {
             log.info("[stopPersistent] no persistent process running")
             persistentProcess = nil
@@ -1548,8 +1446,6 @@ final class WineSteamManager {
 
     /// Kills the Wine server for the prefix, terminating all Wine processes.
     func killAll(engine: WineEngine, prefix: WinePrefix) {
-        healthMonitorTask?.cancel()
-        healthMonitorTask = nil
         log.info("[killAll] sending wineserver -k")
         let process = Process()
         process.executableURL = engine.wineserverURL

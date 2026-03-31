@@ -13,6 +13,7 @@ final class BootstrapTests: XCTestCase {
     // MARK: - Phase enum mirror (BootstrapManager.Phase)
 
     /// Mirror of BootstrapManager.Phase
+    /// MIRROR CONTRACT: Mirrors BootstrapManager.Phase (BootstrapManager.swift)
     enum Phase: Equatable {
         case idle
         case awaitingPermission
@@ -23,7 +24,6 @@ final class BootstrapTests: XCTestCase {
         case bootstrappingSteam
         case syncingSession
         case startingSteam
-        case waitingForSteam
         case ready
         case failed(String)
     }
@@ -32,8 +32,7 @@ final class BootstrapTests: XCTestCase {
     /// Returns true if the given failed phase warrants a full prefix wipe.
     private func shouldWipePrefixOnRetry(failedPhase: Phase?) -> Bool {
         let cleanupPhases: [Phase] = [
-            .creatingPrefix, .installingSteam, .bootstrappingSteam,
-            .startingSteam, .waitingForSteam
+            .creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam
         ]
         guard let phase = failedPhase else { return false }
         return cleanupPhases.contains(phase)
@@ -46,7 +45,6 @@ final class BootstrapTests: XCTestCase {
         XCTAssertTrue(shouldWipePrefixOnRetry(failedPhase: .installingSteam))
         XCTAssertTrue(shouldWipePrefixOnRetry(failedPhase: .bootstrappingSteam))
         XCTAssertTrue(shouldWipePrefixOnRetry(failedPhase: .startingSteam))
-        XCTAssertTrue(shouldWipePrefixOnRetry(failedPhase: .waitingForSteam))
     }
 
     func testRetryDoesNotWipeForEarlyPhases() {
@@ -80,7 +78,6 @@ final class BootstrapTests: XCTestCase {
             .bootstrappingSteam,
             .syncingSession,
             .startingSteam,
-            .waitingForSteam,
             .ready,
         ]
 

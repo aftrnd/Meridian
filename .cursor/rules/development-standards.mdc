@@ -28,14 +28,21 @@ The current date matters. Always use the **latest stable versions** of all depen
 
 | Component | Source | Why |
 |-----------|--------|-----|
-| Wine | `wine-crossover` via Gcenx/winecx (NOT `wine-staging`) | CodeWeavers' macOS fork — TLS, Steam compat, WoW64. Same base as Proton. |
-| DXMT | `3Shain/dxmt` latest stable | DirectX 11 → Metal translation |
+| Wine | `wine-devel` from `Gcenx/macOS_Wine_builds` (Wine 11.x) | CLI-verified March 2026: Wine 11.5 — zero abort stubs, `IsMouseInPointerEnabled` present, Metal APIs for DXMT, Security.framework TLS. |
+| DXMT | `3Shain/dxmt` v0.74+ builtin variant | DirectX 11 → Metal. Requires wiremac.so Metal view APIs (present in Wine 11.x+). |
 | DXVK | `doitsujin/dxvk` latest stable | DirectX → Vulkan fallback |
+| Apple GPTK | Apple Game Porting Toolkit (developer.apple.com) | D3D12 → Metal 3 translation |
 | macOS | Target latest stable (currently macOS 26) | Apple Silicon + Metal 3 |
 
-**CRITICAL: Never use `wine-staging` (Gcenx/macOS_Wine_builds).** It is community Wine without CodeWeavers' macOS TLS patches. It causes "Steam needs to be online" failures because HTTPS silently fails. It is also deprecated on Homebrew (disabled 2026-09-01).
+**CRITICAL: Use `wine-devel` from `Gcenx/macOS_Wine_builds`, NOT `Gcenx/winecx`.** The `winecx` repo stopped publishing after Wine 8.0.1 (Feb 2024). `macOS_Wine_builds` publishes Wine 11.x with the same CodeWeavers patches (CW 22435 DXMT Metal APIs, CW 13322/17315/21883 Steam, CW 20760 Rosetta2, Security.framework TLS). CLI-verified March 2026: game launch working.
 
-**CRITICAL: Never use CrossOver Preview.app or CrossOver.app binaries (`wineloader`, the Perl `wine` script, etc.) as standalone engine components.** These are commercial application binaries that depend on CrossOver's full environment (`CX_ROOT`, Perl launcher context, CodeWeavers' compatibility database) for TLS to function. When extracted and run outside CrossOver, HTTPS certificate validation fails silently — producing the exact same "Steam needs to be online" symptom as `wine-staging`. This was proven in the v1.0.9/v1.0.10 engine regression (March 2026): `Crypto API failed certificate check, error flags 0x00000028`. The ONLY acceptable Wine source is `wine-crossover` FOSS from `Gcenx/winecx` — the standalone build with macOS Security.framework TLS baked directly into the binary.
+**CRITICAL: DXMT requires Wine 11.x wiremac.so.** DXMT's wiremetal.so dynamically loads `macdrv_view_create_metal_view` etc. from wiremac.so at runtime. These were added in Wine ~10.x. Wine 8.0.1 wiremac.so does not have them. "Failed to create metal view" crash is a Wine version mismatch, not a DXMT bug.
+
+**CRITICAL: Use `wine-devel` variant, NOT `wine-staging`.** Devel includes CodeWeavers' DXMT and Steam patches. Staging may introduce regressions.
+
+**CRITICAL: Never use CrossOver Preview.app or CrossOver.app binaries as standalone engine components.** These are commercial application binaries that depend on CrossOver's full environment (`CX_ROOT`, Perl launcher context) for TLS to function. When extracted and run standalone, HTTPS certificate validation fails silently. CrossOver is a reference implementation for research only — never copy its binaries into the engine.
+
+**Meridian's goal:** Build our own engine from publicly available open-source components, the same way Valve builds Proton from upstream Wine + their own patches. The engine is fully standalone.
 
 ### CLI Validation Before Code
 
@@ -99,32 +106,27 @@ Reiterated from the update-system rule for emphasis:
 - The engine NEVER compensates for app deficiencies
 - Fix the root layer, publish the fix, verify end-to-end
 
-## Wine 8.0.1 Limitations (v0.9.5 findings, March 2026)
+## Wine 8.0.1 Limitations (current engine, requires upgrade)
 
-Wine 8.0.1 (CrossOverFOSS 23.7.1) — the current distributable engine — has critical limitations that affect game install and launch. These are ENGINE issues, documented here so future sessions don't re-discover them.
+Wine 8.0.1 — the current distributable engine — has critical limitations. These are ENGINE issues that cannot be fixed by app-level patches. The engine must be upgraded to Wine 10.x+ to resolve them. Full details in `engine-research-findings.mdc`.
 
 ### steam.exe Cannot Authenticate
 
-Steam's Windows client under Wine 8.0.1 **never logs in**. Every session shows `[Logged Off, 0, 0]` in `connection_log.txt`. Root causes:
-- `chrome_elf.dll` DllMain calls `GetProcessMitigationPolicy` → abort (Wine 8.x has no stub)
-- Steam Service fails with GLE 126
-- CEF webhelper crash-loops, preventing Steam's authentication flow
+Steam's Windows client under Wine 8.0.1 **never logs in**. Root causes: `GetProcessMitigationPolicy` abort stub, Steam Service GLE 126, CEF webhelper crash-loop. **Consequence:** `steam.exe` is never started at bootstrap. All game downloads use SteamCMD batch mode. Game launches use direct Wine exe invocation. steam.exe is only started on-demand for DRM games that ship `steam_api64.dll`.
 
-**Consequence:** `steam.exe +app_update` and `steam.exe -applaunch` are both non-functional. All game downloads use SteamCMD; all game launches use direct Wine exe invocation.
+### SteamCMD: Batch Mode Only
 
-### 1,516 Abort Stubs
+SteamCMD interactive mode (no args, stdin pipe) is broken in Wine 8.0.1 — exits immediately with no output when stdin is a non-TTY pipe. CLI-verified March 2026. All SteamCMD operations use batch mode: `wine64 steamcmd.exe +login USERNAME +app_update APPID validate +quit`.
 
-Wine 8.0.1 has 1,516 functions across user32, kernel32, kernelbase, ntdll, and win32u that call `abort()` when invoked. Modern games (especially Unity) hit these stubs and crash immediately. The most common: `IsMouseInPointerEnabled` in user32/win32u.
+### 926+ Abort Stubs (win32u.dll alone)
 
-### CrossOver Preview Engine Path (Personal Use)
+Wine 8.0.1 has 926 `__wine_stub_*` functions in win32u.dll that call `abort()`. CX Preview (Wine 11.4) has zero. The most impactful: `NtUserIsMouseInPointerEnabled` crashes every Unity game. 49 exports missing from user32.dll. See the full list in `engine-research-findings.mdc`.
 
-When CrossOver Preview 27 is installed locally, `WineEngine.detect()` uses its `wineloader` and `wineserver` instead of the Gcenx binaries. This eliminates 1,131 of the 1,516 abort stubs. The CX DLLs are a matched version set — individual DLLs CANNOT be mixed across Wine versions (causes `NtdllDefWindowProc_W` not found crashes).
+### DXMT Cannot Render (winemac.so version mismatch)
 
-When CX engine is active:
-- `steam.exe` is NEVER started (it shows a login window because CEF now works)
-- Downloads use SteamCMD (separate binary, own credential cache)
-- Game launch uses direct Wine exe (`launchGameDirectly`)
-- DXMT DLLs must be in prefix system32 (CX wineloader ignores WINEDLLPATH for d3d11)
+DXMT's `winemetal.so` requires `macdrv_view_create_metal_view` and related Metal APIs from winemac.so. Wine 8.0.1's winemac.so does not export these. Error: "Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT." This is unfixable without upgrading Wine.
+
+**Meridian is fully standalone** — the engine is downloaded from GitHub Releases. There is no reliance on any external Wine installation.
 
 ### SteamCMD Authentication
 

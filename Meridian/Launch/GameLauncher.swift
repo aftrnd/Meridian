@@ -60,6 +60,9 @@ final class GameLauncher {
     /// around install and game-process confirmation.
     var windowSuppressor: SteamWindowSuppressor?
 
+    /// Set by `MeridianApp` for persistent SteamCMD game installs.
+    var steamCMDService: SteamCMDService?
+
     // MARK: - Public API
 
     func launch(
@@ -274,59 +277,20 @@ final class GameLauncher {
             return
         }
 
-        // If the persistent Steam process has died since bootstrap (crash, OOM, etc.)
-        // restart it silently before proceeding — but ONLY when not using the CX engine.
-        // With CX engine, we don't use persistent Steam at all (SteamCMD for downloads,
-        // direct Wine launch for games).
-        if engine.cxPreviewLibPath == nil && !steamManager.isSteamProcessAlive {
-            log.warning("[launch] persistent Steam not alive — restarting before launch")
-            transition(to: .bootstrappingSteam, activity: "Reconnecting to Steam…")
-            do {
-                try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                try await steamManager.waitUntilReady(prefix: prefix)
-                steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
-            } catch {
-                fail("Failed to restart Steam: \(error.localizedDescription)", error: error)
-                return
-            }
-            if let pid = steamManager.persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
-            }
-        }
-
-        appendLog("Environment ready — Steam is running")
+        appendLog("Environment ready")
 
         guard !Task.isCancelled else { return }
 
         // Apply game-specific compatibility fixes before install or launch.
         let compat = GameCompatibilityDB.shared
-        let gameProfile = compat.profile(for: game.id)
-        if let profile = gameProfile {
+        if compat.profile(for: game.id) != nil {
             appendLog("Applying compatibility profile: \(compat.fixSummary(for: game.id))")
             log.info("[launch] game profile appID=\(game.id): \(compat.fixSummary(for: game.id))")
-
-            if profile.requiresCXEngine && engine.cxPreviewLibPath == nil {
-                fail("\(game.name) requires CrossOver Preview to run. Install CrossOver Preview and restart Meridian.")
-                return
-            }
-
-            // Install DXMT DLLs into system32 if required (CX engine + D3D11 game).
-            // CX's wineloader loads DLLs from its own lib path before WINEDLLPATH,
-            // so DXMT must be physically in system32 to take priority.
-            if profile.requiresDXMTInSystem32 && engine.cxPreviewLibPath != nil {
-                do {
-                    try prefix.installDXMTInSystem32(engine: engine)
-                    appendLog("DXMT DLLs installed to system32 (Metal renderer ready)")
-                } catch {
-                    log.warning("[launch] DXMT system32 install failed: \(error.localizedDescription)")
-                }
-            }
         }
 
-        // If the game isn't installed yet, download it via SteamCMD.
-        // SteamCMD is the only reliable headless installer under Wine 8.0.1 because
-        // steam.exe cannot authenticate (webhelper crash-loops, ConnectCache ignored).
-        // SteamCMD uses cached credentials after the first manual login.
+        // If the game isn't installed yet, download it via the persistent SteamCMD session.
+        // All installs go through SteamCMDService — never spawn a separate steamcmd.exe
+        // process, as two instances deadlock on SteamCMD's file locks.
         if !prefix.isGameInstalled(appID: game.id) {
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
@@ -336,21 +300,17 @@ final class GameLauncher {
             appendLog("Preparing download for \(game.name)")
             log.info("[launch] beginning SteamCMD install appID=\(game.id)")
 
-            // Get the Steam account username for SteamCMD login.
-            // SteamCMD uses cached credentials — no password needed after first login.
-            let username = AppSettings.shared.steamCredentialAccountName
-            guard !username.isEmpty else {
-                fail("Steam account username not found. Please sign in again through Settings.")
+            guard let cmdService = steamCMDService else {
+                fail("Game tools not available. Restart Meridian.")
                 return
             }
 
-            // Poll the ACF manifest for real-time download progress. SteamCMD
-            // stdout is heavily buffered through Wine's pipe — progress lines
-            // arrive in large bursts (often all at once for <2 GB games).
-            // The ACF file on disk is updated continuously by SteamCMD.
+            // Poll the ACF manifest for real-time download progress.
             let pollingTask = Task { [weak self, prefix] in
                 let gameName = game.name
                 let appID = game.id
+                let startTime = ContinuousClock.now
+                var hasSeenGameProgress = false
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(2))
                     guard !Task.isCancelled else { break }
@@ -358,38 +318,50 @@ final class GameLauncher {
                        progress.total > 0 {
                         let fraction = Double(progress.downloaded) / Double(progress.total)
                         if fraction > 0 {
+                            hasSeenGameProgress = true
                             self?.downloadProgress = fraction
                             self?.currentActivity = "Downloading \(gameName) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total))"
+                        }
+                    } else if !hasSeenGameProgress {
+                        let elapsed = ContinuousClock.now - startTime
+                        if elapsed > .seconds(10) {
+                            self?.currentActivity = "Warming up game tools — this may take a minute…"
                         }
                     }
                 }
             }
 
             do {
-                try await steamManager.installWithSteamCMD(
+                log.info("[launch] installing via persistent SteamCMD session")
+                try await cmdService.installGame(
                     appID: game.id,
-                    username: username,
-                    engine: engine,
-                    prefix: prefix,
-                    steamAuth: steamAuth,
                     onProgress: { [weak self] line in
-                        // SteamCMD stdout is supplementary — ACF polling is the
-                        // primary progress source. Still parse stdout for the
-                        // "Success!" signal and as a fallback.
-                        if let fraction = Self.parseSteamCMDProgress(line: line) {
-                            self?.downloadProgress = fraction
-                        }
+                        guard let self else { return }
                         let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        guard !trimmed.isEmpty,
-                              !trimmed.hasPrefix("wineserver:"),
+                        guard !trimmed.isEmpty else { return }
+
+                        if let fraction = Self.parseSteamCMDProgress(line: trimmed) {
+                            self.downloadProgress = fraction
+                            if self.currentActivity?.starts(with: "Downloading \(game.name)") != true {
+                                self.currentActivity = "Downloading \(game.name)…"
+                            }
+                        } else if trimmed.hasPrefix("[----]") || trimmed.hasPrefix("[  0%]") {
+                            // SteamCMD self-update (happens on first run, takes 1–3 minutes)
+                            if self.currentActivity != "Updating Steam tools…" {
+                                self.currentActivity = "Updating Steam tools…"
+                            }
+                        } else if trimmed.contains("Logging in") {
+                            self.currentActivity = "Signing in to Steam…"
+                        }
+
+                        guard !trimmed.hasPrefix("wineserver:"),
                               !trimmed.hasPrefix("wine:"),
                               !trimmed.hasPrefix("CWork"),
                               !trimmed.hasPrefix("Redirecting stderr"),
                               !trimmed.hasPrefix("Logging directory"),
-                              !trimmed.hasPrefix("[----]"),
                               !trimmed.hasPrefix("Unloading Steam"),
                               !trimmed.hasPrefix("Loading Steam") else { return }
-                        self?.appendLog(trimmed)
+                        self.appendLog(trimmed)
                     }
                 )
             } catch {
@@ -412,29 +384,9 @@ final class GameLauncher {
 
         guard !Task.isCancelled else { return }
 
-        // Give instant feedback before the multi-second prep steps (wineserver kill,
-        // Steam DRM start). Without this the button stays on "Play" for 5+ seconds.
+        // Give instant feedback before the multi-second prep steps (Steam DRM start).
+        // Without this the button stays on "Play" for 5+ seconds.
         transition(to: .launching, activity: "Preparing \(game.name)…")
-
-        // When CX engine is active, kill any running Gcenx wineserver before launch.
-        // SteamCMD uses Gcenx wine64 (wineserver protocol 768). CX wineloader speaks
-        // protocol 1809 — connecting to the wrong wineserver exits immediately with
-        // "version mismatch 768/1809". This must run before every launch regardless of
-        // whether a fresh SteamCMD install just ran.
-        if engine.cxPreviewLibPath != nil {
-            let gcenxEnv = engine.gcenxEnvironment(for: prefix)
-            await Task.detached {
-                let p = Process()
-                p.executableURL = WineEngine.engineDir.appending(path: "wine/bin/wineserver")
-                p.arguments = ["-k"]
-                p.environment = gcenxEnv
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                try? p.run(); p.waitUntilExit()
-            }.value
-            log.info("[launch] killed Gcenx wineserver before CX game launch")
-            try? await Task.sleep(for: .seconds(2))
-        }
 
         // Tell the health monitor to defer restarts while the game is active.
         steamManager.gameIsRunning = true

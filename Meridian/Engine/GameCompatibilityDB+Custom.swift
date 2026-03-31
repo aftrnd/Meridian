@@ -3,8 +3,6 @@ import Foundation
 // ─── Custom Engine Games ────────────────────────────────────────────────────
 //
 // Games with proprietary or uncommon engines that don't match Unity/Unreal/Godot.
-// The .custom() factory defaults requiresCXEngine=false — override per-game
-// when the engine hits Wine abort stubs that CX fixes.
 //
 // Steam DRM (steam_api64.dll) is detected automatically by gameRequiresSteamAPI()
 // at launch time — no explicit entry needed here for DRM handling alone.
@@ -16,17 +14,19 @@ extension GameCompatibilityDB {
         .custom(
             appID: 813230,
             name: "ANIMAL WELL",
-            status: .verified,
+            status: .playable,
             graphicsAPI: .dx12,
-            requiresCXEngine: true,
-            requiresDXMTInSystem32: true,
-            verifiedWith: "v1.0.11-engine",
+            // No explicit dllOverrides needed — WineEngine.environment() now
+            // sets d3d12,dxgi=n,b globally when GPTK is present, which handles
+            // the IDXGIAdapter4 NULL deref that previously caused this game to crash.
+            // CLI-verified March 2026: crash eliminated with GPTK dxgi=n,b global override.
+            verifiedWith: "v2.0.0-engine",
             notes: """
             Custom engine game. Ships only Animal Well.exe + steam_api64.dll. \
             DRM requires running Steam client (SteamAPI_Init via IPC). \
-            Uses D3D12 → Apple GPTK D3DMetal (GPTK path added to WINEDLLPATH \
-            in v0.9.6). Verified: window appears, game runs with Steam started \
-            silently for DRM.
+            Uses D3D12 via Apple GPTK. Requires dxgi=n,b to use GPTK's \
+            IDXGIAdapter4-capable dxgi.dll — DXMT's dxgi returns E_NOINTERFACE \
+            for IDXGIAdapter4, which the game dereferences without null-checking.
             """
         ),
 

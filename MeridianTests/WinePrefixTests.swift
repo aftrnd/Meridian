@@ -960,7 +960,7 @@ final class WinePrefixTests: XCTestCase {
         //
         // MIRROR CONTRACT: This block must stay in sync with WinePrefix.resetToEngineTemplate().
         // The critical fix (March 2026): do NOT guard on syswow64 already existing — instead
-        // always createDirectory first. Wine 11.4 (CrossOver 27) does not create syswow64 during
+        // always createDirectory first. Wine 11.4 does not create syswow64 during
         // wineboot --init, so templates built with it have no syswow64 directory. The old guard
         //   `if fileExists(i386Src) && fileExists(syswow64)`
         // silently skipped the entire population, causing SteamSetup.exe to exit 53 (kernel32 missing).
@@ -1597,6 +1597,73 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertFalse(updated.contains("old_token"), "Old token must be replaced by new token")
     }
 
+    func testWriteConnectCache_doesNotDoubleAccountBlockOnMerge() throws {
+        // Regression test for: upsertVDFKeyInSection replacing only the account key
+        // line but leaving the old { ... } block in place, producing corrupt VDF.
+        //
+        // Symptom: SteamCMD reports "KeyValues Error: got } in key in file
+        // InstallConfigStore" and hangs, causing an infinite sign-in loop.
+        //
+        // Root cause: accountEntry is a multi-line string. The replace path replaced
+        // only the key line, leaving the old { SteamID ... } block dangling after
+        // the new entry's closing brace.
+        let configDir = tempDir.appending(path: "double_block_test/config")
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+        // Config.vdf as written by SteamCMD after first login — account block already exists.
+        let existingVDF = """
+        "InstallConfigStore"
+        {
+        \t"Software"
+        \t{
+        \t\t"Valve"
+        \t\t{
+        \t\t\t"Steam"
+        \t\t\t{
+        \t\t\t\t"ConnectCache"
+        \t\t\t\t{
+        \t\t\t\t\t"76561198000000000"\t\t"old_token"
+        \t\t\t\t}
+        \t\t\t\t"Accounts"
+        \t\t\t\t{
+        \t\t\t\t\t"testuser"
+        \t\t\t\t\t{
+        \t\t\t\t\t\t"SteamID"\t\t"76561198000000000"
+        \t\t\t\t\t\t"AllowAutoLogin"\t\t"1"
+        \t\t\t\t\t\t"RememberPassword"\t\t"1"
+        \t\t\t\t\t\t"MostRecent"\t\t"1"
+        \t\t\t\t\t}
+        \t\t\t\t}
+        \t\t\t}
+        \t\t}
+        \t}
+        }
+        """
+        let dest = configDir.appending(path: "config.vdf")
+        try existingVDF.write(to: dest, atomically: true, encoding: .utf8)
+
+        try writeConnectCache(configDir: configDir, steamID: "76561198000000000",
+                              refreshToken: "new_token", accountName: "testuser")
+
+        let updated = try String(contentsOf: dest, encoding: .utf8)
+
+        // Structural invariant: the account name must appear exactly once.
+        // A doubled block produces two occurrences.
+        let accountNameCount = updated.components(separatedBy: "\"testuser\"").count - 1
+        XCTAssertEqual(accountNameCount, 1,
+                       "Account name must appear exactly once — doubled block means upsert left old { } in place")
+
+        // The closing-brace count must match the opening-brace count.
+        let openCount  = updated.filter { $0 == "{" }.count
+        let closeCount = updated.filter { $0 == "}" }.count
+        XCTAssertEqual(openCount, closeCount,
+                       "Unbalanced braces in config.vdf — VDF is corrupt (SteamCMD will reject it)")
+
+        XCTAssertTrue(updated.contains("new_token"), "New refresh token must be present")
+        XCTAssertTrue(updated.contains("\"76561198000000000\""), "SteamID must be present")
+        XCTAssertFalse(updated.contains("old_token"), "Old token must be replaced")
+    }
+
     func testWriteConnectCache_writesMinimalVDFWhenNoFileExists() throws {
         let configDir = tempDir.appending(path: "fresh_cache_test/config")
         let token = "eyJhbGciOiJFZERTQSJ9.test"
@@ -1669,7 +1736,7 @@ final class WinePrefixTests: XCTestCase {
     // MARK: - Wine 11.4 regression: syswow64 created even when absent from template
 
     /// Builds a fake engine template WITHOUT a syswow64 directory — mimicking the
-    /// output of `wineboot --init` under Wine 11.4 (CrossOver 27), which does not
+    /// output of `wineboot --init` under Wine 11.4, which does not
     /// create syswow64 at all.
     private func makeEngineTemplateWithoutSyswow64() throws -> (templateDir: URL, i386Dir: URL) {
         let engineDir = tempDir.appending(path: "engine_wine11")
@@ -1689,7 +1756,7 @@ final class WinePrefixTests: XCTestCase {
         return (tmplDir, i386Dir)
     }
 
-    /// Regression test for the Wine 11.4 / CrossOver 27 exit-53 bug.
+    /// Regression test for the Wine 11.4 exit-53 bug.
     ///
     /// Root cause: `wineboot --init` under Wine 11.4 does not create syswow64/.
     /// The old `resetToEngineTemplate` guarded on `syswow64` already existing, so

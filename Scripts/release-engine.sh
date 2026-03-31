@@ -6,7 +6,7 @@
 #   bash Scripts/release-engine.sh [VERSION]
 #
 # Examples:
-#   bash Scripts/release-engine.sh              # auto-increments patch (v1.0.3-engine)
+#   bash Scripts/release-engine.sh              # auto-increments patch (v2.0.1-engine)
 #   bash Scripts/release-engine.sh v2.0.0       # explicit version
 #
 # Prerequisites:
@@ -14,7 +14,7 @@
 #   - curl (standard on macOS)
 #
 # What it does:
-#   1. Uses wine-crossover FOSS from Gcenx/winecx (local Homebrew or downloaded)
+#   1. Downloads wine-devel from Gcenx/macOS_Wine_builds (Wine 11.x with CW patches)
 #   2. Downloads DXMT (builtin) from 3Shain/dxmt (DirectX → Metal)
 #   3. Downloads DXVK from doitsujin/dxvk (DirectX → Vulkan fallback)
 #   4. Assembles wine/bin, wine/lib, wine/share/wine/{nls,fonts}
@@ -24,7 +24,14 @@
 #   6. Validates binaries, NLS data, syswow64, and prefix template
 #   7. Creates a .tar.gz archive and uploads to aftrnd/meridian
 #
-# Install wine-crossover locally for fastest builds: brew install --cask wine-crossover
+# Wine Source: Gcenx/macOS_Wine_builds (wine-devel variant)
+# WHY: Gcenx/winecx (wine-crossover FOSS) stopped publishing new releases after
+#      Wine 8.0.1 (Feb 2024). The macOS_Wine_builds repo publishes Wine 11.x+
+#      with the same CodeWeavers patches (CW 22435 for DXMT Metal APIs, CW 13322/
+#      17315/21883 for Steam, CW 20760 for Rosetta2 thunks, Security.framework TLS).
+#      CLI-verified March 2026: Wine 11.5 fixes all 926 abort stubs, adds
+#      IsMouseInPointerEnabled to user32, has macdrv Metal view APIs for DXMT,
+#      and has Security.framework TLS in crypt32.so (Steam HTTPS works standalone).
 #
 set -euo pipefail
 
@@ -56,59 +63,44 @@ gh auth status >/dev/null 2>&1   || die "gh CLI not authenticated. Run: gh auth 
 
 yellow "Resolving latest component versions..."
 
-# Wine: Gcenx/winecx — CrossOver Wine FOSS (CodeWeavers' open-source macOS fork)
+# Wine: Gcenx/macOS_Wine_builds — wine-devel variant (Wine 11.x with CW patches)
 #
-# CRITICAL: Must use wine-crossover FOSS from Gcenx/winecx, NOT wine-staging and
-# NOT CrossOver Preview/commercial binaries. CrossOver Wine FOSS includes:
-#   - macOS Security.framework TLS integration (Steam HTTPS works standalone)
-#   - Battle-tested Steam compatibility (same Wine base that Valve uses for Proton)
-#   - Proper WoW64 32-bit support on macOS
+# Gcenx/winecx (wine-crossover FOSS) stopped publishing new releases after
+# Wine 8.0.1 (Feb 2024). The macOS_Wine_builds repo publishes the same CodeWeavers
+# patches on top of upstream Wine 11.x+:
+#   - CW 22435: macdrv Metal view APIs (macdrv_view_create_metal_view etc.) — DXMT requires this
+#   - CW 13322, 17315, 21883: Steam compatibility
+#   - CW 20760: wow64cpu Rosetta2 thunks for Apple Silicon
+#   - CW 18947: toggle_executable_pages_for_rosetta
+#   - Security.framework TLS in crypt32.so (Steam HTTPS works standalone)
 #
-# NEVER use wine-staging (Gcenx/macOS_Wine_builds). It is community Wine without
-# CodeWeavers' macOS TLS patches. It causes "Steam needs to be online to update"
-# failures because HTTPS silently fails. Deprecated on Homebrew (2026-09-01).
+# CLI-verified March 2026 (Wine 11.5):
+#   - user32.dll exports IsMouseInPointerEnabled (Unity games no longer abort)
+#   - win32u.dll has 0 abort stubs (was 926 in Wine 8.0.1)
+#   - wiremac.so exports macdrv Metal APIs (DXMT works)
+#   - steam.exe bootstraps and downloads full client
+#   - SteamCMD batch login succeeds with cached credentials
+#   - Game launch: No I'm not a Human (Unity) ran 30+ seconds without crashing
 #
-# NEVER use CrossOver Preview.app or CrossOver.app binaries (wineloader, wine).
-# These are commercial application components that depend on CrossOver's full
-# environment (CX_ROOT, Perl launcher, etc.) for TLS to function. When extracted
-# and used standalone, HTTPS certificate validation fails silently — same symptom
-# as wine-staging. This was proven in the v1.0.9/v1.0.10 engine regression
-# (March 2026): "Crypto API failed certificate check, error flags 0x00000028".
+# Use wine-devel (not wine-staging) — devel includes CodeWeavers' DXMT/Steam patches.
+# wine-staging adds more patches that may cause regressions for our use case.
 #
-# If wine-crossover FOSS is installed locally via Homebrew, use that directly.
-# Otherwise download from Gcenx/winecx GitHub releases.
-WINE_REPO="Gcenx/winecx"
+# NEVER use CrossOver Preview.app or CrossOver.app commercial binaries.
+# NEVER use wine-staging from Gcenx/macOS_Wine_builds (different repo/variant).
+WINE_REPO="Gcenx/macOS_Wine_builds"
+WINE_LOCAL=false
 
-# Prefer locally installed wine-crossover FOSS (brew install --cask wine-crossover)
-WINE_LOCAL_APP="/opt/homebrew/Caskroom/wine-crossover"
-if [ -d "${WINE_LOCAL_APP}" ]; then
-    # Find the latest installed version
-    WINE_LOCAL_VER=$(ls "${WINE_LOCAL_APP}" | sort -V | tail -1)
-    WINE_LOCAL_ROOT="${WINE_LOCAL_APP}/${WINE_LOCAL_VER}/Wine Crossover.app/Contents/Resources/wine"
-    if [ -x "${WINE_LOCAL_ROOT}/bin/wine64" ]; then
-        WINE_TAG="local-${WINE_LOCAL_VER}"
-        WINE_ASSET="(local install)"
-        WINE_URL=""
-        WINE_LOCAL=true
-        info "Wine:    wine-crossover ${WINE_LOCAL_VER} (local Homebrew cask — no download needed)"
-    fi
-fi
-
-# Fall back to downloading from Gcenx/winecx releases
-if [ -z "${WINE_URL:-}" ] && [ "${WINE_LOCAL:-false}" != "true" ]; then
-    WINE_TAG=$(gh release list --repo "${WINE_REPO}" --limit 10 2>/dev/null \
-        | grep -v "Pre-release\|broken" \
-        | grep -oE 'crossover-wine-[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' \
-        | head -1)
-    [ -n "${WINE_TAG}" ] || die "Could not determine latest wine-crossover release from ${WINE_REPO}. Install locally: brew install --cask wine-crossover"
-    # Gcenx/winecx asset naming: wine-crossover-XX.Y.Z-osx64.tar.xz
-    WINE_ASSET="${WINE_TAG}-osx64.tar.xz"
-    WINE_URL=$(gh release view "${WINE_TAG}" --repo "${WINE_REPO}" --json assets \
-        -q ".assets[] | select(.name == \"${WINE_ASSET}\") | .url" 2>/dev/null)
-    [ -n "${WINE_URL}" ] || die "Could not find asset '${WINE_ASSET}' in ${WINE_REPO}@${WINE_TAG}"
-    WINE_LOCAL=false
-    info "Wine:    ${WINE_TAG} (${WINE_ASSET}) [wine-crossover FOSS — CodeWeavers macOS build]"
-fi
+# Download latest wine-devel from Gcenx/macOS_Wine_builds
+WINE_TAG=$(gh release list --repo "${WINE_REPO}" --limit 10 2>/dev/null \
+    | grep -v "Pre-release\|broken" \
+    | grep -oE '[0-9]+\.[0-9]+(_[0-9]+)?' \
+    | head -1)
+[ -n "${WINE_TAG}" ] || die "Could not determine latest wine-devel release from ${WINE_REPO}"
+WINE_ASSET="wine-devel-${WINE_TAG}-osx64.tar.xz"
+WINE_URL=$(gh release view "${WINE_TAG}" --repo "${WINE_REPO}" --json assets \
+    -q ".assets[] | select(.name == \"${WINE_ASSET}\") | .url" 2>/dev/null)
+[ -n "${WINE_URL}" ] || die "Could not find asset '${WINE_ASSET}' in ${WINE_REPO}@${WINE_TAG}"
+info "Wine:    ${WINE_TAG} (${WINE_ASSET}) [wine-devel with CW patches — Gcenx/macOS_Wine_builds]"
 
 # DXMT: 3Shain/dxmt — builtin variant (DLLs go into lib/wine/ — no override needed)
 # Use grep -oE to extract the tag regardless of column position (gh adds an extra
@@ -179,14 +171,10 @@ WINE_FILE="${DOWNLOADS}/${WINE_ASSET}"
 DXMT_FILE="${DOWNLOADS}/${DXMT_ASSET}"
 DXVK_FILE="${DOWNLOADS}/${DXVK_ASSET}"
 
-if [ "${WINE_LOCAL}" = "true" ]; then
-    info "Using local wine-crossover (skipping download)"
-else
-    info "Downloading Wine ${WINE_TAG}..."
-    curl -fL --progress-bar -o "${WINE_FILE}" "${WINE_URL}" \
-        || die "Failed to download Wine from ${WINE_URL}"
-    info "  → $(du -sh "${WINE_FILE}" | cut -f1)"
-fi
+info "Downloading Wine ${WINE_TAG}..."
+curl -fL --progress-bar -o "${WINE_FILE}" "${WINE_URL}" \
+    || die "Failed to download Wine from ${WINE_URL}"
+info "  → $(du -sh "${WINE_FILE}" | cut -f1)"
 
 info "Downloading DXMT ${DXMT_TAG}..."
 curl -fL --progress-bar -o "${DXMT_FILE}" "${DXMT_URL}" \
@@ -206,30 +194,23 @@ yellow "Staging Wine ${WINE_TAG}..."
 rm -rf "${STAGING}"
 mkdir -p "${STAGING}/wine"
 
-if [ "${WINE_LOCAL}" = "true" ]; then
-    # Use locally installed wine-crossover directly
-    WINE_ROOT="${WINE_LOCAL_ROOT}"
-    [ -d "${WINE_ROOT}/bin" ] || die "Could not locate bin/ in local wine-crossover at ${WINE_ROOT}"
-    [ -d "${WINE_ROOT}/lib" ] || die "Could not locate lib/ in local wine-crossover at ${WINE_ROOT}"
-    info "Wine root: ${WINE_ROOT} (local)"
-else
-    WINE_EXTRACT="/tmp/meridian-wine-extract"
-    rm -rf "${WINE_EXTRACT}"
-    mkdir -p "${WINE_EXTRACT}"
-    tar xf "${WINE_FILE}" -C "${WINE_EXTRACT}"
+WINE_EXTRACT="/tmp/meridian-wine-extract"
+rm -rf "${WINE_EXTRACT}"
+mkdir -p "${WINE_EXTRACT}"
+tar xf "${WINE_FILE}" -C "${WINE_EXTRACT}"
 
-    # Gcenx wine-crossover archives are macOS .app bundles:
-    #   Wine Crossover.app/Contents/Resources/wine/{bin,lib,share}
-    # Search for the first directory named "bin" that is a sibling of "lib".
-    WINE_BIN_DIR=$(find "${WINE_EXTRACT}" -type d -name "bin" | while read -r d; do
-        parent="$(dirname "${d}")"
-        [ -d "${parent}/lib" ] && echo "${parent}" && break
-    done | head -1)
-    WINE_ROOT="${WINE_BIN_DIR}"
-    [ -n "${WINE_ROOT}" ] && [ -d "${WINE_ROOT}/bin" ] || die "Could not locate bin/ inside Wine archive"
-    [ -d "${WINE_ROOT}/lib" ] || die "Could not locate lib/ inside Wine archive"
-    info "Wine root: ${WINE_ROOT}"
-fi
+# Gcenx/macOS_Wine_builds archives are macOS .app bundles:
+#   wine-devel: "Wine Devel.app/Contents/Resources/wine/{bin,lib,share}"
+#   wine-staging: "Wine Staging.app/Contents/Resources/wine/{bin,lib,share}"
+# Search for the first directory named "bin" that is a sibling of "lib".
+WINE_BIN_DIR=$(find "${WINE_EXTRACT}" -type d -name "bin" | while read -r d; do
+    parent="$(dirname "${d}")"
+    [ -d "${parent}/lib" ] && echo "${parent}" && break
+done | head -1)
+WINE_ROOT="${WINE_BIN_DIR}"
+[ -n "${WINE_ROOT}" ] && [ -d "${WINE_ROOT}/bin" ] || die "Could not locate bin/ inside Wine archive"
+[ -d "${WINE_ROOT}/lib" ] || die "Could not locate lib/ inside Wine archive"
+info "Wine root: ${WINE_ROOT}"
 
 # Copy bin/ (wine/wine64, wineserver, wineboot, etc.)
 cp -R "${WINE_ROOT}/bin" "${STAGING}/wine/bin"
@@ -385,6 +366,47 @@ info "DXVK: installed ${DXVK_COUNT} DLL(s)"
 
 rm -rf "${DXVK_EXTRACT}"
 
+# ---------- Apple GPTK (D3D12 → Metal) ----------
+#
+# Apple's Game Porting Toolkit translates Direct3D 12 to Metal 3 via:
+#   wine/lib/gptk/wine/x86_64-windows/d3d12.dll   (PE shim, 122KB)
+#   wine/lib/gptk/wine/x86_64-unix/d3d12.so        (Unix bridge, 96KB)
+#   wine/lib/gptk/external/libd3dshared.dylib       (coordinator, 96KB)
+#   wine/lib/gptk/external/D3DMetal.framework/      (Apple Metal translator, 5MB)
+#
+# GPTK is sourced from a local CrossOver Preview installation. It is distributed
+# by Apple as part of the Game Porting Toolkit and by CodeWeavers via CrossOver.
+# Source: /Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/apple_gptk/
+#
+# WineEngine.swift detects the presence of gptk/external/D3DMetal.framework and
+# automatically configures DYLD_FALLBACK_LIBRARY_PATH, WINEDLLPATH, and
+# WINEDLLOVERRIDES=d3d12=n,b so D3D12 games use GPTK while DXMT handles D3D11.
+#
+# GPTK is optional: if not bundled, D3D12 games fall back to Wine's builtin
+# d3d12.dll stub (which currently fails to create a device). D3D11 games work
+# regardless via DXMT.
+
+GPTK_SOURCE="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/apple_gptk"
+GPTK_DEST="${STAGING}/wine/lib/gptk"
+
+if [ -d "${GPTK_SOURCE}" ]; then
+    yellow "Staging Apple GPTK from local CrossOver Preview..."
+    mkdir -p "${GPTK_DEST}"
+    cp -R "${GPTK_SOURCE}/" "${GPTK_DEST}/"
+
+    # Validate key components
+    [ -f "${GPTK_DEST}/external/D3DMetal.framework/D3DMetal" ] || die "GPTK: D3DMetal.framework missing"
+    [ -f "${GPTK_DEST}/external/libd3dshared.dylib" ]          || die "GPTK: libd3dshared.dylib missing"
+    [ -f "${GPTK_DEST}/wine/x86_64-windows/d3d12.dll" ]        || die "GPTK: d3d12.dll missing"
+    GPTK_SIZE=$(du -sh "${GPTK_DEST}" | cut -f1)
+    info "GPTK: staged ${GPTK_SIZE} → wine/lib/gptk/ ✓"
+else
+    yellow "Warning: CrossOver Preview not found at ${GPTK_SOURCE}"
+    yellow "  GPTK (D3D12 support) will NOT be bundled in this engine release."
+    yellow "  D3D12 games will fail to create a D3D12 device."
+    yellow "  Install CrossOver Preview to enable GPTK bundling."
+fi
+
 # ---------- pre-built prefix template ----------
 #
 # Running wineboot --init at the user's machine during first launch is slow
@@ -407,7 +429,7 @@ rm -rf "${PREFIX_TEMPLATE}"
 mkdir -p "${PREFIX_TEMPLATE}"
 
 info "Running wineboot --init (this may take 1-3 minutes on the build machine)..."
-# Wine 11+ (CrossOver Preview): DYLD_FALLBACK_LIBRARY_PATH needs lib/ for dylibs
+# Wine 11+: DYLD_FALLBACK_LIBRARY_PATH needs lib/ for dylibs
 # and lib/wine/x86_64-unix for .so modules. The wine64 binary is an alias of wine.
 # wineboot is a Windows PE (lib/wine/x86_64-windows/wineboot.exe) invoked via Wine.
 WINEPREFIX="${PREFIX_TEMPLATE}" \
@@ -438,9 +460,9 @@ info "Prefix template: ${TEMPLATE_DLL_COUNT} DLLs in system32"
 
 # Ensure syswow64/ exists in the template.
 #
-# Wine 8.x (Gcenx) created an empty syswow64/ after wineboot --init. Wine 11.x
-# (CrossOver 27) does not create the directory at all. The app's WinePrefix.create()
-# and resetToEngineTemplate() populate syswow64 from i386-windows/, but they must
+# Wine 8.x created an empty syswow64/ after wineboot --init. Wine 11.x does not
+# create the directory at all. The app's WinePrefix.create() and
+# resetToEngineTemplate() populate syswow64 from i386-windows/, but they must
 # find the directory already existing — so we guarantee it here.
 # Without this, SteamSetup.exe (32-bit PE) exits 53 (STATUS_DLL_NOT_FOUND / kernel32).
 mkdir -p "${PREFIX_TEMPLATE}/drive_c/windows/syswow64"
@@ -493,6 +515,13 @@ info "prefix-template verified ✓"
 [ -f "${STAGING}/wine/lib/wine/x86_64-windows/dxgi.dll" ]        || die "DXMT dxgi.dll missing"
 info "DXMT builtin DLLs verified ✓"
 
+# GPTK (optional — warn rather than die so builds work without CrossOver Preview)
+if [ -f "${STAGING}/wine/lib/gptk/external/D3DMetal.framework/D3DMetal" ]; then
+    info "GPTK D3D12 verified ✓"
+else
+    yellow "Warning: GPTK not bundled — D3D12 games will not work (install CrossOver Preview to enable)"
+fi
+
 FILE_COUNT=$(find "${STAGING}" -type f | wc -l | tr -d ' ')
 STAGING_SIZE=$(du -sh "${STAGING}" | cut -f1)
 info "Staged ${FILE_COUNT} files (${STAGING_SIZE})"
@@ -513,9 +542,10 @@ yellow "Uploading release ${TAG} to ${REPO}..."
 
 NOTES="Wine engine runtime for Meridian.
 
-**Wine:** ${WINE_VERSION} (${WINE_TAG}, via Gcenx/winecx — CrossOver Wine)
+**Wine:** ${WINE_VERSION} (${WINE_TAG}, via Gcenx/macOS_Wine_builds)
 **DXMT:** ${DXMT_TAG} — DirectX 11/10 → Metal (3Shain/dxmt, builtin DLLs)
 **DXVK:** ${DXVK_TAG} — DirectX → Vulkan fallback (doitsujin/dxvk)
+**GPTK:** Apple Game Porting Toolkit — DirectX 12 → Metal (if bundled)
 **Architecture:** arm64 / x86_64 (Rosetta 2)
 **Archive size:** ${ARCHIVE_SIZE}
 **Files:** ${FILE_COUNT}

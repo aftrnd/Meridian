@@ -26,6 +26,7 @@ struct GameDetailView: View {
     @Environment(GameLauncher.self)       private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
+    @Environment(SteamCMDService.self)    private var steamCMDService
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
@@ -227,7 +228,8 @@ struct GameDetailView: View {
                         engine: engine,
                         steamManager: steamManager,
                         sessionBridge: sessionBridge,
-                        engineDownloader: engineDownloader
+                        engineDownloader: engineDownloader,
+                        steamCMDService: steamCMDService
                     )
                 }
             }
@@ -286,15 +288,19 @@ struct GameDetailView: View {
                 .allowsHitTesting(false)
             }
             .overlay(alignment: .bottomLeading) {
-                if g.playtimeMinutes > 0 {
-                    Text(g.playtimeFormatted + " played")
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.85))
-                        .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
-                        .padding(.horizontal, GameDetailMetrics.horizontalPadding)
-                        .padding(.bottom, 16)
-                        .allowsHitTesting(false)
+                let compatProfile = GameCompatibilityDB.shared.profile(for: g.id)
+                HStack(alignment: .bottom, spacing: 6) {
+                    BannerCompatBadge(status: compatProfile?.status ?? .untested)
+                    if g.playtimeMinutes > 0 {
+                        Text(g.playtimeFormatted + " played")
+                            .font(.subheadline)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                            .allowsHitTesting(false)
+                    }
                 }
+                .padding(.horizontal, GameDetailMetrics.horizontalPadding)
+                .padding(.bottom, 16)
             }
             .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
     }
@@ -1117,10 +1123,83 @@ private struct AchievementIcon: View {
     }
 }
 
+// MARK: - Compat Badge (banner overlay)
+
+/// Single-icon compatibility indicator shown in the hero banner.
+/// Color encodes status; `.help()` tooltip explains it on hover.
+private struct BannerCompatBadge: View {
+    let status: CompatStatus
+
+    private var icon: String {
+        status == .verified ? "checkmark.seal.fill" : "xmark.seal.fill"
+    }
+
+    private var color: Color {
+        status == .verified ? .green : Color(white: 0.70)
+    }
+
+    private var tooltip: String {
+        switch status {
+        case .verified:
+            return "Meridian Verified — this game has been tested and runs well on your Mac."
+        case .playable:
+            return "Playable — this game runs with minor issues. Expect a good experience."
+        case .launches:
+            return "Launches — this game starts but may have significant issues during play."
+        case .broken:
+            return "Broken — this game currently crashes or fails to run under Meridian."
+        case .untested:
+            return "Untested — this game has not yet been verified with Meridian."
+        }
+    }
+
+    var body: some View {
+        Image(systemName: icon)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(color)
+            .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+            .help(tooltip)
+    }
+}
+
+// MARK: - Compat Badge (info card row)
+
+private struct CompatBadge: View {
+    let status: CompatStatus
+
+    private var label: String {
+        switch status {
+        case .verified: return "Verified"
+        case .playable:  return "Playable"
+        case .launches:  return "Launches"
+        case .broken:    return "Broken"
+        case .untested:  return "Untested"
+        }
+    }
+
+    private var color: Color {
+        switch status {
+        case .verified: return .green
+        case .playable:  return Color(hue: 0.25, saturation: 0.70, brightness: 0.65)
+        case .launches:  return Color(hue: 0.12, saturation: 0.90, brightness: 0.85)
+        case .broken:    return .red
+        case .untested:  return Color(white: 0.50)
+        }
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+}
+
 // MARK: - Metacritic Badge
 
-private struct MetacriticBadge: View {
-    let score: Int
+private struct MetacriticBadge: View {    let score: Int
 
     private var color: Color {
         switch score {

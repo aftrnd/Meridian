@@ -11,10 +11,10 @@ enum GameEngine: String {
 }
 
 /// What DirectX/Vulkan API the game renders with.
-/// Drives DXMT vs GPTK D3DMetal vs native Vulkan selection at launch.
+/// Drives DXMT vs DXVK selection at launch.
 enum GraphicsAPI: String {
     case dx11      // DirectX 11 → DXMT → Metal
-    case dx12      // DirectX 12 → GPTK D3DMetal → Metal
+    case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
     case unknown
 }
@@ -48,10 +48,6 @@ struct GameProfile {
     /// WINEDLLOVERRIDES value. nil = use engine default.
     let dllOverrides: String?
 
-    /// Whether this game requires the CrossOver 24+ engine (CX Preview locally)
-    /// to avoid abort stubs missing from Wine 8.0.1.
-    let requiresCXEngine: Bool
-
     /// Metal renderer preference.
     enum DXMTMode {
         case auto          // Use DXMT if available
@@ -59,11 +55,6 @@ struct GameProfile {
         case disabled      // Force Wine's built-in d3d11, bypassing DXMT
     }
     let dxmtMode: DXMTMode
-
-    /// Whether to install DXMT DLLs into the Wine prefix system32 before launch.
-    /// Needed when the CX engine is active (its built-in d3d11 takes priority over
-    /// WINEDLLPATH, so DXMT must be physically in system32 to win).
-    let requiresDXMTInSystem32: Bool
 
     /// Extra environment variables specific to this game.
     let extraEnv: [String: String]
@@ -81,9 +72,7 @@ struct GameProfile {
         graphicsAPI: GraphicsAPI = .unknown,
         status: CompatStatus = .untested,
         dllOverrides: String? = nil,
-        requiresCXEngine: Bool = false,
         dxmtMode: DXMTMode = .auto,
-        requiresDXMTInSystem32: Bool = false,
         extraEnv: [String: String] = [:],
         verifiedWith: String? = nil,
         notes: String = ""
@@ -94,9 +83,7 @@ struct GameProfile {
         self.graphicsAPI = graphicsAPI
         self.status = status
         self.dllOverrides = dllOverrides
-        self.requiresCXEngine = requiresCXEngine
         self.dxmtMode = dxmtMode
-        self.requiresDXMTInSystem32 = requiresDXMTInSystem32
         self.extraEnv = extraEnv
         self.verifiedWith = verifiedWith
         self.notes = notes
@@ -105,17 +92,13 @@ struct GameProfile {
     // MARK: - Factory methods
 
     /// Unity game preset.
-    /// Defaults: requiresCXEngine=true (IsMouseInPointerEnabled abort stubs),
-    /// requiresDXMTInSystem32=true (CX wineloader ignores WINEDLLPATH),
-    /// graphicsAPI=.dx11. All params overridable per-game.
+    /// Defaults: graphicsAPI=.dx11. All params overridable per-game.
     static func unity(
         appID: Int,
         name: String,
         status: CompatStatus = .untested,
         graphicsAPI: GraphicsAPI = .dx11,
         dxmtMode: DXMTMode = .auto,
-        requiresCXEngine: Bool = true,
-        requiresDXMTInSystem32: Bool = true,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
         verifiedWith: String? = nil,
@@ -124,23 +107,20 @@ struct GameProfile {
         GameProfile(
             appID: appID, name: name,
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: status,
-            dllOverrides: dllOverrides, requiresCXEngine: requiresCXEngine,
-            dxmtMode: dxmtMode, requiresDXMTInSystem32: requiresDXMTInSystem32,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
             extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
         )
     }
 
     /// Unreal Engine game preset.
-    /// Defaults: requiresCXEngine=true, requiresDXMTInSystem32=true,
-    /// graphicsAPI=.dx11. All params overridable per-game.
+    /// Defaults: graphicsAPI=.dx11. All params overridable per-game.
     static func unreal(
         appID: Int,
         name: String,
         status: CompatStatus = .untested,
         graphicsAPI: GraphicsAPI = .dx11,
         dxmtMode: DXMTMode = .auto,
-        requiresCXEngine: Bool = true,
-        requiresDXMTInSystem32: Bool = true,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
         verifiedWith: String? = nil,
@@ -149,23 +129,19 @@ struct GameProfile {
         GameProfile(
             appID: appID, name: name,
             gameEngine: .unreal, graphicsAPI: graphicsAPI, status: status,
-            dllOverrides: dllOverrides, requiresCXEngine: requiresCXEngine,
-            dxmtMode: dxmtMode, requiresDXMTInSystem32: requiresDXMTInSystem32,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
             extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
         )
     }
 
     /// Custom/unknown engine game preset.
-    /// Defaults: requiresCXEngine=false, requiresDXMTInSystem32=false.
-    /// Override per-game when the custom engine needs CX stubs or DXMT.
     static func custom(
         appID: Int,
         name: String,
         status: CompatStatus = .untested,
         graphicsAPI: GraphicsAPI = .unknown,
         dxmtMode: DXMTMode = .auto,
-        requiresCXEngine: Bool = false,
-        requiresDXMTInSystem32: Bool = false,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
         verifiedWith: String? = nil,
@@ -174,8 +150,8 @@ struct GameProfile {
         GameProfile(
             appID: appID, name: name,
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: status,
-            dllOverrides: dllOverrides, requiresCXEngine: requiresCXEngine,
-            dxmtMode: dxmtMode, requiresDXMTInSystem32: requiresDXMTInSystem32,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
             extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
         )
     }

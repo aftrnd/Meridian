@@ -170,6 +170,7 @@ final class AppSettings: @unchecked Sendable {
         hiddenAppIDs    = []
         favoriteAppIDs  = []
         UserDefaults.standard.removeObject(forKey: "launchTimestamps")
+        UserDefaults.standard.removeObject(forKey: "isSteamLoggedIn")
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
         steamCredentialRefreshToken = ""

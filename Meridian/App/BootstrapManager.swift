@@ -8,7 +8,11 @@ private let log = MeridianLog(category: "BootstrapManager")
 ///
 /// Runs each phase in order, skipping steps that are already complete
 /// (prefix exists, Steam installed, etc.). The final phase starts a
-/// persistent Steam process so game launches are near-instant via IPC.
+/// persistent SteamCMD interactive session so game installs are instant.
+///
+/// steam.exe is NOT started at bootstrap — steam.exe authentication is unreliable — use SteamCMD batch mode for installs
+/// and its crash-restart loop destabilizes the shared wineserver. steam.exe is only
+/// started on-demand for games that require Steam DRM (steam_api64.dll).
 ///
 /// State is published for the splash screen to display real milestones.
 @Observable
@@ -27,7 +31,6 @@ final class BootstrapManager {
         case bootstrappingSteam
         case syncingSession
         case startingSteam
-        case waitingForSteam
         case ready
         case failed(String)
     }
@@ -63,7 +66,8 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) {
         guard phase == .idle || isFailed else { return }
 
@@ -73,7 +77,8 @@ final class BootstrapManager {
                 engine: engine,
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
-                engineDownloader: engineDownloader
+                engineDownloader: engineDownloader,
+                steamCMDService: steamCMDService
             )
         }
     }
@@ -106,9 +111,10 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) {
-        let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam, .waitingForSteam]
+        let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam]
         if let failed = lastFailedPhase, cleanupPhases.contains(failed) {
             log.info("[retry] previous failure in \(String(describing: failed)) — killing Wine and wiping entire prefix for clean start")
             steamManager.killAll(engine: engine, prefix: prefix)
@@ -118,7 +124,7 @@ final class BootstrapManager {
         phase = .idle
         statusMessage = ""
         engineDownloadState = .idle
-        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader)
+        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader, steamCMDService: steamCMDService)
     }
 
     // MARK: - Pipeline
@@ -130,13 +136,36 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) async {
         let pipelineStart = ContinuousClock.now
 
-        // Pre-flight: kill any orphaned Wine processes from a previous session that
-        // didn't shut down cleanly. Without this, leftover wineserver/steam.exe
-        // processes hold locks that prevent the new bootstrap from succeeding.
+        // Pre-flight: set cleanup context from known static paths BEFORE running cleanup.
+        //
+        // The paths are fixed constants — they never vary per-machine. Setting context here
+        // ensures wineserver -k runs at startup even on the very first call, before
+        // startPersistent ever sets the context in the normal flow.
+        //
+        // Without this, wineserver -k is skipped and pkill -f is the only fallback.
+        // pkill -f cannot find orphan Wine processes because Wine replaces its argv[0]
+        // with the Windows program path (e.g. "C:\...\steamcmd.exe") after startup —
+        // the engine path is no longer visible to pkill. wineserver -k is the only
+        // reliable way to kill all Wine processes for a specific WINEPREFIX.
+        if engine.isReady && TerminationCleanup.context == nil {
+            let engineDir = WineEngine.engineDir
+            TerminationCleanup.context = TerminationCleanup.Context(
+                wineserverPath: engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false),
+                winePrefix: prefix.path.path(percentEncoded: false),
+                engineDirPath: engineDir.path(percentEncoded: false),
+                libraryPath: engineDir.appending(path: "wine/lib").path(percentEncoded: false)
+            )
+            log.info("[bootstrap] cleanup context set from static paths (early, pre-cleanup)")
+        }
+
+        // Kill any orphaned Wine processes from a previous session that didn't shut down
+        // cleanly. Without this, leftover wineserver processes cause SteamCMD to connect
+        // to a stale/corrupt wineserver and hang indefinitely during login.
         await Task.detached(priority: .userInitiated) {
             TerminationCleanup.killAllWineProcesses()
         }.value
@@ -398,60 +427,44 @@ final class BootstrapManager {
         guard !Task.isCancelled else { return }
 
         // 6. Engage window suppression now that all prefix operations are complete.
-        // This must happen BEFORE starting persistent Steam so its windows are hidden.
-        // It must NOT happen earlier — prefix operations (wineboot --init, wineboot --update,
-        // SteamSetup.exe) spawn transient Wine GUI windows that must be allowed to render
-        // and exit naturally.
+        // This must NOT happen earlier — prefix operations (wineboot --init,
+        // wineboot --update, SteamSetup.exe) spawn transient Wine GUI windows that
+        // must be allowed to render and exit naturally.
+        // steam.exe is NOT started at bootstrap. We use SteamCMD batch mode for all
+        // game installs. steam.exe is only started on-demand for DRM games that need
+        // a live Steam IPC socket (startSteamForDRM).
         windowSuppressor?.beginSession()
 
-        // 7. Start persistent Steam — but SKIP when the CX engine is active.
+        // 7. Warm up SteamCMD: run `+login USERNAME +quit` so the self-update and
+        //    credential cache are ready before the user clicks Install.
         //
-        // With the CX engine, Steam's CEF/webhelper works correctly (1,131 stubs fixed),
-        // which means steam.exe -silent still shows its login window (QR code) because
-        // Steam isn't authenticated. We don't need persistent Steam at all:
-        // - Downloads use SteamCMD (separate binary, own auth)
-        // - Game launch uses direct exe via Wine (no steam.exe -applaunch)
+        // On first ever run: SteamCMD downloads ~300MB of self-updates. This takes
+        // 1–3 minutes and happens here on the splash screen ("Preparing game tools…").
         //
-        // Without the CX engine (Gcenx-only), persistent Steam is started as before
-        // for backward compatibility with the old +app_update IPC flow.
-        if engine.cxPreviewLibPath != nil {
-            log.info("[bootstrap] CX engine active — skipping persistent Steam (not needed for SteamCMD + direct launch)")
-            steamManager.isRunning = true
-        } else {
-            transition(to: .startingSteam, message: "Starting Steam…")
-            do {
-                try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                log.info("[bootstrap] persistent Steam process launched")
-            } catch {
-                fail("Failed to start Steam: \(error.localizedDescription)")
-                return
-            }
-
-            if let pid = steamManager.persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
-            }
-
-            steamManager.onSteamRevived = { [weak self, weak steamManager] in
-                guard let pid = steamManager?.persistentProcessIdentifier else { return }
-                self?.windowSuppressor?.resumeSuppressing(pid: pid)
-                log.info("[bootstrap] suppressor re-engaged after Steam revival (pid=\(pid))")
-            }
-
-            guard !Task.isCancelled else { return }
-
-            transition(to: .waitingForSteam, message: "Waiting for Steam to initialize…")
-            do {
-                try await steamManager.waitUntilReady(prefix: prefix) { [weak self] message in
-                    self?.statusMessage = message
-                    log.info("[bootstrap] waitUntilReady status: \(message)")
+        // On subsequent launches: SteamCMD verifies its install in ~7 seconds.
+        //
+        // The warm-up is non-fatal — if it fails (no network, stale credentials),
+        // bootstrap still completes and installGame() will retry on demand.
+        let steamCMDUsername = AppSettings.shared.steamCredentialAccountName
+        if !steamCMDUsername.isEmpty && FileManager.default.fileExists(atPath: steamcmdPath) {
+            // Save credentials first (instantaneous).
+            try? await steamCMDService.start(
+                username: steamCMDUsername,
+                engine: engine,
+                prefix: prefix
+            )
+            // Now warm up — this is where the self-update and login cache happen.
+            transition(to: .startingSteam, message: "Preparing game tools…")
+            log.info("[bootstrap] warming up SteamCMD (+login +quit)…")
+            await steamCMDService.warmUp { [weak self] line in
+                // Forward notable SteamCMD output to the splash status line
+                if line.hasPrefix("[") || line.contains("Logging in") || line.contains("Waiting") {
+                    self?.statusMessage = line
                 }
-                log.info("[bootstrap] Steam is ready ✓")
-            } catch {
-                fail("Steam failed to start: \(error.localizedDescription)")
-                return
             }
-
-            steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
+            log.info("[bootstrap] SteamCMD warm-up complete ✓")
+        } else {
+            log.info("[bootstrap] skipping SteamCMD setup (username=\(steamCMDUsername.isEmpty ? "empty" : "set"), steamcmd=\(FileManager.default.fileExists(atPath: steamcmdPath)))")
         }
 
         lastFailedPhase = nil

@@ -30,6 +30,7 @@ struct SettingsView: View {
 
 private struct SteamSettingsTab: View {
     @Environment(SteamAuthService.self) private var steamAuth
+    @Environment(WineSteamManager.self) private var steamManager
     @Environment(SteamLibraryStore.self) private var library
     @State private var apiKeyInput: String = ""
     @State private var isValidating = false
@@ -61,6 +62,7 @@ private struct SteamSettingsTab: View {
 
                         Button("Sign Out", role: .destructive) {
                             steamAuth.signOut()
+                            steamManager.isSteamLoggedIn = false
                         }
                         .buttonStyle(.bordered)
                     }
@@ -235,6 +237,9 @@ private struct EngineSettingsTab: View {
                 steamManager.killAll(engine: engine, prefix: prefix)
                 prefix.reset()
                 engine.resetEngine()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NSApplication.shared.terminate(nil)
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -425,7 +430,7 @@ private struct UpdatesSettingsTab: View {
 
     private var engineVersionString: String {
         if let v = engine.engineVersion { return v }
-        return engine.isReady ? engine.backendName : "Not installed"
+        return engine.isReady ? "Meridian Engine" : "Not installed"
     }
 
     @ViewBuilder
@@ -627,7 +632,7 @@ private struct EngineStatusRow: View {
                 Text(engine.isReady ? "Wine Runtime" : "Not installed")
                     .fontWeight(.medium)
                 if engine.isReady {
-                    Text("Backend: \(engine.backendName)")
+                    Text("Meridian Engine")
                         .font(.caption)
                         .foregroundStyle(.green)
                 } else {

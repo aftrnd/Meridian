@@ -16,9 +16,7 @@ import Foundation
 ///
 /// ## Fix categories
 /// - `dllOverrides`: WINEDLLOVERRIDES value for this game (merged at launch)
-/// - `requiresCXEngine`: game crashes on Wine 8.0.1 stubs fixed in CrossOver 24+
 /// - `dxmtMode`: Metal renderer preference (.auto / .required / .disabled)
-/// - `requiresDXMTInSystem32`: DXMT DLLs must be in prefix system32 for CX engine
 /// - `extraEnv`: per-game environment variables (merged at launch)
 /// - `graphicsAPI`: which DirectX/Vulkan API the game renders with
 /// - `status`: verification state (.verified / .playable / .launches / .broken / .untested)
@@ -58,17 +56,6 @@ final class GameCompatibilityDB {
         profiles[appID]
     }
 
-    /// Whether this game requires the CrossOver engine for correct operation.
-    func requiresCXEngine(appID: Int) -> Bool {
-        profiles[appID]?.requiresCXEngine ?? false
-    }
-
-    /// Whether DXMT DLLs must be installed into system32 for this game.
-    /// True when: the CX engine is active AND the game uses D3D11/DXGI.
-    func requiresDXMTInSystem32(appID: Int) -> Bool {
-        profiles[appID]?.requiresDXMTInSystem32 ?? false
-    }
-
     /// Returns the WINEDLLOVERRIDES string for this game, if any.
     func dllOverrides(for appID: Int) -> String? {
         profiles[appID]?.dllOverrides
@@ -84,8 +71,6 @@ final class GameCompatibilityDB {
         guard let p = profiles[appID] else { return "none" }
         var parts: [String] = ["[\(p.status.rawValue)]"]
         if p.graphicsAPI != .unknown { parts.append(p.graphicsAPI.rawValue.uppercased()) }
-        if p.requiresCXEngine { parts.append("CX engine") }
-        if p.requiresDXMTInSystem32 { parts.append("DXMT→system32") }
         if let ov = p.dllOverrides { parts.append("overrides: \(ov)") }
         if !p.extraEnv.isEmpty { parts.append("\(p.extraEnv.count) env vars") }
         return parts.joined(separator: ", ")

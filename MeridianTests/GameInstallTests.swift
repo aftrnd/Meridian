@@ -456,6 +456,7 @@ final class GameInstallTests: XCTestCase {
     private enum TestDXMTMode { case auto, required, disabled }
 
     /// Mirror of GameProfile for testing DB lookups.
+    /// MIRROR CONTRACT: Mirrors GameProfile (GameProfile.swift)
     private struct TestGameProfile {
         let appID: Int
         let name: String
@@ -463,9 +464,7 @@ final class GameInstallTests: XCTestCase {
         let graphicsAPI: TestGraphicsAPI
         let status: TestCompatStatus
         let dllOverrides: String?
-        let requiresCXEngine: Bool
         let dxmtMode: TestDXMTMode
-        let requiresDXMTInSystem32: Bool
         let extraEnv: [String: String]
     }
 
@@ -473,26 +472,22 @@ final class GameInstallTests: XCTestCase {
         3180070: TestGameProfile(
             appID: 3180070, name: "No, I'm not a Human",
             gameEngine: .unity, graphicsAPI: .dx11, status: .verified,
-            dllOverrides: nil, requiresCXEngine: true, dxmtMode: .auto,
-            requiresDXMTInSystem32: true, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
         ),
         813230: TestGameProfile(
             appID: 813230, name: "ANIMAL WELL",
             gameEngine: .custom, graphicsAPI: .dx12, status: .verified,
-            dllOverrides: nil, requiresCXEngine: true, dxmtMode: .auto,
-            requiresDXMTInSystem32: true, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
         ),
         3527290: TestGameProfile(
             appID: 3527290, name: "PEAK",
             gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
-            dllOverrides: nil, requiresCXEngine: true, dxmtMode: .required,
-            requiresDXMTInSystem32: true, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
         ),
         4069520: TestGameProfile(
             appID: 4069520, name: "Super Battle Golf",
-            gameEngine: .unity, graphicsAPI: .dx11, status: .broken,
-            dllOverrides: nil, requiresCXEngine: true, dxmtMode: .auto,
-            requiresDXMTInSystem32: true, extraEnv: [:]
+            gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
         ),
     ]
 
@@ -502,17 +497,12 @@ final class GameInstallTests: XCTestCase {
         }
     }
 
-    func testKnownGamesRequireCXEngine() {
-        for (appID, profile) in testProfiles {
-            XCTAssertTrue(profile.requiresCXEngine,
-                          "\(profile.name) (appID=\(appID)) should require CX engine")
-        }
-    }
-
-    func testKnownGamesRequireDXMTInSystem32() {
-        for (appID, profile) in testProfiles {
-            XCTAssertTrue(profile.requiresDXMTInSystem32,
-                          "\(profile.name) (appID=\(appID)) should require DXMT in system32")
+    func testDX12GamesHaveCorrectGraphicsAPI() {
+        let dx12IDs = [813230, 3527290, 4069520] // Animal Well, PEAK, Super Battle Golf
+        for appID in dx12IDs {
+            let profile = testProfiles[appID]
+            XCTAssertEqual(profile?.graphicsAPI, .dx12,
+                           "\(profile?.name ?? String(appID)) should be .dx12")
         }
     }
 
@@ -557,17 +547,13 @@ final class GameInstallTests: XCTestCase {
     private func unityFactory(
         appID: Int = 1,
         name: String = "Test",
-        requiresCXEngine: Bool = true,
-        requiresDXMTInSystem32: Bool = true,
         graphicsAPI: TestGraphicsAPI = .dx11,
         dxmtMode: TestDXMTMode = .auto
     ) -> TestGameProfile {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, requiresCXEngine: requiresCXEngine,
-            dxmtMode: dxmtMode, requiresDXMTInSystem32: requiresDXMTInSystem32,
-            extraEnv: [:]
+            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:]
         )
     }
 
@@ -575,46 +561,36 @@ final class GameInstallTests: XCTestCase {
     private func customFactory(
         appID: Int = 1,
         name: String = "Test",
-        requiresCXEngine: Bool = false,
-        requiresDXMTInSystem32: Bool = false,
         graphicsAPI: TestGraphicsAPI = .unknown
     ) -> TestGameProfile {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, requiresCXEngine: requiresCXEngine,
-            dxmtMode: .auto, requiresDXMTInSystem32: requiresDXMTInSystem32,
-            extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
         )
     }
 
-    func testUnityFactoryDefaultsRequireCX() {
+    func testUnityFactoryDefaults() {
         let p = unityFactory()
-        XCTAssertTrue(p.requiresCXEngine)
-        XCTAssertTrue(p.requiresDXMTInSystem32)
         XCTAssertEqual(p.gameEngine, .unity)
         XCTAssertEqual(p.graphicsAPI, .dx11)
+        XCTAssertEqual(p.dxmtMode, .auto)
     }
 
     func testUnityFactoryAllowsOverride() {
-        let p = unityFactory(requiresCXEngine: false, graphicsAPI: .dx12, dxmtMode: .required)
-        XCTAssertFalse(p.requiresCXEngine)
+        let p = unityFactory(graphicsAPI: .dx12, dxmtMode: .required)
         XCTAssertEqual(p.graphicsAPI, .dx12)
         XCTAssertEqual(p.dxmtMode, .required)
     }
 
-    func testCustomFactoryDefaultsNoCX() {
+    func testCustomFactoryDefaults() {
         let p = customFactory()
-        XCTAssertFalse(p.requiresCXEngine)
-        XCTAssertFalse(p.requiresDXMTInSystem32)
         XCTAssertEqual(p.gameEngine, .custom)
         XCTAssertEqual(p.graphicsAPI, .unknown)
     }
 
     func testCustomFactoryAllowsOverride() {
-        let p = customFactory(requiresCXEngine: true, requiresDXMTInSystem32: true, graphicsAPI: .dx12)
-        XCTAssertTrue(p.requiresCXEngine)
-        XCTAssertTrue(p.requiresDXMTInSystem32)
+        let p = customFactory(graphicsAPI: .dx12)
         XCTAssertEqual(p.graphicsAPI, .dx12)
     }
 
