@@ -447,7 +447,8 @@ private struct SteamLoginStepContent: View {
             // Prefix exists at this point (bootstrap is done before the sheet appears).
             // Write session files into the prefix so SteamCMD auto-logs in.
             // No steam.exe is started here — it cannot authenticate under Wine 8.0.1.
-            // SteamCMD will authenticate lazily when the first game install begins.
+            // SteamCMD credentials are established lazily on first game install attempt
+            // (SteamCMDService.installGame() fix2 recovery path with Keychain password).
             mgr.killAll(engine: eng, prefix: prefix)
             mgr.clearPersistentProcess()
             try? await Task.sleep(for: .seconds(1))

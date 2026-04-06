@@ -80,6 +80,12 @@ final class WineSteamManager {
         killAll(engine: engine, prefix: prefix)
         try? await Task.sleep(for: .seconds(2))
 
+        // Strip BootStrapperInhibitAll from steam.cfg before launching Steam.
+        // A previous failed session may have left this flag in place (the bug that
+        // caused the bootstrap bootloop). Steam reads this flag and suppresses its
+        // self-update — the exact update that downloads steamui.dll.
+        prefix.stripBootStrapperInhibit()
+
         let steamExe  = prefix.steamExePath.path(percentEncoded: false)
         let dllPath   = prefix.steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
         let pkgDirURL = prefix.steamInstallDir.appending(path: "package")
@@ -762,6 +768,12 @@ final class WineSteamManager {
         process.currentDirectoryURL = gamePath
 
         var env = engine.environment(for: prefix)
+
+        // Suppress Wine's crash debugger (winedbg) for all game launches.
+        // Without this, any game crash triggers winedbg.exe to auto-attach and show
+        // a "program has encountered an error" dialog that users cannot dismiss cleanly.
+        // Setting WINE_DISABLE_WINE_CRASH_DIALOG silently terminates crashed processes.
+        env["WINE_DISABLE_WINE_CRASH_DIALOG"] = "1"
 
         let compat = GameCompatibilityDB.shared
         let gameExtraEnv = compat.extraEnv(for: appID)

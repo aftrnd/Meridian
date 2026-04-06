@@ -118,6 +118,9 @@ final class GameLauncher {
         launchTask?.cancel()
         launchTask = nil
 
+        // Immediately terminate any active SteamCMD download before the broader cleanup.
+        steamCMDService?.shutdown()
+
         steamManager.gameIsRunning = false
         await cleanupProcesses(engine: engine, steamManager: steamManager)
 
@@ -311,9 +314,11 @@ final class GameLauncher {
                 let appID = game.id
                 let startTime = ContinuousClock.now
                 var hasSeenGameProgress = false
+                var pollCount = 0
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(2))
                     guard !Task.isCancelled else { break }
+                    pollCount += 1
                     if let progress = prefix.gameDownloadProgress(appID: appID),
                        progress.total > 0 {
                         let fraction = Double(progress.downloaded) / Double(progress.total)
@@ -321,6 +326,11 @@ final class GameLauncher {
                             hasSeenGameProgress = true
                             self?.downloadProgress = fraction
                             self?.currentActivity = "Downloading \(gameName) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total))"
+                        } else {
+                            // ACF exists and total is known, but BytesDownloaded=0.
+                            // SteamCMD doesn't update BytesDownloaded in real-time — it stays
+                            // 0 during the entire download. Show a status message instead of silence.
+                            self?.currentActivity = "Downloading \(gameName)…"
                         }
                     } else if !hasSeenGameProgress {
                         let elapsed = ContinuousClock.now - startTime
@@ -340,30 +350,52 @@ final class GameLauncher {
                         let trimmed = line.trimmingCharacters(in: .whitespaces)
                         guard !trimmed.isEmpty else { return }
 
+                        // Download progress — update bar + activity label, do NOT append raw line
                         if let fraction = Self.parseSteamCMDProgress(line: trimmed) {
                             self.downloadProgress = fraction
-                            if self.currentActivity?.starts(with: "Downloading \(game.name)") != true {
-                                self.currentActivity = "Downloading \(game.name)…"
-                            }
-                        } else if trimmed.hasPrefix("[----]") || trimmed.hasPrefix("[  0%]") {
-                            // SteamCMD self-update (happens on first run, takes 1–3 minutes)
+                            let pct = Int(fraction * 100)
+                            self.currentActivity = pct > 0
+                                ? "Downloading \(game.name) — \(pct)%"
+                                : "Downloading \(game.name)…"
+                            return
+                        }
+
+                        // SteamCMD self-update progress (first run only)
+                        if trimmed.hasPrefix("[----]") || trimmed.hasPrefix("[  0%]") {
                             if self.currentActivity != "Updating Steam tools…" {
                                 self.currentActivity = "Updating Steam tools…"
                             }
-                        } else if trimmed.contains("Logging in") {
-                            self.currentActivity = "Signing in to Steam…"
+                            self.appendLog(trimmed)
+                            return
                         }
 
-                        guard !trimmed.hasPrefix("wineserver:"),
-                              !trimmed.hasPrefix("wine:"),
-                              !trimmed.hasPrefix("CWork"),
-                              !trimmed.hasPrefix("Redirecting stderr"),
-                              !trimmed.hasPrefix("Logging directory"),
-                              !trimmed.hasPrefix("Unloading Steam"),
-                              !trimmed.hasPrefix("Loading Steam") else { return }
+                        // Meaningful SteamCMD status lines — show in log + update activity
+                        if trimmed.contains("Logging in using cached credentials") {
+                            self.currentActivity = "Signing in to Steam…"
+                            return
+                        }
+                        if trimmed.contains("Logging in user") {
+                            self.currentActivity = "Signing in to Steam…"
+                            return
+                        }
+                        if trimmed.contains("Waiting for user info") || trimmed.contains("Waiting for client config") {
+                            return // silent — already shown via currentActivity
+                        }
+                        if trimmed.contains("Success! App") {
+                            self.downloadProgress = 1.0
+                            return // success handled by post-install guard
+                        }
+
+                        // Append all other meaningful lines that made it past shouldShowLine
                         self.appendLog(trimmed)
                     }
                 )
+            } catch is CancellationError {
+                pollingTask.cancel()
+                downloadProgress = nil
+                currentActivity = nil
+                log.info("[launch] download cancelled by user")
+                return
             } catch {
                 pollingTask.cancel()
                 fail("Download failed: \(error.localizedDescription)", error: error)

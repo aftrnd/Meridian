@@ -32,6 +32,7 @@ struct MeridianApp: App {
             appDelegate.steamManager      = steamManager
             appDelegate.bootstrap         = bootstrap
             appDelegate.steamCMDService   = steamCMDService
+            steamCMDService.passwordProvider = { steamAuth.loadSteamPassword() }
         }()
 
         WindowGroup {

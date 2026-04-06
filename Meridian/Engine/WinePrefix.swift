@@ -92,11 +92,19 @@ struct WinePrefix: Sendable {
         let exePath = steamExePath.path(percentEncoded: false)
         let result = FileManager.default.fileExists(atPath: exePath)
         log.debug("[isSteamInstalled] steam.exe → \(result)")
-        // Also log steamui.dll presence — its absence means bootstrap is incomplete
-        let dllPath = steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
-        let hasDLL  = FileManager.default.fileExists(atPath: dllPath)
-        log.debug("[isSteamInstalled] steamui.dll → \(hasDLL) (bootstrap complete=\(hasDLL))")
+        log.debug("[isSteamInstalled] steamui.dll → \(isSteamBootstrapped) (bootstrap complete=\(isSteamBootstrapped))")
         return result
+    }
+
+    /// Whether Steam's first-run client download has completed.
+    ///
+    /// `SteamSetup.exe /S` installs only the bootstrapper stub (steam.exe).
+    /// The full client (including steamui.dll) is downloaded when steam.exe
+    /// runs for the first time without `BootStrapperInhibitAll`. This property
+    /// distinguishes "Steam stub installed" from "Steam fully bootstrapped".
+    var isSteamBootstrapped: Bool {
+        let dllPath = steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        return FileManager.default.fileExists(atPath: dllPath)
     }
 
     /// Returns `true` when the Wine prefix's Steam install has an authenticated user
@@ -507,8 +515,9 @@ struct WinePrefix: Sendable {
 
         let dest = configDir.appending(path: "config.vdf")
 
-        let jwtEntry      = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
-        let accountEntry  = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+        let jwtEntry         = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
+        let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
+        let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
 
         // Try to merge into an existing file that has a Steam section.
         if let existing = try? String(contentsOf: dest, encoding: .utf8),
@@ -517,10 +526,18 @@ struct WinePrefix: Sendable {
             var updated = existing
 
             // Update or insert the steamID JWT entry inside the ConnectCache block.
+            // steam.exe reads ConnectCache by SteamID for auto-login.
             updated = upsertVDFKeyInSection(in: updated,
                                             sectionKey: "\"ConnectCache\"",
                                             newKeyLine: jwtEntry,
                                             matchPrefix: "\"\(steamID)\"")
+
+            // Update or insert the username JWT entry inside the ConnectCache block.
+            // SteamCMD (+login USERNAME) reads ConnectCache by account name.
+            updated = upsertVDFKeyInSection(in: updated,
+                                            sectionKey: "\"ConnectCache\"",
+                                            newKeyLine: usernameJwtEntry,
+                                            matchPrefix: "\"\(accountName)\"")
 
             // Update or insert the Accounts entry.
             updated = upsertVDFKeyInSection(in: updated,
@@ -534,7 +551,7 @@ struct WinePrefix: Sendable {
         }
 
         // No existing file (or no Steam section) — write a minimal VDF.
-        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\t\t\t\t}"
+        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
         let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
         let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
 
@@ -678,28 +695,46 @@ struct WinePrefix: Sendable {
         let fm = FileManager.default
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
 
-        let alreadyBootstrapped = isSteamInstalled  // steamui.dll present = fully bootstrapped
+        let alreadyBootstrapped = isSteamBootstrapped
 
-        // Build required settings
         var required = ["SteamNoSandbox=1"]
         if alreadyBootstrapped {
-            // Only add BootStrapperInhibitAll after Steam is fully installed.
-            // During first-run bootstrap, this flag must NOT be present or Steam
-            // cannot download its client files.
             required.append("BootStrapperInhibitAll=enable")
         }
 
+        let desiredContent = required.joined(separator: "\n") + "\n"
+
+        // Check both that all required settings are present AND that no stale
+        // settings remain (e.g. BootStrapperInhibitAll before bootstrap completes).
         if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
-           required.allSatisfy({ existing.contains($0) }) {
+           existing == desiredContent {
             log.debug("[ensureSteamCFG] steam.cfg already configured — skipping")
             return
         }
 
         try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
 
-        let cfg = required.joined(separator: "\n") + "\n"
-        try cfg.write(to: cfgURL, atomically: true, encoding: .utf8)
+        try desiredContent.write(to: cfgURL, atomically: true, encoding: .utf8)
         log.info("[ensureSteamCFG] steam.cfg written: \(required.joined(separator: ", ")) → \(cfgURL.path(percentEncoded: false))")
+    }
+
+    /// Removes `BootStrapperInhibitAll=enable` from `steam.cfg` if present.
+    ///
+    /// Called defensively before the bootstrap loop to ensure a stale flag from
+    /// a previous failed session does not prevent Steam from downloading its
+    /// client update.
+    func stripBootStrapperInhibit() {
+        let cfgURL = steamInstallDir.appending(path: "steam.cfg")
+        guard let content = try? String(contentsOf: cfgURL, encoding: .utf8),
+              content.contains("BootStrapperInhibitAll") else { return }
+        let cleaned = content
+            .components(separatedBy: .newlines)
+            .filter { !$0.contains("BootStrapperInhibitAll") }
+            .joined(separator: "\n")
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        let final = trimmed.isEmpty ? "" : trimmed + "\n"
+        try? final.write(to: cfgURL, atomically: true, encoding: .utf8)
+        log.info("[stripBootStrapperInhibit] removed BootStrapperInhibitAll from steam.cfg")
     }
 
     // MARK: - Library Setup

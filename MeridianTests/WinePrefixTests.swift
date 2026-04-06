@@ -28,7 +28,8 @@ import Foundation
 ///   • steamInstallDir(driveC:)           ← WinePrefix.steamInstallDir
 ///   • steamExeWindowsPath(driveC:)       ← WinePrefix.steamExeWindowsPath
 ///   • ensureDefaultLibrary(steamInstallDir:) ← WinePrefix.ensureDefaultLibrary()
-///   • ensureSteamCFG(steamInstallDir:)   ← WinePrefix.ensureSteamCFG()
+///   • ensureSteamCFG(steamInstallDir:isSteamBootstrapped:)  ← WinePrefix.ensureSteamCFG()
+///   • stripBootStrapperInhibit(steamInstallDir:) ← WinePrefix.stripBootStrapperInhibit()
 ///   • hasSteamLoginSession(configDir:)   ← WinePrefix.hasSteamLoginSession()
 ///   • steamLibraryFolders(...)           ← WinePrefix.steamLibraryFolders
 ///   • isGameInstalled(...)               ← WinePrefix.isGameInstalled()
@@ -218,13 +219,41 @@ final class WinePrefixTests: XCTestCase {
     }
 
     /// Mirrors WinePrefix.ensureSteamCFG
-    private func ensureSteamCFG(steamInstallDir: URL) throws {
+    ///
+    /// `isSteamBootstrapped` is passed as a parameter rather than being computed
+    /// from the file system so tests can control it explicitly.
+    private func ensureSteamCFG(steamInstallDir: URL, isSteamBootstrapped: Bool = false) throws {
         let fm = FileManager.default
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
+
+        var required = ["SteamNoSandbox=1"]
+        if isSteamBootstrapped {
+            required.append("BootStrapperInhibitAll=enable")
+        }
+
+        let desiredContent = required.joined(separator: "\n") + "\n"
+
         if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
-           existing.contains("SteamNoSandbox=1") { return }
+           existing == desiredContent {
+            return
+        }
+
         try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
-        try "SteamNoSandbox=1".write(to: cfgURL, atomically: true, encoding: .utf8)
+        try desiredContent.write(to: cfgURL, atomically: true, encoding: .utf8)
+    }
+
+    /// Mirrors WinePrefix.stripBootStrapperInhibit
+    private func stripBootStrapperInhibit(steamInstallDir: URL) {
+        let cfgURL = steamInstallDir.appending(path: "steam.cfg")
+        guard let content = try? String(contentsOf: cfgURL, encoding: .utf8),
+              content.contains("BootStrapperInhibitAll") else { return }
+        let cleaned = content
+            .components(separatedBy: .newlines)
+            .filter { !$0.contains("BootStrapperInhibitAll") }
+            .joined(separator: "\n")
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        let final = trimmed.isEmpty ? "" : trimmed + "\n"
+        try? final.write(to: cfgURL, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Temp directory setup
@@ -856,20 +885,110 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertEqual(occurrences, 1, "SteamNoSandbox=1 must appear exactly once after two ensureSteamCFG calls")
     }
 
-    /// Verifies that `ensureSteamCFG` does not overwrite a user-customised `steam.cfg`
-    /// that already contains `SteamNoSandbox=1`, preserving any additional settings.
-    func testEnsureSteamCFG_doesNotOverwriteExistingConfig() throws {
+    /// Verifies that `ensureSteamCFG` overwrites a steam.cfg that contains stale
+    /// extra settings, enforcing the exact desired content. This prevents stale
+    /// `BootStrapperInhibitAll` from persisting when steamui.dll is absent.
+    func testEnsureSteamCFG_overwritesStaleContent() throws {
         let (steam, _) = try makePrefix()
         let cfgURL = steam.appending(path: "steam.cfg")
 
-        let customConfig = "SteamNoSandbox=1\nSomeOtherSetting=2\n"
-        try customConfig.write(to: cfgURL, atomically: true, encoding: .utf8)
+        let staleConfig = "SteamNoSandbox=1\nBootStrapperInhibitAll=enable\n"
+        try staleConfig.write(to: cfgURL, atomically: true, encoding: .utf8)
 
-        try ensureSteamCFG(steamInstallDir: steam)
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: false)
 
         let afterContent = try String(contentsOf: cfgURL, encoding: .utf8)
-        XCTAssertEqual(afterContent, customConfig,
-                       "ensureSteamCFG must not modify steam.cfg when SteamNoSandbox=1 is already present")
+        XCTAssertEqual(afterContent, "SteamNoSandbox=1\n",
+                       "ensureSteamCFG must strip BootStrapperInhibitAll when bootstrap is not complete")
+    }
+
+    // MARK: - Bootstrap bootloop regression (BootStrapperInhibitAll)
+
+    /// Regression test: before bootstrap completes (steamui.dll absent), steam.cfg
+    /// must NOT contain `BootStrapperInhibitAll=enable`. If present, Steam suppresses
+    /// its self-update and steamui.dll is never downloaded — permanent bootloop.
+    func testEnsureSteamCFG_doesNotWriteBootStrapperInhibitBeforeBootstrap() throws {
+        let (steam, _) = try makePrefix()
+        // steam.exe exists (SteamSetup.exe already ran) but steamui.dll does not
+        try Data().write(to: steam.appending(path: "steam.exe"))
+
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: false)
+
+        let content = try String(contentsOf: steam.appending(path: "steam.cfg"), encoding: .utf8)
+        XCTAssertTrue(content.contains("SteamNoSandbox=1"),
+                      "steam.cfg must always contain SteamNoSandbox=1")
+        XCTAssertFalse(content.contains("BootStrapperInhibitAll"),
+                       "steam.cfg must NOT contain BootStrapperInhibitAll before steamui.dll exists")
+    }
+
+    /// After bootstrap completes (steamui.dll present), steam.cfg should include
+    /// `BootStrapperInhibitAll=enable` to skip redundant update checks.
+    func testEnsureSteamCFG_writesBootStrapperInhibitAfterBootstrap() throws {
+        let (steam, _) = try makePrefix()
+        try Data().write(to: steam.appending(path: "steam.exe"))
+        try Data().write(to: steam.appending(path: "steamui.dll"))
+
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: true)
+
+        let content = try String(contentsOf: steam.appending(path: "steam.cfg"), encoding: .utf8)
+        XCTAssertTrue(content.contains("SteamNoSandbox=1"))
+        XCTAssertTrue(content.contains("BootStrapperInhibitAll=enable"),
+                      "steam.cfg must contain BootStrapperInhibitAll after bootstrap")
+    }
+
+    /// If steamui.dll is deleted (prefix reset, engine upgrade), re-running
+    /// ensureSteamCFG must strip `BootStrapperInhibitAll` so the next bootstrap
+    /// can proceed. Also verifies stripBootStrapperInhibit as a standalone call.
+    func testEnsureSteamCFG_removesStaleBootStrapperInhibit() throws {
+        let (steam, _) = try makePrefix()
+        let cfgURL = steam.appending(path: "steam.cfg")
+
+        // Simulate a previously-bootstrapped state
+        let bootstrappedCfg = "SteamNoSandbox=1\nBootStrapperInhibitAll=enable\n"
+        try bootstrappedCfg.write(to: cfgURL, atomically: true, encoding: .utf8)
+
+        // Now steamui.dll is gone (prefix was reset)
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: false)
+
+        let content = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertTrue(content.contains("SteamNoSandbox=1"))
+        XCTAssertFalse(content.contains("BootStrapperInhibitAll"),
+                       "Stale BootStrapperInhibitAll must be removed when steamui.dll is absent")
+
+        // Also verify the standalone strip function
+        let staleAgain = "SteamNoSandbox=1\nBootStrapperInhibitAll=enable\n"
+        try staleAgain.write(to: cfgURL, atomically: true, encoding: .utf8)
+        stripBootStrapperInhibit(steamInstallDir: steam)
+
+        let afterStrip = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertTrue(afterStrip.contains("SteamNoSandbox=1"))
+        XCTAssertFalse(afterStrip.contains("BootStrapperInhibitAll"),
+                       "stripBootStrapperInhibit must remove the flag")
+    }
+
+    /// Verifies the strip-then-restore round-trip used by SteamCMDService:
+    /// 1. ensureSteamCFG writes BootStrapperInhibitAll (bootstrapped state)
+    /// 2. stripBootStrapperInhibit removes it (before SteamCMD launch)
+    /// 3. ensureSteamCFG restores it (after SteamCMD exit)
+    func testBootStrapperInhibit_stripAndRestoreRoundTrip() throws {
+        let (steam, _) = try makePrefix()
+        let cfgURL = steam.appending(path: "steam.cfg")
+
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: true)
+        let initial = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertTrue(initial.contains("BootStrapperInhibitAll=enable"),
+                      "Initial state must have BootStrapperInhibitAll")
+
+        stripBootStrapperInhibit(steamInstallDir: steam)
+        let stripped = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertTrue(stripped.contains("SteamNoSandbox=1"))
+        XCTAssertFalse(stripped.contains("BootStrapperInhibitAll"),
+                       "After strip, BootStrapperInhibitAll must be absent")
+
+        try ensureSteamCFG(steamInstallDir: steam, isSteamBootstrapped: true)
+        let restored = try String(contentsOf: cfgURL, encoding: .utf8)
+        XCTAssertEqual(restored, initial,
+                       "After restore, steam.cfg must match the initial bootstrapped state")
     }
 
     /// Regression test: verifies that the webhelper-crash-caused install failure
@@ -1427,19 +1546,22 @@ final class WinePrefixTests: XCTestCase {
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         let dest = configDir.appending(path: "config.vdf")
 
-        let jwtEntry     = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
-        let accountEntry = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+        let jwtEntry         = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
+        let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
+        let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
 
         if let existing = try? String(contentsOf: dest, encoding: .utf8),
            existing.contains("\"Steam\"") {
             var updated = upsertVDFKeyInSection(in: existing, sectionKey: "\"ConnectCache\"",
                                                 newKeyLine: jwtEntry, matchPrefix: "\"\(steamID)\"")
+            updated = upsertVDFKeyInSection(in: updated, sectionKey: "\"ConnectCache\"",
+                                            newKeyLine: usernameJwtEntry, matchPrefix: "\"\(accountName)\"")
             updated = upsertVDFKeyInSection(in: updated, sectionKey: "\"Accounts\"",
                                             newKeyLine: accountEntry, matchPrefix: "\"\(accountName)\"")
             try updated.write(to: dest, atomically: true, encoding: .utf8)
             return
         }
-        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\t\t\t\t}"
+        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
         let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
         let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
@@ -1531,6 +1653,28 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertTrue(content.contains(token))
         XCTAssertTrue(content.contains("\"76561198000000000\""))
         XCTAssertTrue(content.contains("\"testuser\""))
+    }
+
+    /// SteamCMD `+login USERNAME` reads ConnectCache by account name, not SteamID.
+    /// Without a username-keyed entry, SteamCMD falls through to password login,
+    /// triggering a second Steam Guard notification.
+    func testWriteConnectCache_writesUsernameKeyInConnectCache() throws {
+        let configDir = tempDir.appending(path: "username_key_test/config")
+        let token = "eyJ_username_key_test_token"
+        try writeConnectCache(configDir: configDir, steamID: "76561198000000000", refreshToken: token, accountName: "testuser")
+
+        let content = try String(contentsOf: configDir.appending(path: "config.vdf"), encoding: .utf8)
+
+        // Both keys must be present under ConnectCache
+        let lines = content.components(separatedBy: .newlines)
+        let connectCacheLines = lines.filter { $0.contains(token) }
+        XCTAssertEqual(connectCacheLines.count, 2,
+                       "ConnectCache must contain both SteamID and username keys with the refresh token")
+
+        XCTAssertTrue(connectCacheLines.contains(where: { $0.contains("\"76561198000000000\"") }),
+                      "ConnectCache must have a SteamID-keyed entry for steam.exe")
+        XCTAssertTrue(connectCacheLines.contains(where: { $0.contains("\"testuser\"") && !$0.contains("SteamID") }),
+                      "ConnectCache must have a username-keyed entry for SteamCMD")
     }
 
     func testWriteConnectCache_mergesIntoExistingSteamCMDConfigVDF() throws {
@@ -1647,11 +1791,11 @@ final class WinePrefixTests: XCTestCase {
 
         let updated = try String(contentsOf: dest, encoding: .utf8)
 
-        // Structural invariant: the account name must appear exactly once.
-        // A doubled block produces two occurrences.
+        // The account name appears in two places: ConnectCache (username JWT key)
+        // and Accounts (block key). A doubled Accounts block would produce 3+.
         let accountNameCount = updated.components(separatedBy: "\"testuser\"").count - 1
-        XCTAssertEqual(accountNameCount, 1,
-                       "Account name must appear exactly once — doubled block means upsert left old { } in place")
+        XCTAssertEqual(accountNameCount, 2,
+                       "Account name must appear exactly twice (ConnectCache key + Accounts block key)")
 
         // The closing-brace count must match the opening-brace count.
         let openCount  = updated.filter { $0 == "{" }.count
@@ -1686,9 +1830,9 @@ final class WinePrefixTests: XCTestCase {
                               refreshToken: token, accountName: "user1")
 
         let content = try String(contentsOf: configDir.appending(path: "config.vdf"), encoding: .utf8)
-        // Token should appear exactly once (not duplicated).
+        // Token appears twice: once under SteamID key, once under username key.
         let occurrences = content.components(separatedBy: token).count - 1
-        XCTAssertEqual(occurrences, 1, "Token must not be duplicated on repeated writeConnectCache calls")
+        XCTAssertEqual(occurrences, 2, "Token must appear exactly twice (SteamID key + username key) — not more on repeated calls")
     }
 
     func testWriteLoginUsers_thenHasSteamLoginSession_roundTrip() throws {

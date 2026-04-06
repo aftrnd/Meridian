@@ -29,6 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
+        if let w = mainWindow {
+            setTrafficLights(hidden: true, in: w)
+        }
+
         DispatchQueue.main.async { [weak self] in
             self?.enforceMainWindowLaunchFrame()
         }
