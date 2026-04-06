@@ -280,6 +280,9 @@ final class BootstrapManager {
             // Record the engine tag used to create this prefix so we can detect
             // future engine upgrades that require a DLL symlink refresh.
             settings.lastPrefixEngineTag = engine.engineVersion ?? ""
+
+            // Register WinRT class mappings that Wine's wineboot doesn't create.
+            await prefix.registerWinRTClasses(engine: engine)
         }
 
         guard !Task.isCancelled else { return }
@@ -303,6 +306,7 @@ final class BootstrapManager {
                 try await prefix.resetToEngineTemplate(engine: engine)
                 settings.lastPrefixEngineTag = currentTag
                 log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
+                await prefix.registerWinRTClasses(engine: engine)
             } catch {
                 log.error("[bootstrap] prefix reset failed (non-fatal): \(error.localizedDescription) — continuing with existing prefix")
             }
@@ -347,6 +351,15 @@ final class BootstrapManager {
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
         log.info("[bootstrap] steam.cfg and libraryfolders.vdf pre-written before bootstrap")
+
+        // Ensure WinRT class registrations are up to date.
+        // Only runs when the stored version is behind the current version — avoids
+        // spawning a Wine process on every launch for an already-configured prefix.
+        if settings.winRTRegistrationAppliedVersion < WinePrefix.winRTRegistrationVersion {
+            log.info("[bootstrap] WinRT registration version \(settings.winRTRegistrationAppliedVersion) < \(WinePrefix.winRTRegistrationVersion) — re-registering")
+            await prefix.registerWinRTClasses(engine: engine)
+            settings.winRTRegistrationAppliedVersion = WinePrefix.winRTRegistrationVersion
+        }
 
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
@@ -463,6 +476,14 @@ final class BootstrapManager {
                 }
             }
             log.info("[bootstrap] SteamCMD warm-up complete ✓")
+
+            // Kill any lingering Wine processes from the SteamCMD PTY session.
+            // The `script -q /dev/null` wrapper leaves the wine64/wineserver alive
+            // after steamcmd.exe exits, causing an orphaned Wine CMD window to
+            // appear in the library. Killing here is safe — warmUp is the last
+            // Wine operation before bootstrap completes.
+            steamManager.killAll(engine: engine, prefix: prefix)
+            try? await Task.sleep(for: .seconds(1))
         } else {
             log.info("[bootstrap] skipping SteamCMD setup (username=\(steamCMDUsername.isEmpty ? "empty" : "set"), steamcmd=\(FileManager.default.fileExists(atPath: steamcmdPath)))")
         }

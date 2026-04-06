@@ -2160,11 +2160,17 @@ final class WinePrefixTests: XCTestCase {
 
     // MARK: - gameRequiresSteamAPI / writeSteamAppID
 
-    /// Mirror of WinePrefix.gameRequiresSteamAPI — checks for steam_api64.dll or steam_api.dll
+    /// Mirror of WinePrefix.gameRequiresSteamAPI — recursively searches for steam_api64.dll or steam_api.dll
     private func gameRequiresSteamAPI(gameDir: URL) -> Bool {
         let fm = FileManager.default
-        return fm.fileExists(atPath: gameDir.appending(path: "steam_api64.dll").path(percentEncoded: false))
-            || fm.fileExists(atPath: gameDir.appending(path: "steam_api.dll").path(percentEncoded: false))
+        guard let enumerator = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) else { return false }
+        while let file = enumerator.nextObject() as? String {
+            let lower = (file as NSString).lastPathComponent.lowercased()
+            if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                return true
+            }
+        }
+        return false
     }
 
     func testGameRequiresSteamAPI_trueWhenSteamApi64Present() throws {
@@ -2184,6 +2190,21 @@ final class WinePrefixTests: XCTestCase {
         try "".write(to: gameDir.appending(path: "steam_api.dll"), atomically: true, encoding: .utf8)
 
         XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir))
+    }
+
+    /// Regression test: Unity games (e.g. PEAK) place steam_api64.dll in
+    /// GameName_Data/Plugins/x86_64/ — not the root. Root-only detection
+    /// returned false and caused the game to exit after ~6 seconds.
+    func testGameRequiresSteamAPI_trueWhenDLLInSubdirectory() throws {
+        let fm = FileManager.default
+        let gameDir = tempDir.appending(path: "PEAK")
+        let pluginsDir = gameDir.appending(path: "PEAK_Data/Plugins/x86_64")
+        try fm.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
+        try "".write(to: gameDir.appending(path: "PEAK.exe"), atomically: true, encoding: .utf8)
+        try "".write(to: pluginsDir.appending(path: "steam_api64.dll"), atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir),
+                      "Must detect steam_api64.dll in subdirectory (Unity Plugins path)")
     }
 
     func testGameRequiresSteamAPI_falseWhenNoDRM() throws {

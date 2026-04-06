@@ -431,6 +431,7 @@ final class GameLauncher {
         // is available. The SteamWindowSuppressor hides Steam's windows. After the
         // game exits we kill the Steam process we started.
         let needsSteamForDRM = prefix.gameRequiresSteamAPI(appID: game.id)
+            && !(GameCompatibilityDB.shared.profile(for: game.id)?.skipSteamDRM ?? false)
         if needsSteamForDRM {
             log.info("[launch] Steam DRM detected (steam_api64.dll present) — starting Steam IPC host")
             appendLog("Initialising Steam…")
@@ -450,9 +451,11 @@ final class GameLauncher {
             }
 
             // Give the Steam IPC socket time to initialise before the game exe
-            // tries to connect. 3 seconds is conservative; in practice ~1s suffices.
+            // tries to connect. Under Wine, steam.exe needs 5-15 seconds to start,
+            // authenticate via ConnectCache, and open the IPC named pipe.
+            // 8 seconds is a conservative minimum.
             appendLog("Starting game…")
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: .seconds(8))
         }
 
         // Pause window suppression BEFORE launching the game exe.

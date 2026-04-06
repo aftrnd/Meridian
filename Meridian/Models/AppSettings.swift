@@ -142,6 +142,17 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "lastPrefixEngineTag") }
     }
 
+    /// Tracks which WinRT registration batch has been applied to the current prefix.
+    ///
+    /// Increment `WinePrefix.winRTRegistrationVersion` whenever new WinRT entries are
+    /// added to `registerWinRTClasses()`. Bootstrap compares this stored value against
+    /// the current version and only re-runs registration when behind. This avoids
+    /// spawning a Wine process on every launch for an already-configured prefix.
+    var winRTRegistrationAppliedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "winRTRegistrationAppliedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "winRTRegistrationAppliedVersion") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

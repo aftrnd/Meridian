@@ -485,6 +485,25 @@ rm -rf "${PREFIX_TEMPLATE}"
 echo "${TAG}" > "${STAGING}/wine/meridian-engine-version.txt"
 info "Embedded engine version: ${TAG}"
 
+# ---------- custom WinRT stubs ----------
+#
+# Wine's coremessaging.dll only implements DispatcherQueueController but not
+# DispatcherQueue itself. Unity 6.3+ needs DispatcherQueue::GetForCurrentThread()
+# or it crashes immediately after D3D11 initialization.
+# Build and replace coremessaging.dll with our extended stub.
+
+yellow "Building custom coremessaging.dll (DispatcherQueue stub)..."
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    COREMSG_OUT="${STAGING}/wine/lib/wine/x86_64-windows/coremessaging.dll"
+    bash "$(dirname "${BASH_SOURCE[0]}")/build-coremessaging.sh" "${COREMSG_OUT}" \
+        || yellow "Warning: coremessaging.dll build failed — using Wine's built-in (Unity 6.3+ games will not work)"
+    info "coremessaging.dll: custom stub installed ✓"
+else
+    yellow "Warning: x86_64-w64-mingw32-gcc not found — skipping coremessaging stub build"
+    yellow "  Install: brew install mingw-w64"
+    yellow "  Unity 6.3+ games (Unity 6000.3+) will fail with CLASS_E_CLASSNOTAVAILABLE for Windows.System.DispatcherQueue"
+fi
+
 # ---------- validate ----------
 
 yellow "Validating staged engine..."

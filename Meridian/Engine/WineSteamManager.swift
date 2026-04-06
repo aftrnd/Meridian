@@ -764,7 +764,6 @@ final class WineSteamManager {
 
         let process = Process()
         process.executableURL = engine.wine64URL
-        process.arguments = [exeFullPath]
         process.currentDirectoryURL = gamePath
 
         var env = engine.environment(for: prefix)
@@ -812,6 +811,13 @@ final class WineSteamManager {
         log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
         if !gameExtraEnv.isEmpty {
             log.info("[launchGameDirectly] game extraEnv: \(gameExtraEnv)")
+        }
+
+        // Build process arguments: exe + any per-game launch args from the compatibility DB
+        let gameLaunchArgs = compat.profile(for: appID)?.launchArgs ?? []
+        process.arguments = [exeFullPath] + gameLaunchArgs
+        if !gameLaunchArgs.isEmpty {
+            log.info("[launchGameDirectly] launchArgs: \(gameLaunchArgs.joined(separator: " "))")
         }
 
         let stderrPipe = Pipe()

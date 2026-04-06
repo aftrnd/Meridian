@@ -59,6 +59,17 @@ struct GameProfile {
     /// Extra environment variables specific to this game.
     let extraEnv: [String: String]
 
+    /// Command-line arguments appended to the game executable when launching.
+    /// Use for engine-level flags like `-force-d3d11` (Unity) that change
+    /// rendering path without needing DLL overrides.
+    let launchArgs: [String]
+
+    /// When true, skip launching steam.exe for DRM even if steam_api64.dll is
+    /// detected in the game directory. Use for games that have the DLL bundled
+    /// but handle SteamAPI_Init() failure gracefully without needing a live
+    /// Steam IPC socket. Verified by running the game directly without steam.exe.
+    let skipSteamDRM: Bool
+
     /// Engine tag when this profile was last verified (e.g. "v1.0.11-engine").
     let verifiedWith: String?
 
@@ -74,6 +85,8 @@ struct GameProfile {
         dllOverrides: String? = nil,
         dxmtMode: DXMTMode = .auto,
         extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
         verifiedWith: String? = nil,
         notes: String = ""
     ) {
@@ -85,6 +98,8 @@ struct GameProfile {
         self.dllOverrides = dllOverrides
         self.dxmtMode = dxmtMode
         self.extraEnv = extraEnv
+        self.launchArgs = launchArgs
+        self.skipSteamDRM = skipSteamDRM
         self.verifiedWith = verifiedWith
         self.notes = notes
     }
@@ -101,6 +116,8 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -109,12 +126,12 @@ struct GameProfile {
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
+            extraEnv: extraEnv, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            verifiedWith: verifiedWith, notes: notes
         )
     }
 
-    /// Unreal Engine game preset.
-    /// Defaults: graphicsAPI=.dx11. All params overridable per-game.
     static func unreal(
         appID: Int,
         name: String,
@@ -123,6 +140,8 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -131,11 +150,12 @@ struct GameProfile {
             gameEngine: .unreal, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
+            extraEnv: extraEnv, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            verifiedWith: verifiedWith, notes: notes
         )
     }
 
-    /// Custom/unknown engine game preset.
     static func custom(
         appID: Int,
         name: String,
@@ -144,6 +164,8 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -152,7 +174,9 @@ struct GameProfile {
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, verifiedWith: verifiedWith, notes: notes
+            extraEnv: extraEnv, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            verifiedWith: verifiedWith, notes: notes
         )
     }
 }

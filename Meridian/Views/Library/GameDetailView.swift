@@ -1002,7 +1002,7 @@ private struct StatusCard: View {
         case .bootstrappingSteam:
             return "Updating Steam — first launch takes a few minutes"
         case .awaitingInstallConfirmation:
-            return launcher.currentActivity ?? "Preparing download…"
+            return "Downloading…"
         case .launching:
             if let last = launcher.logs.last, !last.isEmpty {
                 return last
@@ -1126,30 +1126,56 @@ private struct AchievementIcon: View {
 // MARK: - Compat Badge (banner overlay)
 
 /// Single-icon compatibility indicator shown in the hero banner.
-/// Color encodes status; `.help()` tooltip explains it on hover.
+/// Four visual states using seal icons:
+///   - Green checkmark.seal.fill → verified or playable (tested, runs well)
+///   - Yellow exclamationmark.triangle.fill → launches with known issues
+///   - Red xmark.seal.fill → confirmed broken
+///   - Gray questionmark.seal → untested / unknown
+/// Tapping shows a popover with details.
 private struct BannerCompatBadge: View {
     let status: CompatStatus
+    @State private var showingPopover = false
 
     private var icon: String {
-        status == .verified ? "checkmark.seal.fill" : "xmark.seal.fill"
+        switch status {
+        case .verified, .playable: return "checkmark.seal.fill"
+        case .launches:            return "exclamationmark.triangle.fill"
+        case .broken:              return "xmark.seal.fill"
+        case .untested:            return "questionmark.seal"
+        }
     }
 
     private var color: Color {
-        status == .verified ? .green : Color(white: 0.70)
+        switch status {
+        case .verified, .playable: return .green
+        case .launches:            return .yellow
+        case .broken:              return .red
+        case .untested:            return Color(white: 0.55)
+        }
     }
 
-    private var tooltip: String {
+    private var statusTitle: String {
+        switch status {
+        case .verified: return "Meridian Verified"
+        case .playable:  return "Playable"
+        case .launches:  return "Launches with Issues"
+        case .broken:    return "Not Compatible"
+        case .untested:  return "Not Yet Tested"
+        }
+    }
+
+    private var statusDetail: String {
         switch status {
         case .verified:
-            return "Meridian Verified — this game has been tested and runs well on your Mac."
+            return "This game has been tested and runs well on your Mac with Meridian."
         case .playable:
-            return "Playable — this game runs with minor issues. Expect a good experience."
+            return "This game runs with minor issues. Expect a generally good experience."
         case .launches:
-            return "Launches — this game starts but may have significant issues during play."
+            return "This game starts but may have significant issues during play."
         case .broken:
-            return "Broken — this game currently crashes or fails to run under Meridian."
+            return "This game currently does not work with Meridian."
         case .untested:
-            return "Untested — this game has not yet been verified with Meridian."
+            return "This game has not yet been tested with Meridian. It may or may not work."
         }
     }
 
@@ -1158,7 +1184,24 @@ private struct BannerCompatBadge: View {
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(color)
             .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
-            .help(tooltip)
+            .onTapGesture { showingPopover.toggle() }
+            .popover(isPresented: $showingPopover, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: icon)
+                            .foregroundStyle(color)
+                        Text(statusTitle)
+                            .font(.headline)
+                    }
+                    Text(statusDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(14)
+                .frame(width: 220)
+            }
+            .contentShape(Rectangle())
     }
 }
 

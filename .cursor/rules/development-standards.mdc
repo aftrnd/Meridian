@@ -139,3 +139,91 @@ SteamCMD requires an interactive first login (password + Steam Guard). After tha
 ### platform_type in SteamCredentialAuth
 
 `BeginAuthSessionViaCredentials` MUST use `platform_type: "1"` (SteamClient), NOT `"2"` (WebBrowser). Using `"2"` produces a JWT with `aud: ["web"]` — the Steam desktop client silently discards this for ConnectCache auto-login. The regression test `testPlatformType_isSteamClient` guards this.
+
+## One-Time Prefix Setup Pattern
+
+Some prefix changes must run **once** (e.g. adding a registry key, migrating a config file) but do NOT need to run on every launch. The established pattern uses a versioned AppSettings key:
+
+```swift
+// In AppSettings.swift — persisted in UserDefaults
+var winRTRegistrationAppliedVersion: Int {
+    get { UserDefaults.standard.integer(forKey: "winRTRegistrationAppliedVersion") }
+    set { UserDefaults.standard.set(newValue, forKey: "winRTRegistrationAppliedVersion") }
+}
+
+// In WinePrefix.swift — bump this when new entries are added
+static let winRTRegistrationVersion = 1
+```
+
+```swift
+// In BootstrapManager — runs the work only when behind
+if settings.winRTRegistrationAppliedVersion < WinePrefix.winRTRegistrationVersion {
+    await prefix.registerWinRTClasses(engine: engine)
+    settings.winRTRegistrationAppliedVersion = WinePrefix.winRTRegistrationVersion
+}
+```
+
+**Rules:**
+- Bump the static `version` constant whenever new entries are added to the setup function
+- The stored version starts at `0` (UserDefaults default), so version `1` runs once for ALL existing prefixes on next launch
+- The setup function must be idempotent (`reg add /f`, file writes with atomic replace, etc.)
+- Never call setup functions unconditionally on every launch — spawning a Wine process on every app start adds unnecessary latency
+- This pattern mirrors how `lastPrefixEngineTag` guards engine upgrades
+
+**Current version-tracked setup:**
+| Version | Function | What it does |
+|---------|----------|--------------|
+| 1 | `WinePrefix.registerWinRTClasses` | Adds `Windows.System.DispatcherQueue → coremessaging.dll` registry entry |
+| 2 | `WinePrefix.registerWinRTClasses` | Copies custom coremessaging.dll stub into prefix system32 (DLL was present but prefix had stale original copy) |
+
+## Custom Stub DLLs for Missing Wine Implementations
+
+When Wine lacks a WinRT or Windows API implementation needed by a game, a custom stub DLL can be cross-compiled with mingw-w64 (already installed via Homebrew) and dropped into the engine's `wine/lib/wine/x86_64-windows/`. This is the same mechanism DXMT and DXVK use.
+
+**Pattern:**
+1. Identify the missing class from game logs: `err:combase:RoGetActivationFactory Class "X" not found in Y.dll`
+2. Write a C stub in `Scripts/<dllname>/<dllname>_stub.c`
+3. Write a build script `Scripts/build-<dllname>.sh` using `x86_64-w64-mingw32-gcc -shared`
+4. Integrate into `release-engine.sh` to rebuild with each engine release
+5. Drop into `wine/lib/wine/x86_64-windows/<dllname>.dll`
+
+**Example:** `Scripts/coremessaging/coremessaging_stub.c` adds `IDispatcherQueueStatics::GetForCurrentThread()` that Wine's built-in coremessaging.dll doesn't implement. Required by Unity 6.3+ games (`GetForCurrentThread()` must return S_OK + non-NULL queue or Unity crashes).
+
+**Key principles for stubs:**
+- Implement the minimum vtable: QueryInterface/AddRef/Release/GetIids/GetRuntimeClassName/GetTrustLevel for COM, then the specific methods
+- `TryEnqueue`-style work dispatch methods should return `S_OK, *result=TRUE` — games check whether work was accepted, not whether it actually ran
+- Static singleton objects (no heap allocation) for factories
+- Heap-allocated objects only when AddRef/Release must track lifetime (controllers etc.)
+- Always export `DllGetActivationFactory` handling ALL classes in that DLL's namespace
+- Build validation: `x86_64-w64-mingw32-objdump -p output.dll | grep export` to verify symbols
+
+## Per-Game Environment Overrides
+
+Global engine environment variables (like `WINEDLLOVERRIDES=d3d12,d3d12core=n` for VKD3D-proton) can conflict with per-game launch configurations. Use `GameProfile.extraEnv` to override environment on a per-game basis.
+
+**Critical pattern: clearing WINEDLLOVERRIDES for -force-d3d11 games**
+
+When a Unity game uses `-force-d3d11` to bypass DX12, the global VKD3D-proton override forces Wine to load vkd3d-proton's `d3d12.dll` anyway. Unity still probes D3D12 capabilities, causing a delay-load crash.
+
+```swift
+.unity(
+    appID: 3180070,
+    extraEnv: ["WINEDLLOVERRIDES": ""],  // Clear VKD3D-proton override
+    launchArgs: ["-force-d3d11"],
+    ...
+)
+```
+
+**Debugging tip:** If a game works from terminal but not from Meridian, compare the environments — `WINEDLLOVERRIDES` and `WINEDLLPATH` are the most likely culprits.
+
+## Game Compatibility Badge System
+
+Four visual states for the hero banner badge:
+
+| Status | Icon | Color | Meaning |
+|--------|------|-------|---------|
+| `.verified` / `.playable` | `checkmark.seal.fill` | Green | Tested, runs well |
+| `.launches` | `exclamationmark.triangle.fill` | Yellow | Starts, has known issues |
+| `.broken` | `xmark.seal.fill` | Red | Confirmed does not work |
+| `.untested` | `questionmark.seal` | Gray | Not yet tested |
+

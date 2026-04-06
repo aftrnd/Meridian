@@ -946,8 +946,9 @@ struct WinePrefix: Sendable {
     /// game initialises silently and exits within a few seconds. The fix is
     /// to start `steam.exe -silent` before launching these games.
     ///
-    /// Checks only the top-level game directory — subdirectory copies of the
-    /// DLL (e.g. in redistributable packages) are intentionally ignored.
+    /// Searches recursively through the game directory so it correctly handles
+    /// Unity games (DLL in GameName_Data/Plugins/x86_64/), Unreal games
+    /// (DLL in Engine/Binaries/ThirdParty/Steamworks/), and any other layout.
     func gameRequiresSteamAPI(appID: Int) -> Bool {
         guard let installDirName = gameInstallDir(appID: appID) else { return false }
         let fm = FileManager.default
@@ -955,25 +956,30 @@ struct WinePrefix: Sendable {
             let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
             let gameDirPath = gameDir.path(percentEncoded: false)
             guard fm.fileExists(atPath: gameDirPath) else { continue }
-            let steamAPI64 = gameDir.appending(path: "steam_api64.dll").path(percentEncoded: false)
-            let steamAPI32 = gameDir.appending(path: "steam_api.dll").path(percentEncoded: false)
-            let result = fm.fileExists(atPath: steamAPI64) || fm.fileExists(atPath: steamAPI32)
-            log.debug("[gameRequiresSteamAPI] appID=\(appID) → \(result)")
-            return result
+            guard let enumerator = fm.enumerator(atPath: gameDirPath) else { continue }
+            while let file = enumerator.nextObject() as? String {
+                let lower = (file as NSString).lastPathComponent.lowercased()
+                if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                    log.debug("[gameRequiresSteamAPI] appID=\(appID) → true (found \(file))")
+                    return true
+                }
+            }
+            log.debug("[gameRequiresSteamAPI] appID=\(appID) → false")
+            return false
         }
         log.debug("[gameRequiresSteamAPI] appID=\(appID) → false (game dir not found)")
         return false
     }
 
-    /// Writes `steam_appid.txt` into the game's install directory.
+    /// Writes `steam_appid.txt` into the game's install directory and, if
+    /// `steam_api64.dll` is in a subdirectory (e.g. Unity's
+    /// `GameName_Data/Plugins/x86_64/`), also into that subdirectory.
     ///
     /// `steam_api64.dll` reads this file at startup to determine the application
-    /// ID when it cannot retrieve it from the Steam client shortcut. Writing it
-    /// before launch allows the DLL to complete its initialisation even before
-    /// the Steam client IPC socket is fully ready.
+    /// ID when it cannot retrieve it from the Steam client shortcut. Unity games
+    /// load it relative to the DLL, not the exe, so both locations are needed.
     ///
-    /// The file contains just the numeric appID (no newline required). Safe to
-    /// call repeatedly — the file is overwritten each time.
+    /// Safe to call repeatedly — the file is overwritten each time.
     func writeSteamAppID(_ appID: Int) {
         guard let installDirName = gameInstallDir(appID: appID) else {
             log.warning("[writeSteamAppID] cannot find install dir for appID=\(appID)")
@@ -983,16 +989,107 @@ struct WinePrefix: Sendable {
         for library in steamLibraryFolders {
             let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
             guard fm.fileExists(atPath: gameDir.path(percentEncoded: false)) else { continue }
-            let file = gameDir.appending(path: "steam_appid.txt")
+
+            // Always write to the root install directory (for most games + exe lookup)
+            let rootFile = gameDir.appending(path: "steam_appid.txt")
             do {
-                try "\(appID)".write(to: file, atomically: true, encoding: .utf8)
+                try "\(appID)".write(to: rootFile, atomically: true, encoding: .utf8)
                 log.info("[writeSteamAppID] wrote steam_appid.txt (\(appID)) to \(gameDir.lastPathComponent)")
             } catch {
-                log.warning("[writeSteamAppID] failed: \(error.localizedDescription)")
+                log.warning("[writeSteamAppID] failed writing to root: \(error.localizedDescription)")
+            }
+
+            // Also write alongside steam_api64.dll if it lives in a subdirectory
+            if let enumerator = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) {
+                while let file = enumerator.nextObject() as? String {
+                    let lower = (file as NSString).lastPathComponent.lowercased()
+                    if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                        let dllDir = gameDir.appending(path: (file as NSString).deletingLastPathComponent)
+                        let dllDirPath = dllDir.path(percentEncoded: false)
+                        if dllDirPath != gameDir.path(percentEncoded: false) {
+                            let sideFile = dllDir.appending(path: "steam_appid.txt")
+                            do {
+                                try "\(appID)".write(to: sideFile, atomically: true, encoding: .utf8)
+                                log.info("[writeSteamAppID] wrote steam_appid.txt (\(appID)) alongside DLL at \(file)")
+                            } catch {
+                                log.warning("[writeSteamAppID] failed writing beside DLL: \(error.localizedDescription)")
+                            }
+                        }
+                        break
+                    }
+                }
             }
             return
         }
         log.warning("[writeSteamAppID] game dir not found for appID=\(appID)")
+    }
+
+    // MARK: - WinRT Registration
+
+    /// Increment this when new entries are added to `registerWinRTClasses()`.
+    /// BootstrapManager compares `AppSettings.winRTRegistrationAppliedVersion`
+    /// against this value and only re-runs registration when the prefix is behind.
+    static let winRTRegistrationVersion = 2
+
+    /// Registers WinRT ActivatableClassId entries that Wine's wineboot does not
+    /// create by default, mapping class names to their implementing DLLs.
+    ///
+    /// Without these entries, `combase!RoGetActivationFactory` returns
+    /// "Failed to find library" even when the DLL (e.g. coremessaging.dll) is
+    /// present and exports `DllGetActivationFactory`. Wine resolves class names
+    /// by looking up `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\<Class>`
+    /// and reading the `DllPath` value.
+    ///
+    /// This is idempotent — `reg add /f` overwrites any existing value.
+    func registerWinRTClasses(engine: WineEngine) async {
+        // Step 1: Copy custom stub DLLs into the prefix system32.
+        //
+        // Prefix system32 has real file copies (not symlinks) of Wine DLLs
+        // written during prefix creation. The custom stubs in the engine's
+        // wine/lib/wine/x86_64-windows/ are NOT automatically propagated into
+        // the prefix — we must copy them explicitly.
+        let dllsToInstall: [(URL, String)] = [
+            // Our extended coremessaging.dll with IDispatcherQueueStatics support
+            (WineEngine.engineDir.appending(path: "wine/lib/wine/x86_64-windows/coremessaging.dll"),
+             "coremessaging.dll"),
+        ]
+        let system32 = path.appending(path: "drive_c/windows/system32")
+        for (src, dllName) in dllsToInstall {
+            let dest = system32.appending(path: dllName)
+            if FileManager.default.fileExists(atPath: src.path(percentEncoded: false)) {
+                do {
+                    if FileManager.default.fileExists(atPath: dest.path(percentEncoded: false)) {
+                        try FileManager.default.removeItem(at: dest)
+                    }
+                    try FileManager.default.copyItem(at: src, to: dest)
+                    log.info("[registerWinRTClasses] installed \(dllName) into prefix system32")
+                } catch {
+                    log.warning("[registerWinRTClasses] failed to install \(dllName): \(error.localizedDescription)")
+                }
+            } else {
+                log.warning("[registerWinRTClasses] engine stub not found: \(src.lastPathComponent) — skipping")
+            }
+        }
+
+        // Step 2: Register ActivatableClassId entries.
+        // Class name -> system32 DLL path
+        let entries: [(String, String)] = [
+            // Unity 6.3+ (and any WinRT app) calls RoGetActivationFactory with
+            // "Windows.System.DispatcherQueue". Our extended coremessaging.dll
+            // handles this class; Wine's shipped version does not.
+            ("Windows.System.DispatcherQueue",
+             "C:\\windows\\system32\\coremessaging.dll"),
+        ]
+        for (className, dllPath) in entries {
+            let key = "HKLM\\SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId\\\(className)"
+            log.info("[registerWinRTClasses] registering \(className)")
+            try? await engine.run(
+                args: ["reg", "add", key,
+                       "/v", "DllPath", "/t", "REG_SZ", "/d", dllPath, "/f"],
+                prefix: self
+            )
+        }
+        log.info("[registerWinRTClasses] WinRT class registration complete ✓")
     }
 
     // MARK: - VDF / Path Helpers

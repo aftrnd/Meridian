@@ -313,6 +313,7 @@ final class SteamCMDService {
         let deadline = ContinuousClock.now + .seconds(7200) // 2h max
         var succeeded = false
         var lastError: String? = nil
+        var successDetectedAt: ContinuousClock.Instant? = nil  // for post-success hang detection
 
         while ContinuousClock.now < deadline {
             guard process.isRunning else {
@@ -343,7 +344,10 @@ final class SteamCMDService {
                 guard !clean.isEmpty else { continue }
                 log.info("[installGame:out] \(clean)")
 
-                if clean.contains("Success! App") { succeeded = true }
+                if clean.contains("Success! App") {
+                    succeeded = true
+                    successDetectedAt = ContinuousClock.now
+                }
                 if clean.hasPrefix("ERROR!") || clean.contains("Login Failure") {
                     lastError = clean
                 }
@@ -351,6 +355,16 @@ final class SteamCMDService {
                 if Self.shouldShowLine(clean) {
                     await MainActor.run { onProgress(clean) }
                 }
+            }
+
+            // Post-success hang detection: Wine sometimes triggers an assertion
+            // failure in "Unloading Steam API..." after SteamCMD succeeds, causing
+            // the process to hang indefinitely. Force-terminate after 10 seconds.
+            if succeeded, let successAt = successDetectedAt,
+               ContinuousClock.now - successAt > .seconds(10) {
+                log.warning("[installGame] process still running 10s after Success! — Wine assertion hang, terminating")
+                process.terminate()
+                break
             }
 
             do {
