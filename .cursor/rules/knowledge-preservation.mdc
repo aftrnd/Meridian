@@ -47,11 +47,13 @@ Chronological record of major root-cause discoveries. Add an entry every time so
 - Symptom: App hung indefinitely, `wine64 wineboot --update` had already exited
 - Root cause: `NSFileHandle.availableData` blocks on a pipe when the write-end is held open by wineserver (which inherits all wine64 fds). This is a POSIX blocking `read()`, not a non-blocking read as Apple's docs imply.
 - Fix: `readNonBlocking()` in `WineEngine.swift` — sets `O_NONBLOCK` before `availableData`, restores flags after
+- **Verified working April 9 2026:** wipeboot --update completed in 6 seconds (exit=0). No hang.
 
 **Steam sign-in screen appearing after Meridian closed**
 - Symptom: Windows Steam login window visible after Meridian force-quit
 - Root cause: `wineboot --update` runs `HKCU\...\Run` entries. Steam registers itself there. With no valid ConnectCache, Steam shows sign-in UI. SteamWindowSuppressor is not active during wipeboot.
 - Fix: `WinePrefix.refreshSystemDLLs()` deletes the Steam Run key before every wineboot call
+- **Verified working April 9 2026:** No Steam UI appeared. Only Meridian's UI was visible.
 
 **Bootstrap steam.exe exits without downloading (exit=0)**
 - Symptom: Steam tried to download its client, got "http error 0", exited. All bootstrap attempts failed similarly.
@@ -61,10 +63,25 @@ Chronological record of major root-cause discoveries. Add an entry every time so
 **wineboot --update triggered on every launch**
 - Symptom: Every app launch ran "Applying new Wine engine…" and triggered wipeboot
 - Root cause: `lastPrefixEngineTag` stored `v4.0.0-engine` (a locally-built engine). The auto-downloaded engine was `v3.0.0-engine`. Every launch saw a mismatch. wipeboot hanged → tag never updated → loop.
-- Fix: The pipe fix (above) allowed wipeboot to complete once → tag updated → loop broken
+- Fix: The pipe fix (above) allowed wipeboot to complete once → tag updated to `v3.0.0-engine` → loop broken
+- **Verified working April 9 2026:** wipeboot ran once, completed, subsequent launches skip it entirely.
 
 **Orphaned steamservice.exe / winedevice.exe from days ago**
 - Symptom: `ps aux` showed Wine processes from Monday still running on Thursday
 - Root cause: Wine processes replace `argv[0]` with Windows path after startup (`C:\...\steamservice.exe`). `pkill -f "com.meridian.app/engine"` no longer matches them. wipeboot starts new wineserver sessions that don't cover these orphans.
 - Fix: `TerminationCleanup` added `pkill -f "steamservice.exe"` and `pkill -f "winedevice.exe"` to the initial sweep
+
+### April 2026 — First verified end-to-end clean boot
+
+**Confirmed working sequence (April 9 2026, v0.9.7.1 + fixes):**
+1. App launch → startup cleanup kills all orphaned Wine processes
+2. Engine detected (v3.0.0-engine) → tag matches → wipeboot skipped
+3. prefix exists, steam installed (steamui.dll present) → no bootstrap needed
+4. Session sync → SteamCMD credential cache expired → Meridian auth UI presented
+5. User authenticated via Meridian UI (email + 2FA) → home screen
+6. No Steam UI appeared at any point
+7. Library opened correctly
+
+**SteamCMD credential expiry is expected and handled:** The SteamCMD token cache expires periodically. When it does, `installGame()` will return a login failure (exit=5 or 7), trigger `reauthenticate()`, and prompt via Meridian's UI. This is the correct path — the user never sees the Windows Steam sign-in screen.
+
 
