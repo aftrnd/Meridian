@@ -120,7 +120,7 @@ final class WineSteamManager {
             let process = Process()
             process.executableURL = engine.wine64URL
             process.arguments = args
-            process.environment = engine.environment(for: prefix)
+            process.environment = engine.steamCMDEnvironment(for: prefix)
 
             let errPipe = Pipe()
             let outPipe = Pipe()
@@ -166,7 +166,7 @@ final class WineSteamManager {
                     // steam.exe on the system and caused infinite-loop false positives
                     // when the virtual desktop was in use.
                     let wineserverPath = engine.wineserverURL.path(percentEncoded: false)
-                    let prefixEnv = engine.environment(for: prefix)
+                    let prefixEnv = engine.steamCMDEnvironment(for: prefix)
                     let wineserverAlive = await Task.detached {
                         let t = Process()
                         t.executableURL = URL(filePath: wineserverPath)
