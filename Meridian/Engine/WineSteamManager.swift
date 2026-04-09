@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "WineSteamManager")
 
@@ -57,11 +56,6 @@ final class WineSteamManager {
         return !exists
     }
 
-    /// Runs Steam non-silently to complete the first-run client download.
-    ///
-    /// Launches Steam.exe without `-silent` so it can show its update UI
-    /// and download the full client (~150MB). Waits for `steamui.dll` to
-    /// appear on disk, then shuts Steam down.
     /// Runs Steam to complete the first-run client download.
     ///
     /// Steam's update pipeline has two observable phases under Wine:
@@ -731,13 +725,20 @@ final class WineSteamManager {
     /// Launches a game executable directly via Wine, bypassing steam.exe entirely.
     ///
     /// Used when: SteamCMD downloaded the game files and the game doesn't require
+    /// Result of launching a game directly via Wine.
+    struct GameLaunchResult {
+        let pid: Int32
+        let process: Process
+    }
+
+    /// Launches a game's main executable directly via Wine, bypassing
     /// Steam DRM validation. Most indie/Unity games work this way.
     @discardableResult
     func launchGameDirectly(
         appID: Int,
         engine: WineEngine,
         prefix: WinePrefix
-    ) async throws -> Int32 {
+    ) async throws -> GameLaunchResult {
         guard let installDir = prefix.gameInstallDir(appID: appID) else {
             throw SteamError.installFailed("Cannot find install directory for appID \(appID)")
         }
@@ -853,7 +854,7 @@ final class WineSteamManager {
             }
         }
 
-        return pid
+        return GameLaunchResult(pid: pid, process: process)
     }
 
     /// Launches a game via `wine64 steam.exe -applaunch APPID`.

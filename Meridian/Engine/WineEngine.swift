@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "WineEngine")
 
@@ -18,11 +17,11 @@ private let log = MeridianLog(category: "WineEngine")
 ///   - Wine FOSS (wine-devel from Gcenx/macOS_Wine_builds), DXMT (open source),
 ///     DXVK (open source), Apple GPTK (Apple-distributed), MoltenVK (Apache 2.0)
 ///
-/// ## D3D12 Support (VKD3D-proton)
+/// ## D3D12 Support (experimental)
 ///
 /// When `wine/lib/vkd3d-proton/` is present, `environment(for:)` sets WINEDLLPATH
 /// and `d3d12,d3d12core=n` override so VKD3D-proton handles D3D12→Vulkan→MoltenVK→Metal.
-/// VKD3D-proton DLLs are true native Windows DLLs (no Wine PE-Unix bridge needed).
+/// VKD3D-proton DLLs are native Windows PE DLLs (no Wine PE-Unix bridge needed).
 /// DXMT continues to handle D3D11/D3D10 via builtin wiremetal.so.
 @Observable
 @MainActor
@@ -64,9 +63,9 @@ final class WineEngine {
     /// Path to DXVK DLLs (DirectX -> Vulkan -> Metal via MoltenVK).
     private(set) var dxvkPath: String?
 
-    /// Path to Apple GPTK directory (D3D12 -> Metal via D3DMetal.framework).
-    /// Present when `wine/lib/gptk/external/D3DMetal.framework` exists in the engine.
-    private(set) var gptkPath: String?
+    /// Path to the D3D12 implementation directory.
+    /// Present when `wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll` exists in the engine.
+    private(set) var d3d12Path: String?
 
     var isReady: Bool { state == .ready }
 
@@ -130,6 +129,7 @@ final class WineEngine {
             libraryPath = nil
             dxmtPath = nil
             dxvkPath = nil
+            d3d12Path = nil
             return
         }
 
@@ -147,13 +147,11 @@ final class WineEngine {
         let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
         if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
 
-        // VKD3D-proton for D3D12: detect presence
+        // D3D12: detect VKD3D-proton
         let vkd3dProton = Self.engineDir.appending(path: "wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll").path(percentEncoded: false)
-        if fm.fileExists(atPath: vkd3dProton) {
-            gptkPath = Self.engineDir.appending(path: "wine/lib/vkd3d-proton").path(percentEncoded: false)
-        } else {
-            gptkPath = nil
-        }
+        d3d12Path = fm.fileExists(atPath: vkd3dProton)
+            ? Self.engineDir.appending(path: "wine/lib/vkd3d-proton").path(percentEncoded: false)
+            : nil
 
         backendName   = "Meridian"
         engineVersion = readEngineVersion()
@@ -169,7 +167,7 @@ final class WineEngine {
         log.info("[detect]   lib=\(self.libraryPath ?? "none")")
         log.info("[detect]   dxmt=\(dxmtMode)")
         log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
-        log.info("[detect]   gptk=\(self.gptkPath ?? "none (D3D12 disabled)")")
+        log.info("[detect]   d3d12=\(self.d3d12Path ?? "none (D3D12 disabled)")")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
         log.info("[detect] backend=\(backendName) ✓")
     }
@@ -212,7 +210,7 @@ final class WineEngine {
         libraryPath             = nil
         dxmtPath                = nil
         dxvkPath                = nil
-        gptkPath                = nil
+        d3d12Path               = nil
     }
 
     // MARK: - Environment
@@ -257,8 +255,6 @@ final class WineEngine {
 
         // D3D11 → DXMT (builtin wiremetal.so, no overrides needed).
         // D3D12 → VKD3D-proton (native DLLs in lib/vkd3d-proton/, loaded via WINEDLLPATH).
-        // VKD3D-proton translates D3D12→Vulkan→MoltenVK→Metal. True native Windows DLLs,
-        // no __wine_unix_call needed (unlike GPTK which has an ABI mismatch with Gcenx Wine).
         let vkd3dDir = Self.engineDir.appending(path: "wine/lib/vkd3d-proton/x86_64-windows").path(percentEncoded: false)
         if FileManager.default.fileExists(atPath: vkd3dDir) {
             env["WINEDLLPATH"] = vkd3dDir

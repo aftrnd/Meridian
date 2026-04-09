@@ -174,14 +174,4 @@ final class SteamLocalAuthServer: @unchecked Sendable {
             _ = send(fd, ptr.baseAddress!, packet.count, 0)
         }
     }
-
-    // MARK: - Errors (retained for callers of start())
-
-    enum ServerError: LocalizedError {
-        case bindFailed
-
-        var errorDescription: String? {
-            "Could not bind to a local port for Steam authentication."
-        }
-    }
 }

@@ -290,7 +290,8 @@ struct GameDetailView: View {
             .overlay(alignment: .bottomLeading) {
                 let compatProfile = GameCompatibilityDB.shared.profile(for: g.id)
                 HStack(alignment: .bottom, spacing: 6) {
-                    BannerCompatBadge(status: compatProfile?.status ?? .untested)
+                    BannerCompatBadge(status: compatProfile?.status ?? .untested,
+                                      profile: compatProfile)
                     if g.playtimeMinutes > 0 {
                         Text(g.playtimeFormatted + " played")
                             .font(.subheadline)
@@ -637,7 +638,7 @@ struct GameDetailView: View {
         guard isThisGame else { return false }
         switch launcher.launchState {
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .awaitingInstallConfirmation, .installing, .launching, .running, .stopping, .uninstalling:
+             .awaitingInstallConfirmation, .launching, .running, .stopping, .uninstalling:
             return true
         default:
             return false
@@ -699,12 +700,6 @@ struct GameDetailView: View {
                 }
             }
 
-        case .installing:
-            HStack(spacing: 8) {
-                ProgressButton(launcher.currentActivity ?? "Installing…")
-                cancelButton
-            }
-
         case .launching:
             HStack(spacing: 8) {
                 ProgressButton("Launching…")
@@ -748,7 +743,7 @@ struct GameDetailView: View {
                         .inactiveAwareProminence(controlActiveState == .inactive)
                         .controlSize(.large)
                     } else {
-                        Button { handlePlayTapped() } label: {
+                        Button { currentGame.isInstalled ? handlePlayTapped() : handleInstallTapped() } label: {
                             Label("Retry", systemImage: "arrow.clockwise")
                                 .frame(
                                     minWidth: GameDetailMetrics.launchButtonMinWidth,
@@ -776,22 +771,35 @@ struct GameDetailView: View {
         }
     }
 
+    @ViewBuilder
     private var idleButton: some View {
-        Button { handlePlayTapped() } label: {
-            Label(
-                currentGame.isInstalled ? "Play" : "Install & Play",
-                systemImage: currentGame.isInstalled ? "play.fill" : "arrow.down.circle.fill"
-            )
-            .font(.headline)
-            .frame(
-                minWidth: GameDetailMetrics.launchButtonMinWidth,
-                minHeight: GameDetailMetrics.launchButtonHeight
-            )
+        if currentGame.isInstalled {
+            Button { handlePlayTapped() } label: {
+                Label("Play", systemImage: "play.fill")
+                    .font(.headline)
+                    .frame(
+                        minWidth: GameDetailMetrics.launchButtonMinWidth,
+                        minHeight: GameDetailMetrics.launchButtonHeight
+                    )
+            }
+            .inactiveAwareProminence(controlActiveState == .inactive)
+            .controlSize(.large)
+            .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+            .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
+        } else {
+            Button { handleInstallTapped() } label: {
+                Label("Install", systemImage: "arrow.down.circle.fill")
+                    .font(.headline)
+                    .frame(
+                        minWidth: GameDetailMetrics.launchButtonMinWidth,
+                        minHeight: GameDetailMetrics.launchButtonHeight
+                    )
+            }
+            .inactiveAwareProminence(controlActiveState == .inactive)
+            .controlSize(.large)
+            .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+            .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "")
         }
-        .inactiveAwareProminence(controlActiveState == .inactive)
-        .controlSize(.large)
-        .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
-        .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
     }
 
     private var isLauncherBusyWithOtherGame: Bool {
@@ -832,6 +840,21 @@ struct GameDetailView: View {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    private func handleInstallTapped() {
+        guard engine.isReady else {
+            showEngineSetup = true
+            return
+        }
+        launcher.installOnly(
+            game: currentGame,
+            engine: engine,
+            steamManager: steamManager,
+            sessionBridge: sessionBridge,
+            steamAuth: steamAuth,
+            library: library
+        )
     }
 
     private func handlePlayTapped() {
@@ -1128,20 +1151,21 @@ private struct AchievementIcon: View {
 /// Single-icon compatibility indicator shown in the hero banner.
 /// Four visual states using seal icons:
 ///   - Green checkmark.seal.fill → verified or playable (tested, runs well)
-///   - Yellow exclamationmark.triangle.fill → launches with known issues
+///   - Yellow exclamationmark.seal.fill → launches with known issues
 ///   - Red xmark.seal.fill → confirmed broken
-///   - Gray questionmark.seal → untested / unknown
-/// Tapping shows a popover with details.
+///   - Gray   checkmark.seal (outline)  → untracked / not yet tested
+/// Tapping shows a popover with compatibility status and the rendering pipeline.
 private struct BannerCompatBadge: View {
     let status: CompatStatus
+    var profile: GameProfile?
     @State private var showingPopover = false
 
     private var icon: String {
         switch status {
         case .verified, .playable: return "checkmark.seal.fill"
-        case .launches:            return "exclamationmark.triangle.fill"
+        case .launches:            return "seal.fill"
         case .broken:              return "xmark.seal.fill"
-        case .untested:            return "questionmark.seal"
+        case .untested:            return "xmark.seal.fill"
         }
     }
 
@@ -1179,6 +1203,15 @@ private struct BannerCompatBadge: View {
         }
     }
 
+    /// Whether to show the "Optimized for Apple Silicon" tagline.
+    /// Only shown when the game is known to be working and has a confirmed rendering path.
+    private var showAppleSiliconBadge: Bool {
+        switch status {
+        case .verified, .playable: return profile != nil
+        default:                   return false
+        }
+    }
+
     var body: some View {
         Image(systemName: icon)
             .font(.subheadline.weight(.semibold))
@@ -1186,22 +1219,85 @@ private struct BannerCompatBadge: View {
             .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
             .onTapGesture { showingPopover.toggle() }
             .popover(isPresented: $showingPopover, arrowEdge: .bottom) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Image(systemName: icon)
-                            .foregroundStyle(color)
-                        Text(statusTitle)
-                            .font(.headline)
-                    }
-                    Text(statusDetail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(14)
-                .frame(width: 220)
+                pipelinePopover
             }
             .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var pipelinePopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+
+            // ── Status header ────────────────────────────────────────────────
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .foregroundStyle(color)
+                    .font(.headline)
+                Text(statusTitle)
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+
+            Text(statusDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+
+            // ── Rendering pipeline card (shown when profile exists) ──────────
+            if let p = profile {
+                Divider()
+                    .padding(.horizontal, 8)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Rendering Pipeline")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                        .kerning(0.4)
+
+                    pipelineRow(label: "Game Engine",   value: p.gameEngineDisplayName)
+                    pipelineRow(label: "Graphics API",  value: p.graphicsAPIDisplayName)
+                    pipelineRow(label: "Translation",   value: p.translationLayerDescription)
+                    pipelineRow(label: "Output",        value: "Apple Metal")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+
+                // ── Apple Silicon optimized tagline ──────────────────────────
+                if showAppleSiliconBadge {
+                    Divider()
+                        .padding(.horizontal, 8)
+
+                    HStack(spacing: 6) {
+                        Image(systemName: "apple.logo")
+                            .font(.caption.weight(.semibold))
+                        Text("Optimized for Apple Silicon")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                }
+            }
+        }
+        .frame(width: 280)
+    }
+
+    private func pipelineRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 90, alignment: .leading)
+            Text(value)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
+        }
     }
 }
 

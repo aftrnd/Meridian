@@ -7,6 +7,17 @@ alwaysApply: true
 
 These are strict rules that apply to ALL changes in the Meridian codebase. Violations cause regressions — enforce them without exception.
 
+## Open Source First — Always Use the Best Publicly Available Tools
+
+**Always build the Meridian engine from the latest, publicly available open-source components.** Never pin to old versions without a documented, tested regression in the newer version.
+
+| Principle | Detail |
+|-----------|--------|
+| **Latest stable** | Use the latest stable release of every component. Version tables in this doc are regularly updated. |
+| **Open source preferred** | Wine (LGPL), DXMT (Apache), DXVK (zlib), MoltenVK (Apache) are all open source. GPTK's D3DMetal.framework is Apple-proprietary but freely distributed by Apple for exactly this use case. |
+| **CrossOver is reference only** | CrossOver Preview is installed on dev machines solely to study how CodeWeavers solves problems. Peek at their approach, document findings in the rules, then implement independently using open-source components. **Never redistribute CrossOver binaries. Never depend on CrossOver at runtime.** CrossOver Preview's `wineloader` and Perl launcher require `CX_ROOT` to function — they break silently when extracted standalone. |
+| **Document everything learned** | Whenever CrossOver or any reference implementation reveals a technique, it goes straight into `engine-research-findings.mdc` so every future session builds on it rather than re-deriving it. |
+
 ## No Guessing — Facts Only
 
 **NEVER guess about Wine, Steam, or macOS behavior.** Every behavioral assumption must be backed by:
@@ -28,13 +39,14 @@ The current date matters. Always use the **latest stable versions** of all depen
 
 | Component | Source | Why |
 |-----------|--------|-----|
-| Wine | `wine-devel` from `Gcenx/macOS_Wine_builds` (Wine 11.x) | CLI-verified March 2026: Wine 11.5 — zero abort stubs, `IsMouseInPointerEnabled` present, Metal APIs for DXMT, Security.framework TLS. |
-| DXMT | `3Shain/dxmt` v0.74+ builtin variant | DirectX 11 → Metal. Requires wiremac.so Metal view APIs (present in Wine 11.x+). |
-| DXVK | `doitsujin/dxvk` latest stable | DirectX → Vulkan fallback |
-| Apple GPTK | Apple Game Porting Toolkit (developer.apple.com) | D3D12 → Metal 3 translation |
+| Wine | CX Wine 11.4 from CrossOver Preview (full CodeWeavers patches) | Has `ntdll.__wine_unix_call` required by CX's d3d12.dll. All CW patches: DXMT Metal APIs, Steam compat, Rosetta2, Security.framework TLS. |
+| DXMT | CrossOver Preview `lib/dxmt/` (installed as Wine builtins) | DirectX 11 → Metal. Same DXMT as CX ships. |
+| GPTK | Apple Game Porting Toolkit from CrossOver Preview `lib64/apple_gptk/` | D3D12 → D3DMetal.framework → Metal. CX's native d3d12.dll (120KB, full Win32 dispatch). |
+| VKD3D-proton | `HansKristian-Work/vkd3d-proton` latest stable | Detected in engine but **NOT used on macOS/Apple Silicon**: requires `VK_EXT_transform_feedback` which MoltenVK doesn't support. CLI-verified failing April 2026. |
+| DXVK | `doitsujin/dxvk` latest stable | DirectX 9/10/11 → Vulkan fallback (when DXMT fails or is disabled) |
 | macOS | Target latest stable (currently macOS 26) | Apple Silicon + Metal 3 |
 
-**CRITICAL: Use `wine-devel` from `Gcenx/macOS_Wine_builds`, NOT `Gcenx/winecx`.** The `winecx` repo stopped publishing after Wine 8.0.1 (Feb 2024). `macOS_Wine_builds` publishes Wine 11.x with the same CodeWeavers patches (CW 22435 DXMT Metal APIs, CW 13322/17315/21883 Steam, CW 20760 Rosetta2, Security.framework TLS). CLI-verified March 2026: game launch working.
+**CRITICAL: Use CX Wine from CrossOver Preview, NOT Gcenx/macOS_Wine_builds.** Gcenx Wine lacks `ntdll.__wine_unix_call` which CX's d3d12.dll requires for D3D12. CLI-verified April 2026: CX's d3d12.dll fails to load on Gcenx Wine with "unimplemented function ntdll.dll.__wine_unix_call". CX Wine has the same CW patches plus this essential function. `release-engine.sh` copies Wine, DXMT, DXVK, and GPTK from the locally installed CrossOver Preview. End users never need CX installed -- everything ships in the Meridian engine tarball.
 
 **CRITICAL: DXMT requires Wine 11.x wiremac.so.** DXMT's wiremetal.so dynamically loads `macdrv_view_create_metal_view` etc. from wiremac.so at runtime. These were added in Wine ~10.x. Wine 8.0.1 wiremac.so does not have them. "Failed to create metal view" crash is a Wine version mismatch, not a DXMT bug.
 
@@ -59,6 +71,45 @@ WINE64="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wine6
 ```
 
 Only after confirming the behavior in the terminal should the Swift code be updated.
+
+## Fix Scope Classification — Engine-wide vs Game-specific
+
+**Every fix MUST be classified before implementation.** The wrong classification wastes effort and creates false confidence.
+
+### Classification Rules
+
+| Symptom | Classification | Where to fix |
+|---------|---------------|--------------|
+| `STATUS_DLL_NOT_FOUND` (exit 53) for a system DLL | **Engine-wide** | `WinePrefix` setup + `WineEngine.environment` |
+| Missing or wrong Wine API (abort stub, unimplemented) | **Engine-wide** | Engine upgrade or custom stub DLL |
+| Game crashes with specific D3D error or shader issue | **Game-specific** | `GameCompatibilityDB` entry |
+| Game needs specific launch args (`-force-d3d11`, etc.) | **Game-specific** | `GameProfile.launchArgs` |
+| Game needs `WINEDLLOVERRIDES` only for that game | **Game-specific** | `GameProfile.dllOverrides` or `extraEnv` |
+| SteamCMD auth / DRM / window suppression broken | **Engine-wide** | Bootstrap, WineSteamManager, suppressor |
+
+### Process
+
+1. **Read `meridian.log` first** — determine the exact error before classifying
+2. **Ask: does this affect all games or just one?** If unsure, test a second game
+3. **If engine-wide:** fix the infrastructure, document in `development-standards.mdc` and `engine-research-findings.mdc`
+4. **If game-specific:** add/update `GameCompatibilityDB` entry with root cause, fix, and status
+5. **Always CLI-verify before closing** — run the game directly from terminal after the fix
+
+### Best Available Technology for Graphics
+
+When adding or updating a game profile, always use the best available renderer for its graphics API. Do not default to the most conservative option if a better-performing path is available.
+
+| Game API | Preferred Renderer | Fallback | Notes |
+|----------|-------------------|---------|-------|
+| D3D9, D3D10, D3D11 | **DXMT** (builtin wiremetal.so → Metal) | DXVK → MoltenVK → Metal | DXMT has lower latency: no Vulkan layer in the path |
+| D3D12 | **GPTK** (D3D12 → D3DMetal.framework → Metal via custom bridge d3d12.dll, loaded via WINEDLLPATH) | — | No Vulkan required. CX d3d12.dll can't be used (needs ntdll.__wine_unix_call). Set `dxgi=n,b` globally for IDXGIAdapter4 fix. |
+| OpenGL / Vulkan | Wine's native implementation + MoltenVK | — | No override needed |
+
+**DXMT is always preferred over DXVK for D3D11** because it translates directly to Metal without a Vulkan intermediary — fewer layers = lower CPU overhead and better frame pacing on Apple Silicon.
+
+**VKD3D-proton is NOT the D3D12 path on macOS.** It requires `VK_EXT_transform_feedback` which MoltenVK on Apple Silicon does not support. CLI-verified failing April 2026.
+
+**GPTK is the active D3D12 path** — bypasses Vulkan entirely via D3DMetal.framework → Metal. A custom bridge d3d12.dll (using __wine_unix_call_dispatcher) is required because CX's d3d12.dll imports ntdll.__wine_unix_call which Gcenx Wine doesn't have. Loaded via WINEDLLPATH (no system32 installation needed).
 
 ## Log-First Debugging
 
@@ -106,28 +157,16 @@ Reiterated from the update-system rule for emphasis:
 - The engine NEVER compensates for app deficiencies
 - Fix the root layer, publish the fix, verify end-to-end
 
-## Wine 8.0.1 Limitations (current engine, requires upgrade)
+## Wine 11.5 — Current Engine (wine-devel, Gcenx/macOS_Wine_builds)
 
-Wine 8.0.1 — the current distributable engine — has critical limitations. These are ENGINE issues that cannot be fixed by app-level patches. The engine must be upgraded to Wine 10.x+ to resolve them. Full details in `engine-research-findings.mdc`.
-
-### steam.exe Cannot Authenticate
-
-Steam's Windows client under Wine 8.0.1 **never logs in**. Root causes: `GetProcessMitigationPolicy` abort stub, Steam Service GLE 126, CEF webhelper crash-loop. **Consequence:** `steam.exe` is never started at bootstrap. All game downloads use SteamCMD batch mode. Game launches use direct Wine exe invocation. steam.exe is only started on-demand for DRM games that ship `steam_api64.dll`.
-
-### SteamCMD: Batch Mode Only
-
-SteamCMD interactive mode (no args, stdin pipe) is broken in Wine 8.0.1 — exits immediately with no output when stdin is a non-TTY pipe. CLI-verified March 2026. All SteamCMD operations use batch mode: `wine64 steamcmd.exe +login USERNAME +app_update APPID validate +quit`.
-
-### 926+ Abort Stubs (win32u.dll alone)
-
-Wine 8.0.1 has 926 `__wine_stub_*` functions in win32u.dll that call `abort()`. CX Preview (Wine 11.4) has zero. The most impactful: `NtUserIsMouseInPointerEnabled` crashes every Unity game. 49 exports missing from user32.dll. See the full list in `engine-research-findings.mdc`.
-
-### DXMT Cannot Render (winemac.so version mismatch)
-
-DXMT's `winemetal.so` requires `macdrv_view_create_metal_view` and related Metal APIs from winemac.so. Wine 8.0.1's winemac.so does not export these. Error: "Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT." This is unfixable without upgrading Wine.
+The current engine is Wine 11.5 (wine-devel). Key properties CLI-verified March 2026:
+- Zero abort stubs in win32u.dll (was 926 in Wine 8.0.1)
+- `IsMouseInPointerEnabled` present — Unity games no longer crash on pointer check
+- wiremac.so exports Metal view APIs required by DXMT
+- Security.framework TLS — Steam HTTPS works standalone (no CrossOver needed)
+- steam.exe bootstraps and authenticates correctly
 
 **Meridian is fully standalone** — the engine is downloaded from GitHub Releases. There is no reliance on any external Wine installation.
-
 ### SteamCMD Authentication
 
 SteamCMD requires an interactive first login (password + Steam Guard). After that, it caches credentials in `config.vdf` and subsequent logins are passwordless (`+login username` without password). The credential cache persists across wineserver restarts.
@@ -176,6 +215,12 @@ if settings.winRTRegistrationAppliedVersion < WinePrefix.winRTRegistrationVersio
 | 1 | `WinePrefix.registerWinRTClasses` | Adds `Windows.System.DispatcherQueue → coremessaging.dll` registry entry |
 | 2 | `WinePrefix.registerWinRTClasses` | Copies custom coremessaging.dll stub into prefix system32 (DLL was present but prefix had stale original copy) |
 
+**VKD3D-proton / D3D12 prefix setup (separate version counter):**
+| Version | Function | What it does |
+|---------|----------|--------------|
+| 1 | `WinePrefix.installVKD3DProton` | (INCORRECT) Copied VKD3D-proton DLLs to system32 — caused GPTK conflict |
+| 2 | `WinePrefix.installVKD3DProton` | Removes VKD3D-proton DLLs from system32 (cleanup) — GPTK uses WINEDLLPATH, not system32 |
+
 ## Custom Stub DLLs for Missing Wine Implementations
 
 When Wine lacks a WinRT or Windows API implementation needed by a game, a custom stub DLL can be cross-compiled with mingw-w64 (already installed via Homebrew) and dropped into the engine's `wine/lib/wine/x86_64-windows/`. This is the same mechanism DXMT and DXVK use.
@@ -199,22 +244,24 @@ When Wine lacks a WinRT or Windows API implementation needed by a game, a custom
 
 ## Per-Game Environment Overrides
 
-Global engine environment variables (like `WINEDLLOVERRIDES=d3d12,d3d12core=n` for VKD3D-proton) can conflict with per-game launch configurations. Use `GameProfile.extraEnv` to override environment on a per-game basis.
+Global engine environment variables (like `WINEDLLOVERRIDES=d3d12,dxgi=n,b` for GPTK) can conflict with per-game launch configurations. Use `GameProfile.extraEnv` to override environment on a per-game basis.
 
-**Critical pattern: clearing WINEDLLOVERRIDES for -force-d3d11 games**
+**Critical pattern: clearing WINEDLLOVERRIDES for aggressive D3D12-probing Unity games**
 
-When a Unity game uses `-force-d3d11` to bypass DX12, the global VKD3D-proton override forces Wine to load vkd3d-proton's `d3d12.dll` anyway. Unity still probes D3D12 capabilities, causing a delay-load crash.
+When a Unity game uses `-force-d3d11` to bypass D3D12, the global GPTK override (`d3d12,dxgi=n,b`) still loads GPTK's d3d12.dll during Unity's D3D12 capability probe. Unity 6000.3+ probes D3D12 more aggressively — if device creation succeeds during the probe it can alter internal state and crash, even when the game actually renders via D3D11. Fix: clear `WINEDLLOVERRIDES` so Wine uses its builtin d3d12 stub (returns `E_NOINTERFACE` safely) and DXMT's builtin dxgi.
 
 ```swift
 .unity(
     appID: 3180070,
-    extraEnv: ["WINEDLLOVERRIDES": ""],  // Clear VKD3D-proton override
+    extraEnv: ["WINEDLLOVERRIDES": ""],  // Clear GPTK d3d12/dxgi override
     launchArgs: ["-force-d3d11"],
     ...
 )
 ```
 
-**Debugging tip:** If a game works from terminal but not from Meridian, compare the environments — `WINEDLLOVERRIDES` and `WINEDLLPATH` are the most likely culprits.
+Unity 6000.0 (e.g. PEAK) does NOT need this — it doesn't probe D3D12 aggressively with GPTK loaded.
+
+**Debugging tip:** If a game works from terminal but not from Meridian, compare the environments — `WINEDLLOVERRIDES`, `WINEDLLPATH`, and `DYLD_FALLBACK_LIBRARY_PATH` are the most likely culprits.
 
 ## Game Compatibility Badge System
 

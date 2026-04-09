@@ -65,8 +65,8 @@ defaults delete com.meridian.app lastPrefixEngineTag 2>/dev/null || true
 
 ## End users vs maintainers
 
-- **End users** do **not** need CrossOver. The only supported runtime is the bundled engine downloaded from GitHub Releases. There is no CrossOver fallback in `WineEngine.detect()`.
-- **Maintainers** may use CrossOver.app on their machine only as a *source* when running `release-engine.sh` to produce a newer Wine tree for the public engine tarball.
+- **End users** do **not** need CrossOver. The only supported runtime is the bundled engine downloaded from GitHub Releases. There is no CrossOver fallback in `WineEngine.detect()`. Meridian is fully self-contained.
+- **Maintainers** must have CrossOver Preview installed at `/Applications/CrossOver Preview.app`. Running `release-engine.sh` copies Wine, DXMT, DXVK, and GPTK from CX Preview into the engine tarball. The tarball is uploaded to GitHub Releases and auto-downloaded by end users.
 
 ## Developer Release Workflow
 
@@ -99,7 +99,12 @@ The engine tarball (`meridian-engine-arm64.tar.gz`) MUST contain:
 
 `release-engine.sh` validates all of the above with `die()` checks. If a new required file is identified, add both the copy step AND the validation check to the script.
 
-**CRITICAL: The engine MUST be built from `wine-crossover` FOSS (Gcenx/winecx), NOT `wine-staging` and NOT CrossOver Preview/commercial binaries.** CrossOver Wine FOSS includes CodeWeavers' macOS Security.framework TLS patches baked into the standalone binary. Using `wine-staging` or CrossOver commercial binaries (`wineloader` from CrossOver.app/Preview.app) causes silent TLS failures ("Steam needs to be online to update") because those binaries require `CX_ROOT` and the CrossOver Perl launcher context to function.
+**CRITICAL: The engine MUST be built from `wine-devel` from `Gcenx/macOS_Wine_builds`, NOT `Gcenx/winecx`, NOT `wine-staging`, and NOT CrossOver Preview/commercial binaries.**
+
+- `Gcenx/winecx` (CrossOver Wine FOSS) stopped publishing after Wine 8.0.1 (Feb 2024) — do NOT use it
+- `Gcenx/macOS_Wine_builds` (wine-devel) publishes Wine 11.x with the same CodeWeavers patches (CW 22435 DXMT Metal APIs, CW 13322/17315/21883 Steam, CW 20760 Rosetta2, Security.framework TLS baked in) — use this
+- `wine-staging` may introduce regressions for the Steam/DXMT use case — do NOT use it
+- CrossOver Preview/commercial binaries require `CX_ROOT` and the CrossOver Perl launcher context for TLS to function — silently fail when extracted standalone — do NOT use them
 
 ## Key Files
 

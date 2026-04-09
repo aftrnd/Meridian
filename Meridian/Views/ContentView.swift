@@ -21,6 +21,7 @@ struct ContentView: View {
     @Environment(GameLauncher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
+    @Environment(\.openSettings) private var openSettings
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var sidebarDestination: SidebarDestination = .home
@@ -65,6 +66,9 @@ struct ContentView: View {
                     splashVisible = false
                 }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .meridianOpenSettings)) { _ in
+            openSettings()
         }
         // Re-show the setup sheet whenever the user signs out — the .onAppear
         // check on mainContent only fires once at bootstrap. Without this,
@@ -132,6 +136,7 @@ struct ContentView: View {
 
 extension Notification.Name {
     static let meridianBootstrapReady = Notification.Name("meridianBootstrapReady")
+    static let meridianOpenSettings   = Notification.Name("meridianOpenSettings")
 }
 
 // MARK: - Sidebar

@@ -39,7 +39,7 @@ final class GameCompatibilityDB {
     /// Merges all per-engine extension arrays into a single list.
     /// Add new engine categories here as a single additional term.
     private static var allProfiles: [GameProfile] {
-        unityProfiles + customEngineProfiles
+        unityProfiles + sourceEngineProfiles + customEngineProfiles
     }
 
     /// All known game profiles, keyed by appID for O(1) lookup at launch time.

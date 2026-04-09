@@ -153,6 +153,16 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "winRTRegistrationAppliedVersion") }
     }
 
+    /// Tracks whether VKD3D-proton DLLs have been installed into the prefix system32.
+    ///
+    /// Increment `WinePrefix.vkd3dProtonInstalledVersion` whenever the set of DLLs
+    /// to install changes. Bootstrap compares this stored value against the current
+    /// version and only re-runs the install when behind.
+    var vkd3dProtonInstalledVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "vkd3dProtonInstalledVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "vkd3dProtonInstalledVersion") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

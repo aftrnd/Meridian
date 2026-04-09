@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "GameLauncher")
 
@@ -25,12 +24,11 @@ final class GameLauncher {
         case preparingEngine
         case preparingPrefix
         case bootstrappingSteam
-        case awaitingInstallConfirmation // SteamCMD download in progress
-        case installing   // Reserved: ACF on disk, waiting for StateFlags == 4
+        case awaitingInstallConfirmation
         case launching
         case running(appID: Int)
         case stopping(appID: Int)
-        case uninstalling // waiting for Steam to delete the ACF manifest
+        case uninstalling
         case exited(appID: Int)
         case failed(String)
     }
@@ -79,6 +77,21 @@ final class GameLauncher {
         }
     }
 
+    /// Downloads and installs a game without launching it.
+    /// When complete the launcher returns to `.idle` and `Game.isInstalled` becomes true.
+    func installOnly(
+        game: Game,
+        engine: WineEngine,
+        steamManager: WineSteamManager,
+        sessionBridge: SteamSessionBridge,
+        steamAuth: SteamAuthService? = nil,
+        library: SteamLibraryStore? = nil
+    ) {
+        Task {
+            await installOnlyImpl(game: game, engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, steamAuth: steamAuth, library: library)
+        }
+    }
+
     private func launchImpl(
         game: Game,
         engine: WineEngine,
@@ -89,7 +102,7 @@ final class GameLauncher {
     ) async {
         switch launchState {
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .awaitingInstallConfirmation, .installing, .launching, .stopping, .uninstalling:
+             .awaitingInstallConfirmation, .launching, .stopping, .uninstalling:
             log.warning("[launch] ignoring — already in state \(String(describing: self.launchState))")
             return
         case .running:
@@ -107,7 +120,42 @@ final class GameLauncher {
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
                 steamAuth: steamAuth,
-                library: library
+                library: library,
+                launchAfterInstall: true
+            )
+        }
+    }
+
+    private func installOnlyImpl(
+        game: Game,
+        engine: WineEngine,
+        steamManager: WineSteamManager,
+        sessionBridge: SteamSessionBridge,
+        steamAuth: SteamAuthService?,
+        library: SteamLibraryStore?
+    ) async {
+        switch launchState {
+        case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
+             .awaitingInstallConfirmation, .launching, .stopping, .uninstalling:
+            log.warning("[installOnly] ignoring — already in state \(String(describing: self.launchState))")
+            return
+        case .running:
+            log.warning("[installOnly] ignoring — a game is currently running")
+            return
+        case .idle, .exited, .failed:
+            break
+        }
+
+        launchTask?.cancel()
+        launchTask = Task { [weak self] in
+            await self?.executeLaunchPipeline(
+                game: game,
+                engine: engine,
+                steamManager: steamManager,
+                sessionBridge: sessionBridge,
+                steamAuth: steamAuth,
+                library: library,
+                launchAfterInstall: false
             )
         }
     }
@@ -252,7 +300,8 @@ final class GameLauncher {
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService?,
-        library: SteamLibraryStore?
+        library: SteamLibraryStore?,
+        launchAfterInstall: Bool
     ) async {
         logs.removeAll()
         currentActivity = nil
@@ -414,6 +463,17 @@ final class GameLauncher {
             downloadProgress = nil
         }
 
+        // Install-only mode: stop here without proceeding to launch.
+        if !launchAfterInstall {
+            appendLog("Installation complete")
+            MeridianNotifications.sendInstallComplete(gameName: game.name)
+            launchState = .idle
+            activeAppID = nil
+            pipelineStartDate = nil
+            currentActivity = nil
+            return
+        }
+
         guard !Task.isCancelled else { return }
 
         // Give instant feedback before the multi-second prep steps (Steam DRM start).
@@ -470,17 +530,39 @@ final class GameLauncher {
         transition(to: .launching, activity: "Launching \(game.name)…")
         appendLog("Launching \(game.name)…")
 
-        let launchedPID: Int32
+        let launchResult: WineSteamManager.GameLaunchResult
         do {
-            launchedPID = try await steamManager.launchGameDirectly(
+            launchResult = try await steamManager.launchGameDirectly(
                 appID: game.id,
                 engine: engine,
                 prefix: prefix
             )
-            log.info("[launch] dispatched pid=\(launchedPID)")
-            log.info("[launch] wine process pid=\(launchedPID)")
+            log.info("[launch] dispatched pid=\(launchResult.pid)")
         } catch {
             fail("Launch failed: \(error.localizedDescription)", error: error)
+            return
+        }
+
+        // Fast-fail: if Wine exits within the first 3 seconds it almost certainly
+        // crashed at DLL load time (exit 53 = STATUS_DLL_NOT_FOUND, common for
+        // d3d12.dll on engines without a compatible D3D12 implementation). Detecting
+        // this immediately saves the user from a 120-second monitor timeout.
+        try? await Task.sleep(for: .seconds(3))
+        guard !Task.isCancelled else { return }
+
+        if !launchResult.process.isRunning {
+            let exitCode = launchResult.process.terminationStatus
+            log.error("[launch] game process exited immediately (code=\(exitCode)) — aborting before monitor")
+            let msg: String
+            switch exitCode {
+            case 53:
+                msg = "Game failed to start: a required system DLL was not found (exit 53). " +
+                      "This is a known engine limitation for D3D12 games. " +
+                      "A future engine update will add D3D12 support."
+            default:
+                msg = "Game exited immediately (exit code \(exitCode)). Check Settings → Diagnostics for details."
+            }
+            fail(msg)
             return
         }
 
@@ -492,11 +574,11 @@ final class GameLauncher {
         let gamePattern = prefix.gameInstallDir(appID: game.id)
         log.info("[launch] resolved game pattern: \(gamePattern ?? "nil")")
         appendLog("Waiting for \(game.name) to start…")
-        log.info("[launch] state=LAUNCHING appID=\(game.id) | monitoring pid=\(launchedPID)")
+        log.info("[launch] state=LAUNCHING appID=\(game.id) | monitoring pid=\(launchResult.pid)")
 
         gameProcess.startMonitoring(
             appID: game.id,
-            launchedPID: launchedPID,
+            launchedPID: launchResult.pid,
             engine: engine,
             prefix: prefix,
             gamePattern: gamePattern,

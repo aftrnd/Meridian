@@ -104,6 +104,36 @@ struct GameProfile {
         self.notes = notes
     }
 
+    // MARK: - Display helpers
+
+    var gameEngineDisplayName: String {
+        switch gameEngine {
+        case .unity:   return "Unity"
+        case .unreal:  return "Unreal Engine"
+        case .godot:   return "Godot"
+        case .custom:  return "Custom Engine"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    var graphicsAPIDisplayName: String {
+        switch graphicsAPI {
+        case .dx11:    return "DirectX 11"
+        case .dx12:    return "DirectX 12"
+        case .vulkan:  return "Vulkan"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    var translationLayerDescription: String {
+        switch graphicsAPI {
+        case .dx11:    return "DXMT → Metal"
+        case .dx12:    return "VKD3D-proton → MoltenVK"
+        case .vulkan:  return "MoltenVK"
+        case .unknown: return "Unknown"
+        }
+    }
+
     // MARK: - Factory methods
 
     /// Unity game preset.

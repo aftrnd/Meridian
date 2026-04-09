@@ -213,7 +213,7 @@ struct HomeView: View {
                             .background(.thinMaterial, in: Capsule())
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.white))
+                    .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                 }
                 .padding(.leading, leadingInset)
                 .padding(.trailing, 24)
@@ -339,7 +339,7 @@ struct HomeView: View {
         }
         switch launcher.launchState {
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .awaitingInstallConfirmation, .installing, .launching:
+             .awaitingInstallConfirmation, .launching:
             return .launching
         case .running:
             return .running

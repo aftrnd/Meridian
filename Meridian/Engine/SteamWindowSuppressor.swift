@@ -1,7 +1,6 @@
 import AppKit
 import ApplicationServices
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "SteamWindowSuppressor")
 

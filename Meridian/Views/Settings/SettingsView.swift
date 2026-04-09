@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 
 struct SettingsView: View {
     @Environment(SteamAuthService.self) private var steamAuth
@@ -7,19 +8,26 @@ struct SettingsView: View {
     @Environment(SteamWindowSuppressor.self) private var suppressor
     @Environment(AppUpdateChecker.self) private var updateChecker
 
+    /// Persisted so the menu command "Check for Updates…" can navigate here directly.
+    @AppStorage("meridian.settingsTab") private var selectedTab = "steam"
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             SteamSettingsTab()
                 .tabItem { Label("Steam", systemImage: "person.badge.key") }
+                .tag("steam")
 
             EngineSettingsTab()
                 .tabItem { Label("Engine", systemImage: "gearshape.2") }
+                .tag("engine")
 
             PermissionsSettingsTab()
                 .tabItem { Label("Permissions", systemImage: "hand.raised") }
+                .tag("permissions")
 
             UpdatesSettingsTab()
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
+                .tag("updates")
         }
         .frame(width: 520)
         .padding(24)
@@ -253,47 +261,159 @@ private struct EngineSettingsTab: View {
 private struct PermissionsSettingsTab: View {
     @Environment(SteamWindowSuppressor.self) private var suppressor
 
+    @State private var notificationsStatus: UNAuthorizationStatus = .notDetermined
+
     var body: some View {
         Form {
             Section {
-                HStack(spacing: 12) {
-                    Image(systemName: suppressor.isPermissionGranted
-                          ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                        .font(.title2)
-                        .foregroundStyle(suppressor.isPermissionGranted ? .green : .orange)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Accessibility")
-                            .fontWeight(.medium)
-                        Text(suppressor.isPermissionGranted
-                             ? "Granted — Steam windows will be suppressed automatically."
-                             : "Not granted — Steam UI may appear during installs and launches.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                // Accessibility
+                PermissionRow(
+                    icon: suppressor.isPermissionGranted ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                    iconColor: suppressor.isPermissionGranted ? .green : .orange,
+                    title: "Accessibility",
+                    detail: suppressor.isPermissionGranted
+                        ? "Granted — Steam windows will be suppressed automatically."
+                        : "Not granted — Steam UI may appear during installs and launches.",
+                    status: suppressor.isPermissionGranted ? .granted : .notGranted,
+                    onGrant: { suppressor.requestPermission() },
+                    onOpenSettings: {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                     }
+                )
 
-                    Spacer()
-
-                    if suppressor.isPermissionGranted {
-                        Label("Granted", systemImage: "checkmark.circle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.green)
-                    } else {
-                        Button("Grant Access") {
-                            suppressor.requestPermission()
+                // Notifications
+                PermissionRow(
+                    icon: notificationsIcon,
+                    iconColor: notificationsIconColor,
+                    title: "Notifications",
+                    detail: notificationsDetail,
+                    status: notificationsRowStatus,
+                    onGrant: {
+                        MeridianNotifications.requestAuthorization()
+                        // Re-query after a short delay so the row reflects the new state
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(500))
+                            await refreshNotificationsStatus()
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                    },
+                    onOpenSettings: {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
                     }
-                }
+                )
             } header: {
                 Text("macOS Permissions")
             } footer: {
-                Text("Accessibility permission allows Meridian to minimize Steam's windows automatically, keeping Steam running silently in the background. If the prompt does not appear, open System Settings → Privacy & Security → Accessibility and enable Meridian manually.")
+                Text("Accessibility lets Meridian suppress Steam's windows automatically. Notifications alert you when a game download finishes. If a permission prompt does not appear, open System Settings → Privacy & Security.")
                     .font(.caption)
             }
         }
         .formStyle(.grouped)
+        .task { await refreshNotificationsStatus() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await refreshNotificationsStatus() }
+        }
+    }
+
+    // MARK: - Notifications helpers
+
+    private func refreshNotificationsStatus() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        notificationsStatus = settings.authorizationStatus
+    }
+
+    private var notificationsRowStatus: PermissionRow.Status {
+        switch notificationsStatus {
+        case .authorized, .provisional, .ephemeral: return .granted
+        case .denied:                                return .denied
+        default:                                     return .notGranted
+        }
+    }
+
+    private var notificationsIcon: String {
+        switch notificationsStatus {
+        case .authorized, .provisional, .ephemeral: return "checkmark.shield.fill"
+        case .denied:                               return "xmark.shield.fill"
+        default:                                    return "bell.badge.fill"
+        }
+    }
+
+    private var notificationsIconColor: Color {
+        switch notificationsStatus {
+        case .authorized, .provisional, .ephemeral: return .green
+        case .denied:                               return .red
+        default:                                    return .orange
+        }
+    }
+
+    private var notificationsDetail: String {
+        switch notificationsStatus {
+        case .authorized, .provisional, .ephemeral:
+            return "Granted — you'll be notified when game downloads finish."
+        case .denied:
+            return "Blocked — open System Settings to re-enable notifications."
+        default:
+            return "Not granted — Meridian won't be able to notify you when installs complete."
+        }
+    }
+}
+
+// MARK: - Reusable permission row
+
+private struct PermissionRow: View {
+    enum Status { case granted, notGranted, denied }
+
+    let icon: String
+    let iconColor: Color
+    let title: String
+    let detail: String
+    let status: Status
+    let onGrant: () -> Void
+    let onOpenSettings: () -> Void
+    /// Optional secondary action shown alongside the "Granted" label (e.g. configure style).
+    var onConfigure: (() -> Void)? = nil
+    var configureLabel: String = "Configure"
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundStyle(iconColor)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .fontWeight(.medium)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer()
+
+            switch status {
+            case .granted:
+                HStack(spacing: 8) {
+                    if let configure = onConfigure {
+                        Button(configureLabel, action: configure)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                    Label("Granted", systemImage: "checkmark.circle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.green)
+                }
+            case .notGranted:
+                Button("Grant Access", action: onGrant)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            case .denied:
+                Button("Open Settings", action: onOpenSettings)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -323,17 +443,7 @@ private struct UpdatesSettingsTab: View {
             }
 
             Section {
-                HStack(alignment: .center) {
-                    updateStatusLabel
-                    Spacer()
-                    Button(updateChecker.state == .checking ? "Checking…" : "Check for Updates") {
-                        updateChecker.installedEngineTag = engine.engineVersion
-                        updateChecker.checkNow()
-                    }
-                    .disabled(updateChecker.state == .checking)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
+                updateStatusCard
 
                 if let last = settings.lastUpdateCheck {
                     Text("Last checked \(last.formatted(.relative(presentation: .named)))")
@@ -422,6 +532,99 @@ private struct UpdatesSettingsTab: View {
 
     // MARK: - Helpers
 
+    /// A prominent status card that replaces the old small inline label.
+    /// Shows checking/up-to-date/available/failed states clearly.
+    @ViewBuilder
+    private var updateStatusCard: some View {
+        switch updateChecker.state {
+        case .idle:
+            Button {
+                updateChecker.installedEngineTag = engine.engineVersion
+                updateChecker.checkNow()
+            } label: {
+                Label("Check for Updates", systemImage: "arrow.clockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+
+        case .checking:
+            HStack(spacing: 12) {
+                ProgressView()
+                    .scaleEffect(0.85)
+                    .frame(width: 24, height: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Checking for updates…")
+                        .fontWeight(.medium)
+                    Text("Connecting to GitHub")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(.vertical, 4)
+
+        case .upToDate:
+            HStack(spacing: 12) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("You're up to date!")
+                        .fontWeight(.medium)
+                    Text("Meridian \(AppUpdateChecker.currentVersion) is the latest version.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    updateChecker.installedEngineTag = engine.engineVersion
+                    updateChecker.checkNow()
+                } label: {
+                    Text("Check Again")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.vertical, 4)
+
+        case .updateAvailable:
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                Text("An update is available — see below.")
+                    .fontWeight(.medium)
+                Spacer()
+            }
+            .padding(.vertical, 4)
+
+        case .failed(let message):
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Update check failed")
+                        .fontWeight(.medium)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button {
+                    updateChecker.installedEngineTag = engine.engineVersion
+                    updateChecker.checkNow()
+                } label: {
+                    Text("Retry")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
     private var fullVersionString: String {
         let v = AppUpdateChecker.currentVersion
         let b = AppUpdateChecker.currentBuild
@@ -431,31 +634,6 @@ private struct UpdatesSettingsTab: View {
     private var engineVersionString: String {
         if let v = engine.engineVersion { return v }
         return engine.isReady ? "Meridian Engine" : "Not installed"
-    }
-
-    @ViewBuilder
-    private var updateStatusLabel: some View {
-        switch updateChecker.state {
-        case .idle:
-            EmptyView()
-        case .checking:
-            HStack(spacing: 6) {
-                ProgressView().scaleEffect(0.7)
-                Text("Checking…").foregroundStyle(.secondary)
-            }
-        case .upToDate:
-            let label = updateChecker.hasEngineUpdate ? "App is up to date" : "Up to date"
-            Label(label, systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-        case .updateAvailable(let version):
-            Label("\(cleanTag(version)) available", systemImage: "arrow.down.circle.fill")
-                .foregroundStyle(.blue)
-        case .failed(let message):
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
-                .font(.caption)
-                .lineLimit(2)
-        }
     }
 
     @ViewBuilder

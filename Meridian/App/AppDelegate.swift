@@ -1,10 +1,10 @@
 import AppKit
-import os.log
+import UserNotifications
 
 private let log = MeridianLog(category: "AppDelegate")
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
 
     private static let splashSize     = NSSize(width: 480, height: 300)
     private static let fullFrameSize  = NSSize(width: 1030, height: 625)
@@ -27,6 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cleanupDone = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Become the notification delegate so banners display even when Meridian is
+        // in the foreground (without this delegate method macOS suppresses them).
+        UNUserNotificationCenter.current().delegate = self
+        MeridianNotifications.requestAuthorization()
+
         NSApp.setActivationPolicy(.regular)
 
         if let w = mainWindow {
@@ -163,5 +168,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         cleanupDone = true
         TerminationCleanup.killAllWineProcesses()
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    /// Allows notification banners to appear while Meridian is the active foreground app.
+    /// Without this, macOS silently drops notifications when the app is focused.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        // .banner  → slide-in popup (requires alert style ≠ "None" in System Settings)
+        // .list    → always record in Notification Centre regardless of alert style
+        // .sound   → play the notification sound
+        completionHandler([.banner, .list, .sound])
     }
 }

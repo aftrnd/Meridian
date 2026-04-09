@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "EngineDownloader")
 
@@ -343,19 +342,5 @@ private final class DownloadTaskDelegate: NSObject, URLSessionDownloadDelegate {
         guard let error else { return }
         continuation?.resume(throwing: error)
         continuation = nil
-    }
-}
-
-// MARK: - Architecture helper
-
-private extension ProcessInfo {
-    var machineArchitecture: String {
-        var sysinfo = utsname()
-        uname(&sysinfo)
-        return withUnsafePointer(to: &sysinfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
-                String(cString: $0)
-            }
-        }
     }
 }

@@ -84,6 +84,17 @@ struct MeridianApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 480, height: 300)
         .commands {
+            // "Check for Updates…" goes in the app-name menu, right after "About Meridian".
+            // CommandGroup(after: .appInfo) is the standard macOS placement.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updateChecker.installedEngineTag = engine.engineVersion
+                    updateChecker.checkNow()
+                    UserDefaults.standard.set("updates", forKey: "meridian.settingsTab")
+                    NotificationCenter.default.post(name: .meridianOpenSettings, object: nil)
+                }
+            }
+
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Meridian") {
                 Button("Sign Out of Steam") {
