@@ -18,7 +18,63 @@ These are strict rules that apply to ALL changes in the Meridian codebase. Viola
 | **CrossOver is reference only** | CrossOver Preview is installed on dev machines solely to study how CodeWeavers solves problems. Peek at their approach, document findings in the rules, then implement independently using open-source components. **Never redistribute CrossOver binaries. Never depend on CrossOver at runtime.** CrossOver Preview's `wineloader` and Perl launcher require `CX_ROOT` to function — they break silently when extracted standalone. |
 | **Document everything learned** | Whenever CrossOver or any reference implementation reveals a technique, it goes straight into `engine-research-findings.mdc` so every future session builds on it rather than re-deriving it. |
 
-## No Guessing — Facts Only
+## Steam UI Is Never Shown — Fundamental Design Principle
+
+**Meridian has its own macOS UI for everything. The Windows Steam client is a hidden backend — its windows must NEVER surface to the user.**
+
+The `SteamWindowSuppressor` uses the macOS Accessibility API to immediately hide any Wine window the moment it appears. This must be running whenever Wine processes are alive.
+
+### The Only Legitimate Steam Window
+
+The bootstrap phase (first launch, `steamui.dll` absent) is the one and only exception: Steam shows its update UI while downloading its ~150MB client. Meridian shows a progress screen during this, and it is expected. Everything else is a bug.
+
+### What Causes Unexpected Steam UI (and the Fix)
+
+| Symptom | Root Cause | Fix |
+|---|---|---|
+| Steam sign-in screen after wineboot | `wineboot --update` runs `HKCU\...\Run` entries; Steam is registered there | `refreshSystemDLLs()` deletes the Steam Run key before wineboot (CLI-verified April 2026) |
+| Steam windows visible during bootstrap | `SteamWindowSuppressor` only engages after all prefix operations complete (step 6) | By design — wineboot/SteamSetup dialogs must render to complete. Steam autorun is handled by deleting the Run key. |
+| Steam windows after Meridian crash | Meridian crashes without cleanup → Wine processes orphaned → suppressor gone | `TerminationCleanup` kills by Windows process name patterns (post-argv[0]-replacement) |
+| Steam sign-in with `-silent` flag | Steam started but has no valid ConnectCache session | `SteamSessionBridge.prepare()` must run before any steam.exe start; check that session sync ran |
+
+### The SteamWindowSuppressor Engagement Sequence
+
+```
+1. Cleanup kills previous session's Wine processes
+2. wineboot / SteamSetup run (suppressor NOT engaged — their own dialogs must render)
+3. Steam bootstrap downloads steamui.dll (suppressor NOT engaged — UI is intentional)
+4. Session sync (SteamSessionBridge.prepare)
+5. windowSuppressor?.beginSession()  ← suppressor engages HERE (step 6 in BootstrapManager)
+6. SteamCMD warmup runs suppressed
+7. DRM-game steam.exe starts — suppressor already active
+```
+
+**Never call `windowSuppressor?.beginSession()` before step 5.** The earlier phases need their Wine UI.
+
+---
+
+## Wine Environment: Game vs Admin — CRITICAL Rule
+
+Two environment functions exist. Using the wrong one causes hangs, crashes, and unexpected UI.
+
+| Function | Contains D3D Overrides | Use For |
+|---|---|---|
+| `engine.environment(for:)` | **YES** — `WINEDLLOVERRIDES=d3d12,d3d12core=n`, `WINEDLLPATH=vkd3d-proton/...` | Game launches ONLY |
+| `engine.steamCMDEnvironment(for:)` | **NO** | Everything else |
+
+**"Everything else" means:**
+- `engine.run()` admin commands (wineboot, reg, winedbg, any internal Wine operation)
+- `WineSteamManager.bootstrap()` launching steam.exe for first-run download
+- `WineSteamManager.bootstrap()` wineserver liveness check
+- SteamCMD (warmUp, installGame, reauthenticate)
+
+**Why this matters:** When VKD3D-proton is present in the engine, `environment(for:)` injects `WINEDLLOVERRIDES=d3d12,d3d12core=n`. VKD3D's `DllMain` attempts Vulkan initialisation immediately. MoltenVK is not in the DYLD search path for the admin environment. Result: admin Wine processes (wineboot, steam.exe bootstrap) either hang, crash silently, or show unexpected UI.
+
+CLI-verified April 2026: `wineboot --update` with VKD3D overrides caused `engine.run()` to hang indefinitely. `steam.exe` with VKD3D overrides exited with exit=0 without performing the bootstrap download.
+
+---
+
+
 
 **NEVER guess about Wine, Steam, or macOS behavior.** Every behavioral assumption must be backed by:
 

@@ -1,0 +1,126 @@
+---
+description: Meridian file logging system — architecture, log locations, how to read logs during debugging
+alwaysApply: true
+---
+
+# Logging System
+
+**ALWAYS check the log file when debugging any issue:**
+`~/Library/Application Support/com.meridian.app/logs/meridian.log`
+
+Read this file FIRST before forming hypotheses. It contains timestamped, categorized output from every subsystem. The log captures stderr from Wine processes, exit codes, phase timings, and error details that are not visible in the Xcode console.
+
+Meridian writes structured, timestamped logs to plain text files in addition to the macOS unified log (Xcode console). This enables post-mortem debugging without Xcode attached.
+
+## Log File Locations
+
+| File | Path |
+|------|------|
+| **Current session** | `~/Library/Application Support/com.meridian.app/logs/meridian.log` |
+| **Previous session** | `~/Library/Application Support/com.meridian.app/logs/meridian-previous.log` |
+
+At every app launch, `meridian.log` is renamed to `meridian-previous.log` (one generation kept), and a fresh `meridian.log` is created. This means the current session's log is always in `meridian.log`.
+
+The log directory is created automatically on first launch. Files are flushed after every write, so they survive crashes.
+
+## Reading Logs
+
+**In Settings:** Settings → Updates → Diagnostics → "Open Log" button opens `meridian.log` in the system default text editor.
+
+**In Terminal:**
+```bash
+# Tail the live log while the app runs
+tail -f ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+
+# Grep for errors only
+grep ERROR ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+
+# Grep for Steam bootstrap failures
+grep -E "healthMonitor|waitUntilReady|BOOTSTRAP" ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+
+# Full absolute path (for AI tools reading the file directly)
+# /Users/<username>/Library/Application Support/com.meridian.app/logs/meridian.log
+```
+
+**From AI/Cursor:** Read the file directly with the Read tool using the absolute path — the log is plain UTF-8 text.
+
+## Log Format
+
+Each line:
+```
+2026-03-27 14:32:05 CDT  [INFO]  [WineSteamManager] [startPersistent] pid=47788
+2026-03-27 14:32:06 CDT  [WARN]  [BootstrapManager] [bootstrap] Steam failed to start
+2026-03-27 14:32:06 CDT  [ERROR] [WineSteamManager] [healthMonitor] Steam died — uptime=4s exitCode=1 reason=normal-exit retry=1/5
+```
+
+Format: `<ISO-8601 timestamp>  [LEVEL]  [Category] <message>`
+
+Levels: `INFO`, `DEBUG`, `WARN`, `ERROR`
+
+## Startup Header
+
+Every log begins with a diagnostic header block:
+```
+================================================================================
+Meridian v1.0.3 (Build 42)  —  started 2026-03-27 14:32:05 CDT
+macOS 15.4.0 | arm64
+Application Support: /Users/nick/Library/Application Support/com.meridian.app/
+Log: /Users/nick/Library/Application Support/com.meridian.app/logs/meridian.log
+================================================================================
+```
+
+## Implementation
+
+All logging goes through `MeridianLog` (`Meridian/Utilities/MeridianLog.swift`), which simultaneously writes to:
+- `os.Logger` (macOS unified log, visible in Xcode console and `log stream`)
+- `LogFileWriter.shared` (the on-disk file, via a dedicated serial `DispatchQueue`)
+
+**Replacing a logger in a new file:**
+```swift
+// Old:
+private let log = Logger(subsystem: "com.meridian.app", category: "MyComponent")
+
+// New:
+private let log = MeridianLog(category: "MyComponent")
+```
+
+Call sites are identical: `log.info(...)`, `log.warning(...)`, `log.error(...)`, `log.debug(...)`. Plain `String` interpolation only — no `privacy:` annotations needed.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `Meridian/Utilities/MeridianLog.swift` | `MeridianLog` struct + `LogFileWriter` singleton |
+| All 16 engine/app/steam/launch Swift files | Use `MeridianLog(category:)` as their module-level `log` |
+
+## Categories in Use
+
+| Category | File |
+|----------|------|
+| `AppUpdateChecker` | Engine/AppUpdateChecker.swift |
+| `EngineDownloader` | Engine/EngineDownloader.swift |
+| `WineEngine` | Engine/WineEngine.swift |
+| `WineSteamManager` | Engine/WineSteamManager.swift |
+| `SteamWindowSuppressor` | Engine/SteamWindowSuppressor.swift |
+| `GameProcess` | Engine/GameProcess.swift |
+| `WinePrefix` | Engine/WinePrefix.swift |
+| `TerminationCleanup` | Engine/TerminationCleanup.swift |
+| `AppDelegate` | App/AppDelegate.swift |
+| `BootstrapManager` | App/BootstrapManager.swift |
+| `GameLauncher` | Launch/GameLauncher.swift |
+| `SteamAPI` | Steam/SteamAPIService.swift |
+| `SteamAuth` | Steam/SteamAuthService.swift |
+| `SteamCredentialAuth` | Steam/SteamCredentialAuth.swift |
+| `SteamLibrary` | Steam/SteamLibraryStore.swift |
+| `SteamSessionBridge` | Steam/SteamSessionBridge.swift |
+
+## Noise Reduction
+
+`SteamWindowSuppressor` only logs poll diagnostics when the observed Wine process count changes or every 60 seconds (120 ticks × 0.5s). This avoids flooding the log with hundreds of identical `poll#NNNN` lines during idle sessions.
+
+## Important Constraints
+
+- Do NOT use `Logger(subsystem:category:)` directly in new code — always use `MeridianLog(category:)` so output reaches the file.
+- Do NOT use `privacy:` annotations in `MeridianLog` call sites (they are `os.Logger`-specific syntax and will cause a compile error).
+- `LogFileWriter` is a `final class: @unchecked Sendable` — all writes are serialized on its `DispatchQueue`. It is safe to call from any thread, actor, or `Task`.
+- Log files are not uploaded or transmitted anywhere. They are purely local diagnostic files in Application Support.

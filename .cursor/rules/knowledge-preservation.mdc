@@ -34,3 +34,37 @@ Every discovery, root cause analysis, CLI test result, and behavioral finding MU
 - Passwords, API keys, or refresh tokens (these go in Keychain/UserDefaults at runtime)
 - CrossOver Preview binary paths in committed code comments (the CX integration is personal-use)
 - Decompilation results or proprietary CodeWeavers internals beyond what PE export tables show
+
+---
+
+## Session Breakthroughs Log
+
+Chronological record of major root-cause discoveries. Add an entry every time something significant is resolved. Format: date, symptom, root cause, fix location.
+
+### April 2026 — Boot stability fixes
+
+**Bootstrap frozen at "Applying new Wine engine…"**
+- Symptom: App hung indefinitely, `wine64 wineboot --update` had already exited
+- Root cause: `NSFileHandle.availableData` blocks on a pipe when the write-end is held open by wineserver (which inherits all wine64 fds). This is a POSIX blocking `read()`, not a non-blocking read as Apple's docs imply.
+- Fix: `readNonBlocking()` in `WineEngine.swift` — sets `O_NONBLOCK` before `availableData`, restores flags after
+
+**Steam sign-in screen appearing after Meridian closed**
+- Symptom: Windows Steam login window visible after Meridian force-quit
+- Root cause: `wineboot --update` runs `HKCU\...\Run` entries. Steam registers itself there. With no valid ConnectCache, Steam shows sign-in UI. SteamWindowSuppressor is not active during wipeboot.
+- Fix: `WinePrefix.refreshSystemDLLs()` deletes the Steam Run key before every wineboot call
+
+**Bootstrap steam.exe exits without downloading (exit=0)**
+- Symptom: Steam tried to download its client, got "http error 0", exited. All bootstrap attempts failed similarly.
+- Root cause: `WineSteamManager.bootstrap()` used `engine.environment(for:)` which injected VKD3D D3D12 overrides into steam.exe. When VKD3D is present, d3d12.dll is forced to load, VKD3D's DllMain tries to init Vulkan, MoltenVK not found, process exits.
+- Fix: `bootstrap()` and all non-game Wine launches use `engine.steamCMDEnvironment(for:)` only
+
+**wineboot --update triggered on every launch**
+- Symptom: Every app launch ran "Applying new Wine engine…" and triggered wipeboot
+- Root cause: `lastPrefixEngineTag` stored `v4.0.0-engine` (a locally-built engine). The auto-downloaded engine was `v3.0.0-engine`. Every launch saw a mismatch. wipeboot hanged → tag never updated → loop.
+- Fix: The pipe fix (above) allowed wipeboot to complete once → tag updated → loop broken
+
+**Orphaned steamservice.exe / winedevice.exe from days ago**
+- Symptom: `ps aux` showed Wine processes from Monday still running on Thursday
+- Root cause: Wine processes replace `argv[0]` with Windows path after startup (`C:\...\steamservice.exe`). `pkill -f "com.meridian.app/engine"` no longer matches them. wipeboot starts new wineserver sessions that don't cover these orphans.
+- Fix: `TerminationCleanup` added `pkill -f "steamservice.exe"` and `pkill -f "winedevice.exe"` to the initial sweep
+
