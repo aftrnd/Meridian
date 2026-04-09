@@ -64,6 +64,11 @@ enum TerminationCleanup {
         log.info("[cleanup] steamwebhelper pre-kill exit=\(swh1)")
         let stm1 = pkill(["-9", "-f", "steam.exe"])
         log.info("[cleanup] steam.exe pre-kill exit=\(stm1)")
+        // Wine processes replace argv[0] with a Windows path after startup, so the
+        // engine-path pkill below won't find them. Kill by the Windows path string
+        // which still appears in their command line after the replacement.
+        pkill(["-9", "-f", "steamservice.exe"])
+        pkill(["-9", "-f", "winedevice.exe"])
 
         // 2. Brief pause — let the kill signal land before wineserver tears down.
         usleep(100_000) // 100 ms

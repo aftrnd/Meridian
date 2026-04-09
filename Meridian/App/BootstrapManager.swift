@@ -303,6 +303,10 @@ final class BootstrapManager {
             let t = ContinuousClock.now
             do {
                 try await prefix.resetToEngineTemplate(engine: engine)
+                // Kill Wine processes started by wineboot (wineserver, winedevice, etc.)
+                // before the registration step so it starts a clean new session.
+                steamManager.killAll(engine: engine, prefix: prefix)
+                try? await Task.sleep(for: .seconds(1))
                 settings.lastPrefixEngineTag = currentTag
                 log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
                 await prefix.registerWinRTClasses(engine: engine)

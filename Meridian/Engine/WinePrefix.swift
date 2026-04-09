@@ -341,6 +341,15 @@ struct WinePrefix: Sendable {
     /// around its absence — if `wineboot --update` fails, the caller receives a clear error.
     func refreshSystemDLLs(engine: WineEngine, engineTag: String) async throws {
         log.info("[refreshSystemDLLs] running wineboot --update for engine \(engineTag)")
+
+        // Remove Steam's autorun registry entry before wineboot --update.
+        // wineboot processes HKCU\...\Run entries and starts any registered programs.
+        // Steam registers itself there during installation — if not removed, wineboot
+        // starts steam.exe which shows its sign-in window when no valid session exists.
+        // Steam re-adds itself the next time it runs normally, so this is safe to strip.
+        let runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        try? await engine.run(args: ["reg", "delete", runKey, "/v", "Steam", "/f"], prefix: self)
+
         let process = try await engine.run(args: ["wineboot", "--update"], prefix: self)
         guard process.terminationStatus == 0 else {
             log.error("[refreshSystemDLLs] wineboot --update failed exit=\(process.terminationStatus) — check engine contains wine/share/wine/wine.inf")
