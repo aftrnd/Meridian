@@ -288,7 +288,7 @@ final class WineEngine {
         process.executableURL = wineExe
         process.arguments = args
 
-        var env = environment(for: prefix)
+        var env = steamCMDEnvironment(for: prefix)
         env.merge(extraEnv) { _, new in new }
         process.environment = env
 
