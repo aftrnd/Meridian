@@ -311,14 +311,13 @@ final class WineEngine {
             }
         }
 
-        // Process has exited. Read whatever is buffered in the pipes RIGHT NOW
-        // using availableData (non-blocking). Do NOT use readDataToEndOfFile() —
-        // Wine child processes (wineserver, services.exe, winedevice.exe) inherit
-        // the pipe file descriptors and stay alive indefinitely. readDataToEndOfFile
-        // blocks until ALL holders of the write end close it, causing a deadlock
-        // that freezes the app forever (e.g. wineboot --update never "returns").
-        let stdout = String(data: stdoutPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+        // Process has exited. Read buffered pipe output with O_NONBLOCK so we don't
+        // block waiting for wine child processes (wineserver, winedevice.exe) that
+        // inherited the pipe write-ends and stay alive indefinitely.
+        // availableData calls read() which blocks when the write end is still open
+        // and no data has been written — exactly the case here after wine64 exits.
+        let stdout = String(data: readNonBlocking(stdoutPipe), encoding: .utf8) ?? ""
+        let stderr = String(data: readNonBlocking(stderrPipe), encoding: .utf8) ?? ""
         try? stdoutPipe.fileHandleForReading.close()
         try? stderrPipe.fileHandleForReading.close()
 
@@ -356,4 +355,23 @@ final class WineEngine {
 private extension String {
     /// Returns `self` if non-empty, otherwise `nil`.
     var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+// MARK: - Non-blocking pipe read
+
+/// Reads whatever bytes are currently buffered in a Pipe without blocking.
+///
+/// availableData calls read() which blocks when the write end of the pipe
+/// is still held open by another process (e.g. wineserver inheriting Wine's
+/// pipe fds). Setting O_NONBLOCK makes read() return EAGAIN immediately
+/// instead of blocking, so we get buffered data without waiting for EOF.
+private func readNonBlocking(_ pipe: Pipe) -> Data {
+    let fh = pipe.fileHandleForReading
+    let fd = fh.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0 else { return Data() }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    let data = fh.availableData
+    fcntl(fd, F_SETFL, flags)
+    return data
 }
