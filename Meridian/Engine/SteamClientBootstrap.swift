@@ -12,8 +12,24 @@ private let log = MeridianLog(category: "SteamClientBootstrap")
 /// `steamui.dll` is present and Steam is fully bootstrapped.
 struct SteamClientBootstrap {
 
-    static let manifestURL = URL(string: "https://cdn.steamstatic.com/client/steam_client_win32")!
-    static let cdnBase = "https://cdn.steamstatic.com/client/"
+    // cdn.akamai.steamstatic.com is tried first — confirmed working with ATS on macOS 26.
+    // cdn.steamstatic.com is the fallback (now also in NSExceptionDomains).
+    static let manifestURLs: [URL] = [
+        URL(string: "https://cdn.akamai.steamstatic.com/client/steam_client_win32")!,
+        URL(string: "https://cdn.steamstatic.com/client/steam_client_win32")!,
+    ]
+    // SteamCMD has its own manifest. The bootstrapper stub (steamcmd.exe) ships without
+    // steamconsole.dll and other required DLLs — they come from these packages, not from
+    // the Steam client packages above. We download and extract them alongside the Steam
+    // client to give steamcmd.exe everything it needs to start.
+    static let steamCMDManifestURLs: [URL] = [
+        URL(string: "https://cdn.akamai.steamstatic.com/client/steam_cmd_win32")!,
+        URL(string: "https://cdn.steamstatic.com/client/steam_cmd_win32")!,
+    ]
+    static let cdnBases = [
+        "https://cdn.akamai.steamstatic.com/client/",
+        "https://cdn.steamstatic.com/client/",
+    ]
 
     // MARK: - Manifest Parsing
 
@@ -103,18 +119,38 @@ struct SteamClientBootstrap {
         to installDir: URL,
         progress: @escaping @Sendable (Int64, Int64) -> Void
     ) async throws {
-        log.info("[downloadAndInstall] fetching manifest from \(manifestURL.absoluteString)")
-        let (manifestData, manifestResponse) = try await URLSession.shared.data(from: manifestURL)
-        let httpStatus = (manifestResponse as? HTTPURLResponse)?.statusCode ?? -1
-        guard httpStatus == 200 else {
-            log.error("[downloadAndInstall] manifest download failed: HTTP \(httpStatus)")
-            throw BootstrapError.manifestDownloadFailed(statusCode: httpStatus)
+        // Try manifest URLs in preference order; remember which CDN base succeeded.
+        var manifestText: String?
+        var activeCDNBase = cdnBases[0]
+        var lastError: Error = BootstrapError.manifestDownloadFailed(statusCode: -1)
+        for (index, url) in manifestURLs.enumerated() {
+            log.info("[downloadAndInstall] fetching manifest from \(url.absoluteString)")
+            do {
+                let (manifestData, manifestResponse) = try await URLSession.shared.data(from: url)
+                let httpStatus = (manifestResponse as? HTTPURLResponse)?.statusCode ?? -1
+                guard httpStatus == 200 else {
+                    log.warning("[downloadAndInstall] manifest HTTP \(httpStatus) from \(url.host ?? url.absoluteString) — trying next")
+                    lastError = BootstrapError.manifestDownloadFailed(statusCode: httpStatus)
+                    continue
+                }
+                guard let text = String(data: manifestData, encoding: .utf8) else {
+                    log.warning("[downloadAndInstall] manifest not valid UTF-8 from \(url.host ?? url.absoluteString) — trying next")
+                    lastError = BootstrapError.manifestParseFailed
+                    continue
+                }
+                manifestText = text
+                activeCDNBase = cdnBases[index]
+                log.info("[downloadAndInstall] manifest downloaded from \(url.host ?? url.absoluteString): \(manifestData.count) bytes")
+                break
+            } catch {
+                log.warning("[downloadAndInstall] manifest fetch failed from \(url.host ?? url.absoluteString): \(error.localizedDescription) — trying next")
+                lastError = error
+            }
         }
-        guard let manifestText = String(data: manifestData, encoding: .utf8) else {
-            log.error("[downloadAndInstall] manifest is not valid UTF-8")
-            throw BootstrapError.manifestParseFailed
+        guard let manifestText else {
+            log.error("[downloadAndInstall] all manifest URLs failed — last error: \(lastError.localizedDescription)")
+            throw lastError
         }
-        log.info("[downloadAndInstall] manifest downloaded: \(manifestData.count) bytes")
 
         let packages = parseManifest(manifestText)
         guard !packages.isEmpty else {
@@ -134,7 +170,7 @@ struct SteamClientBootstrap {
         for (index, pkg) in packages.enumerated() {
             try Task.checkCancellation()
 
-            let url = URL(string: cdnBase + pkg.file)!
+            let url = URL(string: activeCDNBase + pkg.file)!
             log.info("[downloadAndInstall] [\(index + 1)/\(packages.count)] \(pkg.name) (\(pkg.size / 1024)KB)")
 
             let localFile = packageDir.appending(path: pkg.file)
@@ -210,9 +246,25 @@ struct SteamClientBootstrap {
     // MARK: - Zip Extraction
 
     private static func extractZip(_ zipFile: URL, to destination: URL) throws {
+        // Steam packages have two quirks that defeat standard tools:
+        // 1. A 20-byte proprietary Valve header is prepended before the ZIP data.
+        //    ditto -xk requires PK magic at byte 0 and fails.
+        //    unzip finds the end-of-central-directory from the tail — handles the header.
+        // 2. ZIP entry paths use Windows backslash separators (e.g. "bin\cef\file").
+        //    unzip on macOS/Unix treats backslash as a valid filename character, so it
+        //    creates files with literal backslashes in their names rather than nested dirs.
+        //    Python zipfile with explicit replacement converts paths correctly.
+        let script = """
+import zipfile, sys
+src, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as z:
+    for info in z.infolist():
+        info.filename = info.filename.replace('\\\\', '/')
+        z.extract(info, dst)
+"""
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        process.arguments = ["-xk", zipFile.path(percentEncoded: false), destination.path(percentEncoded: false)]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", script, zipFile.path(percentEncoded: false), destination.path(percentEncoded: false)]
 
         let errPipe = Pipe()
         process.standardError = errPipe
@@ -243,7 +295,117 @@ struct SteamClientBootstrap {
         log.info("[writeInstalledManifest] wrote \(manifestPath.lastPathComponent)")
     }
 
-    // MARK: - Errors
+    // MARK: - SteamCMD Package Download
+
+    /// Downloads and extracts the SteamCMD packages (steam_cmd_win32 manifest) into installDir.
+    ///
+    /// The bootstrapper stub (steamcmd.exe from SteamSetup.exe) ships without steamconsole.dll
+    /// and other required DLLs. These come from the steam_cmd_win32 manifest — a separate set
+    /// of packages distinct from the Steam client. Without them, steamcmd crashes at startup
+    /// with "Fatal Error: Failed to load steamconsole.dll" before it can self-update.
+    ///
+    /// The IsBootstrapperPackage entry (steamcmd_win32) is skipped — it's the same 2013 stub
+    /// already installed by SteamSetup.exe.
+    static func downloadAndInstallSteamCMD(
+        to installDir: URL,
+        progress: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws {
+        var manifestText: String?
+        var activeCDNBase = cdnBases[0]
+        var lastError: Error = BootstrapError.manifestDownloadFailed(statusCode: -1)
+
+        for (index, url) in steamCMDManifestURLs.enumerated() {
+            log.info("[downloadAndInstallSteamCMD] fetching manifest from \(url.absoluteString)")
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                guard status == 200, let text = String(data: data, encoding: .utf8) else {
+                    lastError = BootstrapError.manifestDownloadFailed(statusCode: status)
+                    continue
+                }
+                manifestText = text
+                activeCDNBase = cdnBases[index]
+                log.info("[downloadAndInstallSteamCMD] manifest from \(url.host ?? ""): \(data.count) bytes")
+                break
+            } catch {
+                log.warning("[downloadAndInstallSteamCMD] \(url.host ?? ""): \(error.localizedDescription)")
+                lastError = error
+            }
+        }
+        guard let manifestText else { throw lastError }
+
+        // Parse all packages — download all except the site server web UI (14MB of HTML/JS
+        // for steamcmd's server management mode, irrelevant for game installs) and the
+        // error reporter (crash reporting, not needed in our environment).
+        // The bootstrapper package (steamcmd_win32) IS included — it contains the updated
+        // steamcmd.exe (4.2MB) that replaces the 2013 stub from SteamSetup.exe.
+        let allPkgs = parseManifest(manifestText)
+        let packages = allPkgs.filter {
+            !$0.name.contains("siteserverui") && !$0.name.contains("errorreporter")
+        }
+
+        guard !packages.isEmpty else {
+            log.error("[downloadAndInstallSteamCMD] no packages found in manifest")
+            throw BootstrapError.manifestParseFailed
+        }
+
+        let totalBytes = Int64(packages.reduce(0) { $0 + $1.size })
+        log.info("[downloadAndInstallSteamCMD] \(packages.count) packages, \(totalBytes / 1_048_576) MB total")
+
+        let fm = FileManager.default
+        let packageDir = installDir.appending(path: "package")
+        try fm.createDirectory(at: packageDir, withIntermediateDirectories: true)
+
+        var downloadedBytes: Int64 = 0
+        for (index, pkg) in packages.enumerated() {
+            try Task.checkCancellation()
+            let url = URL(string: activeCDNBase + pkg.file)!
+            let localFile = packageDir.appending(path: pkg.file)
+
+            if fm.fileExists(atPath: localFile.path(percentEncoded: false)),
+               let attrs = try? fm.attributesOfItem(atPath: localFile.path(percentEncoded: false)),
+               let sz = attrs[.size] as? Int, sz == pkg.size,
+               verifySHA256(file: localFile, expected: pkg.sha256) {
+                log.info("[downloadAndInstallSteamCMD] [\(index+1)/\(packages.count)] \(pkg.name) cached ✓")
+                downloadedBytes += Int64(pkg.size)
+                progress(downloadedBytes, totalBytes)
+                continue
+            }
+
+            log.info("[downloadAndInstallSteamCMD] [\(index+1)/\(packages.count)] downloading \(pkg.name) (\(pkg.size / 1024)KB)")
+            let (data, response) = try await URLSession.shared.data(from: url)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            guard status == 200 else { throw BootstrapError.packageDownloadFailed(name: pkg.name, statusCode: status) }
+            guard data.count == pkg.size else { throw BootstrapError.packageSizeMismatch(name: pkg.name, expected: pkg.size, actual: data.count) }
+            let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            guard sha == pkg.sha256 else { throw BootstrapError.packageHashMismatch(name: pkg.name) }
+            try data.write(to: localFile)
+            downloadedBytes += Int64(pkg.size)
+            progress(downloadedBytes, totalBytes)
+        }
+
+        log.info("[downloadAndInstallSteamCMD] extracting SteamCMD packages")
+        for pkg in packages {
+            try Task.checkCancellation()
+            let localFile = packageDir.appending(path: pkg.file)
+            log.info("[downloadAndInstallSteamCMD] extracting \(pkg.name)")
+            try extractZip(localFile, to: installDir)
+        }
+
+        let consolePath = installDir.appending(path: "steamconsole.dll").path(percentEncoded: false)
+        let cmdPath = installDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        if fm.fileExists(atPath: consolePath) && fm.fileExists(atPath: cmdPath) {
+            // Verify the new steamcmd.exe is larger than the 2013 stub (1.6MB)
+            let size = (try? fm.attributesOfItem(atPath: cmdPath))?[.size] as? Int ?? 0
+            if size > 2_000_000 {
+                log.info("[downloadAndInstallSteamCMD] SteamCMD packages installed ✓ (steamcmd.exe=\(size/1024)KB, steamconsole.dll present)")
+            } else {
+                log.warning("[downloadAndInstallSteamCMD] steamcmd.exe appears to be old stub (\(size/1024)KB) — steamcmd_win32 package may not have extracted correctly")
+            }
+        } else {
+            log.warning("[downloadAndInstallSteamCMD] steamconsole.dll or steamcmd.exe absent after extraction — SteamCMD may fail")
+        }
+    }
 
     enum BootstrapError: LocalizedError {
         case manifestDownloadFailed(statusCode: Int)

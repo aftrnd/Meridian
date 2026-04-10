@@ -455,6 +455,9 @@ private struct SteamLoginStepContent: View {
             try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
             try? prefix.writeConnectCache(steamID: steamID, refreshToken: refreshToken, accountName: accountName)
             prefix.backupSteamCMDConfig()
+            // Persist credentials to AppSettings so SteamSessionBridge.prepare()
+            // can re-write ConnectCache on every subsequent launch without re-auth.
+            sessionBridge.setPendingTokens(steamID: steamID, accountName: accountName, refreshToken: refreshToken)
             // Mark as authenticated so needsAPIKey returns true when advance() runs.
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true

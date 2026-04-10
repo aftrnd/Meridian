@@ -115,7 +115,13 @@ The current date matters. Always use the **latest stable versions** of all depen
 
 **CRITICAL: Use CX Wine, NOT Gcenx wine-devel, for the Wine binary.** Gcenx Wine 11.6 fails HTTPS with HTTP error 0 on macOS 26 — Steam bootstrap never downloads its client. CLI-verified April 2026: Steam bootstrap with CX Wine 11.4 downloads at 130 MB/s. `release-engine.sh` copies Wine from CX Preview `CrossOver-Hosted Application/wineloader`; DXMT, DXVK, GPTK also sourced from CrossOver Preview.
 
-**False theory (do NOT repeat):** Earlier hypothesis was that CX Wine uses GnuTLS standalone and fails. This is wrong. `otool -L crypt32.so` on both CX Wine and Gcenx Wine shows ONLY `Security.framework` — neither binary links to libgnutls. The TLS failure with Gcenx Wine on macOS 26 has unknown root cause. CX Wine TLS is fine when lib64 is NOT on DYLD_FALLBACK_LIBRARY_PATH.
+**TLS architecture (corrected April 10, 2026):** Wine has two separate TLS paths. `crypt32.so`
+uses Security.framework for certificates — this works without lib64. `secur32.so` uses GnuTLS
+exclusively for Schannel/TLS handshakes — it REQUIRES lib64 on DYLD_FALLBACK_LIBRARY_PATH so
+it can dlopen libgnutls.30.dylib. lib64/libgnutls also needs `@loader_path` rpath (added by
+release-engine.sh) for its @rpath/libgmp.10.dylib dependency. Both steamCMDEnvironment and
+environment(for:) now include lib64. Steam's own bootstrapper uses statically-linked OpenSSL
+(not Wine's TLS) which fails under WoW64 — Meridian bypasses it with native macOS bootstrap.
 
 **GPTK + CX Wine ABI:** GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call`. This function exists in CX Wine but NOT Gcenx Wine. `WineEngine.detect()` checks `ntdll.dll` (the Windows PE DLL) for the null-terminated export name `__wine_unix_call\0` via binary string search. **NOT ntdll.so** — the standalone symbol is absent from the Unix .so; it only appears in the PE export table (verified at byte offset 673776, April 2026). With CX Wine: gptkPath set → D3D12 active. With Gcenx Wine: gptkPath = nil → D3D12 disabled.
 
@@ -295,6 +301,12 @@ if settings.winRTRegistrationAppliedVersion < WinePrefix.winRTRegistrationVersio
 |---------|----------|--------------|
 | 1 | `WinePrefix.installVKD3DProton` | (INCORRECT) Copied VKD3D-proton DLLs to system32 — caused GPTK conflict |
 | 2 | `WinePrefix.installVKD3DProton` | Removes VKD3D-proton DLLs from system32 (cleanup) — GPTK uses WINEDLLPATH, not system32 |
+
+**Steam install path + WoW64 crypto registry (separate version counter, `steamInstallPathRegistrationVersion`):**
+| Version | Function | What it does |
+|---------|----------|--------------|
+| 1 | `WinePrefix.writeSteamInstallPathRegistryKeys` | Writes HKLM Steam install path (WoW64 + 64-bit) and HKCU SteamPath/SteamExe |
+| 2 | `WinePrefix.writeSteamInstallPathRegistryKeys` | Also writes WoW64 crypto provider types (Type 001/003/012/013/018/024) and DLL paths — wine.inf omits these, causing CryptAcquireContextA to fail in all 32-bit apps |
 
 ## Custom Stub DLLs for Missing Wine Implementations
 

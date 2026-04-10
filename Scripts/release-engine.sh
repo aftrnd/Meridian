@@ -26,23 +26,21 @@
 #
 # Wine source: CrossOver Preview (CX Wine 11.4 with full CodeWeavers patches)
 #   WHY CX Wine (not Gcenx wine-devel):
-#   1. TLS: Both CX Wine and Gcenx Wine crypt32.so link ONLY to Security.framework
-#      (CLI-verified April 2026: otool -L confirms no libgnutls linkage in either).
-#      CX Wine Steam bootstrap is confirmed working when lib64 is NOT on
-#      DYLD_FALLBACK_LIBRARY_PATH. The app's steamCMDEnvironment only adds lib:
-#      lib/wine/x86_64-unix to DYLD — NOT lib64. CX Wine TLS works fine standalone.
+#   1. TLS: secur32.so uses GnuTLS exclusively for Schannel/TLS (NOT Security.framework).
+#      lib64 MUST be on DYLD_FALLBACK_LIBRARY_PATH at runtime so secur32.so can dlopen
+#      libgnutls.30.dylib. libgnutls also needs @loader_path rpath (added below) so its
+#      @rpath/libgmp.10.dylib dependency resolves. crypt32.so uses Security.framework
+#      for certificate ops — its GnuTLS dlopen is only for PFX import/export.
 #   2. GPTK: CX Wine has ntdll.__wine_unix_call which CX's d3d12.dll requires.
 #      Gcenx Wine lacks this function — GPTK is permanently disabled with Gcenx.
 #      CX Wine enables full D3D12 → D3DMetal → Metal support automatically.
 #   3. Steam compat: CX Wine has CodeWeavers patches for Steam IPC, DXMT Metal APIs,
 #      and Rosetta 2. Both binaries have the same patches, but only CX enables GPTK.
 #
-# CRITICAL: DO NOT add lib64 to DYLD_FALLBACK_LIBRARY_PATH in the app.
-#   lib64 contains libgnutls.30.dylib. If it's on DYLD, crypt32.so can pick it up
-#   and use GnuTLS (which fails standalone). The app's steamCMDEnvironment and
-#   environment(for:) intentionally omit lib64 from DYLD. lib64 is only used during
-#   release-engine.sh's wineboot --init prefix-template build (where it's needed
-#   for wineserver's MoltenVK/GStreamer dependencies at build time only).
+#   NOTE: Steam's own 32-bit bootstrapper statically links OpenSSL which fails TLS
+#   under WoW64 on macOS 26. Meridian bypasses it with native macOS bootstrap
+#   (SteamClientBootstrap.swift using URLSession). Wine's TLS (via GnuTLS) is
+#   still needed for SteamCMD, WinHTTP, and other Wine HTTPS operations.
 #
 set -euo pipefail
 
@@ -221,11 +219,9 @@ fi
 # ---------- lib64 dylibs from CX Preview ----------
 # Wine's .so modules have rpath @loader_path/../../../lib64 which resolves to
 # wine/lib64/ at runtime. All supporting dylibs must be there.
-# NOTE: lib64 is NOT added to DYLD_FALLBACK_LIBRARY_PATH by the app (steamCMDEnvironment
-# and environment(for:) only add lib:lib/wine/x86_64-unix). lib64 is only needed at
-# build time for the wineboot --init prefix template step below.
-# libgnutls is staged here (it's in lib64, not on the DYLD path the app uses) but see
-# validation below — if it ever ends up in lib/ (which IS on DYLD), that's a hard error.
+# lib64 IS on DYLD_FALLBACK_LIBRARY_PATH at runtime (steamCMDEnvironment and environment(for:)
+# both include it). secur32.so needs to dlopen libgnutls.30.dylib for Wine TLS.
+# libgnutls also needs @loader_path rpath to find @rpath/libgmp.10.dylib (fixed below).
 yellow "Staging lib64 dylibs (from CX Preview)..."
 mkdir -p "${STAGING}/wine/lib64"
 python3 -c "
@@ -290,7 +286,7 @@ mkdir -p "${PREFIX_TEMPLATE}"
 info "Running wineboot --init (this may take 1-3 minutes)..."
 # Run wineboot --init in background with a 180s timeout.
 # lib64 is included in DYLD here (build-time only) so wineserver can find MoltenVK/GStreamer.
-# The app's steamCMDEnvironment does NOT include lib64 in DYLD at runtime.
+# lib64 included in DYLD — same as app runtime. Needed for GnuTLS (secur32.so TLS).
 WINEPREFIX="${PREFIX_TEMPLATE}" \
 DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix:${STAGING}/wine/lib64" \
 WINEDLLPATH="${STAGING}/wine/lib/wine" \
@@ -386,12 +382,12 @@ else
 fi
 
 # Critical: verify libgnutls was NOT accidentally staged in wine/lib/.
-# wine/lib/ IS on DYLD_FALLBACK_LIBRARY_PATH — if libgnutls ends up there,
-# crypt32.so will dopen it and break TLS. lib64/ is NOT on DYLD at runtime
-# (only used during this wineboot --init build step) so libgnutls there is fine.
+# libgnutls must be in lib64/ (not lib/). secur32.so's dlopen("libgnutls.30.dylib")
+# searches DYLD in order — lib64 is appended last. If libgnutls were in lib/ it
+# would load before lib64/libgmp.10.dylib is findable via @rpath.
 GNUTLS_LIB=$(find "${STAGING}/wine/lib" -maxdepth 1 -name 'libgnutls*' 2>/dev/null | head -1)
-[ -z "${GNUTLS_LIB}" ] || die "libgnutls found in wine/lib/ — would break TLS: ${GNUTLS_LIB}"
-info "libgnutls not in wine/lib/ — DYLD TLS path is clean ✓"
+[ -z "${GNUTLS_LIB}" ] || die "libgnutls found in wine/lib/ — must be in lib64/ only: ${GNUTLS_LIB}"
+info "libgnutls correctly in lib64/ only ✓"
 
 # Verify Wine ABI: check whether ntdll.so contains __wine_unix_call exactly
 # (not just __wine_unix_call_dispatcher which is a different function).

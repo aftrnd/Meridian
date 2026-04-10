@@ -364,6 +364,17 @@ final class BootstrapManager {
             settings.winRTRegistrationAppliedVersion = WinePrefix.winRTRegistrationVersion
         }
 
+        // Write Steam HKLM install-path registry keys (once per prefix).
+        // steam.exe writes these on first run; our native bootstrap bypasses steam.exe
+        // so they are never created. steamcmd.exe (32-bit WoW64) reads
+        // HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath at startup — if absent,
+        // it throws a C++ exception before loading any Steam DLLs and exits with code 3.
+        if settings.steamInstallPathRegistrationVersion < WinePrefix.steamInstallPathRegistrationVersion {
+            log.info("[bootstrap] Steam install path not registered — writing HKLM keys")
+            await prefix.writeSteamInstallPathRegistryKeys(engine: engine)
+            settings.steamInstallPathRegistrationVersion = WinePrefix.steamInstallPathRegistrationVersion
+        }
+
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
             transition(to: .bootstrappingSteam, message: "Downloading Steam client…")
@@ -480,13 +491,44 @@ final class BootstrapManager {
             // Now warm up — this is where the self-update and login cache happen.
             transition(to: .startingSteam, message: "Preparing game tools…")
             log.info("[bootstrap] warming up SteamCMD (+login +quit)…")
+            var noNativeCredentials = false
             await steamCMDService.warmUp { [weak self] line in
-                // Forward notable SteamCMD output to the splash status line
-                if line.hasPrefix("[") || line.contains("Logging in") || line.contains("Waiting") {
-                    self?.statusMessage = line
+                guard let self else { return }
+                if line.hasPrefix("[") || line.contains("Logging in") || line.contains("Waiting")
+                    || line.contains("Loading Steam") || line.contains("Verifying") || line.contains("Checking") {
+                    self.statusMessage = line
+                }
+                if line.contains("password:") || line.contains("Cached credentials not found") {
+                    log.warning("[bootstrap] SteamCMD warm-up: no cached credentials — will re-authenticate")
+                    noNativeCredentials = true
+                    steamCMDService.shutdown()
                 }
             }
             log.info("[bootstrap] SteamCMD warm-up complete ✓")
+
+            // If warm-up found no native credential cache, establish it now during
+            // bootstrap so the user only sees one 2FA prompt (here, at onboarding
+            // time) rather than being prompted again when they click Install.
+            //
+            // SteamCMD's native cache is distinct from the JWT ConnectCache written
+            // by writeConnectCache. The JWT is only used by steam.exe for auto-login.
+            // SteamCMD batch mode (+login USERNAME) requires its own encrypted blob
+            // which is only written by a full +login USERNAME PASSWORD run.
+            if noNativeCredentials {
+                log.info("[bootstrap] establishing SteamCMD native credential cache…")
+                transition(to: .startingSteam, message: "Verifying Steam account…")
+                let ok = await steamCMDService.reestablishCredentials(
+                    engine: engine,
+                    prefix: prefix,
+                    onProgress: { [weak self] msg in self?.statusMessage = msg }
+                )
+                if ok {
+                    log.info("[bootstrap] SteamCMD native credentials established ✓")
+                    statusMessage = "Steam account verified ✓"
+                } else {
+                    log.warning("[bootstrap] could not establish credentials — first Install will prompt for Steam Guard")
+                }
+            }
 
             // Kill any lingering Wine processes from the SteamCMD PTY session.
             // The `script -q /dev/null` wrapper leaves the wine64/wineserver alive

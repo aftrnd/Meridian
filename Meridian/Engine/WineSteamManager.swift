@@ -93,6 +93,20 @@ final class WineSteamManager {
             throw SteamError.bootstrapFailed(exitCode: -1, detail: "steamui.dll missing after native bootstrap")
         }
 
+        // Download SteamCMD-specific packages (steamconsole.dll etc.) from the
+        // steam_cmd_win32 manifest. The bootstrapper stub from SteamSetup.exe does not
+        // include these — without steamconsole.dll, steamcmd.exe crashes at startup.
+        log.info("[bootstrap] downloading SteamCMD packages (steamconsole.dll etc.)")
+        do {
+            try await SteamClientBootstrap.downloadAndInstallSteamCMD(
+                to: prefix.steamInstallDir,
+                progress: { _, _ in }
+            )
+        } catch {
+            // Non-fatal: the warm-up step will re-attempt if needed.
+            log.warning("[bootstrap] SteamCMD packages download failed (non-fatal): \(error.localizedDescription)")
+        }
+
         log.info("[bootstrap] Steam bootstrap complete ✓ (native macOS download)")
     }
 

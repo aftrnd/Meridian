@@ -163,6 +163,17 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "vkd3dProtonInstalledVersion") }
     }
 
+    /// Tracks whether the Steam HKLM install-path registry keys have been written.
+    ///
+    /// steam.exe writes HKLM\SOFTWARE\Valve\Steam\InstallPath on first run.
+    /// When using the native bootstrap (steam.exe never runs its own updater),
+    /// these keys are absent and 32-bit steamcmd.exe crashes immediately on startup.
+    /// Increment `WinePrefix.steamInstallPathRegistrationVersion` to force a re-write.
+    var steamInstallPathRegistrationVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "steamInstallPathRegistrationVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "steamInstallPathRegistrationVersion") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {
