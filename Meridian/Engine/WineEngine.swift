@@ -400,17 +400,28 @@ private extension String {
 
 /// Reads whatever bytes are currently buffered in a Pipe without blocking.
 ///
-/// availableData calls read() which blocks when the write end of the pipe
-/// is still held open by another process (e.g. wineserver inheriting Wine's
-/// pipe fds). Setting O_NONBLOCK makes read() return EAGAIN immediately
-/// instead of blocking, so we get buffered data without waiting for EOF.
+/// Uses raw Darwin.read() with O_NONBLOCK rather than availableData.
+/// NSConcreteFileHandle.availableData throws NSFileHandleOperationException
+/// when read() returns EAGAIN (errno 35) — it does not return empty Data.
+/// Darwin.read() returns -1 on EAGAIN which we handle by breaking the loop.
 private func readNonBlocking(_ pipe: Pipe) -> Data {
     let fh = pipe.fileHandleForReading
     let fd = fh.fileDescriptor
     let flags = fcntl(fd, F_GETFL)
     guard flags >= 0 else { return Data() }
     fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-    let data = fh.availableData
-    fcntl(fd, F_SETFL, flags)
-    return data
+    defer { fcntl(fd, F_SETFL, flags) }
+
+    var result = Data()
+    var buf = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let n = Darwin.read(fd, &buf, buf.count)
+        if n > 0 {
+            result.append(contentsOf: buf[..<n])
+        } else {
+            // n == 0: EOF  |  n == -1: EAGAIN or other error — stop reading
+            break
+        }
+    }
+    return result
 }
