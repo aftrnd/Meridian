@@ -10,7 +10,61 @@ Meridian uses a strict two-track versioning scheme: one for the **app** and one 
 
 ---
 
-## App Version (the .app bundle)
+## Branch & Release Structure
+
+Meridian follows a two-tier branch model. This is a rule — follow it on every session.
+
+### Version branches — `vX.Y.Z`
+
+```
+v0.9.7    ← stable release branch (all commits shipped in that version)
+v0.9.8    ← current stable base branch
+v1.0.0    ← next major release base
+```
+
+- Each `vX.Y.Z` branch is the **clean, working base** for that version.
+- It receives only tested, working commits — no experiments, no WIP.
+- GitHub releases and tags are cut from these branches.
+- When ready to ship a new version, bump `MARKETING_VERSION` on this branch and tag it.
+
+### Feature branches — `feature/vX.Y.Z-description`
+
+```
+feature/v0.9.8-dev        ← general development for v0.9.8
+feature/v0.9.8-d3d12      ← specific D3D12 work targeting v0.9.8
+feature/v0.9.8-ui-polish  ← UI work targeting v0.9.8
+```
+
+- Feature branches are **always named after the target version they merge into**.
+- Branched from the corresponding version branch (`v0.9.8`).
+- Merged back to the version branch when the feature is complete and tested.
+- Never merge an untested feature directly to a version branch.
+
+### Workflow
+
+```
+v0.9.8 ──────────────────────────────────────► (stable)
+          \                        /
+           feature/v0.9.8-dev ────
+
+v0.9.9 ──────────────────────────────────────► (next, branched from v0.9.8 when ready)
+```
+
+```bash
+# Start new feature work
+git checkout v0.9.8
+git checkout -b feature/v0.9.8-my-feature
+# ... develop, test ...
+git checkout v0.9.8 && git merge feature/v0.9.8-my-feature
+
+# Cut next version base
+git checkout v0.9.8
+git checkout -b v0.9.9
+```
+
+---
+
+
 
 ### Source of truth: `MARKETING_VERSION` in Xcode build settings
 
