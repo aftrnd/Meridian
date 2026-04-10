@@ -158,19 +158,25 @@ final class WineEngine {
             : nil
 
         // GPTK: D3D12 → D3DMetal.framework → Metal
-        // REQUIRES CX Wine ABI: ntdll.__wine_unix_call must be present.
+        // REQUIRES CX Wine ABI: ntdll.__wine_unix_call must be present as a PE export.
         // GPTK's d3d12.dll AND dxgi.dll both import ntdll.__wine_unix_call.
-        // Loading them on Gcenx Wine (which lacks this function) causes:
+        // Loading them on Gcenx Wine (which lacks this export) causes:
         //   "wine: Call from ... to unimplemented function ntdll.dll.__wine_unix_call, aborting"
-        // With CX Wine (current engine base): __wine_unix_call IS present → gptkPath is set
+        // With CX Wine (current engine base): __wine_unix_call IS exported → gptkPath is set
         // and GPTK env vars are injected for game launches → D3D12 → D3DMetal → Metal works.
         // CLI-verified April 2026: CX Wine steam.exe bootstrap downloads successfully
         // (confirmed 130 MB/s download). Gcenx Wine 11.6 fails with HTTP error 0 on macOS 26.
-        let ntdllSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/ntdll.so")
+        //
+        // DETECTION: Search the Windows PE ntdll.dll (not ntdll.so) for the null-terminated
+        // string "__wine_unix_call\0". The PE export table embeds the export name as a C string.
+        // CLI-verified April 2026: ntdll.dll contains "__wine_unix_call\0" at byte offset 673776.
+        // ntdll.so does NOT contain this string — the .so has only __wine_unix_call_dispatcher
+        // and __wine_unix_call_funcs. Searching ntdll.so was the original bug causing cxABI=false.
+        let ntdllDll = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows/ntdll.dll")
         let hasCXWineABI: Bool = {
-            guard let data = try? Data(contentsOf: ntdllSo, options: .mappedIfSafe),
+            guard let data = try? Data(contentsOf: ntdllDll, options: .mappedIfSafe),
                   let base = "__wine_unix_call".data(using: .utf8) else { return false }
-            // Append null byte to match the exact symbol, not the longer __wine_unix_call_dispatcher
+            // Append null byte to match the exact export name, not __wine_unix_call_dispatcher
             var marker = base
             marker.append(0)
             return data.range(of: marker) != nil

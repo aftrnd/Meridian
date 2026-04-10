@@ -88,6 +88,11 @@ final class WineSteamManager {
         let launchTimeout: Duration = .seconds(600)
         // How long the package dir must be size-stable before we declare download done.
         let quiescenceWindow: Duration = .seconds(25)
+        // A real Steam client download writes 100+ MB to package/. Tiny stable sizes (< 1 MB)
+        // are stale residuals (e.g. steam_client_metrics.bin, ~137 bytes) — not a finished
+        // download. Without this guard the quiescence timer fires immediately on stale state
+        // and kills Steam before it ever downloads anything.
+        let quiescenceMinBytes = 1 * 1024 * 1024  // 1 MB
 
         for launchNum in 1...maxLaunches {
             // dll may already be present if a prior launch wrote it just before exiting.
@@ -221,6 +226,9 @@ final class WineSteamManager {
                 // Once those files stop growing, the download is complete and Steam
                 // enters the "apply" phase — which hangs under Wine indefinitely.
                 // Detecting size stability lets us restart without any fixed timeout.
+                // Guard: only start the quiescence timer once the package dir exceeds
+                // 1 MB — stale residuals (e.g. steam_client_metrics.bin, ~137 bytes)
+                // must not trigger a false "download complete" restart.
                 let currentPackageSize: Int = {
                     guard let children = try? FileManager.default.contentsOfDirectory(
                         at: pkgDirURL,
@@ -238,7 +246,7 @@ final class WineSteamManager {
                     }
                     lastPackageSize = currentPackageSize
                     packageSizeStableAt = nil
-                } else if currentPackageSize > 0 {
+                } else if currentPackageSize >= quiescenceMinBytes {
                     if packageSizeStableAt == nil {
                         packageSizeStableAt = ContinuousClock.now
                         log.info("[bootstrap] package dir stable at \(currentPackageSize) bytes — quiescence timer started")
@@ -248,6 +256,8 @@ final class WineSteamManager {
                         log.info("[bootstrap] package dir quiescent for \(quiescenceWindow) (\(elapsed) total) — download done, Steam stuck in apply phase — restarting")
                         break pollLoop
                     }
+                } else if currentPackageSize > 0 {
+                    log.debug("[bootstrap] package dir below quiescence threshold (\(currentPackageSize) bytes < \(quiescenceMinBytes)) — waiting for real download")
                 }
 
                 if pollCount % 5 == 0 {

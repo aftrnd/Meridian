@@ -124,10 +124,11 @@ final class BootstrapTests: XCTestCase {
 
     // MARK: - Package directory quiescence logic
 
-    /// Mirror of the quiescence detection logic used in WineSteamManager.bootstrap().
+    /// Mirror of WineSteamManager.bootstrap() quiescence detection.
     /// Given a sequence of directory sizes, returns the index at which quiescence
-    /// is detected (size stable for `windowPolls` consecutive polls), or nil.
-    private func detectQuiescence(sizes: [Int], windowPolls: Int) -> Int? {
+    /// is detected (size stable for `windowPolls` consecutive polls and >= minBytes), or nil.
+    /// `minBytes` mirrors `quiescenceMinBytes` (1 MB) — stale tiny residuals do not trigger.
+    private func detectQuiescence(sizes: [Int], windowPolls: Int, minBytes: Int = 1 * 1024 * 1024) -> Int? {
         var lastSize: Int = -1
         var stableCount: Int = 0
 
@@ -135,7 +136,7 @@ final class BootstrapTests: XCTestCase {
             if size != lastSize {
                 lastSize = size
                 stableCount = 0
-            } else if size > 0 {
+            } else if size >= minBytes {
                 stableCount += 1
                 if stableCount >= windowPolls {
                     return i
@@ -146,15 +147,17 @@ final class BootstrapTests: XCTestCase {
     }
 
     func testQuiescenceDetectsStableSize() {
-        // Size grows then stabilizes
-        let sizes = [0, 1000, 5000, 10000, 10000, 10000, 10000]
+        let mb = 1 * 1024 * 1024
+        // Size grows above threshold then stabilizes
+        let sizes = [0, mb, mb * 5, mb * 10, mb * 10, mb * 10, mb * 10]
         let result = detectQuiescence(sizes: sizes, windowPolls: 3)
         XCTAssertNotNil(result)
         XCTAssertEqual(result, 6)
     }
 
     func testQuiescenceNotTriggeredWhenGrowing() {
-        let sizes = [0, 1000, 2000, 3000, 4000, 5000]
+        let mb = 1 * 1024 * 1024
+        let sizes = [0, mb, mb * 2, mb * 3, mb * 4, mb * 5]
         let result = detectQuiescence(sizes: sizes, windowPolls: 3)
         XCTAssertNil(result)
     }
@@ -166,16 +169,36 @@ final class BootstrapTests: XCTestCase {
     }
 
     func testQuiescenceNeedsEnoughStablePolls() {
-        let sizes = [0, 5000, 5000]
+        let mb = 1 * 1024 * 1024
+        let sizes = [0, mb * 5, mb * 5]
         let result = detectQuiescence(sizes: sizes, windowPolls: 3)
         XCTAssertNil(result, "Only 1 stable poll, need 3")
     }
 
     func testQuiescenceResetsByGrowth() {
-        // Stable at 5000, then grows, then stable at 8000
-        let sizes = [5000, 5000, 5000, 8000, 8000, 8000, 8000]
+        let mb = 1 * 1024 * 1024
+        // Stable at 5 MB, then grows, then stable at 80 MB
+        let sizes = [mb * 5, mb * 5, mb * 5, mb * 80, mb * 80, mb * 80, mb * 80]
         let result = detectQuiescence(sizes: sizes, windowPolls: 3)
         XCTAssertEqual(result, 6, "Should detect quiescence at the second stable run")
+    }
+
+    func testQuiescenceBelowMinBytesNotTriggered() {
+        // 137 bytes — the exact stale residual size seen in production (steam_client_metrics.bin)
+        let sizes = [137, 137, 137, 137, 137, 137, 137, 137, 137, 137]
+        let result = detectQuiescence(sizes: sizes, windowPolls: 3)
+        XCTAssertNil(result, "Tiny stable residual below 1 MB must not trigger quiescence")
+    }
+
+    func testQuiescenceBelowMinBytesWithCustomThreshold() {
+        // Verify the threshold itself works: sizes at exactly minBytes trigger, below do not
+        let threshold = 1000
+        let below = Array(repeating: threshold - 1, count: 10)
+        XCTAssertNil(detectQuiescence(sizes: below, windowPolls: 3, minBytes: threshold),
+                     "Size below threshold must not trigger")
+        let atThreshold = Array(repeating: threshold, count: 10)
+        XCTAssertNotNil(detectQuiescence(sizes: atThreshold, windowPolls: 3, minBytes: threshold),
+                        "Size at threshold must trigger")
     }
 
     // MARK: - Health monitor retry budget
