@@ -253,14 +253,14 @@ final class WineEngine {
             env["WINESERVER"] = wineServer.path(percentEncoded: false)
         }
 
-        // D3D11 → DXMT (builtin wiremetal.so, no overrides needed).
-        // D3D12 → VKD3D-proton (native DLLs in lib/vkd3d-proton/, loaded via WINEDLLPATH).
-        let vkd3dDir = Self.engineDir.appending(path: "wine/lib/vkd3d-proton/x86_64-windows").path(percentEncoded: false)
-        if FileManager.default.fileExists(atPath: vkd3dDir) {
-            env["WINEDLLPATH"] = vkd3dDir
-            env["WINEDLLOVERRIDES"] = "d3d12,d3d12core=n"
-            log.debug("[env] VKD3D-proton D3D12 enabled: \(vkd3dDir)")
-        }
+        // D3D11 → DXMT (builtin wiremetal.so in lib/wine/x86_64-windows/, no overrides needed).
+        // D3D12 → GPTK (D3DMetal.framework → Metal) when engine includes lib/gptk/.
+        //         VKD3D-proton is present in the engine package but NOT used on macOS/Apple Silicon:
+        //         it requires VK_EXT_transform_feedback which MoltenVK does not support.
+        //         Setting WINEDLLOVERRIDES=d3d12,d3d12core=n forces Wine to load VKD3D-proton's
+        //         native d3d12.dll for ALL games, causing 0xc06d007e (E_DELAYLOAD_MOD_NOT_FOUND)
+        //         in any Unity game that probes D3D12 (even with -force-d3d11).
+        //         CLI-verified non-functional April 2026. Do NOT re-add this override.
 
         log.debug("[env] full environment: \(env.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " | "))")
 
