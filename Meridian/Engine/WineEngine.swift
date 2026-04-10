@@ -14,16 +14,15 @@ private let log = MeridianLog(category: "WineEngine")
 /// the bootstrap pipeline will auto-download the correct release from GitHub.
 ///
 /// All runtime components are legally redistributable:
-///   - Gcenx Wine LGPL, DXMT MIT, DXVK zlib, Apple GPTK Apple-distributed,
+///   - CX Wine LGPL, DXMT MIT, DXVK zlib, Apple GPTK Apple-distributed,
 ///     MoltenVK Apache 2.0
 ///
 /// ## D3D12 Support
 ///
 /// GPTK (D3D12 → D3DMetal → Metal) requires CX Wine ABI. Detection checks for
 /// `__wine_unix_call` in ntdll.so — GPTK's d3d12.dll and dxgi.dll both import this
-/// function. Loading them on Gcenx Wine (which lacks it) causes an immediate abort.
-/// With Gcenx Wine 11.6 (current engine): gptkPath is nil, DX11 works via DXMT.
-/// With CX Wine: gptkPath is set automatically, full GPTK environment is injected.
+/// function. With CX Wine (current engine): gptkPath is set, full GPTK environment
+/// is injected for game launches. D3D12 → D3DMetal → Metal works automatically.
 @Observable
 @MainActor
 final class WineEngine {
@@ -163,7 +162,10 @@ final class WineEngine {
         // GPTK's d3d12.dll AND dxgi.dll both import ntdll.__wine_unix_call.
         // Loading them on Gcenx Wine (which lacks this function) causes:
         //   "wine: Call from ... to unimplemented function ntdll.dll.__wine_unix_call, aborting"
-        // CLI-verified April 2026: Gcenx Wine 11.6 does NOT export __wine_unix_call.
+        // With CX Wine (current engine base): __wine_unix_call IS present → gptkPath is set
+        // and GPTK env vars are injected for game launches → D3D12 → D3DMetal → Metal works.
+        // CLI-verified April 2026: CX Wine steam.exe bootstrap downloads successfully
+        // (confirmed 130 MB/s download). Gcenx Wine 11.6 fails with HTTP error 0 on macOS 26.
         let ntdllSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/ntdll.so")
         let hasCXWineABI: Bool = {
             guard let data = try? Data(contentsOf: ntdllSo, options: .mappedIfSafe),
@@ -295,8 +297,10 @@ final class WineEngine {
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
                 // Gcenx Wine or GPTK not present: DX11 via DXMT builtin, no D3D12
-                // Do NOT include lib64 — libgnutls in lib64 hijacks Wine's TLS away
-                // from Security.framework, breaking Steam CDN HTTPS.
+                // NOTE: do NOT add lib64 to DYLD here — lib64 contains libgnutls, and
+                // if libgnutls is on the DYLD search path, crypt32.so can pick it up
+                // and break TLS. lib64 is only used during release-engine.sh wineboot
+                // build — never at app runtime.
                 env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
             }
         }

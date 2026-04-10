@@ -9,37 +9,40 @@ Meridian's engine is assembled from LGPL-licensed CX Wine components + open-sour
 
 ---
 
-## Engine: Gcenx Wine 11.6 (wine-devel) — Current
+## Engine: CX Wine 11.4 (CrossOver Preview) — Current
 
-**Current Meridian engine:** Gcenx Wine 11.6 from Gcenx/macOS_Wine_builds (wine-devel).
-**Previous:** CX Wine 11.4 from CrossOver Preview — replaced April 2026 because of TLS regression (see below).
-**Before that:** Gcenx Wine 11.5 — replaced April 2026 for D3D12 investigation (now reverted).
+**Current Meridian engine:** CX Wine 11.4 from CrossOver Preview.
+**Previous:** Gcenx Wine 11.6 — tried April 2026, broke TLS on macOS 26 (see below). Reverted.
+**Before that:** CX Wine 11.4 — the original working engine.
 **Before that:** Wine 8.0.1 (CrossOverFOSS 23.7.1) — obsolete.
 
-**Why Gcenx Wine over CX Wine (TLS regression, CLI-verified April 2026):**
-CX Wine 11.4 when run standalone (outside CrossOver's full app bundle) fails HTTPS connections
-with HTTP error 0. Root cause: CX Wine's crypt32.so uses GnuTLS (`libgnutls.30.dylib`) for
-some TLS operations. Even though lib64/libgnutls.30.dylib was staged correctly into the engine,
-the GnuTLS initialization path in CX Wine fails when the full CrossOver environment is absent.
-Steam's CDN requests fail silently: `bootstrap_log.txt` shows `Download failed: http error 0
-(cdn.steamstatic.com/...)` → `Error: Steam needs to be online to update.`
-Gcenx Wine uses Apple's Security.framework for TLS — works standalone with no external deps.
-CLI-verified April 2026: switching back to Gcenx Wine 11.6 restores working Steam bootstrap.
+**Why CX Wine over Gcenx Wine (TLS failure, CLI-verified April 2026):**
+Gcenx Wine 11.6 fails HTTPS connections on macOS 26.4 with HTTP error 0 on Steam CDN.
+steam.exe bootstrap_log.txt: `Download failed: http error 0 (cdn.steamstatic.com/...)` →
+`Error: Steam needs to be online to update.` on every attempt. Root cause unknown — possibly
+a macOS 26-specific Security.framework incompatibility with Gcenx Wine's standalone TLS path.
+CX Wine 11.4 bootstraps correctly: CLI-verified April 2026 at 130 MB/s download speed.
 
-**Rendering: DXMT, DXVK, GPTK still sourced from CrossOver Preview (legally redistributable).**
-The TLS failure is specific to CX Wine's standalone HTTP stack — it does NOT affect DXMT
-(builtin d3d11.dll uses wiremetal.so, no network), DXVK, or GPTK framework files.
+**Confirmed FALSE theory (do not repeat):**
+Earlier hypothesis was that CX Wine uses GnuTLS via `lib64/libgnutls.30.dylib` and fails
+standalone. This is WRONG. `otool -L crypt32.so` on BOTH CX Wine and Gcenx Wine shows:
+`/System/Library/Frameworks/Security.framework` — neither links to libgnutls. The TLS
+failure with Gcenx Wine is NOT caused by libgnutls; it's a Gcenx Wine incompatibility with
+macOS 26. CX Wine TLS works fine standalone when lib64 is NOT on DYLD_FALLBACK_LIBRARY_PATH.
 
-**GPTK status with Gcenx Wine 11.6 (DISABLED):**
-GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call` (CX Wine only function).
-Loading them on Gcenx Wine causes: "unimplemented function ntdll.dll.__wine_unix_call, aborting".
-WineEngine.detect() checks `ntdll.so` for the null-terminated symbol `__wine_unix_call\0`
-(NOT `__wine_unix_call_dispatcher` which is a different function with a matching prefix).
-With Gcenx Wine 11.6: `nm -gU ntdll.so | grep "__wine_unix_call$"` → no output → gptkPath = nil.
-GPTK files are still staged in the engine for the future CX Wine path.
-**Current D3D12 status: not working. DX11 via DXMT: fully working.**
+**CRITICAL: lib64 must NOT be on DYLD at runtime (but for different reason than thought):**
+lib64 contains libgnutls.30.dylib. Even though crypt32.so doesn't LINK to it, dynamic
+loading via dlopen could still pick it up. The app's steamCMDEnvironment and environment(for:)
+only add `lib:lib/wine/x86_64-unix` to DYLD — never lib64. This is correct and must stay.
 
-### Why Wine 11.5 over Wine 8.0.1
+**Why CX Wine also enables GPTK (D3D12):**
+CX Wine has `ntdll.__wine_unix_call` (a CodeWeavers extension). GPTK's d3d12.dll and dxgi.dll
+both import this function. WineEngine.detect() does a binary string search for
+`__wine_unix_call\0` in ntdll.so — if found, gptkPath is set and GPTK env vars are injected
+for game launches. With CX Wine: gptkPath set → D3D12 → D3DMetal → Metal works.
+With Gcenx Wine: no `__wine_unix_call` → gptkPath = nil → D3D12 disabled.
+
+**Why CX Wine 11.4 has all the same DX11 patches as Gcenx 11.6:**
 
 | Issue | Wine 8.0.1 | Wine 11.5 |
 |---|---|---|

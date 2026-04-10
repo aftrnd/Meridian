@@ -15,7 +15,7 @@ These are strict rules that apply to ALL changes in the Meridian codebase. Viola
 |-----------|--------|
 | **Latest stable** | Use the latest stable release of every component. Version tables in this doc are regularly updated. |
 | **Open source preferred** | Wine (LGPL), DXMT (Apache), DXVK (zlib), MoltenVK (Apache) are all open source. GPTK's D3DMetal.framework is Apple-proprietary but freely distributed by Apple for exactly this use case. |
-| **CX Wine components are LGPL** | CX Wine (wine64, wineserver, DLLs, d3d12.dll) is LGPL 2.1 — legally redistributable. `release-engine.sh` sources DXMT, DXVK, and GPTK from CrossOver Preview. The Wine binary is Gcenx wine-devel (see below). End users never need CrossOver installed — everything ships self-contained. |
+| **CX Wine components are LGPL** | CX Wine (wine64, wineserver, DLLs, d3d12.dll) is LGPL 2.1 — legally redistributable. `release-engine.sh` sources Wine binary + DLLs + DXMT + DXVK + GPTK from CrossOver Preview. End users never need CrossOver installed — everything ships self-contained. |
 | **Document everything learned** | Whenever CrossOver or any reference implementation reveals a technique, it goes straight into `engine-research-findings.mdc` so every future session builds on it rather than re-deriving it. |
 
 ## Steam UI Is Never Shown — Fundamental Design Principle
@@ -106,22 +106,24 @@ The current date matters. Always use the **latest stable versions** of all depen
 
 | Component | Source | Why |
 |-----------|--------|-----|
-| Wine | Gcenx wine-devel 11.6 from Gcenx/macOS_Wine_builds | Security.framework TLS — works standalone without CrossOver. CLI-verified April 2026: CX Wine 11.4 fails with HTTP error 0 on Steam CDN (GnuTLS dependency broken when run outside CrossOver bundle). Gcenx Wine 11.6 has same CW patches (DXMT Metal APIs, Steam compat, Rosetta2) + working TLS. |
+| Wine | CX Wine 11.4 from CrossOver Preview (`CrossOver-Hosted Application/wineloader`) | GPTK (D3D12) requires CX Wine's `ntdll.__wine_unix_call`. CX Wine TLS confirmed working standalone (CLI-verified April 2026: 130 MB/s Steam CDN download). Gcenx Wine 11.6 fails with HTTP error 0 on macOS 26 — unknown macOS 26 incompatibility. |
 | DXMT | CrossOver Preview `lib/dxmt/` (installed as Wine builtins) | DirectX 11 → Metal. Same DXMT as CX ships. |
 | GPTK | Apple Game Porting Toolkit from CrossOver Preview `lib64/apple_gptk/` | D3D12 → D3DMetal.framework → Metal. CX's native d3d12.dll (120KB, full Win32 dispatch). |
 | VKD3D-proton | `HansKristian-Work/vkd3d-proton` latest stable | Detected in engine but **NOT used on macOS/Apple Silicon**: requires `VK_EXT_transform_feedback` which MoltenVK doesn't support. CLI-verified failing April 2026. |
 | DXVK | `doitsujin/dxvk` latest stable | DirectX 9/10/11 → Vulkan fallback (when DXMT fails or is disabled) |
 | macOS | Target latest stable (currently macOS 26) | Apple Silicon + Metal 3 |
 
-**CRITICAL: Use Gcenx wine-devel, NOT CX Wine, for the Wine binary.** CX Wine 11.4 when run standalone fails HTTPS with HTTP error 0 (GnuTLS dependency broken outside CrossOver bundle). CLI-verified April 2026: Steam bootstrap with CX Wine 11.4 → `Download failed: http error 0` on every Steam CDN request → "Steam needs to be online to update". Gcenx Wine 11.6 uses Security.framework for TLS — works standalone. `release-engine.sh` downloads Gcenx wine-devel; DXMT, DXVK, GPTK sourced from CrossOver Preview.
+**CRITICAL: Use CX Wine, NOT Gcenx wine-devel, for the Wine binary.** Gcenx Wine 11.6 fails HTTPS with HTTP error 0 on macOS 26 — Steam bootstrap never downloads its client. CLI-verified April 2026: Steam bootstrap with CX Wine 11.4 downloads at 130 MB/s. `release-engine.sh` copies Wine from CX Preview `CrossOver-Hosted Application/wineloader`; DXMT, DXVK, GPTK also sourced from CrossOver Preview.
 
-**GPTK + CX Wine ABI:** GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call`. This function does NOT exist in Gcenx Wine (only in CX Wine). Loading GPTK DLLs on Gcenx Wine causes: "unimplemented function ntdll.dll.__wine_unix_call, aborting". `WineEngine.detect()` checks `ntdll.so` for the null-terminated symbol `__wine_unix_call\0` (to distinguish from `__wine_unix_call_dispatcher`) and only sets `gptkPath` (enabling GPTK env vars) when CX ABI is confirmed. With Gcenx Wine 11.6: GPTK is staged in the engine but disabled — D3D12 unsupported, DX11 via DXMT fully working.
+**False theory (do NOT repeat):** Earlier hypothesis was that CX Wine uses GnuTLS standalone and fails. This is wrong. `otool -L crypt32.so` on both CX Wine and Gcenx Wine shows ONLY `Security.framework` — neither binary links to libgnutls. The TLS failure with Gcenx Wine on macOS 26 has unknown root cause. CX Wine TLS is fine when lib64 is NOT on DYLD_FALLBACK_LIBRARY_PATH.
+
+**GPTK + CX Wine ABI:** GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call`. This function exists in CX Wine but NOT Gcenx Wine. `WineEngine.detect()` checks ntdll.so for the null-terminated symbol `__wine_unix_call\0` via binary string search (not nm). With CX Wine: gptkPath set → D3D12 active. With Gcenx Wine: gptkPath = nil → D3D12 disabled.
 
 **CRITICAL: DXMT requires Wine 11.x wiremac.so.** DXMT's wiremetal.so dynamically loads `macdrv_view_create_metal_view` etc. from wiremac.so at runtime. These were added in Wine ~10.x. Wine 8.0.1 wiremac.so does not have them. "Failed to create metal view" crash is a Wine version mismatch, not a DXMT bug.
 
 **CRITICAL: Use `wine-devel` variant, NOT `wine-staging`.** Devel includes CodeWeavers' DXMT and Steam patches. Staging may introduce regressions.
 
-**Meridian's engine is fully self-contained.** `release-engine.sh` assembles Gcenx Wine 11.6 (LGPL) + DXMT (MIT, from CX Preview) + DXVK (zlib, from CX Preview) + Apple GPTK (freely distributed, from CX Preview) + MoltenVK (Apache 2.0, bundled in Gcenx) into a single tarball on GitHub Releases. End users download it automatically — no external dependencies.
+**Meridian's engine is fully self-contained.** `release-engine.sh` assembles CX Wine 11.4 (LGPL) + DXMT (MIT) + DXVK (zlib) + Apple GPTK (freely distributed) into a single tarball on GitHub Releases. End users download it automatically — no external dependencies.
 
 ### CLI Validation Before Code
 
@@ -173,14 +175,14 @@ When adding or updating a game profile, always use the best available renderer f
 | Game API | Preferred Renderer | Fallback | Notes |
 |----------|-------------------|---------|-------|
 | D3D9, D3D10, D3D11 | **DXMT** (builtin wiremetal.so → Metal) | DXVK → MoltenVK → Metal | DXMT has lower latency: no Vulkan layer in the path |
-| D3D12 | **GPTK** (D3D12 → D3DMetal.framework → Metal via CX d3d12.dll) when CX Wine ABI is present | — | **Currently disabled** (Gcenx Wine 11.6 lacks `ntdll.__wine_unix_call`). GPTK files staged in engine. `WineEngine.detect()` enables GPTK only when ntdll.so exports `__wine_unix_call` exactly. |
+| D3D12 | **GPTK** (D3D12 → D3DMetal.framework → Metal via CX d3d12.dll) when CX Wine ABI is present | — | **ACTIVE** with CX Wine 11.4. `WineEngine.detect()` finds `__wine_unix_call` in ntdll.so and sets gptkPath → GPTK env vars injected for game launches. |
 | OpenGL / Vulkan | Wine's native implementation + MoltenVK | — | No override needed |
 
 **DXMT is always preferred over DXVK for D3D11** because it translates directly to Metal without a Vulkan intermediary — fewer layers = lower CPU overhead and better frame pacing on Apple Silicon.
 
 **VKD3D-proton is NOT the D3D12 path on macOS.** It requires `VK_EXT_transform_feedback` which MoltenVK on Apple Silicon does not support. CLI-verified failing April 2026.
 
-**GPTK is the intended D3D12 path** — bypasses Vulkan entirely via D3DMetal.framework → Metal. CX Wine's d3d12.dll imports `ntdll.__wine_unix_call`. Loaded via WINEDLLPATH (no system32 installation needed). `WineEngine.environment(for:)` sets GPTK env vars when `gptkPath` is set. With Gcenx Wine 11.6, GPTK is staged but gptkPath = nil (no CX ABI). **Currently D3D12 is not supported; DX11 via DXMT is the active renderer.**
+**GPTK is the intended D3D12 path** — bypasses Vulkan entirely via D3DMetal.framework → Metal. CX Wine's d3d12.dll imports `ntdll.__wine_unix_call`. Loaded via WINEDLLPATH. `WineEngine.environment(for:)` sets GPTK env vars when `gptkPath` is set. With CX Wine 11.4 (current engine): gptkPath is set → **D3D12 via GPTK is fully active**.
 
 ## Log-First Debugging
 
@@ -228,15 +230,15 @@ Reiterated from the update-system rule for emphasis:
 - The engine NEVER compensates for app deficiencies
 - Fix the root layer, publish the fix, verify end-to-end
 
-## Gcenx Wine 11.6 — Current Engine (wine-devel)
+## CX Wine 11.4 — Current Engine (CrossOver Preview)
 
-The current engine is Gcenx Wine 11.6 (wine-devel). Key properties CLI-verified April 2026:
-- `ntdll.__wine_unix_call` present — CX d3d12.dll loads natively (D3D12 via GPTK)
+The current engine is CX Wine 11.4 from CrossOver Preview. Key properties CLI-verified April 2026:
+- `ntdll.__wine_unix_call` present — CX d3d12.dll loads natively (D3D12 via GPTK is ACTIVE)
 - Zero abort stubs in win32u.dll (was 926 in Wine 8.0.1)
 - `IsMouseInPointerEnabled` present — Unity games no longer crash on pointer check
 - wiremac.so exports Metal view APIs required by DXMT
-- Security.framework TLS — Steam HTTPS works standalone
-- steam.exe bootstraps and authenticates correctly
+- Security.framework TLS — Steam HTTPS works standalone (confirmed 130 MB/s, April 2026)
+- steam.exe bootstraps and authenticates correctly on macOS 26
 - All CW patches: DXMT Metal APIs, Steam compat, Rosetta2 thunks
 
 **Meridian is fully standalone** — the engine is downloaded from GitHub Releases. End users never need CrossOver installed.
