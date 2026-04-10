@@ -863,6 +863,19 @@ final class WineSteamManager {
             log.info("[launchGameDirectly] graphicsAPI=\(profile.graphicsAPI.rawValue) engine=\(profile.gameEngine.rawValue) status=\(profile.status.rawValue)")
         }
 
+        // D3D12 games: switch WINEDLLPATH from lib/dxmt:lib/wine (DX11 default) to
+        // gptk/wine:lib/wine so GPTK's dxgi is found before any DXMT DLL.
+        // Without this override, even =b loads DXMT's dxgi from lib/dxmt first,
+        // which returns E_NOINTERFACE for IDXGIAdapter4 → NULL deref crash.
+        if let profile = compat.profile(for: appID),
+           profile.graphicsAPI == .dx12,
+           let gptk = engine.gptkPath,
+           let lib = engine.libraryPath {
+            env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+            env["WINEDLLOVERRIDES"] = "d3d12=b;dxgi=b"
+            log.info("[launchGameDirectly] D3D12 — WINEDLLPATH routed through gptk/wine (GPTK dxgi/d3d12 before DXMT)")
+        }
+
         process.environment = env
         log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
         if !gameExtraEnv.isEmpty {

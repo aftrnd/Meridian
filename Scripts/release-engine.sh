@@ -16,7 +16,7 @@
 #
 # What it does:
 #   1. Copies Wine binary + DLLs from CrossOver Preview (CX Wine 11.4)
-#   2. Installs DXMT builtins from CrossOver Preview (DirectX 11/10 → Metal)
+#   2. Stages DXMT from CrossOver Preview into lib/dxmt/ (DirectX 11/10 → Metal)
 #   3. Stages DXVK from CrossOver Preview (DirectX → Vulkan fallback)
 #   4. Stages GPTK from CrossOver Preview (D3D12 → D3DMetal → Metal — ACTIVE with CX Wine)
 #   5. Stages lib64 dylibs from CrossOver Preview (MoltenVK, GStreamer, etc.)
@@ -150,27 +150,37 @@ else
     die "share/wine/ not found in CX Preview"
 fi
 
-# ---------- DXMT builtins (from CrossOver Preview) ----------
-# DXMT translates DirectX 11/10 → Metal. Installs as Wine builtins in lib/wine/
-# alongside CX Wine DLLs. DXMT uses wiremac.so Metal APIs from CX Wine.
-yellow "Installing DXMT builtins (from CX Preview)..."
+# ---------- DXMT — stored in lib/dxmt/ (separate from Wine builtins) ----------
+#
+# CX Preview keeps DXMT in lib/dxmt/ completely separate from lib/wine/.
+# Wine's original dxgi.dll (214KB) and d3d11.dll (416KB) remain in lib/wine/
+# untouched. This preserves the ability to load GPTK's dxgi for D3D12 games:
+#
+#   DX11 games:  WINEDLLPATH = lib/dxmt:lib/wine  → DXMT loaded first ✓
+#   D3D12 games: WINEDLLPATH = gptk/wine:lib/wine → GPTK loaded first ✓
+#
+# If DXMT were merged into lib/wine/ (old approach), GPTK could never take
+# priority for dxgi — any =b override would still find DXMT's 1.7MB dxgi
+# before GPTK's 92KB version, causing IDXGIAdapter4 NULL deref in D3D12 games.
+yellow "Staging DXMT (from CX Preview → lib/dxmt/)..."
 python3 -c "
 import os
 cx_dxmt = '${CX_ROOT}/lib/dxmt'
-staging = '${STAGING}/wine/lib/wine'
+staging = '${STAGING}/wine/lib/dxmt'
 count = 0
 for arch in ['x86_64-unix', 'x86_64-windows', 'i386-windows']:
     src_dir = os.path.join(cx_dxmt, arch)
     dst_dir = os.path.join(staging, arch)
     if not os.path.isdir(src_dir): continue
+    os.makedirs(dst_dir, exist_ok=True)
     for f in os.listdir(src_dir):
         if f.endswith('.so') or f.endswith('.dll'):
             with open(os.path.join(src_dir, f), 'rb') as fh: data = fh.read()
             with open(os.path.join(dst_dir, f), 'wb') as fh: fh.write(data)
             os.chmod(os.path.join(dst_dir, f), 0o755)
             count += 1
-print(f'  DXMT: {count} files installed as Wine builtins')
-" || die "DXMT installation failed"
+print(f'  DXMT: {count} files staged in lib/dxmt/ (separate from Wine builtins)')
+" || die "DXMT staging failed"
 
 # ---------- DXVK (DirectX → Vulkan fallback) — from CrossOver Preview ----------
 yellow "Staging DXVK (from CX Preview)..."
@@ -370,9 +380,9 @@ info "wine.inf verified ✓"
 [ -d "${STAGING}/prefix-template/drive_c/windows/syswow64" ] || die "prefix-template syswow64/ missing"
 info "prefix-template verified ✓"
 
-[ -f "${STAGING}/wine/lib/wine/x86_64-unix/winemetal.so" ]  || die "DXMT winemetal.so missing"
-[ -f "${STAGING}/wine/lib/wine/x86_64-windows/d3d11.dll" ]  || die "DXMT d3d11.dll missing"
-info "DXMT builtin DLLs verified ✓"
+[ -f "${STAGING}/wine/lib/dxmt/x86_64-unix/winemetal.so" ]  || die "DXMT winemetal.so missing from lib/dxmt/"
+[ -f "${STAGING}/wine/lib/dxmt/x86_64-windows/d3d11.dll" ]  || die "DXMT d3d11.dll missing from lib/dxmt/"
+info "DXMT DLLs verified in lib/dxmt/ (separate from Wine builtins) ✓"
 
 if [ -f "${STAGING}/wine/lib/gptk/external/D3DMetal.framework/D3DMetal" ]; then
     [ -f "${STAGING}/wine/lib/gptk/wine/x86_64-windows/d3d12.dll" ] || die "GPTK d3d12.dll missing from gptk/wine/"
@@ -434,7 +444,8 @@ NOTES="Wine engine runtime for Meridian.
 **Engine layout:**
 - \`wine/bin/wine64\` — Wine loader (CX Wine ${WINE_VERSION})
 - \`wine/bin/wineserver\` — Wine server
-- \`wine/lib/wine/\` — Wine DLLs + DXMT builtin DLLs
+- \`wine/lib/wine/\` — Wine DLLs (original builtins — dxgi 214KB, d3d11 416KB)
+- \`wine/lib/dxmt/\` — DXMT DLLs (DirectX 11 → Metal; separate from Wine builtins)
 - \`wine/lib/gptk/\` — Apple GPTK (ACTIVE — D3D12 → D3DMetal → Metal)
 - \`wine/lib/dxvk/\` — DXVK DirectX → Vulkan DLLs (fallback)
 - \`wine/lib64/\` — CX lib64 dylibs (MoltenVK, GnuTLS, GStreamer)

@@ -150,11 +150,17 @@ final class WineEngine {
         let l64 = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
         lib64Path = fm.fileExists(atPath: l64) ? l64 : nil
 
-        // DXMT builtin layout: DLLs live in lib/wine/x86_64-windows/ alongside Wine's own DLLs.
-        let dxmtUnixSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/winemetal.so").path(percentEncoded: false)
-        let dxmtWinDll = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows/d3d11.dll").path(percentEncoded: false)
+        // DXMT is in lib/dxmt/ (separate directory, matches CX Preview layout).
+        // Wine's original dxgi.dll (214KB) and d3d11.dll (416KB) remain untouched
+        // in lib/wine/. This allows GPTK to load its own dxgi for D3D12 games:
+        //   DX11: WINEDLLPATH = lib/dxmt:lib/wine → DXMT dxgi/d3d11 loaded first
+        //   D3D12: WINEDLLPATH = gptk/wine:lib/wine → GPTK dxgi/d3d12 loaded first
+        // If DXMT were in lib/wine/ (old layout), any =b override would still find
+        // DXMT's dxgi before GPTK's, causing IDXGIAdapter4 NULL deref crashes.
+        let dxmtUnixSo = Self.engineDir.appending(path: "wine/lib/dxmt/x86_64-unix/winemetal.so").path(percentEncoded: false)
+        let dxmtWinDll = Self.engineDir.appending(path: "wine/lib/dxmt/x86_64-windows/d3d11.dll").path(percentEncoded: false)
         if fm.fileExists(atPath: dxmtUnixSo) && fm.fileExists(atPath: dxmtWinDll) {
-            dxmtPath = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows").path(percentEncoded: false)
+            dxmtPath = Self.engineDir.appending(path: "wine/lib/dxmt").path(percentEncoded: false)
         }
 
         let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
@@ -201,7 +207,7 @@ final class WineEngine {
 
         let dxmtMode: String = {
             guard let p = self.dxmtPath else { return "none" }
-            return p.hasSuffix("dxmt") ? "\(p) (legacy override)" : "\(p) (builtin)"
+            return p.hasSuffix("dxmt") ? "\(p) (separate dir)" : "\(p)"
         }()
         log.info("[detect] Engine found at \(engineBase)")
         log.info("[detect]   wine64=\(wineExecutableURL?.path(percentEncoded: false) ?? "none")")
@@ -302,14 +308,23 @@ final class WineEngine {
 
             if let gptk = gptkPath {
                 // GPTK present (CX Wine ABI confirmed): D3D12 → D3DMetal → Metal
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir)\(l64Suffix)"
+                //
+                // DYLD includes gptk paths so libd3dshared.dylib/D3DMetal load when a
+                // D3D12 game's WINEDLLPATH routes through gptk/wine. Also includes
+                // lib/dxmt/x86_64-unix for winemetal.so (DXMT's Metal bridge).
+                let dxmtUnixDir = "\(lib)/dxmt/x86_64-unix"
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(dxmtUnixDir):\(unixDir)\(l64Suffix)"
                 env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
 
-                env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+                // DX11 default: DXMT first in WINEDLLPATH, Wine builtins as fallback.
+                // D3D12 games override both WINEDLLPATH and WINEDLLOVERRIDES in
+                // WineSteamManager.launchGameDirectly() based on profile.graphicsAPI == .dx12.
+                let dxmtLibDir = "\(lib)/dxmt"
+                env["WINEDLLPATH"] = "\(dxmtLibDir):\(lib)/wine"
 
-                // d3d12=n,b: load CX d3d12.dll from GPTK wine/ as native
-                // dxgi=n,b: load GPTK dxgi.dll (implements IDXGIAdapter4, prevents NULL deref)
-                env["WINEDLLOVERRIDES"] = "d3d12=n,b;dxgi=n,b"
+                // No global WINEDLLOVERRIDES — Wine's default builtin,native load order
+                // correctly picks DXMT from lib/dxmt for DX11 games. D3D12 games set
+                // d3d12=b;dxgi=b in launchGameDirectly to bypass lib/dxmt entirely.
 
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
