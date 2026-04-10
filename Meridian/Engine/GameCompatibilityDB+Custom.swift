@@ -14,19 +14,19 @@ extension GameCompatibilityDB {
         .custom(
             appID: 813230,
             name: "ANIMAL WELL",
-            status: .launches,
+            status: .verified,
             graphicsAPI: .dx12,
             verifiedWith: "v3.0.5-engine",
             notes: """
             Custom engine game. Ships only Animal Well.exe + steam_api64.dll. \
             DRM requires running Steam client (SteamAPI_Init via IPC). \
-            Uses D3D12 via Apple GPTK (D3DMetal.framework → Metal). \
             \
-            The graphicsAPI=.dx12 profile causes WineSteamManager.launchGameDirectly() \
-            to automatically override WINEDLLPATH to gptk/wine:lib/wine and set \
-            WINEDLLOVERRIDES=d3d12=b;dxgi=b — routing both dxgi and d3d12 through \
-            GPTK's implementations (which support IDXGIAdapter4) instead of DXMT's \
-            (which do not, causing IDXGIAdapter4 NULL deref crash on startup).
+            Rendering stack (CLI-verified April 10, 2026): \
+            Wine's integrated vkd3d → MoltenVK → Metal. \
+            d3d12.dll = system32 Wine builtin (vkd3d, NOT GPTK/D3DMetal). \
+            dxgi.dll = system32 Wine builtin (wined3d). \
+            Works correctly with a clean prefix. \
+            Root fix: mtime-based prefix refresh (stale prefix broke vkd3d init).
             """
         ),
 
