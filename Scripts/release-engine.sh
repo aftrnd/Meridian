@@ -160,7 +160,10 @@ info "Wine DLLs: ${WIN64_COUNT} x86_64-windows, ${UNIX_COUNT} x86_64-unix, ${WIN
 
 # Gcenx lib/*.dylib — includes libMoltenVK.dylib, libinotify.0.dylib, etc.
 # wineserver has rpath @loader_path/../lib/ which resolves to wine/lib/ at runtime.
-yellow "Staging Gcenx lib/ dylibs..."
+# CRITICAL: libgnutls MUST NOT be staged here. wine/lib/ is on DYLD_FALLBACK_LIBRARY_PATH.
+# If libgnutls.30.dylib is present, Wine's crypt32.so dlopens it and uses GnuTLS instead
+# of Security.framework for TLS — GnuTLS fails standalone → HTTP error 0 on Steam CDN.
+yellow "Staging Gcenx lib/ dylibs (libgnutls excluded)..."
 python3 -c "
 import os, shutil
 src_dir = '${GCENX_WINE_ROOT}/lib'
@@ -169,12 +172,14 @@ count = 0
 for f in os.listdir(src_dir):
     src = os.path.join(src_dir, f)
     if os.path.isfile(src) and f.endswith('.dylib'):
+        if 'gnutls' in f.lower():
+            continue  # NEVER stage libgnutls — breaks Gcenx Wine TLS (Security.framework hijacked)
         dst = os.path.join(dst_dir, f)
         with open(src, 'rb') as fh: data = fh.read()
         with open(dst, 'wb') as fh: fh.write(data)
         os.chmod(dst, 0o755)
         count += 1
-print(f'  Gcenx lib/: {count} dylibs staged')
+print(f'  Gcenx lib/: {count} dylibs staged (libgnutls excluded)')
 " || die "Gcenx lib/ dylib staging failed"
 
 # Wine data files (NLS, fonts, wine.inf) — from Gcenx
@@ -416,6 +421,14 @@ if [ -f "${STAGING}/wine/lib/gptk/external/D3DMetal.framework/D3DMetal" ]; then
 else
     yellow "Warning: GPTK not bundled — D3D12 games will not work"
 fi
+
+# Critical: verify libgnutls was NOT accidentally staged in lib/ or lib64/.
+# Its presence hijacks crypt32.so TLS from Security.framework → HTTP error 0 on all CDN requests.
+GNUTLS_LIB=$(find "${STAGING}/wine/lib" -maxdepth 1 -name 'libgnutls*' 2>/dev/null | head -1)
+GNUTLS_LIB64=$(find "${STAGING}/wine/lib64" -maxdepth 1 -name 'libgnutls*' 2>/dev/null | head -1)
+[ -z "${GNUTLS_LIB}" ]   || die "libgnutls found in wine/lib/ — would break TLS: ${GNUTLS_LIB}"
+[ -z "${GNUTLS_LIB64}" ] || die "libgnutls found in wine/lib64/ — would break TLS: ${GNUTLS_LIB64}"
+info "libgnutls absence verified — Security.framework TLS preserved ✓"
 
 # Verify Wine ABI: check whether ntdll.so exports __wine_unix_call exactly
 # (not just __wine_unix_call_dispatcher which is a different function).
