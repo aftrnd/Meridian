@@ -357,7 +357,11 @@ final class GameLauncher {
                 return
             }
 
-            // Poll the ACF manifest for real-time download progress.
+            // Poll the ACF manifest to update the status text during download.
+            // The PTY stream (onProgress callback below) is the authoritative source
+            // for the progress bar fraction — the ACF BytesDownloaded lags behind the
+            // real-time SteamCMD output and overwrites it with stale lower values,
+            // causing the bar to oscillate backward. This task only touches currentActivity.
             let pollingTask = Task { [weak self, prefix] in
                 let gameName = game.name
                 let appID = game.id
@@ -373,12 +377,8 @@ final class GameLauncher {
                         let fraction = Double(progress.downloaded) / Double(progress.total)
                         if fraction > 0 {
                             hasSeenGameProgress = true
-                            self?.downloadProgress = fraction
                             self?.currentActivity = "Downloading \(gameName) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total))"
                         } else {
-                            // ACF exists and total is known, but BytesDownloaded=0.
-                            // SteamCMD doesn't update BytesDownloaded in real-time — it stays
-                            // 0 during the entire download. Show a status message instead of silence.
                             self?.currentActivity = "Downloading \(gameName)…"
                         }
                     } else if !hasSeenGameProgress {

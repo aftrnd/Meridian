@@ -41,7 +41,8 @@ extension GameCompatibilityDB {
             skipSteamDRM: steam_api64.dll is in Plugins/x86_64/ but the game \
             handles SteamAPI_Init() failure gracefully — running steam.exe first \
             causes wineserver conflicts. \
-            Verified: launches from Meridian, plays successfully on v3.0.0-engine.
+            Verified: launches from Meridian, plays successfully on v3.0.0-engine. \
+            User-confirmed April 9 2026 via Meridian v0.9.7.1 — first successful end-to-end game launch.
             """
         ),
 
