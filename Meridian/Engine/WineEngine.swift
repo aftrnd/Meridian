@@ -248,13 +248,12 @@ final class WineEngine {
         guard let lib = libraryPath else { return [:] }
         let wine64  = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
         let server  = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
-        let lib64   = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
         return [
             "WINEPREFIX":                prefix.path.path(percentEncoded: false),
             "WINESERVER":                server,
             "WINELOADER":                wine64,
             "WINEDLLPATH":               "\(lib)/wine",
-            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix:\(lib64)",
+            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix",
             "WINE_LARGE_ADDRESS_AWARE":  "1",
         ]
     }
@@ -278,12 +277,11 @@ final class WineEngine {
 
         if let lib = libraryPath {
             let unixDir = "\(lib)/wine/x86_64-unix"
-            let lib64   = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
 
             if let gptk = gptkPath {
                 // GPTK present (CX Wine ABI confirmed): D3D12 → D3DMetal → Metal
                 // Prepend GPTK dirs so libd3dshared.dylib and D3DMetal.framework are found
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir):\(lib64)"
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir)"
                 env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
 
                 // GPTK wine/ has d3d12.dll, dxgi.dll etc. Main lib/wine/ has DXMT builtins.
@@ -297,7 +295,9 @@ final class WineEngine {
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
                 // Gcenx Wine or GPTK not present: DX11 via DXMT builtin, no D3D12
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir):\(lib64)"
+                // Do NOT include lib64 — libgnutls in lib64 hijacks Wine's TLS away
+                // from Security.framework, breaking Steam CDN HTTPS.
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
             }
         }
 

@@ -263,11 +263,14 @@ else
     yellow "Warning: apple_gptk not found in CX Preview — D3D12 will not work"
 fi
 
-# ---------- lib64 dylibs (MoltenVK, GnuTLS, GStreamer, etc.) from CX Preview ----------
-# CX Wine's .so modules have rpath @loader_path/../../../lib64 pointing here.
-# Gcenx Wine does NOT use lib64 (uses lib/ for MoltenVK, Security.framework for TLS).
-# Staged here for completeness and future CX Wine use.
-yellow "Staging lib64 dylibs (from CX Preview)..."
+# ---------- lib64 dylibs from CX Preview (libgnutls EXCLUDED) ----------
+# CRITICAL: libgnutls MUST NOT be staged. Gcenx Wine's ntdll.so has rpath
+# @loader_path/../../../lib64 → wine/lib64/. If libgnutls.30.dylib is present
+# there, Wine's crypt32 dlopens it and uses GnuTLS instead of Security.framework.
+# GnuTLS from CX's lib64 fails standalone → HTTP error 0 on all Steam CDN requests
+# → "Steam needs to be online to update." CLI-verified April 2026.
+# Gcenx Wine uses Security.framework (always available) when GnuTLS is absent.
+yellow "Staging lib64 dylibs (from CX Preview, libgnutls excluded)..."
 mkdir -p "${STAGING}/wine/lib64"
 python3 -c "
 import os
@@ -277,6 +280,8 @@ count = 0
 for f in os.listdir(src_dir):
     src = os.path.join(src_dir, f)
     if os.path.isfile(src) and f.endswith('.dylib'):
+        if 'gnutls' in f.lower():
+            continue  # NEVER stage libgnutls — breaks Gcenx Wine TLS
         with open(src, 'rb') as fh: data = fh.read()
         with open(os.path.join(dst_dir, f), 'wb') as fh: fh.write(data)
         os.chmod(os.path.join(dst_dir, f), 0o755)
@@ -292,7 +297,7 @@ if os.path.isdir(gst_src):
             with open(src, 'rb') as fh: data = fh.read()
             with open(os.path.join(gst_dst, f), 'wb') as fh: fh.write(data)
             count += 1
-print(f'  lib64: {count} files staged')
+print(f'  lib64: {count} files staged (libgnutls excluded)')
 " || die "lib64 dylibs staging failed"
 
 # ---------- verify Wine works ----------
