@@ -329,7 +329,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = [steamExe] + args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let stderrPipe = Pipe()
@@ -647,7 +647,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -955,7 +955,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -1001,7 +1001,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -1119,7 +1119,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
 
         process.standardOutput = FileHandle.nullDevice
 
@@ -1178,7 +1178,7 @@ final class WineSteamManager {
     ///     `--no-sandbox` is required because Wine cannot emulate Chrome's sandbox.
     private func configureSteamRegistryForSilentMode(engine: WineEngine, prefix: WinePrefix) async {
         let wine64URL = engine.wine64URL
-        let env = engine.environment(for: prefix)
+        let env = engine.steamCMDEnvironment(for: prefix)
         await Task.detached(priority: .userInitiated) {
             func run(_ args: [String]) {
                 let p = Process()
@@ -1205,7 +1205,7 @@ final class WineSteamManager {
     /// can appear during the interactive fallback login flow.
     private func configureSteamRegistryForInteractiveMode(engine: WineEngine, prefix: WinePrefix) async {
         let wine64URL = engine.wine64URL
-        let env = engine.environment(for: prefix)
+        let env = engine.steamCMDEnvironment(for: prefix)
         await Task.detached(priority: .userInitiated) {
             let process = Process()
             process.executableURL = wine64URL
@@ -1431,7 +1431,7 @@ final class WineSteamManager {
         let shutdownProcess = Process()
         shutdownProcess.executableURL = engine.wine64URL
         shutdownProcess.arguments = [prefix.steamExePath.path(percentEncoded: false), "-shutdown"]
-        shutdownProcess.environment = engine.environment(for: prefix)
+        shutdownProcess.environment = engine.steamCMDEnvironment(for: prefix)
 
         let errPipe = Pipe()
         shutdownProcess.standardOutput = FileHandle.nullDevice
@@ -1469,7 +1469,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wineserverURL
         process.arguments = ["-k"]
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
 
         let errPipe = Pipe()
         process.standardOutput = FileHandle.nullDevice

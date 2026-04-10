@@ -1,21 +1,43 @@
 ---
-description: Deep research findings from CrossOver Preview 27 comparison (March 2026). Documents the complete graphics stack, rendering technologies, GPTK architecture, DXMT, DXVK, MoltenVK, Wine internals, and everything Meridian adopts as its own independent engine. NEVER rely on CrossOver — this is research only.
+description: Engine research findings and architecture documentation. Documents the complete graphics stack, rendering technologies, GPTK architecture, DXMT, DXVK, MoltenVK, Wine internals, and the Meridian engine assembly process. All CX Wine components used in the engine are LGPL-licensed and legally redistributable.
 alwaysApply: true
 ---
 
-# Engine Research Findings (March 2026)
+# Engine Research Findings
 
-**CRITICAL:** Meridian is a completely independent engine built from publicly available open-source components. CrossOver Preview was studied as a reference implementation only. Nothing from CrossOver is redistributed or depended upon at runtime. This document records what we learned so future sessions can build on it without re-deriving it.
+Meridian's engine is assembled from LGPL-licensed CX Wine components + open-source rendering layers (DXMT, DXVK, MoltenVK) + Apple's freely-distributed GPTK. `release-engine.sh` copies these from CrossOver Preview into a self-contained engine tarball. End users never need CrossOver installed. This document records architecture decisions and CLI-verified findings so future sessions can build on them.
 
 ---
 
-## Engine: CX Wine 11.4 (CrossOver Preview)
+## Engine: Gcenx Wine 11.6 (wine-devel) — Current
 
-**Current Meridian engine:** CX Wine 11.4 from CrossOver Preview (full CodeWeavers patches).
-**Previous:** Wine 11.5 from Gcenx/macOS_Wine_builds — replaced April 2026 because Gcenx Wine lacks `ntdll.__wine_unix_call` which CX's d3d12.dll requires for D3D12 support.
+**Current Meridian engine:** Gcenx Wine 11.6 from Gcenx/macOS_Wine_builds (wine-devel).
+**Previous:** CX Wine 11.4 from CrossOver Preview — replaced April 2026 because of TLS regression (see below).
+**Before that:** Gcenx Wine 11.5 — replaced April 2026 for D3D12 investigation (now reverted).
 **Before that:** Wine 8.0.1 (CrossOverFOSS 23.7.1) — obsolete.
 
-**Why CX Wine over Gcenx Wine:** CX Wine has `ntdll.__wine_unix_call` which CX's d3d12.dll imports. Gcenx Wine only has `__wine_unix_call_dispatcher` (a different mechanism). CLI-verified April 2026: CX d3d12.dll fails on Gcenx with "unimplemented function ntdll.dll.__wine_unix_call, aborting". CX Wine has the same CW patches as Gcenx plus this essential function. End users never need CX installed — everything ships in the Meridian engine tarball on GitHub Releases.
+**Why Gcenx Wine over CX Wine (TLS regression, CLI-verified April 2026):**
+CX Wine 11.4 when run standalone (outside CrossOver's full app bundle) fails HTTPS connections
+with HTTP error 0. Root cause: CX Wine's crypt32.so uses GnuTLS (`libgnutls.30.dylib`) for
+some TLS operations. Even though lib64/libgnutls.30.dylib was staged correctly into the engine,
+the GnuTLS initialization path in CX Wine fails when the full CrossOver environment is absent.
+Steam's CDN requests fail silently: `bootstrap_log.txt` shows `Download failed: http error 0
+(cdn.steamstatic.com/...)` → `Error: Steam needs to be online to update.`
+Gcenx Wine uses Apple's Security.framework for TLS — works standalone with no external deps.
+CLI-verified April 2026: switching back to Gcenx Wine 11.6 restores working Steam bootstrap.
+
+**Rendering: DXMT, DXVK, GPTK still sourced from CrossOver Preview (legally redistributable).**
+The TLS failure is specific to CX Wine's standalone HTTP stack — it does NOT affect DXMT
+(builtin d3d11.dll uses wiremetal.so, no network), DXVK, or GPTK framework files.
+
+**GPTK status with Gcenx Wine 11.6 (DISABLED):**
+GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call` (CX Wine only function).
+Loading them on Gcenx Wine causes: "unimplemented function ntdll.dll.__wine_unix_call, aborting".
+WineEngine.detect() checks `ntdll.so` for the null-terminated symbol `__wine_unix_call\0`
+(NOT `__wine_unix_call_dispatcher` which is a different function with a matching prefix).
+With Gcenx Wine 11.6: `nm -gU ntdll.so | grep "__wine_unix_call$"` → no output → gptkPath = nil.
+GPTK files are still staged in the engine for the future CX Wine path.
+**Current D3D12 status: not working. DX11 via DXMT: fully working.**
 
 ### Why Wine 11.5 over Wine 8.0.1
 

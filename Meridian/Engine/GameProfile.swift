@@ -128,7 +128,7 @@ struct GameProfile {
     var translationLayerDescription: String {
         switch graphicsAPI {
         case .dx11:    return "DXMT → Metal"
-        case .dx12:    return "VKD3D-proton → MoltenVK"
+        case .dx12:    return "GPTK → D3DMetal → Metal"
         case .vulkan:  return "MoltenVK"
         case .unknown: return "Unknown"
         }

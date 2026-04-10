@@ -13,16 +13,17 @@ private let log = MeridianLog(category: "WineEngine")
 /// If the engine is absent or incomplete, state is `.notInstalled` or `.error` and
 /// the bootstrap pipeline will auto-download the correct release from GitHub.
 ///
-/// All runtime components are open source:
-///   - Wine FOSS (wine-devel from Gcenx/macOS_Wine_builds), DXMT (open source),
-///     DXVK (open source), Apple GPTK (Apple-distributed), MoltenVK (Apache 2.0)
+/// All runtime components are legally redistributable:
+///   - Gcenx Wine LGPL, DXMT MIT, DXVK zlib, Apple GPTK Apple-distributed,
+///     MoltenVK Apache 2.0
 ///
-/// ## D3D12 Support (experimental)
+/// ## D3D12 Support
 ///
-/// When `wine/lib/vkd3d-proton/` is present, `environment(for:)` sets WINEDLLPATH
-/// and `d3d12,d3d12core=n` override so VKD3D-proton handles D3D12→Vulkan→MoltenVK→Metal.
-/// VKD3D-proton DLLs are native Windows PE DLLs (no Wine PE-Unix bridge needed).
-/// DXMT continues to handle D3D11/D3D10 via builtin wiremetal.so.
+/// GPTK (D3D12 → D3DMetal → Metal) requires CX Wine ABI. Detection checks for
+/// `__wine_unix_call` in ntdll.so — GPTK's d3d12.dll and dxgi.dll both import this
+/// function. Loading them on Gcenx Wine (which lacks it) causes an immediate abort.
+/// With Gcenx Wine 11.6 (current engine): gptkPath is nil, DX11 works via DXMT.
+/// With CX Wine: gptkPath is set automatically, full GPTK environment is injected.
 @Observable
 @MainActor
 final class WineEngine {
@@ -63,9 +64,12 @@ final class WineEngine {
     /// Path to DXVK DLLs (DirectX -> Vulkan -> Metal via MoltenVK).
     private(set) var dxvkPath: String?
 
-    /// Path to the D3D12 implementation directory.
-    /// Present when `wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll` exists in the engine.
+    /// Path to the D3D12 implementation directory (VKD3D-proton, not used on macOS).
     private(set) var d3d12Path: String?
+
+    /// Path to the GPTK directory (D3D12 → D3DMetal → Metal).
+    /// Set when `wine/lib/gptk/external/D3DMetal.framework/D3DMetal` exists.
+    private(set) var gptkPath: String?
 
     var isReady: Bool { state == .ready }
 
@@ -130,6 +134,7 @@ final class WineEngine {
             dxmtPath = nil
             dxvkPath = nil
             d3d12Path = nil
+            gptkPath = nil
             return
         }
 
@@ -147,10 +152,30 @@ final class WineEngine {
         let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
         if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
 
-        // D3D12: detect VKD3D-proton
+        // D3D12: detect VKD3D-proton (present but NOT used on macOS — lacks VK_EXT_transform_feedback)
         let vkd3dProton = Self.engineDir.appending(path: "wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll").path(percentEncoded: false)
         d3d12Path = fm.fileExists(atPath: vkd3dProton)
             ? Self.engineDir.appending(path: "wine/lib/vkd3d-proton").path(percentEncoded: false)
+            : nil
+
+        // GPTK: D3D12 → D3DMetal.framework → Metal
+        // REQUIRES CX Wine ABI: ntdll.__wine_unix_call must be present.
+        // GPTK's d3d12.dll AND dxgi.dll both import ntdll.__wine_unix_call.
+        // Loading them on Gcenx Wine (which lacks this function) causes:
+        //   "wine: Call from ... to unimplemented function ntdll.dll.__wine_unix_call, aborting"
+        // CLI-verified April 2026: Gcenx Wine 11.6 does NOT export __wine_unix_call.
+        let ntdllSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/ntdll.so")
+        let hasCXWineABI: Bool = {
+            guard let data = try? Data(contentsOf: ntdllSo, options: .mappedIfSafe),
+                  let base = "__wine_unix_call".data(using: .utf8) else { return false }
+            // Append null byte to match the exact symbol, not the longer __wine_unix_call_dispatcher
+            var marker = base
+            marker.append(0)
+            return data.range(of: marker) != nil
+        }()
+        let gptkD3DMetal = Self.engineDir.appending(path: "wine/lib/gptk/external/D3DMetal.framework/D3DMetal").path(percentEncoded: false)
+        gptkPath = (hasCXWineABI && fm.fileExists(atPath: gptkD3DMetal))
+            ? Self.engineDir.appending(path: "wine/lib/gptk").path(percentEncoded: false)
             : nil
 
         backendName   = "Meridian"
@@ -167,7 +192,8 @@ final class WineEngine {
         log.info("[detect]   lib=\(self.libraryPath ?? "none")")
         log.info("[detect]   dxmt=\(dxmtMode)")
         log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
-        log.info("[detect]   d3d12=\(self.d3d12Path ?? "none (D3D12 disabled)")")
+        log.info("[detect]   d3d12=\(self.d3d12Path ?? "none")")
+        log.info("[detect]   gptk=\(self.gptkPath ?? "none") cxABI=\(hasCXWineABI)")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
         log.info("[detect] backend=\(backendName) ✓")
     }
@@ -211,6 +237,7 @@ final class WineEngine {
         dxmtPath                = nil
         dxvkPath                = nil
         d3d12Path               = nil
+        gptkPath                = nil
     }
 
     // MARK: - Environment
@@ -221,12 +248,13 @@ final class WineEngine {
         guard let lib = libraryPath else { return [:] }
         let wine64  = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
         let server  = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
+        let lib64   = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
         return [
             "WINEPREFIX":                prefix.path.path(percentEncoded: false),
             "WINESERVER":                server,
             "WINELOADER":                wine64,
             "WINEDLLPATH":               "\(lib)/wine",
-            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix",
+            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix:\(lib64)",
             "WINE_LARGE_ADDRESS_AWARE":  "1",
         ]
     }
@@ -241,11 +269,6 @@ final class WineEngine {
             "DOTNET_EnableWriteXorExecute":  "0",
         ]
 
-        if let lib = libraryPath {
-            let unixDir = "\(lib)/wine/x86_64-unix"
-            env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
-        }
-
         if let wineExe = wineExecutableURL {
             env["WINELOADER"] = wineExe.path(percentEncoded: false)
         }
@@ -253,14 +276,30 @@ final class WineEngine {
             env["WINESERVER"] = wineServer.path(percentEncoded: false)
         }
 
-        // D3D11 → DXMT (builtin wiremetal.so in lib/wine/x86_64-windows/, no overrides needed).
-        // D3D12 → GPTK (D3DMetal.framework → Metal) when engine includes lib/gptk/.
-        //         VKD3D-proton is present in the engine package but NOT used on macOS/Apple Silicon:
-        //         it requires VK_EXT_transform_feedback which MoltenVK does not support.
-        //         Setting WINEDLLOVERRIDES=d3d12,d3d12core=n forces Wine to load VKD3D-proton's
-        //         native d3d12.dll for ALL games, causing 0xc06d007e (E_DELAYLOAD_MOD_NOT_FOUND)
-        //         in any Unity game that probes D3D12 (even with -force-d3d11).
-        //         CLI-verified non-functional April 2026. Do NOT re-add this override.
+        if let lib = libraryPath {
+            let unixDir = "\(lib)/wine/x86_64-unix"
+            let lib64   = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
+
+            if let gptk = gptkPath {
+                // GPTK present (CX Wine ABI confirmed): D3D12 → D3DMetal → Metal
+                // Prepend GPTK dirs so libd3dshared.dylib and D3DMetal.framework are found
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir):\(lib64)"
+                env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
+
+                // GPTK wine/ has d3d12.dll, dxgi.dll etc. Main lib/wine/ has DXMT builtins.
+                env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+
+                // d3d12=n,b: load CX d3d12.dll from GPTK wine/ as native
+                // dxgi=n,b: load GPTK dxgi.dll (implements IDXGIAdapter4, prevents NULL deref)
+                env["WINEDLLOVERRIDES"] = "d3d12=n,b;dxgi=n,b"
+
+                // Explicit path for d3d12.so adapter to dlopen libd3dshared.dylib
+                env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
+            } else {
+                // Gcenx Wine or GPTK not present: DX11 via DXMT builtin, no D3D12
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir):\(lib64)"
+            }
+        }
 
         log.debug("[env] full environment: \(env.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " | "))")
 
