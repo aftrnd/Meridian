@@ -117,7 +117,7 @@ The current date matters. Always use the **latest stable versions** of all depen
 
 **False theory (do NOT repeat):** Earlier hypothesis was that CX Wine uses GnuTLS standalone and fails. This is wrong. `otool -L crypt32.so` on both CX Wine and Gcenx Wine shows ONLY `Security.framework` — neither binary links to libgnutls. The TLS failure with Gcenx Wine on macOS 26 has unknown root cause. CX Wine TLS is fine when lib64 is NOT on DYLD_FALLBACK_LIBRARY_PATH.
 
-**GPTK + CX Wine ABI:** GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call`. This function exists in CX Wine but NOT Gcenx Wine. `WineEngine.detect()` checks ntdll.so for the null-terminated symbol `__wine_unix_call\0` via binary string search (not nm). With CX Wine: gptkPath set → D3D12 active. With Gcenx Wine: gptkPath = nil → D3D12 disabled.
+**GPTK + CX Wine ABI:** GPTK's d3d12.dll and dxgi.dll both import `ntdll.__wine_unix_call`. This function exists in CX Wine but NOT Gcenx Wine. `WineEngine.detect()` checks `ntdll.dll` (the Windows PE DLL) for the null-terminated export name `__wine_unix_call\0` via binary string search. **NOT ntdll.so** — the standalone symbol is absent from the Unix .so; it only appears in the PE export table (verified at byte offset 673776, April 2026). With CX Wine: gptkPath set → D3D12 active. With Gcenx Wine: gptkPath = nil → D3D12 disabled.
 
 **CRITICAL: DXMT requires Wine 11.x wiremac.so.** DXMT's wiremetal.so dynamically loads `macdrv_view_create_metal_view` etc. from wiremac.so at runtime. These were added in Wine ~10.x. Wine 8.0.1 wiremac.so does not have them. "Failed to create metal view" crash is a Wine version mismatch, not a DXMT bug.
 
@@ -175,7 +175,7 @@ When adding or updating a game profile, always use the best available renderer f
 | Game API | Preferred Renderer | Fallback | Notes |
 |----------|-------------------|---------|-------|
 | D3D9, D3D10, D3D11 | **DXMT** (builtin wiremetal.so → Metal) | DXVK → MoltenVK → Metal | DXMT has lower latency: no Vulkan layer in the path |
-| D3D12 | **GPTK** (D3D12 → D3DMetal.framework → Metal via CX d3d12.dll) when CX Wine ABI is present | — | **ACTIVE** with CX Wine 11.4. `WineEngine.detect()` finds `__wine_unix_call` in ntdll.so and sets gptkPath → GPTK env vars injected for game launches. |
+| D3D12 | **GPTK** (D3D12 → D3DMetal.framework → Metal via CX d3d12.dll) when CX Wine ABI is present | — | **ACTIVE** with CX Wine 11.4. `WineEngine.detect()` finds `__wine_unix_call` in `ntdll.dll` PE export table (NOT ntdll.so) and sets gptkPath → GPTK env vars injected for game launches. |
 | OpenGL / Vulkan | Wine's native implementation + MoltenVK | — | No override needed |
 
 **DXMT is always preferred over DXVK for D3D11** because it translates directly to Metal without a Vulkan intermediary — fewer layers = lower CPU overhead and better frame pacing on Apple Silicon.

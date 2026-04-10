@@ -56,20 +56,51 @@ final class WineSteamManager {
         return !exists
     }
 
-    /// Runs Steam to complete the first-run client download.
+    /// Downloads and installs the Steam client using native macOS networking.
     ///
-    /// Steam's update pipeline has two observable phases under Wine:
-    ///   1. **Download** — Steam writes ~150 MB of `.zip` packages into its
-    ///      `package/` subdirectory. The progress bar is determinate.
-    ///   2. **Apply (stuck)** — Steam enters an indeterminate "applying update"
-    ///      phase (blue bar cycling left-to-right). Under Wine this phase never
-    ///      completes; Steam does not write `steamui.dll` until relaunched.
+    /// Steam's 32-bit bootstrapper (steam.exe) statically links OpenSSL which cannot
+    /// complete TLS handshakes under WoW64 on macOS 26 with CX Wine 11.4. Instead of
+    /// running steam.exe and waiting for it to download its own client, Meridian
+    /// downloads the Steam client packages directly from Valve's CDN using URLSession
+    /// and extracts them into the Steam install directory.
     ///
-    /// We detect phase transition by watching the `package/` directory size.
-    /// Once it stops growing for `quiescenceWindow` seconds the download is
-    /// done. We then kill Steam and relaunch — the next run finds the cached
-    /// packages, extracts them in seconds, and writes `steamui.dll`.
-    func bootstrap(engine: WineEngine, prefix: WinePrefix) async throws {
+    /// This approach is more reliable (macOS-native TLS), faster (no Wine overhead
+    /// during download), and simpler (no quiescence detection or kill/restart loop).
+    func bootstrap(engine: WineEngine, prefix: WinePrefix,
+                   progress: (@Sendable (Int64, Int64) -> Void)? = nil) async throws {
+        let dllPath = prefix.steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        if FileManager.default.fileExists(atPath: dllPath) {
+            log.info("[bootstrap] steamui.dll already present — skipping")
+            return
+        }
+
+        log.info("[bootstrap] starting native macOS bootstrap (bypassing steam.exe TLS)")
+
+        do {
+            try await SteamClientBootstrap.downloadAndInstall(
+                to: prefix.steamInstallDir,
+                progress: progress ?? { _, _ in }
+            )
+        } catch {
+            log.error("[bootstrap] native bootstrap failed: \(error.localizedDescription)")
+            throw SteamError.bootstrapFailed(
+                exitCode: -1,
+                detail: "Native Steam client download failed: \(error.localizedDescription)"
+            )
+        }
+
+        guard FileManager.default.fileExists(atPath: dllPath) else {
+            throw SteamError.bootstrapFailed(exitCode: -1, detail: "steamui.dll missing after native bootstrap")
+        }
+
+        log.info("[bootstrap] Steam bootstrap complete ✓ (native macOS download)")
+    }
+
+    /// Legacy Wine-based bootstrap — runs steam.exe and monitors package/ directory.
+    ///
+    /// Kept as a fallback. Steam's 32-bit OpenSSL fails TLS under WoW64 on macOS 26,
+    /// so the primary path is `bootstrap()` which uses native macOS networking.
+    func _legacyBootstrap(engine: WineEngine, prefix: WinePrefix) async throws {
         // Kill any stale processes from a prior attempt to avoid wineserver conflicts.
         killAll(engine: engine, prefix: prefix)
         try? await Task.sleep(for: .seconds(2))

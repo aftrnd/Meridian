@@ -366,10 +366,18 @@ final class BootstrapManager {
 
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
-            transition(to: .bootstrappingSteam, message: "Steam is updating — first launch takes a few minutes…")
+            transition(to: .bootstrappingSteam, message: "Downloading Steam client…")
             let t = ContinuousClock.now
             do {
-                try await steamManager.bootstrap(engine: engine, prefix: prefix)
+                try await steamManager.bootstrap(engine: engine, prefix: prefix) { [weak self] downloaded, total in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        let pct = total > 0 ? Int(downloaded * 100 / total) : 0
+                        let mb = downloaded / 1_048_576
+                        let totalMB = total / 1_048_576
+                        self.statusMessage = "Downloading Steam client… \(mb)/\(totalMB) MB (\(pct)%)"
+                    }
+                }
                 log.info("[bootstrap] Steam client bootstrapped in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
             } catch {
                 fail("Steam update failed: \(error.localizedDescription)")

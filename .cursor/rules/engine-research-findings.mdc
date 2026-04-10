@@ -37,9 +37,15 @@ only add `lib:lib/wine/x86_64-unix` to DYLD — never lib64. This is correct and
 
 **Why CX Wine also enables GPTK (D3D12):**
 CX Wine has `ntdll.__wine_unix_call` (a CodeWeavers extension). GPTK's d3d12.dll and dxgi.dll
-both import this function. WineEngine.detect() does a binary string search for
-`__wine_unix_call\0` in ntdll.so — if found, gptkPath is set and GPTK env vars are injected
-for game launches. With CX Wine: gptkPath set → D3D12 → D3DMetal → Metal works.
+both import this function. WineEngine.detect() searches for `__wine_unix_call\0` in
+`wine/lib/wine/x86_64-windows/ntdll.dll` (the PE DLL export table) — if found, gptkPath is set
+and GPTK env vars are injected for game launches. With CX Wine: gptkPath set → D3D12 →
+D3DMetal → Metal works.
+**CRITICAL: Search ntdll.dll (PE), NOT ntdll.so (Unix).** The `__wine_unix_call` export lives
+in the Windows PE ntdll.dll — confirmed at byte offset 673776 via PE export table scan. ntdll.so
+only contains `__wine_unix_call_dispatcher` and `__wine_unix_call_funcs`; the standalone
+`__wine_unix_call\0` is absent from ntdll.so. CLI-verified April 2026: searching ntdll.so
+returned no match (cxABI=false, GPTK disabled). Fixed to search ntdll.dll.
 With Gcenx Wine: no `__wine_unix_call` → gptkPath = nil → D3D12 disabled.
 
 **Why CX Wine 11.4 has all the same DX11 patches as Gcenx 11.6:**
@@ -335,7 +341,7 @@ WINEDLLOVERRIDES="d3d12=b;dxgi=n,b"
 CX_APPLEGPTK_LIBD3DSHARED_PATH="$GPTK/external/libd3dshared.dylib"
 ```
 
-**Detection note:** `WineEngine.detect()` sets `gptkPath` when BOTH `wine/lib/wine/x86_64-windows/d3d12.dll` (bridge) AND `wine/lib/gptk/external/D3DMetal.framework` exist. It does NOT check for `gptk/wine/x86_64-windows/d3d12.dll` (removed by packaging).
+**Detection note:** `WineEngine.detect()` sets `gptkPath` when BOTH `wine/lib/wine/x86_64-windows/d3d12.dll` (bridge) AND `wine/lib/gptk/external/D3DMetal.framework` exist AND `ntdll.dll` exports `__wine_unix_call` (cxABI=true). It does NOT check for `gptk/wine/x86_64-windows/d3d12.dll` (removed by packaging). **IMPORTANT: The cxABI check scans `ntdll.dll` (PE DLL), NOT `ntdll.so` (Unix .so) — the symbol only appears in the PE export table.**
 
 ### GPTK Sourcing
 

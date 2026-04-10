@@ -70,6 +70,11 @@ final class WineEngine {
     /// Set when `wine/lib/gptk/external/D3DMetal.framework/D3DMetal` exists.
     private(set) var gptkPath: String?
 
+    /// Path to lib64/ (MoltenVK, GnuTLS, GStreamer, libgmp).
+    /// Required on DYLD_FALLBACK_LIBRARY_PATH so secur32.so can dlopen libgnutls
+    /// for Wine's TLS stack. Without this, all Wine HTTPS operations fail.
+    private(set) var lib64Path: String?
+
     var isReady: Bool { state == .ready }
 
     // MARK: - Convenience accessors for compatibility with existing code
@@ -130,6 +135,7 @@ final class WineEngine {
             wineExecutableURL = nil
             wineserverExecutableURL = nil
             libraryPath = nil
+            lib64Path = nil
             dxmtPath = nil
             dxvkPath = nil
             d3d12Path = nil
@@ -140,6 +146,9 @@ final class WineEngine {
         wineExecutableURL       = URL(filePath: bundledWine)
         wineserverExecutableURL = URL(filePath: bundledServer)
         libraryPath             = Self.engineDir.appending(path: "wine/lib").path(percentEncoded: false)
+
+        let l64 = Self.engineDir.appending(path: "wine/lib64").path(percentEncoded: false)
+        lib64Path = fm.fileExists(atPath: l64) ? l64 : nil
 
         // DXMT builtin layout: DLLs live in lib/wine/x86_64-windows/ alongside Wine's own DLLs.
         let dxmtUnixSo = Self.engineDir.appending(path: "wine/lib/wine/x86_64-unix/winemetal.so").path(percentEncoded: false)
@@ -242,6 +251,7 @@ final class WineEngine {
         wineExecutableURL       = nil
         wineserverExecutableURL = nil
         libraryPath             = nil
+        lib64Path               = nil
         dxmtPath                = nil
         dxvkPath                = nil
         d3d12Path               = nil
@@ -256,12 +266,14 @@ final class WineEngine {
         guard let lib = libraryPath else { return [:] }
         let wine64  = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
         let server  = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
+        var dyld = "\(lib):\(lib)/wine/x86_64-unix"
+        if let l64 = lib64Path { dyld += ":\(l64)" }
         return [
             "WINEPREFIX":                prefix.path.path(percentEncoded: false),
             "WINESERVER":                server,
             "WINELOADER":                wine64,
             "WINEDLLPATH":               "\(lib)/wine",
-            "DYLD_FALLBACK_LIBRARY_PATH": "\(lib):\(lib)/wine/x86_64-unix",
+            "DYLD_FALLBACK_LIBRARY_PATH": dyld,
             "WINE_LARGE_ADDRESS_AWARE":  "1",
         ]
     }
@@ -286,28 +298,22 @@ final class WineEngine {
         if let lib = libraryPath {
             let unixDir = "\(lib)/wine/x86_64-unix"
 
+            let l64Suffix = lib64Path.map { ":\($0)" } ?? ""
+
             if let gptk = gptkPath {
                 // GPTK present (CX Wine ABI confirmed): D3D12 → D3DMetal → Metal
-                // Prepend GPTK dirs so libd3dshared.dylib and D3DMetal.framework are found
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir)"
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir)\(l64Suffix)"
                 env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
 
-                // GPTK wine/ has d3d12.dll, dxgi.dll etc. Main lib/wine/ has DXMT builtins.
                 env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
 
                 // d3d12=n,b: load CX d3d12.dll from GPTK wine/ as native
                 // dxgi=n,b: load GPTK dxgi.dll (implements IDXGIAdapter4, prevents NULL deref)
                 env["WINEDLLOVERRIDES"] = "d3d12=n,b;dxgi=n,b"
 
-                // Explicit path for d3d12.so adapter to dlopen libd3dshared.dylib
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
-                // Gcenx Wine or GPTK not present: DX11 via DXMT builtin, no D3D12
-                // NOTE: do NOT add lib64 to DYLD here — lib64 contains libgnutls, and
-                // if libgnutls is on the DYLD search path, crypt32.so can pick it up
-                // and break TLS. lib64 is only used during release-engine.sh wineboot
-                // build — never at app runtime.
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)"
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)\(l64Suffix)"
             }
         }
 

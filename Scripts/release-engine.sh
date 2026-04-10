@@ -254,6 +254,21 @@ if os.path.isdir(gst_src):
 print(f'  lib64: {count} files staged')
 " || die "lib64 dylibs staging failed"
 
+# Fix libgnutls rpath so its @rpath/libgmp.10.dylib dependency resolves.
+# CX Preview's libgnutls.30.dylib has ZERO LC_RPATH entries. secur32.so dlopen's
+# it (found via DYLD_FALLBACK_LIBRARY_PATH), but libgnutls then needs libgmp.10.dylib
+# via @rpath — which fails without an rpath pointing to its own directory.
+yellow "Fixing libgnutls.30.dylib rpath for TLS support..."
+GNUTLS_LIB64="${STAGING}/wine/lib64/libgnutls.30.dylib"
+if [ -f "${GNUTLS_LIB64}" ]; then
+    install_name_tool -add_rpath @loader_path "${GNUTLS_LIB64}" 2>/dev/null || true
+    otool -l "${GNUTLS_LIB64}" | grep -q "LC_RPATH" \
+        || die "libgnutls.30.dylib missing LC_RPATH after install_name_tool — TLS will be broken"
+    info "  libgnutls.30.dylib: added @loader_path rpath ✓"
+else
+    yellow "  Warning: libgnutls.30.dylib not found in lib64 — Wine TLS will not work"
+fi
+
 # ---------- verify Wine works ----------
 
 [ -x "${STAGING}/wine/bin/wine64" ]     || die "wine64 not executable"
