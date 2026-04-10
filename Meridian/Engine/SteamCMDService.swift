@@ -199,6 +199,19 @@ final class SteamCMDService {
         stderrTask.cancel()
         activeProcess = nil
 
+        // If the deadline fired and the process is still running, kill it explicitly.
+        // Without this, process.terminationStatus is undefined (reads 0 on a live process)
+        // and backupSteamCMDConfig() would save a config.vdf from a session that never
+        // completed login — poisoning the backup used on every subsequent launch.
+        if process.isRunning {
+            log.warning("[warmUp] 5-minute timeout — terminating SteamCMD (process never exited)")
+            process.terminate()
+            try? await Task.sleep(for: .milliseconds(500))
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+
         let exitCode = process.terminationStatus
         if exitCode == 0 {
             log.info("[warmUp] complete ✓ (exit=0)")

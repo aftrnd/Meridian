@@ -760,3 +760,78 @@ The old `writeConnectCache` tried to upsert entries into existing config.vdf fil
 
 **Fix:** `writeConnectCache` now ALWAYS writes a fresh minimal VDF — never merges. The JWT refresh token in AppSettings is sufficient for steam.exe; SteamCMD uses its own native cache. Fresh VDF = no corruption risk.
 
+---
+
+## Pattern 4: Same-tag Engine Republish Stales the Prefix (CLI-verified April 10, 2026)
+
+When `release-engine.sh` is run again with the same engine version tag (no version bump), `BootstrapManager`'s tag-string comparison (`storedTag == currentTag`) passes, so `wineboot --update` / `resetToEngineTemplate` is skipped. The prefix is left with DLL state corresponding to the OLD engine packaging.
+
+**Symptom:** SteamCMD hangs indefinitely at "Logging in user ... to Steam Public..." — not a TLS error, not a credential error. The TLS handshake itself succeeds (GnuTLS cipher negotiated, session ticket received). The hang is in the Steam CM protocol layer, indicating a Wine prefix/DLL state inconsistency.
+
+**CLI-verified April 10, 2026:**
+- Anonymous login (`+login anonymous`) hangs at "Connecting anonymously to Steam Public..." — eliminates credential theory.
+- Using CrossOver Preview's wineserver (byte-identical binary via MD5 comparison) with the same prefix: login completes in ~5s — eliminates network theory.
+- After CX Preview ran `wineboot --update` (system.reg mtime updated at 16:43): Meridian's own engine also works — confirms stale prefix was root cause.
+- 8 orphan Wine processes (explorer.exe dating to prior day, steamcmd.exe from 12:07) survived every startup cleanup sweep because their argv[0] had been replaced.
+
+**Fix (committed April 10, 2026):**
+- `AppSettings.lastPrefixEngineModTime` stores the mtime of `wine/meridian-engine-version.txt` when the prefix was last reset.
+- `BootstrapManager` compares BOTH tag AND modtime: `needsUpdate = storedTag != currentTag || currentEngineModTime != lastPrefixEngineModTime`
+- Even if the tag string is the same, a changed mtime (always true after a `release-engine.sh` run) triggers a prefix reset.
+- `TerminationCleanup` now adds a "Windows-name sweep" (step 8) killing `explorer.exe`, `steamcmd.exe`, `winedevice.exe`, etc. by their Windows argv[0] path.
+- `TerminationCleanup` now cleans stale `/tmp/.wine-<uid>/server-*` socket directories (step 9).
+- `SteamCMDService.warmUp()` now explicitly terminates the process on 5-minute timeout and guards `backupSteamCMDConfig()` to only run on genuine exit-0, not timeout.
+
+**CORRECTION (April 10, 2026 — Pattern 5 below was the real root cause):** The Pattern 4 fix (mtime detection, cleanup improvements) addresses real secondary issues but was NOT the root cause of the SteamCMD hang. The hang was caused by `com.apple.quarantine` on the engine files — see Pattern 5.
+
+---
+
+## Pattern 5: com.apple.quarantine Blocks Wine Network Access (CLI-verified April 10, 2026)
+
+**This was the actual root cause of all SteamCMD "Loading Steam API..." hangs and DX11 game regressions across multiple sessions.**
+
+### What happens
+
+macOS sets the `com.apple.quarantine` extended attribute on every file downloaded via `URLSession`. When `EngineDownloader` extracts the engine `.tar.gz` via `tar`, the quarantine attribute propagates to all extracted files. On macOS 26, quarantined executables have restricted network access — Wine's `secur32.so` cannot dlopen `libgnutls`, and its TLS connections fail silently.
+
+**Symptoms:**
+- SteamCMD hangs at "Loading Steam API..." indefinitely — even with `+login anonymous` (no credentials needed)
+- DX11 games appear to start but Steam DRM connections fail
+- `wine64 --version` works fine (no network) — binary appears healthy
+- `wineboot --update` hangs indefinitely
+- CX Preview's own wineloader (not quarantined) works perfectly
+
+### CLI proof (April 10, 2026)
+
+```bash
+# Meridian's wine64 — quarantined:
+xattr engine/wine/bin/wine64  # → com.apple.quarantine
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# HANGS at "Loading Steam API..." — never prints "Connecting anonymously..."
+
+# CX Preview's wineloader — NOT quarantined:
+xattr "CrossOver Preview.app/.../wineloader"  # → (no output)
+# binaries are BYTE-FOR-BYTE IDENTICAL: MD5 0e1334f181c1dda39e213c7be3e37fef
+# CX wine with identical binary runs to: "Connecting anonymously to Steam Public...OK"
+
+# After stripping quarantine from Meridian's engine:
+xattr -rd com.apple.quarantine engine/
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# → "Connecting anonymously to Steam Public...OK" in 12 seconds
+```
+
+### Why previous sessions missed this
+
+1. `wine64 --version` works with quarantine (no network needed) — the binary looked healthy.
+2. When CX Preview's wineloader was used in test runs, it worked because CX installs via a signed `.pkg` which does not apply quarantine. Tests concluded "stale prefix" or "TLS issue" — chasing the wrong root cause for three days.
+3. Every TLS, GnuTLS, lib64, prefix-mtime theory was a symptom of the same underlying restricted network access.
+
+### Fix (April 10, 2026)
+
+1. **`EngineDownloader.stripQuarantine(from:)`** — called (a) on the downloaded `.tar.gz` archive before extraction and (b) on the engine directory after extraction. Both are needed because `tar` may still propagate quarantine from archive metadata.
+2. **`BootstrapManager.stripEngineQuarantine()`** — one-time cleanup (versioned via `AppSettings.quarantineCleanedVersion = 1`) for users with engines downloaded before the fix.
+
+### Key rule going forward
+
+After ANY engine download, immediately call `xattr -rd com.apple.quarantine` on the engine directory. Without this, Wine's network stack is broken on macOS 26.
+

@@ -20,9 +20,10 @@ private let log = MeridianLog(category: "WineEngine")
 /// ## D3D12 Support
 ///
 /// GPTK (D3D12 → D3DMetal → Metal) requires CX Wine ABI. Detection checks for
-/// `__wine_unix_call` in ntdll.so — GPTK's d3d12.dll and dxgi.dll both import this
-/// function. With CX Wine (current engine): gptkPath is set, full GPTK environment
-/// is injected for game launches. D3D12 → D3DMetal → Metal works automatically.
+/// `__wine_unix_call` in ntdll.dll (PE export table) — GPTK's d3d12.dll and dxgi.dll
+/// both import this function. With CX Wine (current engine): gptkPath is set, full
+/// GPTK environment is injected for game launches. D3D12 → D3DMetal → Metal works
+/// automatically.
 @Observable
 @MainActor
 final class WineEngine {

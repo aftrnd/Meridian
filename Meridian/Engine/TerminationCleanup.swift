@@ -19,6 +19,11 @@ private let log = MeridianLog(category: "TerminationCleanup")
 ///      / wineserver processes without touching Wine processes from other applications.
 ///   4. Also kills any processes from `/tmp/meridian-engine/` — build artifacts from
 ///      `release-engine.sh` that can persist across reboots.
+///
+/// NOTE: Wine processes replace their argv[0] with the Windows program path shortly
+/// after startup (e.g. `C:\windows\system32\explorer.exe`). After that replacement,
+/// pkill -f on the engine path no longer matches them. The Windows-name sweep below
+/// catches these orphans by matching on the Windows path they replaced argv[0] with.
 enum TerminationCleanup {
 
     /// Paths needed to run `wineserver -k` for our specific prefix at quit time.
@@ -52,6 +57,8 @@ enum TerminationCleanup {
     ///   5. First pkill sweep — by engine path, bottles path, and /tmp/meridian-engine.
     ///   6. 1 s drain — time for late-spawning child processes to appear.
     ///   7. Second sweep — catches anything that respawned between steps 5 and 6.
+    ///   8. Windows-name sweep — kills argv[0]-replaced processes (explorer.exe, etc.).
+    ///   9. Clean stale /tmp/.wine-<uid>/server-* socket directories.
     static func killAllWineProcesses() {
         let start = Date()
         log.info("[cleanup] starting Wine/Steam process cleanup")
@@ -109,6 +116,38 @@ enum TerminationCleanup {
         // 7. Second sweep — catches anything that respawned between sweeps.
         log.info("[cleanup] second pkill sweep")
         runSweep(context: context)
+
+        // 8. Windows-name sweep — kills processes whose argv[0] was replaced with a
+        //    Windows path after startup. These survive the engine-path pkill entirely.
+        //    CLI-verified April 2026: explorer.exe and steamcmd.exe orphans from the
+        //    previous day were still running after every engine-path pkill sweep.
+        let windowsProcessNames = [
+            "explorer.exe", "steamcmd.exe", "steam.exe",
+            "winedevice.exe", "steamwebhelper", "steamservice.exe",
+            "services.exe", "plugplay.exe", "svchost.exe",
+        ]
+        for name in windowsProcessNames {
+            pkill(["-9", "-f", name])
+        }
+        log.info("[cleanup] windows-name sweep complete")
+
+        // 9. Remove stale wineserver socket directories under /tmp/.wine-<uid>/.
+        //    These accumulate when Wine processes are killed without a clean wineserver
+        //    shutdown. A stale socket dir can cause a new wineserver to refuse to start
+        //    or connect to a dead socket — hanging SteamCMD login indefinitely.
+        //    CLI-verified April 2026: 4 stale server-* dirs found after 8 orphan processes.
+        let uid = getuid()
+        let wineTmpDir = URL(filePath: "/tmp/.wine-\(uid)")
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: wineTmpDir,
+            includingPropertiesForKeys: nil,
+            options: .skipsHiddenFiles
+        ) {
+            for entry in entries where entry.lastPathComponent.hasPrefix("server-") {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+        log.info("[cleanup] stale wineserver socket dirs cleaned under /tmp/.wine-\(uid)")
 
         let elapsed = Date().timeIntervalSince(start)
         log.info("[cleanup] done — elapsed=\(String(format: "%.2f", elapsed))s")

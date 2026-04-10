@@ -399,17 +399,22 @@ GNUTLS_LIB=$(find "${STAGING}/wine/lib" -maxdepth 1 -name 'libgnutls*' 2>/dev/nu
 [ -z "${GNUTLS_LIB}" ] || die "libgnutls found in wine/lib/ — must be in lib64/ only: ${GNUTLS_LIB}"
 info "libgnutls correctly in lib64/ only ✓"
 
-# Verify Wine ABI: check whether ntdll.so contains __wine_unix_call exactly
-# (not just __wine_unix_call_dispatcher which is a different function).
-# Uses binary string search matching WineEngine.detect() — the symbol may not
-# appear in nm -gU output if it's not a globally exported Mach-O symbol.
-NTDLL_SO="${STAGING}/wine/lib/wine/x86_64-unix/ntdll.so"
-[ -f "${NTDLL_SO}" ] || die "ntdll.so missing"
-# strings finds any null-terminated ASCII string in the binary (matches WineEngine.swift binary search)
-if strings "${NTDLL_SO}" 2>/dev/null | grep -qE "^__wine_unix_call$"; then
-    info "CX Wine ABI: ntdll contains __wine_unix_call — GPTK is ACTIVE ✓"
+# Verify Wine ABI: check whether ntdll.dll (the Windows PE DLL) contains __wine_unix_call
+# as a null-terminated export name string. This is what WineEngine.detect() does in Swift —
+# it searches the PE binary for "__wine_unix_call\0" (with trailing null) to distinguish
+# CX Wine (has __wine_unix_call) from Gcenx Wine (only has __wine_unix_call_dispatcher).
+#
+# IMPORTANT: Search ntdll.dll (PE), NOT ntdll.so (Unix .so).
+# The export name lives in the Windows PE export table as a C string.
+# ntdll.so only contains __wine_unix_call_dispatcher and __wine_unix_call_funcs —
+# the standalone __wine_unix_call\0 string is NOT present in ntdll.so.
+# CLI-verified April 2026: ntdll.dll at byte offset 673776. ntdll.so has no match.
+NTDLL_DLL="${STAGING}/wine/lib/wine/x86_64-windows/ntdll.dll"
+[ -f "${NTDLL_DLL}" ] || die "ntdll.dll (PE) missing"
+if strings "${NTDLL_DLL}" 2>/dev/null | grep -qE "^__wine_unix_call$"; then
+    info "CX Wine ABI: ntdll.dll PE exports __wine_unix_call — GPTK is ACTIVE ✓"
 else
-    yellow "WARNING: __wine_unix_call NOT found in ntdll.so — GPTK will be DISABLED (expected with Gcenx Wine)"
+    yellow "WARNING: __wine_unix_call NOT found in ntdll.dll PE exports — GPTK will be DISABLED (expected with Gcenx Wine)"
 fi
 
 FILE_COUNT=$(find "${STAGING}" -type f | wc -l | tr -d ' ')

@@ -232,6 +232,15 @@ final class BootstrapManager {
             libraryPath: engine.libraryPath
         )
 
+        // One-time quarantine cleanup for engines downloaded before EngineDownloader
+        // started stripping quarantine automatically. Must run before any Wine process
+        // is launched — quarantined Wine binaries have restricted network access on
+        // macOS 26, causing Wine's TLS/secur32 to fail silently and SteamCMD to hang.
+        if settings.quarantineCleanedVersion < Self.quarantineCleanedCurrentVersion {
+            await Self.stripEngineQuarantine()
+            settings.quarantineCleanedVersion = Self.quarantineCleanedCurrentVersion
+        }
+
         guard !Task.isCancelled else { return }
 
         // 1b. Permission gate — block here until Accessibility is granted or user skips.
@@ -276,9 +285,10 @@ final class BootstrapManager {
                 fail("Failed to create Wine environment: \(error.localizedDescription)")
                 return
             }
-            // Record the engine tag used to create this prefix so we can detect
-            // future engine upgrades that require a DLL symlink refresh.
+            // Record the engine tag and content fingerprint used to create this prefix
+            // so we can detect future engine upgrades or same-tag republishes.
             settings.lastPrefixEngineTag = engine.engineVersion ?? ""
+            settings.lastPrefixEngineModTime = Self.engineVersionFileModTime()
 
             // Register WinRT class mappings that Wine's wineboot doesn't create.
             await prefix.registerWinRTClasses(engine: engine)
@@ -297,8 +307,15 @@ final class BootstrapManager {
         //     Falls back to `wineboot --update` for engines without a template.
         let storedTag = settings.lastPrefixEngineTag
         let currentTag = engine.engineVersion ?? ""
-        if prefix.exists && !currentTag.isEmpty && storedTag != currentTag {
-            log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix to new engine template")
+        let currentEngineModTime = Self.engineVersionFileModTime()
+        let needsUpdate = prefix.exists && !currentTag.isEmpty
+            && (storedTag != currentTag || currentEngineModTime != settings.lastPrefixEngineModTime)
+        if needsUpdate {
+            if storedTag != currentTag {
+                log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix to new engine template")
+            } else {
+                log.info("[bootstrap] engine content changed (same tag \(currentTag), mtime \(settings.lastPrefixEngineModTime) → \(currentEngineModTime)) — resetting prefix to new engine template")
+            }
             transition(to: .creatingPrefix, message: "Applying new Wine engine…")
             let t = ContinuousClock.now
             do {
@@ -308,12 +325,13 @@ final class BootstrapManager {
                 steamManager.killAll(engine: engine, prefix: prefix)
                 try? await Task.sleep(for: .seconds(1))
                 settings.lastPrefixEngineTag = currentTag
+                settings.lastPrefixEngineModTime = currentEngineModTime
                 log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
                 await prefix.registerWinRTClasses(engine: engine)
             } catch {
                 log.error("[bootstrap] prefix reset failed (non-fatal): \(error.localizedDescription) — continuing with existing prefix")
             }
-        } else if storedTag == currentTag {
+        } else {
             log.info("[bootstrap] engine tag unchanged (\(currentTag)) — no prefix update needed")
         }
 
@@ -550,6 +568,47 @@ final class BootstrapManager {
     }
 
     // MARK: - Helpers
+
+    /// Version counter for the one-time quarantine cleanup pass.
+    /// Increment this when a new cleanup action is needed on existing installations.
+    ///
+    /// Version history:
+    ///   1 — strip com.apple.quarantine from the entire engine directory. Engine files
+    ///       downloaded before EngineDownloader started stripping quarantine automatically
+    ///       have restricted network access on macOS 26, breaking Wine TLS.
+    private static let quarantineCleanedCurrentVersion = 1
+
+    /// Strips `com.apple.quarantine` from the entire engine directory.
+    /// Runs off the main actor so it doesn't block the UI during the brief xattr sweep.
+    private static func stripEngineQuarantine() async {
+        await Task.detached(priority: .userInitiated) {
+            let enginePath = WineEngine.engineDir.path(percentEncoded: false)
+            log.info("[bootstrap] stripping com.apple.quarantine from engine (one-time cleanup)…")
+            let process = Process()
+            process.executableURL = URL(filePath: "/usr/bin/xattr")
+            process.arguments = ["-rd", "com.apple.quarantine", enginePath]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError  = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+                log.info("[bootstrap] quarantine stripped from engine ✓")
+            } catch {
+                log.warning("[bootstrap] xattr quarantine strip failed: \(error.localizedDescription)")
+            }
+        }.value
+    }
+
+    /// Returns the filesystem modification time of `wine/meridian-engine-version.txt`
+    /// as a Unix timestamp. This file is written by every `release-engine.sh` run, so
+    /// its mtime changes even when the version tag string is unchanged (same-tag republish).
+    /// Returns 0.0 if the file does not exist.
+    private static func engineVersionFileModTime() -> Double {
+        let versionFile = WineEngine.engineDir.appending(path: "wine/meridian-engine-version.txt")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: versionFile.path(percentEncoded: false)),
+              let modDate = attrs[.modificationDate] as? Date else { return 0.0 }
+        return modDate.timeIntervalSince1970
+    }
 
     private func transition(to newPhase: Phase, message: String) {
         phase = newPhase
