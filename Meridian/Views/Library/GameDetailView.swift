@@ -312,7 +312,7 @@ struct GameDetailView: View {
     /// `HeroBannerImage.loadImage()` but writing directly to `@State`
     /// so the banner can render as a plain `Image` with no `GeometryReader`.
     private func loadBannerImage() async {
-        let urls = [currentGame.heroURL] + currentGame.heroURLFallbacks
+        let urls = currentGame.newCDNHeroURLs + [currentGame.heroURL] + currentGame.heroURLFallbacks
 
         for url in urls {
             if let cached = ImageCache.shared.image(for: url) {
@@ -326,10 +326,10 @@ struct GameDetailView: View {
         for url in urls {
             guard !Task.isCancelled else { return }
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.imageSession.data(from: url)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
                 guard let img = NSImage(data: data) else { continue }
-                ImageCache.shared.store(img, for: url)
+                ImageCache.shared.store(img, for: url, rawData: data)
                 let r = img.size.width / img.size.height
                 if r > 0.05, r < 20 { heroAspectRatio = r }
                 bannerImage = img

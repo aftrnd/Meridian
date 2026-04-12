@@ -38,6 +38,10 @@ extension View {
 
 /// Loads the game's logo PNG (transparent title lockup) from Steam CDN.
 /// Falls back to bold text when no logo exists (same behaviour as Home).
+///
+/// Non-transparent images (e.g. opaque key art that some games publish as logo.png)
+/// are rejected — only images with an alpha channel are accepted as logo overlays.
+/// This prevents the banner art from doubling as the "title" overlay.
 struct HeroLogoImage: View {
     let urls: [URL]
     let fallbackName: String
@@ -69,21 +73,27 @@ struct HeroLogoImage: View {
 
     private func loadLogo() async {
         loadFailed = false
+        loadedImage = nil
 
         for url in urls {
+            // Two-tier cache check (memory + disk).
             if let cached = ImageCache.shared.image(for: url) {
-                loadedImage = cached
-                return
+                if hasAlpha(cached) {
+                    loadedImage = cached
+                    return
+                }
+                // Cached image has no alpha — it's opaque art, not a logo lockup. Skip it.
+                continue
             }
-        }
 
-        for url in urls {
             guard !Task.isCancelled else { return }
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.imageSession.data(from: url)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
                 guard let nsImage = NSImage(data: data) else { continue }
-                ImageCache.shared.store(nsImage, for: url)
+                // Only accept images with an alpha channel as logo overlays.
+                guard hasAlpha(nsImage) else { continue }
+                ImageCache.shared.store(nsImage, for: url, rawData: data)
                 loadedImage = nsImage
                 return
             } catch {
@@ -92,6 +102,15 @@ struct HeroLogoImage: View {
         }
 
         loadFailed = true
+    }
+
+    /// Returns true when the image has a meaningful alpha channel (i.e. can be transparent).
+    private func hasAlpha(_ image: NSImage) -> Bool {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return false
+        }
+        let alpha = cgImage.alphaInfo
+        return alpha != .none && alpha != .noneSkipFirst && alpha != .noneSkipLast
     }
 }
 
@@ -144,6 +163,7 @@ struct HeroBannerImage: View {
 
     private func loadImage() async {
         for url in urls {
+            // Two-tier cache check (memory + disk).
             if let cached = ImageCache.shared.image(for: url) {
                 loadedImage = cached
                 emitSize(for: cached)
@@ -152,10 +172,10 @@ struct HeroBannerImage: View {
 
             guard !Task.isCancelled else { return }
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.imageSession.data(from: url)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
                 guard let nsImage = NSImage(data: data) else { continue }
-                ImageCache.shared.store(nsImage, for: url)
+                ImageCache.shared.store(nsImage, for: url, rawData: data)
                 loadedImage = nsImage
                 emitSize(for: nsImage)
                 return

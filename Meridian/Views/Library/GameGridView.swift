@@ -141,10 +141,10 @@ struct GameGridView: View {
         for url in urlsToTry {
             guard !Task.isCancelled else { return }
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (data, response) = try await URLSession.imageSession.data(from: url)
                 if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
                 guard let nsImage = NSImage(data: data) else { continue }
-                ImageCache.shared.store(nsImage, for: url)
+                ImageCache.shared.store(nsImage, for: url, rawData: data)
                 loadedImage = nsImage
                 return
             } catch {
