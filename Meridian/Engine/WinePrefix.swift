@@ -501,21 +501,15 @@ struct WinePrefix: Sendable {
         log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
     }
 
-    /// Merges `ConnectCache` and `Accounts` into `config/config.vdf`.
+    /// Writes a minimal, well-formed `config/config.vdf` with ConnectCache credentials.
     ///
-    /// SteamCMD stores its encrypted credential cache (auth tokens, server
-    /// timing info, WebSocket preferences) in the same `config/config.vdf` file
-    /// under `InstallConfigStore > Software > Valve > Steam`. If we overwrite
-    /// the file we destroy those credentials, forcing Steam Guard re-confirmation
-    /// on every subsequent SteamCMD launch.
+    /// Always overwrites the existing file. The previous merge approach (upsert into
+    /// steam.exe-generated configs) produced brace-count mismatches in large VDF files,
+    /// causing SteamCMD to hit EOF mid-parse ("got EOF instead of keyname"), report
+    /// "Cached credentials not found", and prompt for a password — blocking forever.
     ///
-    /// Instead we MERGE:
-    /// - If a `ConnectCache` block already exists, inject/update just the
-    ///   steamID key-value entry inside it, leaving `7a611aa1` and other
-    ///   SteamCMD-specific entries untouched.
-    /// - If no `ConnectCache` block exists, append one inside the `Steam` section.
-    /// - Same for `Accounts` — update the entry for this account, preserve others.
-    /// - If no config.vdf exists yet, write the minimal VDF as before.
+    /// A fresh minimal VDF is always correct: the JWT refresh token stored in AppSettings
+    /// is all SteamCMD needs to log in without Steam Guard.
     func writeConnectCache(steamID: String, refreshToken: String, accountName: String) throws {
         let fm = FileManager.default
         let configDir = steamConfigDir
@@ -527,158 +521,12 @@ struct WinePrefix: Sendable {
         let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
         let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
 
-        // Try to merge into an existing file that has a Steam section.
-        if let existing = try? String(contentsOf: dest, encoding: .utf8),
-           existing.contains("\"Steam\"") {
-
-            var updated = existing
-
-            // Update or insert the steamID JWT entry inside the ConnectCache block.
-            // steam.exe reads ConnectCache by SteamID for auto-login.
-            updated = upsertVDFKeyInSection(in: updated,
-                                            sectionKey: "\"ConnectCache\"",
-                                            newKeyLine: jwtEntry,
-                                            matchPrefix: "\"\(steamID)\"")
-
-            // Update or insert the username JWT entry inside the ConnectCache block.
-            // SteamCMD (+login USERNAME) reads ConnectCache by account name.
-            updated = upsertVDFKeyInSection(in: updated,
-                                            sectionKey: "\"ConnectCache\"",
-                                            newKeyLine: usernameJwtEntry,
-                                            matchPrefix: "\"\(accountName)\"")
-
-            // Update or insert the Accounts entry.
-            updated = upsertVDFKeyInSection(in: updated,
-                                            sectionKey: "\"Accounts\"",
-                                            newKeyLine: accountEntry,
-                                            matchPrefix: "\"\(accountName)\"")
-
-            try updated.write(to: dest, atomically: true, encoding: .utf8)
-            log.info("[writeConnectCache] merged into existing config.vdf steamID=\(steamID)")
-            return
-        }
-
-        // No existing file (or no Steam section) — write a minimal VDF.
         let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
         let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
         let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
 
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
-        log.info("[writeConnectCache] written new config.vdf steamID=\(steamID) → \(dest.path(percentEncoded: false))")
-    }
-
-    /// Finds the named VDF section by key, then updates or inserts a key-value
-    /// line inside its brace block. If the section doesn't exist, appends it
-    /// before the closing brace of the parent `"Steam"` section.
-    ///
-    /// - `matchPrefix`: the beginning of an existing line to replace (e.g. `"\"steamID\""`)
-    /// - `newKeyLine`:  the replacement or new line to insert
-    private func upsertVDFKeyInSection(in text: String, sectionKey: String,
-                                       newKeyLine: String, matchPrefix: String) -> String {
-        guard let keyRange = text.range(of: sectionKey) else {
-            // Section not found — append a new section before Steam's closing brace.
-            return insertBeforeSteamClose(in: text,
-                                          text: "\(sectionKey)\n\t\t\t\t{\n\(newKeyLine)\n\t\t\t\t}")
-        }
-
-        // Find the opening brace of this section's value block.
-        var searchStart = keyRange.upperBound
-        while searchStart < text.endIndex && text[searchStart].isWhitespace {
-            searchStart = text.index(after: searchStart)
-        }
-        guard searchStart < text.endIndex, text[searchStart] == "{" else { return text }
-
-        // Walk to the closing brace, collecting the block range.
-        var depth = 0
-        var idx = searchStart
-        while idx < text.endIndex {
-            switch text[idx] {
-            case "{": depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    // `blockOpenIdx...idx` is the `{ ... }` range for this section.
-                    let blockRange = searchStart...idx
-                    var block = String(text[blockRange])
-
-                    // Look for an existing line that starts with matchPrefix inside the block.
-                    let lines = block.components(separatedBy: "\n")
-                    if let existingIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(matchPrefix) }) {
-                        var newLines = lines
-                        // Determine the end of this entry. If the value is a { ... } block
-                        // (multi-line entry), we must remove ALL those lines too, not just the
-                        // key line. Replacing only the key line leaves the old block in the
-                        // file, producing duplicate braces and corrupt VDF.
-                        //
-                        // Root cause of sign-in loop (v0.9.2): accountEntry is a multi-line
-                        // string. When upserted by replacing only the key line the old
-                        // { SteamID ... } block was left behind, causing SteamCMD to report
-                        // "KeyValues Error: got } in key in file InstallConfigStore" and hang.
-                        var endIdx = existingIdx
-                        let lookAhead = existingIdx + 1
-                        if lookAhead < newLines.count,
-                           newLines[lookAhead].trimmingCharacters(in: .whitespaces) == "{" {
-                            // Scan forward to the matching closing brace.
-                            var depth = 0
-                            var scanLine = lookAhead
-                            while scanLine < newLines.count {
-                                for ch in newLines[scanLine] {
-                                    if ch == "{" { depth += 1 }
-                                    else if ch == "}" {
-                                        depth -= 1
-                                        if depth == 0 { endIdx = scanLine }
-                                    }
-                                }
-                                if depth == 0 { break }
-                                scanLine += 1
-                            }
-                        }
-                        newLines.replaceSubrange(existingIdx...endIdx, with: [newKeyLine])
-                        block = newLines.joined(separator: "\n")
-                    } else {
-                        // Insert the new line before the closing `}`.
-                        let closingBrace = block.lastIndex(of: "}")!
-                        block.insert(contentsOf: "\n" + newKeyLine, at: closingBrace)
-                    }
-
-                    // Reconstruct the full text with the updated block.
-                    let prefixText = text[text.startIndex..<searchStart]
-                    let suffixText = text[text.index(after: idx)...]
-                    return prefixText + block + suffixText
-                }
-            default: break
-            }
-            idx = text.index(after: idx)
-        }
-        return text
-    }
-
-    /// Inserts `text` just before the closing brace of the innermost `"Steam"` section.
-    private func insertBeforeSteamClose(in vdf: String, text: String) -> String {
-        guard let steamKeyRange = vdf.range(of: "\"Steam\"") else { return vdf }
-        var searchStart = steamKeyRange.upperBound
-        while searchStart < vdf.endIndex && vdf[searchStart].isWhitespace {
-            searchStart = vdf.index(after: searchStart)
-        }
-        guard searchStart < vdf.endIndex, vdf[searchStart] == "{" else { return vdf }
-
-        var depth = 0
-        var idx = searchStart
-        while idx < vdf.endIndex {
-            switch vdf[idx] {
-            case "{": depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    var result = vdf
-                    result.insert(contentsOf: "\n" + text + "\n\t\t\t", at: idx)
-                    return result
-                }
-            default: break
-            }
-            idx = vdf.index(after: idx)
-        }
-        return vdf
+        log.info("[writeConnectCache] written config.vdf steamID=\(steamID)")
     }
 
     // MARK: - Webhelper Configuration
@@ -1038,6 +886,101 @@ struct WinePrefix: Sendable {
     /// BootstrapManager compares `AppSettings.winRTRegistrationAppliedVersion`
     /// against this value and only re-runs registration when the prefix is behind.
     static let winRTRegistrationVersion = 2
+
+    // MARK: - Steam Install Path Registration
+
+    /// Increment when the set of HKLM Steam or WoW64 crypto registry keys changes.
+    /// steam.exe writes these on first run; the native bootstrap bypasses steam.exe,
+    /// so we must write them explicitly before steamcmd.exe (32-bit WoW64) starts.
+    static let steamInstallPathRegistrationVersion = 2
+
+    /// Writes registry keys that steam.exe sets on first run, required by steamcmd.exe.
+    ///
+    /// **Steam install paths:** steamcmd.exe is 32-bit. Under WoW64, reads from
+    /// HKLM\SOFTWARE\Valve\Steam are redirected to HKLM\SOFTWARE\WOW6432Node\Valve\Steam.
+    /// If InstallPath is absent there, steamcmd throws a C++ exception at startup.
+    ///
+    /// **WoW64 crypto provider types:** Wine's wine.inf only writes crypto provider
+    /// registry entries to the 64-bit hive (HKLM\SOFTWARE\Microsoft\Cryptography\Defaults).
+    /// The 32-bit WoW64 view (WOW6432Node\...) is absent, causing CryptAcquireContextA
+    /// to fail with NTE_PROV_TYPE_NOT_DEF (0x80090017) in every 32-bit process, including
+    /// steamcmd.exe — which then throws a C++ exception, catches it, checks for mscoree.dll,
+    /// doesn't find it, and calls ExitProcess(3).
+    func writeSteamInstallPathRegistryKeys(engine: WineEngine) async {
+        log.info("[writeSteamInstallPathRegistryKeys] writing Steam HKLM/HKCU + WoW64 crypto keys")
+        let installPath = "C:\\Program Files\\Steam"
+        let installPathFwd = "C:/Program Files/Steam"
+
+        // Steam install path keys
+        let pathKeys: [(String, String, String)] = [
+            ("HKLM\\SOFTWARE\\Valve\\Steam",                "InstallPath", installPath),
+            ("HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam",   "InstallPath", installPath),
+            ("HKCU\\SOFTWARE\\Valve\\Steam",                "SteamPath",   installPathFwd),
+            ("HKCU\\SOFTWARE\\Valve\\Steam",                "SteamExe",    "\(installPathFwd)/steam.exe"),
+        ]
+
+        // WoW64 crypto provider types — mirrors the 64-bit entries that wine.inf writes
+        // to HKLM\SOFTWARE\Microsoft\Cryptography\Defaults but omits from WOW6432Node.
+        let cryptoBase = "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Cryptography\\Defaults"
+        let cryptoTypeKeys: [(String, String, String)] = [
+            ("\(cryptoBase)\\Provider Types\\Type 001", "Name",     "Microsoft Enhanced Cryptographic Provider v1.0"),
+            ("\(cryptoBase)\\Provider Types\\Type 001", "TypeName", "RSA Full (Signature and Key Exchange)"),
+            ("\(cryptoBase)\\Provider Types\\Type 003", "Name",     "Microsoft Base DSS Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 003", "TypeName", "DSS Signature"),
+            ("\(cryptoBase)\\Provider Types\\Type 012", "Name",     "Microsoft RSA SChannel Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 012", "TypeName", "RSA SChannel"),
+            ("\(cryptoBase)\\Provider Types\\Type 013", "Name",     "Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 013", "TypeName", "DSS Signature with Diffie-Hellman Key Exchange"),
+            ("\(cryptoBase)\\Provider Types\\Type 018", "Name",     "Microsoft DH SChannel Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 018", "TypeName", "Diffie-Hellman SChannel"),
+            ("\(cryptoBase)\\Provider Types\\Type 024", "Name",     "Microsoft Enhanced RSA and AES Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 024", "TypeName", "RSA Full and AES"),
+            ("\(cryptoBase)\\Provider\\Microsoft Base Cryptographic Provider v1.0",               "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced Cryptographic Provider v1.0",           "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Strong Cryptographic Provider",                  "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft RSA SChannel Cryptographic Provider",            "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced RSA and AES Cryptographic Provider",    "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Base DSS Cryptographic Provider",               "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft DH SChannel Cryptographic Provider",            "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider", "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+        ]
+
+        for (key, valueName, data) in pathKeys + cryptoTypeKeys {
+            do {
+                try await engine.run(
+                    args: ["reg", "add", key, "/v", valueName, "/t", "REG_SZ", "/d", data, "/f"],
+                    prefix: self
+                )
+                log.debug("[writeSteamInstallPathRegistryKeys] wrote \(key)\\\\\\(valueName)")
+            } catch {
+                log.error("[writeSteamInstallPathRegistryKeys] failed \(key)\\\\\\(valueName): \(error.localizedDescription)")
+            }
+        }
+
+        // Write Type DWORD values for each provider entry
+        let cryptoProviderTypes: [(String, Int)] = [
+            ("\(cryptoBase)\\Provider\\Microsoft Base Cryptographic Provider v1.0",               1),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced Cryptographic Provider v1.0",           1),
+            ("\(cryptoBase)\\Provider\\Microsoft Strong Cryptographic Provider",                  1),
+            ("\(cryptoBase)\\Provider\\Microsoft RSA SChannel Cryptographic Provider",            12),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced RSA and AES Cryptographic Provider",    24),
+            ("\(cryptoBase)\\Provider\\Microsoft Base DSS Cryptographic Provider",               3),
+            ("\(cryptoBase)\\Provider\\Microsoft DH SChannel Cryptographic Provider",            18),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider", 13),
+        ]
+        for (key, typeVal) in cryptoProviderTypes {
+            do {
+                try await engine.run(
+                    args: ["reg", "add", key, "/v", "Type", "/t", "REG_DWORD", "/d", String(typeVal), "/f"],
+                    prefix: self
+                )
+            } catch {
+                log.error("[writeSteamInstallPathRegistryKeys] DWORD failed \(key): \(error.localizedDescription)")
+            }
+        }
+
+        log.info("[writeSteamInstallPathRegistryKeys] Steam install path + WoW64 crypto registry keys written ✓")
+    }
 
     /// Registers WinRT ActivatableClassId entries that Wine's wineboot does not
     /// create by default, mapping class names to their implementing DLLs.

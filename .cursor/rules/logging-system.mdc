@@ -101,6 +101,7 @@ Call sites are identical: `log.info(...)`, `log.warning(...)`, `log.error(...)`,
 | `EngineDownloader` | Engine/EngineDownloader.swift |
 | `WineEngine` | Engine/WineEngine.swift |
 | `WineSteamManager` | Engine/WineSteamManager.swift |
+| `SteamClientBootstrap` | Engine/SteamClientBootstrap.swift |
 | `SteamWindowSuppressor` | Engine/SteamWindowSuppressor.swift |
 | `GameProcess` | Engine/GameProcess.swift |
 | `WinePrefix` | Engine/WinePrefix.swift |

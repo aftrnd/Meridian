@@ -57,7 +57,17 @@ private func steamInstallDir(driveC: URL) -> URL { ... }
 
 ### CLI Testing for Game Compatibility
 
-Before adding a game to `GameCompatibilityDB`, test it from CLI using the bundled engine only:
+**CRITICAL: CLI testing CANNOT verify games with Steam DRM.** Games that ship `steam_api64.dll` call `SteamAPI_Init()` which requires a live Steam IPC socket. Without the Meridian app running `startSteamForDRM()`, `SteamSessionBridge.prepare()`, and the full bootstrap pipeline, these games exit silently within seconds — even if the Wine command "succeeds" with exit=0.
+
+**Known Steam DRM games (non-exhaustive):** Animal Well (813230), most AAA titles, any game with `steam_api64.dll` in its install directory.
+
+**Rules for CLI testing:**
+1. **Never claim a CLI test "worked" unless the game window was visibly running and interactive.** Exit=0 does not mean the game ran — Wine exits 0 even when Steam DRM fails.
+2. **Always check for `steam_api64.dll`** in the game directory before attempting CLI testing. If present, the game MUST be tested through the Meridian app.
+3. **DRM-free games only** can be meaningfully tested from CLI. These are games without `steam_api64.dll` that accept direct wine64 execution.
+4. **The Meridian app is the canonical test environment.** CLI testing is a supplement for quick iteration on DRM-free games, not a replacement for in-app testing.
+
+For DRM-free games that CAN be CLI-tested:
 
 ```bash
 WINE64="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wine64"
@@ -68,12 +78,12 @@ LIB="$HOME/Library/Application Support/com.meridian.app/engine/wine/lib"
 export WINEPREFIX WINESERVER
 export DYLD_FALLBACK_LIBRARY_PATH="$LIB:$LIB/wine/x86_64-unix"
 
-# 1. Install via SteamCMD
-"$WINE64" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamcmd.exe" \
-  +login USERNAME +app_update APPID validate +quit
+# 1. Check for Steam DRM first
+ls "$WINEPREFIX/drive_c/Program Files/Steam/steamapps/common/GAMEDIR/steam_api64.dll" 2>/dev/null \
+  && echo "STEAM DRM DETECTED — must test through Meridian app" && exit 1
 
-# 2. Launch directly
-"$WINE64" "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/GAMEDIR/game.exe" 2>&1 | head -50
+# 2. Launch directly (DRM-free only)
+"$WINE64" "$WINEPREFIX/drive_c/Program Files/Steam/steamapps/common/GAMEDIR/game.exe" 2>&1 | head -50
 
 # 3. Check for abort stubs
 grep "aborting\|unimplemented function" /tmp/game-output.txt

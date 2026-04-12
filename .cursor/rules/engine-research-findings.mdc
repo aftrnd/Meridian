@@ -1,23 +1,65 @@
 ---
-description: Deep research findings from CrossOver Preview 27 comparison (March 2026). Documents the complete graphics stack, rendering technologies, GPTK architecture, DXMT, DXVK, MoltenVK, Wine internals, and everything Meridian adopts as its own independent engine. NEVER rely on CrossOver — this is research only.
+description: Engine research findings and architecture documentation. Documents the complete graphics stack, rendering technologies, GPTK architecture, DXMT, DXVK, MoltenVK, Wine internals, and the Meridian engine assembly process. All CX Wine components used in the engine are LGPL-licensed and legally redistributable.
 alwaysApply: true
 ---
 
-# Engine Research Findings (March 2026)
+# Engine Research Findings
 
-**CRITICAL:** Meridian is a completely independent engine built from publicly available open-source components. CrossOver Preview was studied as a reference implementation only. Nothing from CrossOver is redistributed or depended upon at runtime. This document records what we learned so future sessions can build on it without re-deriving it.
+Meridian's engine is assembled from LGPL-licensed CX Wine components + open-source rendering layers (DXMT, DXVK, MoltenVK) + Apple's freely-distributed GPTK. `release-engine.sh` copies these from CrossOver Preview into a self-contained engine tarball. End users never need CrossOver installed. This document records architecture decisions and CLI-verified findings so future sessions can build on them.
 
 ---
 
-## Engine: CX Wine 11.4 (CrossOver Preview)
+## Engine: CX Wine 11.4 (CrossOver Preview) — Current
 
-**Current Meridian engine:** CX Wine 11.4 from CrossOver Preview (full CodeWeavers patches).
-**Previous:** Wine 11.5 from Gcenx/macOS_Wine_builds — replaced April 2026 because Gcenx Wine lacks `ntdll.__wine_unix_call` which CX's d3d12.dll requires for D3D12 support.
+**Current Meridian engine:** CX Wine 11.4 from CrossOver Preview.
+**Previous:** Gcenx Wine 11.6 — tried April 2026, broke TLS on macOS 26 (see below). Reverted.
+**Before that:** CX Wine 11.4 — the original working engine.
 **Before that:** Wine 8.0.1 (CrossOverFOSS 23.7.1) — obsolete.
 
-**Why CX Wine over Gcenx Wine:** CX Wine has `ntdll.__wine_unix_call` which CX's d3d12.dll imports. Gcenx Wine only has `__wine_unix_call_dispatcher` (a different mechanism). CLI-verified April 2026: CX d3d12.dll fails on Gcenx with "unimplemented function ntdll.dll.__wine_unix_call, aborting". CX Wine has the same CW patches as Gcenx plus this essential function. End users never need CX installed — everything ships in the Meridian engine tarball on GitHub Releases.
+**Why CX Wine over Gcenx Wine (TLS failure, CLI-verified April 2026):**
+Gcenx Wine 11.6 fails HTTPS connections on macOS 26.4 with HTTP error 0 on Steam CDN.
+steam.exe bootstrap_log.txt: `Download failed: http error 0 (cdn.steamstatic.com/...)` →
+`Error: Steam needs to be online to update.` on every attempt. Root cause unknown — possibly
+a macOS 26-specific Security.framework incompatibility with Gcenx Wine's standalone TLS path.
+CX Wine 11.4 bootstraps correctly: CLI-verified April 2026 at 130 MB/s download speed.
 
-### Why Wine 11.5 over Wine 8.0.1
+**CORRECTED understanding of TLS (April 10, 2026 — CLI-verified):**
+Wine's TLS stack has TWO separate GnuTLS consumers:
+- `crypt32.so` — uses Security.framework (confirmed `otool -L`). Its GnuTLS dlopen is ONLY
+  for PFX import/export, NOT TLS handshake. crypt32 TLS works fine without lib64.
+- `secur32.so` — uses GnuTLS EXCLUSIVELY for all Schannel/TLS. `otool -L` shows NO
+  Security.framework linkage. Contains string "Failed to load libgnutls, secure connections
+  will not be available." If GnuTLS fails to load, ALL Wine HTTPS operations fail.
+
+**lib64 MUST be on DYLD_FALLBACK_LIBRARY_PATH at runtime** so secur32.so can dlopen
+libgnutls.30.dylib. Additionally, libgnutls needs `@loader_path` rpath (added by
+`install_name_tool` in release-engine.sh) so its `@rpath/libgmp.10.dylib` dependency
+resolves. Without BOTH fixes, Wine's SteamCMD/WinHTTP HTTPS connections fail silently.
+
+**Steam's own bootstrapper (steam.exe) does NOT use Wine's TLS at all.** It statically links
+OpenSSL (x86, "CRYPTOGAMS by appro@openssl.org"). Under WoW64 on macOS 26, this OpenSSL
+cannot complete TLS handshakes — produces "http error 0". Meridian bypasses this with native
+macOS-side bootstrap (`SteamClientBootstrap.swift`) using URLSession.
+
+**Previous "CX Wine TLS confirmed working" claims were false.** The wineserver from
+release-engine.sh's `wineboot --init` step (which runs WITH lib64 on DYLD) cached GnuTLS
+state. Subsequent tests reusing that wineserver inherited the cached state. A clean
+prefix wipe (new wineserver) exposed the real failure.
+
+**Why CX Wine also enables GPTK (D3D12):**
+CX Wine has `ntdll.__wine_unix_call` (a CodeWeavers extension). GPTK's d3d12.dll and dxgi.dll
+both import this function. WineEngine.detect() searches for `__wine_unix_call\0` in
+`wine/lib/wine/x86_64-windows/ntdll.dll` (the PE DLL export table) — if found, gptkPath is set
+and GPTK env vars are injected for game launches. With CX Wine: gptkPath set → D3D12 →
+D3DMetal → Metal works.
+**CRITICAL: Search ntdll.dll (PE), NOT ntdll.so (Unix).** The `__wine_unix_call` export lives
+in the Windows PE ntdll.dll — confirmed at byte offset 673776 via PE export table scan. ntdll.so
+only contains `__wine_unix_call_dispatcher` and `__wine_unix_call_funcs`; the standalone
+`__wine_unix_call\0` is absent from ntdll.so. CLI-verified April 2026: searching ntdll.so
+returned no match (cxABI=false, GPTK disabled). Fixed to search ntdll.dll.
+With Gcenx Wine: no `__wine_unix_call` → gptkPath = nil → D3D12 disabled.
+
+**Why CX Wine 11.4 has all the same DX11 patches as Gcenx 11.6:**
 
 | Issue | Wine 8.0.1 | Wine 11.5 |
 |---|---|---|
@@ -310,7 +352,7 @@ WINEDLLOVERRIDES="d3d12=b;dxgi=n,b"
 CX_APPLEGPTK_LIBD3DSHARED_PATH="$GPTK/external/libd3dshared.dylib"
 ```
 
-**Detection note:** `WineEngine.detect()` sets `gptkPath` when BOTH `wine/lib/wine/x86_64-windows/d3d12.dll` (bridge) AND `wine/lib/gptk/external/D3DMetal.framework` exist. It does NOT check for `gptk/wine/x86_64-windows/d3d12.dll` (removed by packaging).
+**Detection note:** `WineEngine.detect()` sets `gptkPath` when BOTH `wine/lib/wine/x86_64-windows/d3d12.dll` (bridge) AND `wine/lib/gptk/external/D3DMetal.framework` exist AND `ntdll.dll` exports `__wine_unix_call` (cxABI=true). It does NOT check for `gptk/wine/x86_64-windows/d3d12.dll` (removed by packaging). **IMPORTANT: The cxABI check scans `ntdll.dll` (PE DLL), NOT `ntdll.so` (Unix .so) — the symbol only appears in the PE export table.**
 
 ### GPTK Sourcing
 
@@ -404,12 +446,20 @@ Wine 11.5 from Gcenx ships MoltenVK 1.4.1 (CLI-verified: `[mvk-info] MoltenVK ve
 
 ## Steam Bootstrap Process (CLI-verified March 2026)
 
-### How Steam bootstraps with Wine 11.5
+### How Steam bootstraps (native macOS method — April 2026)
 
-1. `SteamSetup.exe /S` installs the Steam launcher stub (steam.exe + basic files)
-2. `steam.exe` (first run without `BootStrapperInhibitAll`) downloads the full client (~557MB)
-3. After `steamui.dll` appears: Steam is fully bootstrapped
-4. Write `BootStrapperInhibitAll=enable` to `steam.cfg` to prevent future update-check overhead
+Steam's 32-bit bootstrapper (steam.exe, PE32, built May 2024) statically links OpenSSL which
+fails TLS under WoW64 on macOS 26 with CX Wine 11.4 ("http error 0"). Meridian bypasses it:
+
+1. `SteamSetup.exe /S` installs the Steam launcher stub (steam.exe + basic files, registry)
+2. `SteamClientBootstrap.swift` downloads manifest from `https://cdn.steamstatic.com/client/steam_client_win32` using URLSession (native macOS TLS)
+3. Downloads ~23 zip packages (~469 MB) with SHA-256 verification
+4. Extracts all packages directly to Steam install directory using `ditto -xk`
+5. `steamui.dll` appears after extraction — Steam is fully bootstrapped
+6. Write `BootStrapperInhibitAll=enable` to `steam.cfg`
+
+The old Wine-based method (`_legacyBootstrap()`) is kept as fallback but not used.
+Key files: `SteamClientBootstrap.swift`, `WineSteamManager.bootstrap()`, `BootstrapManager`.
 
 ### SteamCMD Batch Mode (CLI-verified March 2026)
 
@@ -617,4 +667,171 @@ try? await engine.run(args: ["reg", "delete",
 Steam re-adds itself the next time it starts normally. This is safe to delete on every wineboot run.
 
 CLI-verified April 2026: without this delete, every engine-change `wineboot --update` started `steam.exe -silent` which showed the sign-in screen once Meridian was closed.
+
+---
+
+## Steam Client Bootstrap: Native macOS Download (April 2026)
+
+### Why native bootstrap was needed
+
+`steam.exe`'s 32-bit bootstrapper statically links OpenSSL which cannot complete TLS handshakes under WoW64 on macOS 26. Meridian bypasses it entirely with `SteamClientBootstrap.swift` using `URLSession`.
+
+### Two manifests, two package sets
+
+| Manifest URL | Content | Required for |
+|---|---|---|
+| `cdn.akamai.steamstatic.com/client/steam_client_win32` | ~20 packages, ~470 MB — Steam client DLLs, SteamUI.dll, steamcmd.exe stub (2013) | Steam client bootstrap (steam.exe running at all) |
+| `cdn.akamai.steamstatic.com/client/steam_cmd_win32` | ~5 packages, ~28 MB — steamconsole.dll, updated steamcmd.exe (4.2 MB), tier0_s, vstdlib_s | SteamCMD game installs |
+
+Both must be downloaded during bootstrap. Skipping `steam_cmd_win32` leaves the 2013 stub steamcmd.exe in place which crashes immediately.
+
+### Steam package ZIP format quirks (CLI-verified April 2026)
+
+Steam's `.zip.HASH` packages have two non-standard properties that defeat `ditto` and `unzip`:
+
+1. **20-byte Valve proprietary header prepended** before the ZIP data. `ditto -xk` requires `PK` magic at byte 0 — fails. `unzip` reads from the end-of-central-directory (tail) — handles it.
+2. **Windows backslash path separators in ZIP entries.** On macOS/Unix, `unzip` treats `\` as a valid filename character and creates files with literal backslashes in their names rather than nested directories. SteamCMD then can't find its CEF binaries.
+
+**Fix:** Use Python `zipfile` which handles both issues:
+```python
+import zipfile
+with zipfile.ZipFile(src) as z:
+    for info in z.infolist():
+        info.filename = info.filename.replace('\\', '/')
+        z.extract(info, dst)
+```
+This is implemented in `SteamClientBootstrap.extractZip()`.
+
+### App Transport Security (ATS) on macOS 26
+
+With `NSAllowsArbitraryLoads = false`, macOS 26 blocks HTTPS connections to unlisted domains even for valid certificates. All Steam/GitHub CDN domains must be in `NSExceptionDomains` in `Info.plist`:
+- `cdn.akamai.steamstatic.com` — Steam client packages (confirmed working)
+- `cdn.steamstatic.com` — fallback CDN
+- `objects.githubusercontent.com` — engine/app update downloads
+- `github.com` — release page fallback
+
+### WoW64 crypto provider registry (CLI-verified April 2026)
+
+Wine's `wine.inf` only writes crypto provider types to the 64-bit registry hive (`HKLM\SOFTWARE\Microsoft\Cryptography\Defaults`). The 32-bit WoW64 view (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Cryptography\Defaults`) is absent.
+
+32-bit applications (steamcmd.exe, any 32-bit game) call `CryptAcquireContextA()` which reads from the WoW64 hive. Without it: `NTE_PROV_TYPE_NOT_DEF` (0x80090017) → C++ exception → exit 3. SteamCMD crashes before loading any Steam DLLs.
+
+**Fix:** `WinePrefix.writeSteamInstallPathRegistryKeys()` writes the WoW64 crypto provider types (Type 001, 003, 012, 013, 018, 024) and provider DLL paths. Called once per prefix via versioned AppSettings key `steamInstallPathRegistrationVersion = 2`.
+
+### Steam install path registry (CLI-verified April 2026)
+
+`steam.exe` writes `HKLM\SOFTWARE\Valve\Steam\InstallPath` on first run. With native bootstrap, steam.exe never runs its initializer. steamcmd.exe reads `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath` (WoW64 redirect) — if absent, throws C++ exception at startup.
+
+**Fix:** Also written by `writeSteamInstallPathRegistryKeys()`.
+
+### steamcmd.exe -overrideminos flag (CLI-verified April 2026)
+
+The updated steamcmd.exe (4.2 MB from `steam_cmd_win32` manifest) checks the Windows OS version and refuses to run under Wine's reported version without the `-overrideminos` flag. This flag must be prepended to ALL steamcmd invocations:
+- `steamcmd.exe -overrideminos +login USERNAME +quit`
+- `steamcmd.exe -overrideminos +login USERNAME +app_update APPID validate +quit`
+- `steamcmd.exe -overrideminos +login USERNAME PASSWORD +quit` (reauthenticate)
+
+### SteamCMD credential architecture (CRITICAL — two separate systems)
+
+There are TWO completely separate credential systems that must NOT be confused:
+
+| System | Written by | Read by | Location | What it contains |
+|---|---|---|---|---|
+| **JWT ConnectCache** | `WinePrefix.writeConnectCache()` | `steam.exe` auto-login | `config/config.vdf` under `ConnectCache` | JWT refresh token from Meridian's OAuth flow |
+| **SteamCMD native cache** | `steamcmd.exe +login USERNAME PASSWORD +quit` | `steamcmd.exe +login USERNAME` (batch mode) | Same `config.vdf`, different encrypted blob | SteamCMD's own encrypted credential blob |
+
+**SteamCMD batch mode (`+login USERNAME`) reads ONLY its native cache, NOT the JWT.** Writing a JWT ConnectCache does not help SteamCMD at all.
+
+**Consequences:**
+- After Meridian onboarding (JWT written), warm-up with `+login USERNAME +quit` reports "Cached credentials not found" — expected, not a bug.
+- The fix: during bootstrap warm-up, when "Cached credentials not found" is detected, immediately run `reestablishCredentials()` with the Keychain password. This runs `+login USERNAME PASSWORD +quit` which creates the native cache. **This is the one 2FA prompt the user sees — it MUST happen during bootstrap (splash screen), not when they click Install.**
+
+**`BootstrapManager` warm-up + re-auth flow (April 2026):**
+1. Warm-up runs `+login USERNAME +quit` — sets `noNativeCredentials = true` if cache absent
+2. After warm-up: `steamCMDService.reestablishCredentials(engine:prefix:onProgress:)` runs
+3. Uses `passwordProvider` (Keychain) to call `reauthenticate(password:engine:prefix:)`
+4. Runs `steamcmd.exe -overrideminos +login USERNAME PASSWORD +quit`
+5. SteamCMD logs in, writes native cache, exits 0 → `backupSteamCMDConfig()` saves it
+6. All future warm-ups and installs find the cache and succeed without password or 2FA
+
+### config.vdf merge corruption (April 2026 — NEVER merge again)
+
+The old `writeConnectCache` tried to upsert entries into existing config.vdf files (steam.exe-generated, ~20KB). The VDF manipulation code placed `"ConnectCache"` at column 0, producing 164 opening vs 163 closing braces. SteamCMD parsed the file, hit EOF mid-structure, printed "Cached credentials not found", and blocked forever on the password prompt (stdin = /dev/null).
+
+**Fix:** `writeConnectCache` now ALWAYS writes a fresh minimal VDF — never merges. The JWT refresh token in AppSettings is sufficient for steam.exe; SteamCMD uses its own native cache. Fresh VDF = no corruption risk.
+
+---
+
+## Pattern 4: Same-tag Engine Republish Stales the Prefix (CLI-verified April 10, 2026)
+
+When `release-engine.sh` is run again with the same engine version tag (no version bump), `BootstrapManager`'s tag-string comparison (`storedTag == currentTag`) passes, so `wineboot --update` / `resetToEngineTemplate` is skipped. The prefix is left with DLL state corresponding to the OLD engine packaging.
+
+**Symptom:** SteamCMD hangs indefinitely at "Logging in user ... to Steam Public..." — not a TLS error, not a credential error. The TLS handshake itself succeeds (GnuTLS cipher negotiated, session ticket received). The hang is in the Steam CM protocol layer, indicating a Wine prefix/DLL state inconsistency.
+
+**CLI-verified April 10, 2026:**
+- Anonymous login (`+login anonymous`) hangs at "Connecting anonymously to Steam Public..." — eliminates credential theory.
+- Using CrossOver Preview's wineserver (byte-identical binary via MD5 comparison) with the same prefix: login completes in ~5s — eliminates network theory.
+- After CX Preview ran `wineboot --update` (system.reg mtime updated at 16:43): Meridian's own engine also works — confirms stale prefix was root cause.
+- 8 orphan Wine processes (explorer.exe dating to prior day, steamcmd.exe from 12:07) survived every startup cleanup sweep because their argv[0] had been replaced.
+
+**Fix (committed April 10, 2026):**
+- `AppSettings.lastPrefixEngineModTime` stores the mtime of `wine/meridian-engine-version.txt` when the prefix was last reset.
+- `BootstrapManager` compares BOTH tag AND modtime: `needsUpdate = storedTag != currentTag || currentEngineModTime != lastPrefixEngineModTime`
+- Even if the tag string is the same, a changed mtime (always true after a `release-engine.sh` run) triggers a prefix reset.
+- `TerminationCleanup` now adds a "Windows-name sweep" (step 8) killing `explorer.exe`, `steamcmd.exe`, `winedevice.exe`, etc. by their Windows argv[0] path.
+- `TerminationCleanup` now cleans stale `/tmp/.wine-<uid>/server-*` socket directories (step 9).
+- `SteamCMDService.warmUp()` now explicitly terminates the process on 5-minute timeout and guards `backupSteamCMDConfig()` to only run on genuine exit-0, not timeout.
+
+**CORRECTION (April 10, 2026 — Pattern 5 below was the real root cause):** The Pattern 4 fix (mtime detection, cleanup improvements) addresses real secondary issues but was NOT the root cause of the SteamCMD hang. The hang was caused by `com.apple.quarantine` on the engine files — see Pattern 5.
+
+---
+
+## Pattern 5: com.apple.quarantine Blocks Wine Network Access (CLI-verified April 10, 2026)
+
+**This was the actual root cause of all SteamCMD "Loading Steam API..." hangs and DX11 game regressions across multiple sessions.**
+
+### What happens
+
+macOS sets the `com.apple.quarantine` extended attribute on every file downloaded via `URLSession`. When `EngineDownloader` extracts the engine `.tar.gz` via `tar`, the quarantine attribute propagates to all extracted files. On macOS 26, quarantined executables have restricted network access — Wine's `secur32.so` cannot dlopen `libgnutls`, and its TLS connections fail silently.
+
+**Symptoms:**
+- SteamCMD hangs at "Loading Steam API..." indefinitely — even with `+login anonymous` (no credentials needed)
+- DX11 games appear to start but Steam DRM connections fail
+- `wine64 --version` works fine (no network) — binary appears healthy
+- `wineboot --update` hangs indefinitely
+- CX Preview's own wineloader (not quarantined) works perfectly
+
+### CLI proof (April 10, 2026)
+
+```bash
+# Meridian's wine64 — quarantined:
+xattr engine/wine/bin/wine64  # → com.apple.quarantine
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# HANGS at "Loading Steam API..." — never prints "Connecting anonymously..."
+
+# CX Preview's wineloader — NOT quarantined:
+xattr "CrossOver Preview.app/.../wineloader"  # → (no output)
+# binaries are BYTE-FOR-BYTE IDENTICAL: MD5 0e1334f181c1dda39e213c7be3e37fef
+# CX wine with identical binary runs to: "Connecting anonymously to Steam Public...OK"
+
+# After stripping quarantine from Meridian's engine:
+xattr -rd com.apple.quarantine engine/
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# → "Connecting anonymously to Steam Public...OK" in 12 seconds
+```
+
+### Why previous sessions missed this
+
+1. `wine64 --version` works with quarantine (no network needed) — the binary looked healthy.
+2. When CX Preview's wineloader was used in test runs, it worked because CX installs via a signed `.pkg` which does not apply quarantine. Tests concluded "stale prefix" or "TLS issue" — chasing the wrong root cause for three days.
+3. Every TLS, GnuTLS, lib64, prefix-mtime theory was a symptom of the same underlying restricted network access.
+
+### Fix (April 10, 2026)
+
+1. **`EngineDownloader.stripQuarantine(from:)`** — called (a) on the downloaded `.tar.gz` archive before extraction and (b) on the engine directory after extraction. Both are needed because `tar` may still propagate quarantine from archive metadata.
+2. **`BootstrapManager.stripEngineQuarantine()`** — one-time cleanup (versioned via `AppSettings.quarantineCleanedVersion = 1`) for users with engines downloaded before the fix.
+
+### Key rule going forward
+
+After ANY engine download, immediately call `xattr -rd com.apple.quarantine` on the engine directory. Without this, Wine's network stack is broken on macOS 26.
 

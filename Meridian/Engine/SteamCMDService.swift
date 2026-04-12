@@ -120,7 +120,7 @@ final class SteamCMDService {
         // PTY wrapper so SteamCMD self-update progress flushes in real-time.
         process.executableURL = URL(filePath: "/usr/bin/script")
         process.arguments = ["-q", "/dev/null", engine.wine64URL.path(percentEncoded: false),
-                             steamcmdPath, "+login", savedUsername, "+quit"]
+                             steamcmdPath, "-overrideminos", "+login", savedUsername, "+quit"]
         process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardInput = FileHandle.nullDevice
 
@@ -199,6 +199,19 @@ final class SteamCMDService {
         stderrTask.cancel()
         activeProcess = nil
 
+        // If the deadline fired and the process is still running, kill it explicitly.
+        // Without this, process.terminationStatus is undefined (reads 0 on a live process)
+        // and backupSteamCMDConfig() would save a config.vdf from a session that never
+        // completed login — poisoning the backup used on every subsequent launch.
+        if process.isRunning {
+            log.warning("[warmUp] 5-minute timeout — terminating SteamCMD (process never exited)")
+            process.terminate()
+            try? await Task.sleep(for: .milliseconds(500))
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+
         let exitCode = process.terminationStatus
         if exitCode == 0 {
             log.info("[warmUp] complete ✓ (exit=0)")
@@ -263,6 +276,7 @@ final class SteamCMDService {
             "-q", "/dev/null",
             engine.wine64URL.path(percentEncoded: false),
             steamcmdPath,
+            "-overrideminos",
             "+login", savedUsername,
             "+app_update", "\(appID)", "validate",
             "+quit",
@@ -330,6 +344,10 @@ final class SteamCMDService {
                     if clean.hasPrefix("ERROR!") || clean.contains("Login Failure") {
                         lastError = clean
                     }
+                    if clean.contains("Cached credentials not found") || clean.contains("password:") {
+                        log.warning("[installGame] cached credentials missing (exit drain) — triggering re-auth")
+                        lastError = "Cached credentials not found — login required"
+                    }
                     let filtered = Self.shouldShowLine(clean)
                     if filtered { await MainActor.run { onProgress(clean) } }
                 }
@@ -350,6 +368,14 @@ final class SteamCMDService {
                 }
                 if clean.hasPrefix("ERROR!") || clean.contains("Login Failure") {
                     lastError = clean
+                }
+                // Credentials not cached — steamcmd will block forever at password: prompt
+                // since stdin = /dev/null. Terminate immediately and treat as a login failure
+                // so the re-auth path can recover.
+                if clean.contains("Cached credentials not found") || clean.contains("password:") {
+                    log.warning("[installGame] cached credentials missing — terminating and triggering re-auth")
+                    process.terminate()
+                    lastError = "Cached credentials not found — login required"
                 }
 
                 if Self.shouldShowLine(clean) {
@@ -387,6 +413,26 @@ final class SteamCMDService {
         log.info("[installGame] appID=\(appID) exit=\(exitCode) succeeded=\(succeeded)")
 
         if let err = lastError {
+            // Re-auth path: if credentials are missing, treat the same as login failure.
+            if err.contains("Cached credentials not found") && !isRetrying {
+                if let provider = passwordProvider, let password = provider() {
+                    log.warning("[installGame] credentials missing — re-authenticating with Keychain password")
+                    await MainActor.run { onProgress("Verifying your account — approve the Steam Guard notification on your phone…") }
+                    let authOK = await reauthenticate(password: password, engine: engine, prefix: prefix)
+                    if authOK {
+                        log.info("[installGame] re-auth succeeded — retrying install")
+                        await MainActor.run { onProgress("Account verified — starting download…") }
+                        isRetrying = true
+                        defer { isRetrying = false }
+                        state = .ready // reset so the busy guard doesn't fire on retry
+                        try await installGame(appID: appID, onProgress: onProgress)
+                        return
+                    }
+                    log.warning("[installGame] re-auth failed — cannot install without credentials")
+                }
+                state = .ready
+                throw ServiceError.installFailed(err)
+            }
             state = .ready
             throw ServiceError.installFailed(err)
         }
@@ -403,6 +449,7 @@ final class SteamCMDService {
                     await MainActor.run { onProgress("Account verified — starting download…") }
                     isRetrying = true
                     defer { isRetrying = false }
+                    state = .ready // reset so the busy guard doesn't fire on retry
                     try await installGame(appID: appID, onProgress: onProgress)
                     return
                 } else {
@@ -432,6 +479,37 @@ final class SteamCMDService {
 
     // MARK: - Re-authentication
 
+    /// Establishes SteamCMD's native credential cache using the Keychain password.
+    ///
+    /// SteamCMD's `+login USERNAME` batch mode reads its own encrypted credential blob
+    /// from config.vdf — it does NOT use the JWT ConnectCache written by `writeConnectCache`
+    /// for `steam.exe`. This blob is only written when SteamCMD performs a full interactive
+    /// login (`+login USERNAME PASSWORD`).
+    ///
+    /// Called from BootstrapManager during warm-up when no native credentials are found,
+    /// so the 2FA prompt happens once during bootstrap rather than at game install time.
+    /// Also called from `installGame` as a fallback when the blob has been wiped.
+    ///
+    /// - Returns: `true` if credentials were successfully established.
+    func reestablishCredentials(
+        engine: WineEngine,
+        prefix: WinePrefix,
+        onProgress: (@MainActor @Sendable (String) -> Void)? = nil
+    ) async -> Bool {
+        guard let provider = passwordProvider, let password = provider() else {
+            log.warning("[reestablishCredentials] no Keychain password available — cannot establish native credential cache")
+            return false
+        }
+        await MainActor.run { onProgress?("Verifying your account — approve the Steam Guard notification on your phone…") }
+        let ok = await reauthenticate(password: password, engine: engine, prefix: prefix)
+        if ok {
+            log.info("[reestablishCredentials] SteamCMD native credential cache established ✓")
+        } else {
+            log.warning("[reestablishCredentials] failed — first game install will prompt for Steam Guard")
+        }
+        return ok
+    }
+
     /// Runs `steamcmd.exe +login USERNAME PASSWORD +quit` to rebuild the credential cache.
     ///
     /// Called when an install fails with exit=5/7 (login failure). SteamCMD's self-update
@@ -453,7 +531,7 @@ final class SteamCMDService {
 
         let process = Process()
         process.executableURL = engine.wine64URL
-        process.arguments = [steamcmdPath, "+login", savedUsername, password, "+quit"]
+        process.arguments = [steamcmdPath, "-overrideminos", "+login", savedUsername, password, "+quit"]
         process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice

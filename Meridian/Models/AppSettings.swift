@@ -142,6 +142,17 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "lastPrefixEngineTag") }
     }
 
+    /// Modification time (Unix timestamp) of the engine's `meridian-engine-version.txt`
+    /// when the prefix was last reset/updated. Used as a content fingerprint alongside
+    /// `lastPrefixEngineTag` so that re-publishing the same tag with different content
+    /// (e.g. re-running `release-engine.sh` without bumping the version) still triggers
+    /// a prefix reset. The mtime changes on every `gh release upload` even if the tag
+    /// string is unchanged.
+    var lastPrefixEngineModTime: Double {
+        get { UserDefaults.standard.double(forKey: "lastPrefixEngineModTime") }
+        set { UserDefaults.standard.set(newValue, forKey: "lastPrefixEngineModTime") }
+    }
+
     /// Tracks which WinRT registration batch has been applied to the current prefix.
     ///
     /// Increment `WinePrefix.winRTRegistrationVersion` whenever new WinRT entries are
@@ -161,6 +172,33 @@ final class AppSettings: @unchecked Sendable {
     var vkd3dProtonInstalledVersion: Int {
         get { UserDefaults.standard.integer(forKey: "vkd3dProtonInstalledVersion") }
         set { UserDefaults.standard.set(newValue, forKey: "vkd3dProtonInstalledVersion") }
+    }
+
+    /// Tracks whether the Steam HKLM install-path registry keys have been written.
+    ///
+    /// steam.exe writes HKLM\SOFTWARE\Valve\Steam\InstallPath on first run.
+    /// When using the native bootstrap (steam.exe never runs its own updater),
+    /// these keys are absent and 32-bit steamcmd.exe crashes immediately on startup.
+    /// Increment `WinePrefix.steamInstallPathRegistrationVersion` to force a re-write.
+    var steamInstallPathRegistrationVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "steamInstallPathRegistrationVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "steamInstallPathRegistrationVersion") }
+    }
+
+    /// Tracks whether quarantine attributes have been stripped from the engine directory.
+    ///
+    /// macOS sets `com.apple.quarantine` on files downloaded via URLSession. On macOS 26,
+    /// quarantined Wine executables have restricted network access — secur32.so's GnuTLS
+    /// cannot complete TLS handshakes, causing SteamCMD to hang indefinitely at
+    /// "Loading Steam API...". EngineDownloader strips quarantine after every fresh
+    /// extraction, but users with engines downloaded before this fix need a one-time
+    /// cleanup pass at bootstrap startup.
+    ///
+    /// Version history:
+    ///   1 — initial pass: strip com.apple.quarantine from entire engine directory
+    var quarantineCleanedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "quarantineCleanedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "quarantineCleanedVersion") }
     }
 
     // MARK: - Favorites

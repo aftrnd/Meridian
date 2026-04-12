@@ -39,7 +39,7 @@ import Foundation
 ///   • restoreSteamCMDConfig(...)         ← WinePrefix.restoreSteamCMDConfig()
 ///   • gameRequiresSteamAPI(...)          ← WinePrefix.gameRequiresSteamAPI()
 ///   • writeSteamAppID(...)               ← WinePrefix.writeSteamAppID()
-///   • writeConnectCache(...)             ← WinePrefix.writeConnectCache() (merge behaviour)
+///   • writeConnectCache(...)             ← WinePrefix.writeConnectCache() (always fresh, no merge)
 ///   • vdfKeyValue(from:)                 ← WinePrefix.vdfKeyValue(from:)
 ///   • windowsPathToURL(_:driveC:)        ← WinePrefix.windowsPathToURL(_:)
 ///   • simulateResetToEngineTemplate(...) ← WinePrefix.resetToEngineTemplate()
@@ -1536,12 +1536,11 @@ final class WinePrefixTests: XCTestCase {
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
     }
 
-    /// Mirror of WinePrefix.writeConnectCache — merges ConnectCache/Accounts into config.vdf
+    /// Mirror of WinePrefix.writeConnectCache — always writes fresh minimal config.vdf
     ///
     /// MIRROR CONTRACT: Must stay in sync with WinePrefix.writeConnectCache().
-    /// Key behavior: if config.vdf already has a "Steam" section (written by SteamCMD),
-    /// we upsert only the steamID JWT entry inside ConnectCache and the account entry
-    /// inside Accounts, preserving all other SteamCMD keys (7a611aa1, etc.).
+    /// Always overwrites — no merge. The JWT refresh token in AppSettings is sufficient
+    /// for SteamCMD to log in without Steam Guard.
     private func writeConnectCache(configDir: URL, steamID: String, refreshToken: String, accountName: String) throws {
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
         let dest = configDir.appending(path: "config.vdf")
@@ -1550,80 +1549,10 @@ final class WinePrefixTests: XCTestCase {
         let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
         let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
 
-        if let existing = try? String(contentsOf: dest, encoding: .utf8),
-           existing.contains("\"Steam\"") {
-            var updated = upsertVDFKeyInSection(in: existing, sectionKey: "\"ConnectCache\"",
-                                                newKeyLine: jwtEntry, matchPrefix: "\"\(steamID)\"")
-            updated = upsertVDFKeyInSection(in: updated, sectionKey: "\"ConnectCache\"",
-                                            newKeyLine: usernameJwtEntry, matchPrefix: "\"\(accountName)\"")
-            updated = upsertVDFKeyInSection(in: updated, sectionKey: "\"Accounts\"",
-                                            newKeyLine: accountEntry, matchPrefix: "\"\(accountName)\"")
-            try updated.write(to: dest, atomically: true, encoding: .utf8)
-            return
-        }
         let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
         let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
         let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
-    }
-
-    // Helpers mirroring WinePrefix's private merge helpers.
-    private func upsertVDFKeyInSection(in text: String, sectionKey: String,
-                                       newKeyLine: String, matchPrefix: String) -> String {
-        guard let keyRange = text.range(of: sectionKey) else {
-            return insertBeforeSteamClose(in: text,
-                                          text: "\(sectionKey)\n\t\t\t\t{\n\(newKeyLine)\n\t\t\t\t}")
-        }
-        var searchStart = keyRange.upperBound
-        while searchStart < text.endIndex && text[searchStart].isWhitespace { searchStart = text.index(after: searchStart) }
-        guard searchStart < text.endIndex, text[searchStart] == "{" else { return text }
-        var depth = 0; var idx = searchStart
-        while idx < text.endIndex {
-            switch text[idx] {
-            case "{": depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    let blockRange = searchStart...idx
-                    var block = String(text[blockRange])
-                    let lines = block.components(separatedBy: "\n")
-                    if let existingIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(matchPrefix) }) {
-                        var newLines = lines; newLines[existingIdx] = newKeyLine
-                        block = newLines.joined(separator: "\n")
-                    } else {
-                        let closingBrace = block.lastIndex(of: "}")!
-                        block.insert(contentsOf: "\n" + newKeyLine, at: closingBrace)
-                    }
-                    let prefixText = text[text.startIndex..<searchStart]
-                    let suffixText = text[text.index(after: idx)...]
-                    return prefixText + block + suffixText
-                }
-            default: break
-            }
-            idx = text.index(after: idx)
-        }
-        return text
-    }
-
-    private func insertBeforeSteamClose(in vdf: String, text: String) -> String {
-        guard let steamKeyRange = vdf.range(of: "\"Steam\"") else { return vdf }
-        var searchStart = steamKeyRange.upperBound
-        while searchStart < vdf.endIndex && vdf[searchStart].isWhitespace { searchStart = vdf.index(after: searchStart) }
-        guard searchStart < vdf.endIndex, vdf[searchStart] == "{" else { return vdf }
-        var depth = 0; var idx = searchStart
-        while idx < vdf.endIndex {
-            switch vdf[idx] {
-            case "{": depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    var result = vdf; result.insert(contentsOf: "\n" + text + "\n\t\t\t", at: idx); return result
-                }
-            default: break
-            }
-            idx = vdf.index(after: idx)
-        }
-        return vdf
     }
 
     func testWriteLoginUsers_createsMostRecentEntry() throws {
@@ -1677,14 +1606,14 @@ final class WinePrefixTests: XCTestCase {
                       "ConnectCache must have a username-keyed entry for SteamCMD")
     }
 
-    func testWriteConnectCache_mergesIntoExistingSteamCMDConfigVDF() throws {
-        // SteamCMD writes additional sections (CMWebSocket, AutoUpdateWindowEnabled, etc.)
-        // that must survive writeConnectCache. Previously writeConnectCache replaced the
-        // entire file, destroying those sections and forcing Steam Guard re-confirmation.
-        let configDir = tempDir.appending(path: "merge_test/config")
+    func testWriteConnectCache_overwritesExistingSteamCMDConfigVDF() throws {
+        // writeConnectCache always writes a fresh minimal VDF. Any steam.exe-generated
+        // config.vdf with CMWebSocket, AutoUpdateWindowEnabled etc. is replaced entirely.
+        // This is intentional: the merge approach produced brace-count corruption in large
+        // files, causing SteamCMD to fail with "got EOF instead of keyname".
+        let configDir = tempDir.appending(path: "overwrite_test/config")
         try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
 
-        // Simulate a config.vdf written by SteamCMD with extra sections.
         let steamcmdVDF = """
         "InstallConfigStore"
         {
@@ -1697,17 +1626,9 @@ final class WinePrefixTests: XCTestCase {
         \t\t\t\t"ConnectCache"
         \t\t\t\t{
         \t\t\t\t\t"76561198000000000"\t\t"old_token"
-        \t\t\t\t\t"7a611aa1"\t\t"encrypted_credential_cache_data"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"olduser"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"76561198000000000"
-        \t\t\t\t\t}
+        \t\t\t\t\t"7a611aa1"\t\t"encrypted_data"
         \t\t\t\t}
         \t\t\t\t"AutoUpdateWindowEnabled"\t\t"0"
-        \t\t\t\t"ipv6check_http_state"\t\t"bad"
         \t\t\t}
         \t\t}
         \t}
@@ -1716,96 +1637,49 @@ final class WinePrefixTests: XCTestCase {
         let dest = configDir.appending(path: "config.vdf")
         try steamcmdVDF.write(to: dest, atomically: true, encoding: .utf8)
 
-        // Use the same steamID and accountName as in the existing file — simulates
-        // a token refresh after re-authentication.
         let newToken = "eyJ_new_jwt_token"
         try writeConnectCache(configDir: configDir, steamID: "76561198000000000",
                               refreshToken: newToken, accountName: "olduser")
 
         let updated = try String(contentsOf: dest, encoding: .utf8)
 
-        // New credentials written.
         XCTAssertTrue(updated.contains(newToken), "New refresh token must be present")
         XCTAssertTrue(updated.contains("\"olduser\""), "Account name must be present")
         XCTAssertTrue(updated.contains("\"76561198000000000\""), "SteamID must be present")
 
-        // Old SteamCMD-specific data preserved — this is the key regression guard.
-        XCTAssertTrue(updated.contains("encrypted_credential_cache_data"),
-                      "SteamCMD encrypted credential cache (7a611aa1 key) must be preserved")
-        XCTAssertTrue(updated.contains("\"AutoUpdateWindowEnabled\""),
-                      "SteamCMD extra sections must be preserved")
-        XCTAssertTrue(updated.contains("\"ipv6check_http_state\""),
-                      "SteamCMD extra sections must be preserved")
+        // Old steam.exe-generated sections are NOT preserved — this is intentional.
+        XCTAssertFalse(updated.contains("encrypted_data"),
+                       "Old SteamCMD data must be replaced by fresh minimal VDF")
+        XCTAssertFalse(updated.contains("old_token"), "Old token must be gone")
 
-        // Old JWT token replaced by new one.
-        XCTAssertFalse(updated.contains("old_token"), "Old token must be replaced by new token")
+        // Braces must be balanced.
+        let openCount  = updated.filter { $0 == "{" }.count
+        let closeCount = updated.filter { $0 == "}" }.count
+        XCTAssertEqual(openCount, closeCount, "Braces must be balanced in fresh VDF")
     }
 
-    func testWriteConnectCache_doesNotDoubleAccountBlockOnMerge() throws {
-        // Regression test for: upsertVDFKeyInSection replacing only the account key
-        // line but leaving the old { ... } block in place, producing corrupt VDF.
-        //
-        // Symptom: SteamCMD reports "KeyValues Error: got } in key in file
-        // InstallConfigStore" and hangs, causing an infinite sign-in loop.
-        //
-        // Root cause: accountEntry is a multi-line string. The replace path replaced
-        // only the key line, leaving the old { SteamID ... } block dangling after
-        // the new entry's closing brace.
-        let configDir = tempDir.appending(path: "double_block_test/config")
-        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
-
-        // Config.vdf as written by SteamCMD after first login — account block already exists.
-        let existingVDF = """
-        "InstallConfigStore"
-        {
-        \t"Software"
-        \t{
-        \t\t"Valve"
-        \t\t{
-        \t\t\t"Steam"
-        \t\t\t{
-        \t\t\t\t"ConnectCache"
-        \t\t\t\t{
-        \t\t\t\t\t"76561198000000000"\t\t"old_token"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"testuser"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"76561198000000000"
-        \t\t\t\t\t\t"AllowAutoLogin"\t\t"1"
-        \t\t\t\t\t\t"RememberPassword"\t\t"1"
-        \t\t\t\t\t\t"MostRecent"\t\t"1"
-        \t\t\t\t\t}
-        \t\t\t\t}
-        \t\t\t}
-        \t\t}
-        \t}
-        }
-        """
-        let dest = configDir.appending(path: "config.vdf")
-        try existingVDF.write(to: dest, atomically: true, encoding: .utf8)
+    func testWriteConnectCache_alwaysProducesBalancedBraces() throws {
+        // Regression guard: the old merge approach produced 164 opens vs 163 closes on
+        // large steam.exe-generated configs, causing SteamCMD EOF parse errors.
+        let configDir = tempDir.appending(path: "balanced_braces_test/config")
 
         try writeConnectCache(configDir: configDir, steamID: "76561198000000000",
                               refreshToken: "new_token", accountName: "testuser")
 
-        let updated = try String(contentsOf: dest, encoding: .utf8)
+        let content = try String(contentsOf: configDir.appending(path: "config.vdf"), encoding: .utf8)
 
-        // The account name appears in two places: ConnectCache (username JWT key)
-        // and Accounts (block key). A doubled Accounts block would produce 3+.
-        let accountNameCount = updated.components(separatedBy: "\"testuser\"").count - 1
-        XCTAssertEqual(accountNameCount, 2,
-                       "Account name must appear exactly twice (ConnectCache key + Accounts block key)")
-
-        // The closing-brace count must match the opening-brace count.
-        let openCount  = updated.filter { $0 == "{" }.count
-        let closeCount = updated.filter { $0 == "}" }.count
+        let openCount  = content.filter { $0 == "{" }.count
+        let closeCount = content.filter { $0 == "}" }.count
         XCTAssertEqual(openCount, closeCount,
                        "Unbalanced braces in config.vdf — VDF is corrupt (SteamCMD will reject it)")
 
-        XCTAssertTrue(updated.contains("new_token"), "New refresh token must be present")
-        XCTAssertTrue(updated.contains("\"76561198000000000\""), "SteamID must be present")
-        XCTAssertFalse(updated.contains("old_token"), "Old token must be replaced")
+        // Account name appears exactly twice: ConnectCache key + Accounts block key.
+        let accountNameCount = content.components(separatedBy: "\"testuser\"").count - 1
+        XCTAssertEqual(accountNameCount, 2,
+                       "Account name must appear exactly twice (ConnectCache key + Accounts block key)")
+
+        XCTAssertTrue(content.contains("new_token"))
+        XCTAssertTrue(content.contains("\"76561198000000000\""))
     }
 
     func testWriteConnectCache_writesMinimalVDFWhenNoFileExists() throws {

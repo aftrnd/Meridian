@@ -56,20 +56,65 @@ final class WineSteamManager {
         return !exists
     }
 
-    /// Runs Steam to complete the first-run client download.
+    /// Downloads and installs the Steam client using native macOS networking.
     ///
-    /// Steam's update pipeline has two observable phases under Wine:
-    ///   1. **Download** — Steam writes ~150 MB of `.zip` packages into its
-    ///      `package/` subdirectory. The progress bar is determinate.
-    ///   2. **Apply (stuck)** — Steam enters an indeterminate "applying update"
-    ///      phase (blue bar cycling left-to-right). Under Wine this phase never
-    ///      completes; Steam does not write `steamui.dll` until relaunched.
+    /// Steam's 32-bit bootstrapper (steam.exe) statically links OpenSSL which cannot
+    /// complete TLS handshakes under WoW64 on macOS 26 with CX Wine 11.4. Instead of
+    /// running steam.exe and waiting for it to download its own client, Meridian
+    /// downloads the Steam client packages directly from Valve's CDN using URLSession
+    /// and extracts them into the Steam install directory.
     ///
-    /// We detect phase transition by watching the `package/` directory size.
-    /// Once it stops growing for `quiescenceWindow` seconds the download is
-    /// done. We then kill Steam and relaunch — the next run finds the cached
-    /// packages, extracts them in seconds, and writes `steamui.dll`.
-    func bootstrap(engine: WineEngine, prefix: WinePrefix) async throws {
+    /// This approach is more reliable (macOS-native TLS), faster (no Wine overhead
+    /// during download), and simpler (no quiescence detection or kill/restart loop).
+    func bootstrap(engine: WineEngine, prefix: WinePrefix,
+                   progress: (@Sendable (Int64, Int64) -> Void)? = nil) async throws {
+        let dllPath = prefix.steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        if FileManager.default.fileExists(atPath: dllPath) {
+            log.info("[bootstrap] steamui.dll already present — skipping")
+            return
+        }
+
+        log.info("[bootstrap] starting native macOS bootstrap (bypassing steam.exe TLS)")
+
+        do {
+            try await SteamClientBootstrap.downloadAndInstall(
+                to: prefix.steamInstallDir,
+                progress: progress ?? { _, _ in }
+            )
+        } catch {
+            log.error("[bootstrap] native bootstrap failed: \(error.localizedDescription)")
+            throw SteamError.bootstrapFailed(
+                exitCode: -1,
+                detail: "Native Steam client download failed: \(error.localizedDescription)"
+            )
+        }
+
+        guard FileManager.default.fileExists(atPath: dllPath) else {
+            throw SteamError.bootstrapFailed(exitCode: -1, detail: "steamui.dll missing after native bootstrap")
+        }
+
+        // Download SteamCMD-specific packages (steamconsole.dll etc.) from the
+        // steam_cmd_win32 manifest. The bootstrapper stub from SteamSetup.exe does not
+        // include these — without steamconsole.dll, steamcmd.exe crashes at startup.
+        log.info("[bootstrap] downloading SteamCMD packages (steamconsole.dll etc.)")
+        do {
+            try await SteamClientBootstrap.downloadAndInstallSteamCMD(
+                to: prefix.steamInstallDir,
+                progress: { _, _ in }
+            )
+        } catch {
+            // Non-fatal: the warm-up step will re-attempt if needed.
+            log.warning("[bootstrap] SteamCMD packages download failed (non-fatal): \(error.localizedDescription)")
+        }
+
+        log.info("[bootstrap] Steam bootstrap complete ✓ (native macOS download)")
+    }
+
+    /// Legacy Wine-based bootstrap — runs steam.exe and monitors package/ directory.
+    ///
+    /// Kept as a fallback. Steam's 32-bit OpenSSL fails TLS under WoW64 on macOS 26,
+    /// so the primary path is `bootstrap()` which uses native macOS networking.
+    func _legacyBootstrap(engine: WineEngine, prefix: WinePrefix) async throws {
         // Kill any stale processes from a prior attempt to avoid wineserver conflicts.
         killAll(engine: engine, prefix: prefix)
         try? await Task.sleep(for: .seconds(2))
@@ -88,6 +133,11 @@ final class WineSteamManager {
         let launchTimeout: Duration = .seconds(600)
         // How long the package dir must be size-stable before we declare download done.
         let quiescenceWindow: Duration = .seconds(25)
+        // A real Steam client download writes 100+ MB to package/. Tiny stable sizes (< 1 MB)
+        // are stale residuals (e.g. steam_client_metrics.bin, ~137 bytes) — not a finished
+        // download. Without this guard the quiescence timer fires immediately on stale state
+        // and kills Steam before it ever downloads anything.
+        let quiescenceMinBytes = 1 * 1024 * 1024  // 1 MB
 
         for launchNum in 1...maxLaunches {
             // dll may already be present if a prior launch wrote it just before exiting.
@@ -221,6 +271,9 @@ final class WineSteamManager {
                 // Once those files stop growing, the download is complete and Steam
                 // enters the "apply" phase — which hangs under Wine indefinitely.
                 // Detecting size stability lets us restart without any fixed timeout.
+                // Guard: only start the quiescence timer once the package dir exceeds
+                // 1 MB — stale residuals (e.g. steam_client_metrics.bin, ~137 bytes)
+                // must not trigger a false "download complete" restart.
                 let currentPackageSize: Int = {
                     guard let children = try? FileManager.default.contentsOfDirectory(
                         at: pkgDirURL,
@@ -238,7 +291,7 @@ final class WineSteamManager {
                     }
                     lastPackageSize = currentPackageSize
                     packageSizeStableAt = nil
-                } else if currentPackageSize > 0 {
+                } else if currentPackageSize >= quiescenceMinBytes {
                     if packageSizeStableAt == nil {
                         packageSizeStableAt = ContinuousClock.now
                         log.info("[bootstrap] package dir stable at \(currentPackageSize) bytes — quiescence timer started")
@@ -248,6 +301,8 @@ final class WineSteamManager {
                         log.info("[bootstrap] package dir quiescent for \(quiescenceWindow) (\(elapsed) total) — download done, Steam stuck in apply phase — restarting")
                         break pollLoop
                     }
+                } else if currentPackageSize > 0 {
+                    log.debug("[bootstrap] package dir below quiescence threshold (\(currentPackageSize) bytes < \(quiescenceMinBytes)) — waiting for real download")
                 }
 
                 if pollCount % 5 == 0 {
@@ -329,7 +384,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = [steamExe] + args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let stderrPipe = Pipe()
@@ -647,7 +702,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -808,6 +863,19 @@ final class WineSteamManager {
             log.info("[launchGameDirectly] graphicsAPI=\(profile.graphicsAPI.rawValue) engine=\(profile.gameEngine.rawValue) status=\(profile.status.rawValue)")
         }
 
+        // D3D12 games: switch WINEDLLPATH from lib/dxmt:lib/wine (DX11 default) to
+        // gptk/wine:lib/wine so GPTK's dxgi is found before any DXMT DLL.
+        // Without this override, even =b loads DXMT's dxgi from lib/dxmt first,
+        // which returns E_NOINTERFACE for IDXGIAdapter4 → NULL deref crash.
+        if let profile = compat.profile(for: appID),
+           profile.graphicsAPI == .dx12,
+           let gptk = engine.gptkPath,
+           let lib = engine.libraryPath {
+            env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+            env["WINEDLLOVERRIDES"] = "d3d12=b;dxgi=b"
+            log.info("[launchGameDirectly] D3D12 — WINEDLLPATH routed through gptk/wine (GPTK dxgi/d3d12 before DXMT)")
+        }
+
         process.environment = env
         log.info("[launchGameDirectly] WINEDLLOVERRIDES=\(env["WINEDLLOVERRIDES"] ?? "unset")")
         if !gameExtraEnv.isEmpty {
@@ -955,7 +1023,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -1001,7 +1069,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
         process.standardOutput = FileHandle.nullDevice
 
         let errPipe = Pipe()
@@ -1119,7 +1187,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
 
         process.standardOutput = FileHandle.nullDevice
 
@@ -1178,7 +1246,7 @@ final class WineSteamManager {
     ///     `--no-sandbox` is required because Wine cannot emulate Chrome's sandbox.
     private func configureSteamRegistryForSilentMode(engine: WineEngine, prefix: WinePrefix) async {
         let wine64URL = engine.wine64URL
-        let env = engine.environment(for: prefix)
+        let env = engine.steamCMDEnvironment(for: prefix)
         await Task.detached(priority: .userInitiated) {
             func run(_ args: [String]) {
                 let p = Process()
@@ -1205,7 +1273,7 @@ final class WineSteamManager {
     /// can appear during the interactive fallback login flow.
     private func configureSteamRegistryForInteractiveMode(engine: WineEngine, prefix: WinePrefix) async {
         let wine64URL = engine.wine64URL
-        let env = engine.environment(for: prefix)
+        let env = engine.steamCMDEnvironment(for: prefix)
         await Task.detached(priority: .userInitiated) {
             let process = Process()
             process.executableURL = wine64URL
@@ -1431,7 +1499,7 @@ final class WineSteamManager {
         let shutdownProcess = Process()
         shutdownProcess.executableURL = engine.wine64URL
         shutdownProcess.arguments = [prefix.steamExePath.path(percentEncoded: false), "-shutdown"]
-        shutdownProcess.environment = engine.environment(for: prefix)
+        shutdownProcess.environment = engine.steamCMDEnvironment(for: prefix)
 
         let errPipe = Pipe()
         shutdownProcess.standardOutput = FileHandle.nullDevice
@@ -1469,7 +1537,7 @@ final class WineSteamManager {
         let process = Process()
         process.executableURL = engine.wineserverURL
         process.arguments = ["-k"]
-        process.environment = engine.environment(for: prefix)
+        process.environment = engine.steamCMDEnvironment(for: prefix)
 
         let errPipe = Pipe()
         process.standardOutput = FileHandle.nullDevice

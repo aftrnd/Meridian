@@ -509,6 +509,14 @@ final class SteamWindowSuppressor {
         "first-time setup", "setup", "requires restart",
     ]
 
+    /// Steam informational system popups that should always be suppressed.
+    /// These match the essentialTitlePatterns ("error") but are purely cosmetic —
+    /// the game launches correctly regardless. Checked BEFORE essentialTitlePatterns.
+    private static let steamSystemSuppressiblePatterns: [String] = [
+        "steam - fatal error",  // OS version check: "Steam is no longer supported on your OS"
+        "no longer supported",  // Same popup, matched by content if title is generic
+    ]
+
     private static let suppressibleTitlePatterns: [String] = [
         "friends", "community", "store", "news", "screenshot",
         "chat", "voice", "broadcast", "music player",
@@ -522,6 +530,13 @@ final class SteamWindowSuppressor {
         }
 
         let lower = title.lowercased()
+
+        // Steam informational system popups — always suppress even if they match
+        // essentialTitlePatterns (e.g. "fatal error"). These are cosmetic only;
+        // the game launches correctly regardless.
+        for pattern in Self.steamSystemSuppressiblePatterns {
+            if lower.contains(pattern) { return .suppressible }
+        }
 
         for pattern in Self.essentialTitlePatterns {
             if lower.contains(pattern) { return .essential }
