@@ -168,10 +168,12 @@ final class SteamLibraryStore {
             if let idx = games.firstIndex(where: { $0.id == appID }) {
                 if let h = cdnHashes.capsuleHash { games[idx].libraryCapsuleHash = h }
                 if let h = cdnHashes.logoHash    { games[idx].logoHash = h }
+                if let h = cdnHashes.heroHash    { games[idx].heroHash = h }
             }
             if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
                 if let h = cdnHashes.capsuleHash { recentGames[idx].libraryCapsuleHash = h }
                 if let h = cdnHashes.logoHash    { recentGames[idx].logoHash = h }
+                if let h = cdnHashes.heroHash    { recentGames[idx].heroHash = h }
             }
         }
     }
@@ -294,7 +296,8 @@ final class SteamLibraryStore {
             isInstalled: base.isInstalled,
             windowsOnly: base.windowsOnly,
             libraryCapsuleHash: base.libraryCapsuleHash,
-            logoHash: base.logoHash
+            logoHash: base.logoHash,
+            heroHash: base.heroHash
         )
     }
 

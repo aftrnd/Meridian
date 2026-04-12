@@ -154,7 +154,7 @@ struct HomeView: View {
 
         return ZStack(alignment: .bottomLeading) {
             if let game {
-                HeroBannerImage(urls: [game.heroURL] + game.heroURLFallbacks)
+                HeroBannerImage(urls: game.newCDNHeroURLs + [game.heroURL] + game.heroURLFallbacks)
                     .id(game.id)
                     .transition(.opacity)
                     .applyBackgroundExtension()
@@ -735,10 +735,10 @@ private struct FriendCard: View {
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.imageSession.data(from: url)
             if let http = response as? HTTPURLResponse, http.statusCode != 200 { return }
             guard let nsImage = NSImage(data: data) else { return }
-            ImageCache.shared.store(nsImage, for: url)
+            ImageCache.shared.store(nsImage, for: url, rawData: data)
             avatarImage = nsImage
         } catch {}
     }

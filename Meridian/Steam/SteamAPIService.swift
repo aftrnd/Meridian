@@ -366,26 +366,38 @@ actor SteamAPIService {
                     guard let appID = item.appid ?? item.id else { continue }
                     let ch = item.assets?.libraryCapsuleHash
                     let lh = item.assets?.libraryCapsuleLogoHash
-                    if ch != nil || lh != nil {
-                        result[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh)
-                        log.debug("[fetchLibraryCapsuleHashes] S1 appID=\(appID) capsule=\(ch?.prefix(8) ?? "-") logo=\(lh?.prefix(8) ?? "-")")
+                    let hh = item.assets?.libraryHeroHash
+                    if ch != nil || lh != nil || hh != nil {
+                        result[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh, heroHash: hh)
+                        log.debug("[fetchLibraryCapsuleHashes] S1 appID=\(appID) capsule=\(ch?.prefix(8) ?? "-") logo=\(lh?.prefix(8) ?? "-") hero=\(hh?.prefix(8) ?? "-")")
                     }
                 }
             }
 
             // Strategy 2: raw JSON scan — fills in any missing items AND supplements
-            // games that Strategy 1 found a capsule hash for but missed a logo hash.
-            // Previously this used `where result[appID] == nil`, which meant a game
-            // with a capsule hash but nil logo hash would be skipped entirely.
+            // games that Strategy 1 found a capsule hash for but missed a logo or hero hash.
             let rawHashes = extractHashesFromRaw(data)
             for (appID, hashes) in rawHashes {
                 if result[appID] == nil {
                     result[appID] = hashes
-                    log.debug("[fetchLibraryCapsuleHashes] S2 appID=\(appID) capsule=\(hashes.capsuleHash?.prefix(8) ?? "-") logo=\(hashes.logoHash?.prefix(8) ?? "-")")
-                } else if result[appID]?.logoHash == nil, let lh = hashes.logoHash {
-                    // Capsule was found in S1 but logo was missing — fill it in from the raw scan.
-                    result[appID] = GameCDNHashes(capsuleHash: result[appID]?.capsuleHash, logoHash: lh)
-                    log.debug("[fetchLibraryCapsuleHashes] S2 supplement logo appID=\(appID) logo=\(lh.prefix(8))")
+                    log.debug("[fetchLibraryCapsuleHashes] S2 appID=\(appID) capsule=\(hashes.capsuleHash?.prefix(8) ?? "-") logo=\(hashes.logoHash?.prefix(8) ?? "-") hero=\(hashes.heroHash?.prefix(8) ?? "-")")
+                } else {
+                    let existing = result[appID]!
+                    let newLogo = existing.logoHash == nil ? hashes.logoHash : existing.logoHash
+                    let newHero = existing.heroHash == nil ? hashes.heroHash : existing.heroHash
+                    if newLogo != existing.logoHash || newHero != existing.heroHash {
+                        result[appID] = GameCDNHashes(
+                            capsuleHash: existing.capsuleHash,
+                            logoHash: newLogo,
+                            heroHash: newHero
+                        )
+                        if newLogo != existing.logoHash {
+                            log.debug("[fetchLibraryCapsuleHashes] S2 supplement logo appID=\(appID) logo=\(newLogo?.prefix(8) ?? "-")")
+                        }
+                        if newHero != existing.heroHash {
+                            log.debug("[fetchLibraryCapsuleHashes] S2 supplement hero appID=\(appID) hero=\(newHero?.prefix(8) ?? "-")")
+                        }
+                    }
                 }
             }
 
@@ -429,14 +441,15 @@ actor SteamAPIService {
             guard let appID else { continue }
 
             let target: Any = (item["assets"] as? [String: Any]) ?? item
-            // Eagerly compute both capsule naming variants before combining with ??
+            // Eagerly compute all naming variants before combining with ??
             // so `target` (non-Sendable Any) is not captured lazily across the operator.
             let ch600 = searchForHash(matching: "library_600x900", in: target)
             let chCap = searchForHash(matching: "library_capsule", in: target)
             let ch = ch600 ?? chCap
             let lh = searchForHash(matching: "logo", in: target)
-            if ch != nil || lh != nil {
-                out[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh)
+            let hh = searchForHash(matching: "library_hero", in: target)
+            if ch != nil || lh != nil || hh != nil {
+                out[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh, heroHash: hh)
             }
         }
         return out
@@ -576,6 +589,7 @@ private struct StoreBrowseItem: Decodable {
 struct GameCDNHashes {
     let capsuleHash: String?
     let logoHash: String?
+    let heroHash: String?
 }
 
 private struct StoreBrowseAssets: Decodable {
@@ -586,6 +600,9 @@ private struct StoreBrowseAssets: Decodable {
     /// Alternative field name used in some API versions.
     let libraryCapsule: String?
     let libraryCapsule2x: String?
+    /// Hero banner art (1920×620).
+    let libraryHero: String?
+    let libraryHero2x: String?
     /// "{40hexchars}/logo.png" — logo lockup overlaid on the hero image.
     /// Steam uses several different field names across API versions.
     let libraryHeroLogo: String?
@@ -602,6 +619,8 @@ private struct StoreBrowseAssets: Decodable {
         case mainCapsule       = "main_capsule"
         case libraryCapsule    = "library_capsule"
         case libraryCapsule2x  = "library_capsule_2x"
+        case libraryHero       = "library_hero"
+        case libraryHero2x     = "library_hero_2x"
         case libraryHeroLogo   = "library_hero_logo"
         case logo
         case heroLogo          = "hero_logo"
@@ -624,6 +643,14 @@ private struct StoreBrowseAssets: Decodable {
     var libraryCapsuleLogoHash: String? {
         for candidate in [libraryHeroLogo, logo, logo2x, heroLogo, libraryLogo,
                           logoSmall, libraryHeroLogo2x].compactMap({ $0 }) {
+            if let hash = extractHash(from: candidate) { return hash }
+        }
+        return nil
+    }
+
+    /// Extracts the 40-char SHA-1 content hash from the hero banner fields.
+    var libraryHeroHash: String? {
+        for candidate in [libraryHero, libraryHero2x].compactMap({ $0 }) {
             if let hash = extractHash(from: candidate) { return hash }
         }
         return nil

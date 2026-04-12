@@ -17,6 +17,16 @@ struct GameArtOverride {
     /// SHA-1 content hash for library_600x900_2x.jpg on Steam's new CDN.
     /// Used by the 600×900 portrait card in the Library grid.
     let capsuleHash: String?
+
+    /// SHA-1 content hash for library_hero.jpg on Steam's new CDN.
+    /// Used by the hero banner in the Home carousel and game detail view.
+    let heroHash: String?
+
+    init(logoHash: String? = nil, capsuleHash: String? = nil, heroHash: String? = nil) {
+        self.logoHash    = logoHash
+        self.capsuleHash = capsuleHash
+        self.heroHash    = heroHash
+    }
 }
 
 /// Static registry of manually curated art overrides.
@@ -33,14 +43,17 @@ struct GameArtOverride {
 ///
 /// Extract the 40-char hex between /apps/{appid}/ and /logo_2x.png → that is the logoHash.
 /// Extract the 40-char hex between /apps/{appid}/ and /library_600x900 → that is the capsuleHash.
+/// Extract the 40-char hex between /apps/{appid}/ and /library_hero → that is the heroHash.
 ///
 /// Format for adding a new game:
 ///   // GameName (year) — hashes confirmed via SteamDB YYYY-MM-DD
 ///   // logo:    <full SteamDB logo URL>
 ///   // capsule: <full SteamDB capsule URL>
+///   // hero:    <full SteamDB hero URL>
 ///   appID: GameArtOverride(
 ///       logoHash:    "<40-char hex>",
-///       capsuleHash: "<40-char hex>"
+///       capsuleHash: "<40-char hex>",
+///       heroHash:    "<40-char hex>"
 ///   ),
 enum GameArtOverrides {
 
@@ -62,7 +75,8 @@ enum GameArtOverrides {
         // hero:    https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/4069520/81ccebfda24722ce39d61462a406e186b166b06e/library_hero_2x.jpg
         4069520: GameArtOverride(
             logoHash:    "a5bf0704312c45ce5af99b6fb7fc7c08b1828806",
-            capsuleHash: "2fc1510d6b70cf26a95252290633b6cfd8e4bff1"
+            capsuleHash: "2fc1510d6b70cf26a95252290633b6cfd8e4bff1",
+            heroHash:    "81ccebfda24722ce39d61462a406e186b166b06e"
         ),
 
     ]
@@ -75,5 +89,9 @@ enum GameArtOverrides {
 
     static func capsuleHash(for appID: Int) -> String? {
         registry[appID]?.capsuleHash
+    }
+
+    static func heroHash(for appID: Int) -> String? {
+        registry[appID]?.heroHash
     }
 }

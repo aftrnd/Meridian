@@ -18,6 +18,9 @@ struct Game: Identifiable, Hashable, Sendable {
     /// SHA-1 content hash for logo.png on Steam's new CDN.
     /// Populated alongside libraryCapsuleHash by the background art-hash fetch.
     var logoHash: String? = nil
+    /// SHA-1 content hash for library_hero.jpg on Steam's new CDN.
+    /// Populated alongside libraryCapsuleHash by the background art-hash fetch.
+    var heroHash: String? = nil
 
     // MARK: - Effective hashes (override registry takes priority)
 
@@ -33,6 +36,13 @@ struct Game: Identifiable, Hashable, Sendable {
     /// back to the hash populated by the background fetch.
     var effectiveCapsuleHash: String? {
         GameArtOverrides.capsuleHash(for: id) ?? libraryCapsuleHash
+    }
+
+    /// The library_hero hash to use for CDN URL construction.
+    /// Returns the manually curated override hash if one exists, otherwise falls
+    /// back to the hash populated by the background fetch.
+    var effectiveHeroHash: String? {
+        GameArtOverrides.heroHash(for: id) ?? heroHash
     }
 
     // MARK: - Computed URLs
@@ -60,10 +70,11 @@ struct Game: Identifiable, Hashable, Sendable {
 
     var logoURLFallbacks: [URL] {
         [
-            // 2x variant first — confirmed naming for newer Steam games
-            URL(string: "https://cdn.akamai.steamstatic.com/steam/apps/\(id)/logo_2x.png"),
+            // logo_2x.png across all CDN mirrors
             URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/logo_2x.png"),
             URL(string: "https://steamcdn-a.akamaihd.net/steam/apps/\(id)/logo_2x.png"),
+            // Standard logo.png (may be all that exists on some older titles)
+            URL(string: "https://cdn.akamai.steamstatic.com/steam/apps/\(id)/logo.png"),
             URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/logo.png"),
             URL(string: "https://steamcdn-a.akamaihd.net/steam/apps/\(id)/logo.png"),
         ].compactMap { $0 }
@@ -80,6 +91,20 @@ struct Game: Identifiable, Hashable, Sendable {
             URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
             URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
             URL(string: "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
+        ].compactMap { $0 }
+    }
+
+    /// New hash-based CDN URLs for the library hero banner — required for games
+    /// published after ~2024 that host hero art exclusively on the new CDN.
+    /// Prefers the manual override hash from GameArtOverrides, then the auto-fetched hash.
+    var newCDNHeroURLs: [URL] {
+        guard let hash = effectiveHeroHash, !hash.isEmpty else { return [] }
+        return [
+            URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_hero.jpg"),
+            URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_hero.jpg"),
+            URL(string: "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_hero.jpg"),
+            URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_hero_2x.jpg"),
+            URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/library_hero_2x.jpg"),
         ].compactMap { $0 }
     }
 
@@ -210,7 +235,8 @@ struct Game: Identifiable, Hashable, Sendable {
         isInstalled: Bool = false,
         windowsOnly: Bool = false,
         libraryCapsuleHash: String? = nil,
-        logoHash: String? = nil
+        logoHash: String? = nil,
+        heroHash: String? = nil
     ) {
         self.id                   = id
         self.name                 = name
@@ -222,6 +248,7 @@ struct Game: Identifiable, Hashable, Sendable {
         self.windowsOnly          = windowsOnly
         self.libraryCapsuleHash   = libraryCapsuleHash
         self.logoHash             = logoHash
+        self.heroHash             = heroHash
     }
 }
 
