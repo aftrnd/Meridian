@@ -12,6 +12,7 @@ struct SplashView: View {
     @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(SteamWindowSuppressor.self) private var suppressor
     @Environment(EngineDownloader.self) private var engineDownloader
+    @Environment(SteamCMDService.self) private var steamCMDService
 
     @State private var isExiting = false
 
@@ -60,7 +61,8 @@ struct SplashView: View {
                 engine: engine,
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
-                engineDownloader: engineDownloader
+                engineDownloader: engineDownloader,
+                steamCMDService: steamCMDService
             )
         }
     }
@@ -203,7 +205,8 @@ struct SplashView: View {
                     engine: engine,
                     steamManager: steamManager,
                     sessionBridge: sessionBridge,
-                    engineDownloader: engineDownloader
+                    engineDownloader: engineDownloader,
+                    steamCMDService: steamCMDService
                 )
             }
             .buttonStyle(.borderedProminent)

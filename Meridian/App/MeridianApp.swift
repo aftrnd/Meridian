@@ -16,6 +16,7 @@ struct MeridianApp: App {
     @State private var suppressor        = SteamWindowSuppressor()
     @State private var updateChecker     = AppUpdateChecker()
     @State private var engineDownloader  = EngineDownloader()
+    @State private var steamCMDService   = SteamCMDService()
 
     private let settings = AppSettings.shared
 
@@ -25,10 +26,13 @@ struct MeridianApp: App {
         let _ = {
             bootstrap.windowSuppressor    = suppressor
             launcher.windowSuppressor     = suppressor
+            launcher.steamCMDService      = steamCMDService
             steamManager.windowSuppressor = suppressor
             appDelegate.suppressor        = suppressor
             appDelegate.steamManager      = steamManager
             appDelegate.bootstrap         = bootstrap
+            appDelegate.steamCMDService   = steamCMDService
+            steamCMDService.passwordProvider = { steamAuth.loadSteamPassword() }
         }()
 
         WindowGroup {
@@ -44,6 +48,7 @@ struct MeridianApp: App {
                 .environment(suppressor)
                 .environment(updateChecker)
                 .environment(engineDownloader)
+                .environment(steamCMDService)
                 // Refresh permission state when Meridian becomes active (user may
                 // have just granted Accessibility access in System Preferences).
                 .onReceive(NotificationCenter.default.publisher(
@@ -79,6 +84,17 @@ struct MeridianApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 480, height: 300)
         .commands {
+            // "Check for Updates…" goes in the app-name menu, right after "About Meridian".
+            // CommandGroup(after: .appInfo) is the standard macOS placement.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updateChecker.installedEngineTag = engine.engineVersion
+                    updateChecker.checkNow()
+                    UserDefaults.standard.set("updates", forKey: "meridian.settingsTab")
+                    NotificationCenter.default.post(name: .meridianOpenSettings, object: nil)
+                }
+            }
+
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Meridian") {
                 Button("Sign Out of Steam") {

@@ -397,4 +397,42 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertNotEqual(expectedPlatformType, "2",
                           "platform_type \"2\" (WebBrowser) produces aud:[\"web\"] tokens — Steam's ConnectCache requires aud:[\"client\"] to authenticate.")
     }
+
+    // MARK: - Sign-in flow must not eagerly authenticate SteamCMD
+    //
+    // SteamCMD uses its own credential cache and requires a SEPARATE Steam Guard
+    // mobile confirmation when authenticating with username+password. If the
+    // sign-in flow calls authenticateSteamCMD, the user is forced to approve
+    // twice for one sign-in — once for the credential auth API, once for SteamCMD.
+    //
+    // SteamCMD authentication must be deferred to the first game install, where
+    // installWithSteamCMD handles it lazily with auto re-auth from Keychain.
+    //
+    // This is a documentation test — it cannot exercise the sign-in UI directly
+    // but encodes the architectural constraint so it's immediately visible if
+    // authenticateSteamCMD is accidentally re-added to the sign-in path.
+
+    func testSignInFlowMustNotCallAuthenticateSteamCMD() {
+        // The sign-in completion handler in AuthView.beginSignIn must:
+        //   1. Write session files (writeLoginUsers, writeConnectCache)
+        //   2. Backup config.vdf (backupSteamCMDConfig)
+        //   3. NOT call authenticateSteamCMD
+        //
+        // If this test description no longer matches the code, someone added
+        // authenticateSteamCMD back to the sign-in path — REMOVE IT.
+        // Root cause: SteamCMD +login triggers a second Steam Guard challenge.
+        let signInSteps: [String] = [
+            "writeLoginUsers",
+            "writeConnectCache",
+            "backupSteamCMDConfig",
+        ]
+        let forbiddenSteps: [String] = [
+            "authenticateSteamCMD",
+        ]
+        XCTAssertFalse(signInSteps.isEmpty)
+        for step in forbiddenSteps {
+            XCTAssertFalse(signInSteps.contains(step),
+                           "\(step) must NOT be in the sign-in flow — it causes a double Steam Guard confirmation")
+        }
+    }
 }

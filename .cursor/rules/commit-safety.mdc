@@ -1,0 +1,38 @@
+---
+description: Commit message convention — always mark stability and revert safety
+alwaysApply: true
+---
+
+# Commit Safety Convention
+
+Every commit message MUST include a one-line stability footer so anyone (including AI agents in future sessions) knows at a glance whether it is safe to reset to.
+
+## Format
+
+```
+<type>: <short summary>
+
+<body explaining what and why>
+
+STABLE: <one sentence confirming what works and is safe to revert to>
+```
+
+## Stability Footer Examples
+
+```
+STABLE: DX11 games (No I'm not a Human, PEAK, Super Battle Golf) launch and play correctly. Safe to revert here if future D3D12/GPTK work breaks DX11.
+```
+
+```
+STABLE: Bootstrap, auth, and Steam DRM confirmed working on v3.0.0-engine. Clean revert point before refactoring game install flow.
+```
+
+```
+STABLE: Known broken — intentional WIP. Do NOT treat as a safe revert point.
+```
+
+## Rules
+
+- Every commit gets a `STABLE:` line — even WIP commits (just mark them explicitly broken).
+- The footer describes **what has been user-confirmed working**, so the next session knows exactly what regression risk exists if they revert here.
+- One branch is fine for a feature. Stable commits within it are the safety net.

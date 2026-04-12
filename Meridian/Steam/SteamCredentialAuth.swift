@@ -1,7 +1,6 @@
 import Foundation
 import Security
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "SteamCredentialAuth")
 

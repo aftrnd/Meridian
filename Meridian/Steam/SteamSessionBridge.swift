@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "SteamSessionBridge")
 
@@ -16,7 +15,7 @@ private let log = MeridianLog(category: "SteamSessionBridge")
 /// 2. **Session file copy** — if Steam for Mac is installed, its
 ///    `loginusers.vdf`, `config/`, and `ssfn*` tokens are copied directly
 ///    into the Wine prefix's Steam directory. This achieves auto-login
-///    without credentials. Same approach used by Whisky and CrossOver.
+///    without credentials.
 ///
 /// 3. **No session available** — the user will need to sign into Steam once
 ///    inside the Wine Steam window. After that, Steam's own remember-me

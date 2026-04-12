@@ -1,0 +1,217 @@
+# Bootstrap Diagnosis Protocol
+
+When the user reports bootstrap failures, **always read the log file first** before forming any hypothesis:
+
+```bash
+~/Library/Application Support/com.meridian.app/logs/meridian.log
+```
+
+## Diagnosis Checklist
+
+### 1. Check Steam's own output for "Suppressing Steam update"
+
+```
+grep "Suppressing Steam update" ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+```
+
+If present: Steam read `BootStrapperInhibitAll=enable` from `steam.cfg` and refused to download its client. This blocks the entire bootstrap because `steamui.dll` can never appear.
+
+**Root cause:** `steam.cfg` contains `BootStrapperInhibitAll=enable` while `steamui.dll` is absent.
+
+**Fix:** `ensureSteamCFG()` must only write `BootStrapperInhibitAll` when `isSteamBootstrapped` is true (steamui.dll exists). The `WineSteamManager.bootstrap()` method also calls `prefix.stripBootStrapperInhibit()` defensively before the retry loop.
+
+**Verify on disk:**
+```bash
+cat ~/Library/Application\ Support/com.meridian.app/bottles/steam/drive_c/Program\ Files\ \(x86\)/Steam/steam.cfg
+test -f ~/Library/Application\ Support/com.meridian.app/bottles/steam/drive_c/Program\ Files\ \(x86\)/Steam/steamui.dll && echo "EXISTS" || echo "MISSING"
+```
+
+### 2. Check exit code pattern
+
+| Exit Code | Meaning |
+|-----------|---------|
+| 255 (-1) | Steam exited voluntarily (suppressed update, or normal shutdown) |
+| 0 | Clean exit |
+| 1 | General failure |
+| 53 | `STATUS_DLL_NOT_FOUND` — DLL symlinks broken after engine upgrade without `wineboot --update` |
+
+If every attempt shows `exit=255` with `Suppressing Steam update` in stdout, see item 1 above.
+
+### 3. Check for "Failed to load steamconsole.dll" (SteamCMD broken)
+
+```
+grep "steamconsole.dll" ~/Library/Application\ Support/com.meridian.app/logs/meridian.log
+```
+
+If present: SteamCMD never completed its self-update. The initial `steamcmd.exe` from the zip requires `steamconsole.dll` which is only downloaded during the self-update phase.
+
+**Root cause:** `BootStrapperInhibitAll=enable` in `steam.cfg` blocks SteamCMD's self-update (same flag that caused the steam.exe bootstrap bootloop). SteamCMD reads this flag and exits immediately without updating.
+
+**Verify in `bootstrap_log.txt`:**
+```bash
+cat ~/Library/Application\ Support/com.meridian.app/bottles/steam/drive_c/Program\ Files\ \(x86\)/Steam/logs/bootstrap_log.txt | grep -A1 "Dec.*2013"
+```
+If you see `updater built Dec 2 2013` followed by `Suppressing Steam update`, that is the original SteamCMD stub being blocked.
+
+**Fix:** `SteamCMDService.warmUp()` and `installGame()` call `prefix.stripBootStrapperInhibit()` before launching SteamCMD and `prefix.ensureSteamCFG()` after exit to restore it.
+
+**Verify on disk:**
+```bash
+test -f ~/Library/Application\ Support/com.meridian.app/bottles/steam/drive_c/Program\ Files\ \(x86\)/Steam/steamconsole.dll && echo "EXISTS" || echo "MISSING"
+```
+
+### 4. Check for wineserver death pattern
+
+Look for:
+```
+Steam exited (exit=NNN) and wineserver dead on attempt N — 10s grace period
+```
+
+If wineserver dies immediately on every attempt, check:
+- NLS files present: `ls ~/Library/Application\ Support/com.meridian.app/engine/wine/share/wine/nls/`
+- wine.inf present: `ls ~/Library/Application\ Support/com.meridian.app/engine/wine/share/wine/wine.inf`
+- Prefix corruption: `ls ~/Library/Application\ Support/com.meridian.app/bottles/steam/system.reg`
+
+### 4. Check for package/ directory activity
+
+In the log, look for `pkg=` values in poll lines:
+```
+[bootstrap] poll=5 elapsed=12s pkg=0b pkgDirExists=false
+```
+
+- `pkg=0b pkgDirExists=false` on every poll = Steam never started downloading (likely suppressed, see item 1)
+- `pkg=` growing over time = download in progress, bootstrap is working
+- `pkg=` stable for 25s+ = quiescence detected, Steam stuck in apply phase (expected)
+
+### 5. Check steam.exe vs steamui.dll distinction
+
+In the log header:
+```
+║ steam installed=true    ← only means steam.exe exists (stub from SteamSetup.exe)
+║ needs bootstrap=true    ← means steamui.dll is MISSING (full client not downloaded)
+```
+
+Both `true` simultaneously = Steam stub is installed but bootstrap hasn't completed. This is the normal state that triggers the bootstrap phase.
+
+## Clean Wipe Procedure (for retesting bootstrap from scratch)
+
+Run these commands in Terminal before launching from Xcode. Always kill all Wine processes first.
+
+### Option A: Wipe Steam bottle only (keep engine — faster)
+
+Use this when the engine is fine and you only want to retest the Steam install + bootstrap phase.
+
+```bash
+# 1. Kill all Wine processes
+pkill -9 -f "com.meridian.app/engine" 2>/dev/null; true
+"$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wineserver" -k \
+  --env WINEPREFIX="$HOME/Library/Application Support/com.meridian.app/bottles/steam/" 2>/dev/null; true
+
+# 2. Wipe the bottle
+rm -rf "$HOME/Library/Application Support/com.meridian.app/bottles/steam/"
+
+# 3. Clear the engine tag so BootstrapManager re-runs prefix creation
+defaults delete com.meridian.app lastPrefixEngineTag 2>/dev/null; true
+
+# 4. Clear SteamCMD credential backup (so it's also retested)
+rm -f "$HOME/Library/Application Support/com.meridian.app/steamcmd-config-backup.vdf" 2>/dev/null; true
+```
+
+### Option B: Full wipe (engine + bottle — slowest, re-downloads everything)
+
+Use this when you want to test the full flow including engine download.
+
+```bash
+# 1. Kill all Wine processes
+pkill -9 -f "com.meridian.app" 2>/dev/null; true
+
+# 2. Wipe engine + bottle
+rm -rf "$HOME/Library/Application Support/com.meridian.app/engine/"
+rm -rf "$HOME/Library/Application Support/com.meridian.app/bottles/"
+
+# 3. Clear all Meridian UserDefaults
+defaults delete com.meridian.app 2>/dev/null; true
+```
+
+### Option C: Wipe only steam.cfg (reproduce the BootStrapperInhibitAll bug)
+
+Use this to reproduce the exact bug that caused the April 2026 bootloop without wiping the whole prefix.
+
+```bash
+# Write the broken steam.cfg (BootStrapperInhibitAll present before steamui.dll exists)
+STEAM_DIR="$HOME/Library/Application Support/com.meridian.app/bottles/steam/drive_c/Program Files (x86)/Steam"
+printf "SteamNoSandbox=1\nBootStrapperInhibitAll=enable\n" > "$STEAM_DIR/steam.cfg"
+rm -f "$STEAM_DIR/steamui.dll"
+echo "Broken state ready — launch app to verify self-healing"
+```
+
+### What the app does after a clean wipe
+
+After **Option A** (bottle wipe), launch sequence:
+1. Engine detected (already installed)
+2. Prefix missing → `wineboot --init` or template copy → new prefix
+3. Steam not installed → `SteamSetup.exe /S` → installs steam.exe stub
+4. `ensureSteamCFG()` → `isSteamBootstrapped=false` → writes only `SteamNoSandbox=1` ✓
+5. `needsBootstrap=true` → `bootstrap()` → `stripBootStrapperInhibit()` (no-op on clean file) → launches steam.exe → downloads steamui.dll
+6. Bootstrap completes → SteamCMD warm-up → ready
+
+### 6. Check for VKD3D environment leaking into admin Wine processes
+
+Look for `VKD3D-proton D3D12 enabled` in the log during bootstrap or wipeboot:
+```
+[DEBUG] [WineEngine] [env] VKD3D-proton D3D12 enabled: .../vkd3d-proton/x86_64-windows
+```
+followed shortly by the bootstrap or wipeboot hanging with no further output.
+
+**Root cause:** `engine.environment(for:)` injects `WINEDLLOVERRIDES=d3d12,d3d12core=n` whenever VKD3D-proton is present. Using this function for non-game processes (bootstrap `steam.exe`, `wineboot --update`) causes VKD3D's DllMain to attempt Vulkan init. MoltenVK is not in the DYLD search path for admin environments → VKD3D init fails → process hangs or exits abnormally.
+
+**Affected callers (as of April 2026 — all now fixed):**
+- `WineSteamManager.bootstrap()` used `engine.environment(for:)` → steam.exe exited with exit=0, no download
+- `WineEngine.run()` used `engine.environment(for:)` → wipeboot hung after wine64 exited (pipe read blocked)
+
+**Fix:** All non-game Wine processes use `engine.steamCMDEnvironment(for:)`. Only game launches (`launchGameDirectly`, `launchGame`) use `engine.environment(for:)`.
+
+**Verify:** If you see `VKD3D-proton D3D12 enabled` in the env log for a bootstrap or wipeboot call, that's the bug. Check which function is passing the environment.
+
+### 7. Check for app frozen at "Applying new Wine engine…" with no further log output
+
+The log ends at:
+```
+[WineEngine] [run] wine64 wineboot --update
+[WineEngine] [run] WINEPREFIX=...
+```
+No `exit=` line follows. `wine64` has already exited (verify: `ps aux | grep wine64` returns nothing) but the app is frozen.
+
+**Root cause:** `engine.run()` calls `NSFileHandle.availableData` on the stderr pipe after `terminationHandler` fires. wineserver inherited the pipe write-end and is still running. `availableData` calls POSIX `read()` which blocks when the write-end is open with no data. The app hangs until force-quit.
+
+**Fix:** Use `O_NONBLOCK` on the pipe fd before calling `availableData` (see `readNonBlocking()` in `WineEngine.swift`). CLI-verified April 2026.
+
+**Distinguish from:** wineboot hanging BEFORE wine64 exits (the log never gets to the wineboot line, or processes are visible in `ps`). That is a different issue (Wine environment problem, missing wine.inf, etc.).
+
+---
+
+## Key Files
+
+### SteamCMD stdout buffering (known Valve bug, open since 2014)
+
+SteamCMD uses C standard library full buffering when stdout is a pipe (not a TTY). This means all progress output (`Update state (0x61) downloading...`) arrives in one burst at process exit, not in real-time.
+
+**Meridian's fix:** Wrap `wine64 steamcmd.exe` in a PTY using macOS `/usr/bin/script -q /dev/null`. Inside a PTY, SteamCMD sees a terminal and switches to line buffering, flushing each progress line immediately.
+
+**Current launch pattern in `SteamCMDService.installGame()` and `warmUp()`:**
+```swift
+process.executableURL = URL(filePath: "/usr/bin/script")
+process.arguments = ["-q", "/dev/null", engine.wine64URL.path(...),
+                     steamcmdPath, "+login", username, "+app_update", appID, "validate", "+quit"]
+```
+
+**If progress output is delayed again:** Check that the `script` wrapper is in place. `reauthenticate()` does NOT use this wrapper (its stdout goes to `/dev/null`).
+
+**PTY output notes:** The `script` wrapper may emit `\r` (carriage return) line endings. `LineBuffer.append()` normalises `\r\n` and bare `\r` to `\n` before buffering. `shouldShowLine()` filters ANSI escape sequences (`\u{1B}[...`) that the PTY may emit.
+
+| File | Role |
+|------|------|
+| `Meridian/Engine/WinePrefix.swift` | `ensureSteamCFG()`, `isSteamBootstrapped`, `stripBootStrapperInhibit()` |
+| `Meridian/Engine/WineSteamManager.swift` | `bootstrap()` — runs steam.exe to download full client |
+| `Meridian/App/BootstrapManager.swift` | `runPipeline()` — orchestrates the full init sequence |
+| `MeridianTests/WinePrefixTests.swift` | Regression tests for BootStrapperInhibitAll logic |

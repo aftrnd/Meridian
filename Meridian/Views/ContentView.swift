@@ -21,6 +21,7 @@ struct ContentView: View {
     @Environment(GameLauncher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
+    @Environment(\.openSettings) private var openSettings
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var sidebarDestination: SidebarDestination = .home
@@ -29,6 +30,8 @@ struct ContentView: View {
     /// Starts false so SwiftUI observes the false→true transition that triggers
     /// sheet presentation. Set to true from `.onAppear` on mainContent.
     @State private var showSetupSheet = false
+    /// Guards the onAppear setup check so it runs exactly once per app session.
+    @State private var hasCheckedSetup = false
 
     var body: some View {
         Group {
@@ -43,8 +46,8 @@ struct ContentView: View {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
                     .onAppear {
-                        // Evaluate AFTER mainContent is mounted so SwiftUI sees
-                        // the false→true transition and actually presents the sheet.
+                        guard !hasCheckedSetup else { return }
+                        hasCheckedSetup = true
                         if !steamManager.isSteamLoggedIn || steamAuth.needsAPIKey {
                             showSetupSheet = true
                         }
@@ -62,6 +65,18 @@ struct ContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                     splashVisible = false
                 }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .meridianOpenSettings)) { _ in
+            openSettings()
+        }
+        // Re-show the setup sheet whenever the user signs out — the .onAppear
+        // check on mainContent only fires once at bootstrap. Without this,
+        // signing out in Settings leaves the app with no way to sign back in
+        // until a full restart.
+        .onChange(of: steamAuth.isAuthenticated) { _, authenticated in
+            if !authenticated {
+                showSetupSheet = true
             }
         }
     }
@@ -121,6 +136,7 @@ struct ContentView: View {
 
 extension Notification.Name {
     static let meridianBootstrapReady = Notification.Name("meridianBootstrapReady")
+    static let meridianOpenSettings   = Notification.Name("meridianOpenSettings")
 }
 
 // MARK: - Sidebar
@@ -393,7 +409,7 @@ private struct EngineStatusPill: View {
 
     private var statusLabel: String {
         switch engine.state {
-        case .ready:          return "Engine: \(engine.backendName)"
+        case .ready:          return "Meridian Engine"
         case .notInstalled:   return "Engine Not Found"
         case .error:          return "Engine Error"
         }
@@ -481,4 +497,5 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(BootstrapManager())
         .environment(CategoryStore())
         .environment(AppUpdateChecker())
+        .environment(SteamCMDService())
 }

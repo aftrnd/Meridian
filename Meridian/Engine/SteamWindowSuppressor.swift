@@ -1,7 +1,6 @@
 import AppKit
 import ApplicationServices
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "SteamWindowSuppressor")
 
@@ -170,12 +169,17 @@ final class SteamWindowSuppressor {
 
     /// Pause new-window minimization so the game's own window can appear on screen.
     /// The polling timer and observers remain active; call `resumeSuppressing` to re-enable.
+    ///
+    /// This intentionally does NOT call `restoreAllObservedWindows()`. Game windows start
+    /// fresh and have never been moved by us — calling restore would reposition them from
+    /// their native full-screen layout to a fixed centered point, causing the window to
+    /// jump off-screen. Only `allowSteamUITemporarily()` needs the restore step, to
+    /// un-hide Steam windows that we moved to (-32000, -32000) during suppression.
     func stopSuppressingNewWindows() {
         reengageSuppressionWhenMeridianActivates = false
         suppressionActive = false
         isSuppressing = false
         log.info("[suppressor] suppression paused — game window will appear")
-        restoreAllObservedWindows()
     }
 
     /// Call before `steam.exe -activate` so the window can appear. Suppression turns
@@ -505,6 +509,14 @@ final class SteamWindowSuppressor {
         "first-time setup", "setup", "requires restart",
     ]
 
+    /// Steam informational system popups that should always be suppressed.
+    /// These match the essentialTitlePatterns ("error") but are purely cosmetic —
+    /// the game launches correctly regardless. Checked BEFORE essentialTitlePatterns.
+    private static let steamSystemSuppressiblePatterns: [String] = [
+        "steam - fatal error",  // OS version check: "Steam is no longer supported on your OS"
+        "no longer supported",  // Same popup, matched by content if title is generic
+    ]
+
     private static let suppressibleTitlePatterns: [String] = [
         "friends", "community", "store", "news", "screenshot",
         "chat", "voice", "broadcast", "music player",
@@ -518,6 +530,13 @@ final class SteamWindowSuppressor {
         }
 
         let lower = title.lowercased()
+
+        // Steam informational system popups — always suppress even if they match
+        // essentialTitlePatterns (e.g. "fatal error"). These are cosmetic only;
+        // the game launches correctly regardless.
+        for pattern in Self.steamSystemSuppressiblePatterns {
+            if lower.contains(pattern) { return .suppressible }
+        }
 
         for pattern in Self.essentialTitlePatterns {
             if lower.contains(pattern) { return .essential }

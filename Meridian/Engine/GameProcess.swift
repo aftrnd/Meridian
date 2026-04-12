@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "GameProcess")
 
@@ -16,7 +15,7 @@ private let log = MeridianLog(category: "GameProcess")
 ///   - **Phase 1 (Startup):** Waits up to 120s for `pgrep -f "<game>"` to
 ///     find a match, confirming the game binary has been spawned.
 ///   - **Phase 2 (Running):** Polls `pgrep -f "<game>"` every 3s. When it
-///     returns no matches for 3 consecutive polls, the game has exited.
+///     returns no matches for 2 consecutive polls, the game has exited.
 ///
 /// This is immune to both lingering Wine helper processes (they don't contain
 /// the game name) and transient launcher PID churn (we match by name, not PID).

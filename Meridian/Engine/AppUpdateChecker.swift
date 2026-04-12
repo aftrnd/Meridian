@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 import AppKit
 
 private let log = MeridianLog(category: "AppUpdateChecker")

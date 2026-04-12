@@ -1,7 +1,6 @@
 import AuthenticationServices
 import Security
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "SteamAuth")
 
@@ -75,6 +74,19 @@ final class SteamAuthService: NSObject {
     private enum KeychainKey {
         static let steamID        = "meridian.steam.steamid"
         static let apiKey         = "meridian.steam.apikey"
+        static let steamPassword  = "meridian.steam.password"
+    }
+
+    /// Stores the Steam password in Keychain for SteamCMD re-authentication.
+    /// SteamCMD has its own credential cache that gets wiped on prefix reset.
+    /// When that happens, we need the password to re-authenticate automatically.
+    func saveSteamPassword(_ password: String) {
+        saveSecret(password, key: KeychainKey.steamPassword)
+    }
+
+    /// Retrieves the stored Steam password for SteamCMD auto-authentication.
+    func loadSteamPassword() -> String? {
+        loadSecret(key: KeychainKey.steamPassword)
     }
 
     // MARK: - Computed credential accessors
@@ -206,6 +218,7 @@ final class SteamAuthService: NSObject {
         avatarURL = nil
         deleteSecret(key: KeychainKey.steamID)
         deleteSecret(key: KeychainKey.apiKey)
+        deleteSecret(key: KeychainKey.steamPassword)
         apiKeyPromptDismissed = false
         AppSettings.shared.clearAccountData()
         log.info("[signOut] Keychain cleared, account data reset")

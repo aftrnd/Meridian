@@ -1,37 +1,54 @@
 #!/usr/bin/env bash
 #
-# release-engine.sh — Download, assemble, and publish the Meridian Wine engine.
+# release-engine.sh — Assemble and publish the Meridian Wine engine from CrossOver Preview.
 #
 # Usage:
 #   bash Scripts/release-engine.sh [VERSION]
 #
 # Examples:
-#   bash Scripts/release-engine.sh              # auto-increments patch (v1.0.3-engine)
-#   bash Scripts/release-engine.sh v2.0.0       # explicit version
+#   bash Scripts/release-engine.sh              # auto-increments patch
+#   bash Scripts/release-engine.sh v4.0.0       # explicit version
 #
 # Prerequisites:
+#   - CrossOver Preview installed at /Applications/CrossOver Preview.app
 #   - gh CLI authenticated:   brew install gh && gh auth login
-#   - curl (standard on macOS)
+#   - x86_64-w64-mingw32-gcc: brew install mingw-w64  (for custom coremessaging.dll)
 #
 # What it does:
-#   1. Uses wine-crossover FOSS from Gcenx/winecx (local Homebrew or downloaded)
-#   2. Downloads DXMT (builtin) from 3Shain/dxmt (DirectX → Metal)
-#   3. Downloads DXVK from doitsujin/dxvk (DirectX → Vulkan fallback)
-#   4. Assembles wine/bin, wine/lib, wine/share/wine/{nls,fonts}
-#      Installs DXMT builtin DLLs into wine/lib/wine/x86_64-{unix,windows}
-#      Installs DXVK DLLs into wine/lib/dxvk/
-#   5. Builds a pre-initialized prefix template via wineboot --init
-#   6. Validates binaries, NLS data, syswow64, and prefix template
-#   7. Creates a .tar.gz archive and uploads to aftrnd/meridian
+#   1. Copies Wine binary + DLLs from CrossOver Preview (CX Wine 11.4)
+#   2. Stages DXMT from CrossOver Preview into lib/dxmt/ (DirectX 11/10 → Metal)
+#   3. Stages DXVK from CrossOver Preview (DirectX → Vulkan fallback)
+#   4. Stages GPTK from CrossOver Preview (D3D12 → D3DMetal → Metal — ACTIVE with CX Wine)
+#   5. Stages lib64 dylibs from CrossOver Preview (MoltenVK, GStreamer, etc.)
+#   6. Builds a pre-initialized prefix template via wineboot --init
+#   7. Validates binaries, NLS data, syswow64, and prefix template
+#   8. Creates a .tar.gz archive and uploads to aftrnd/meridian
 #
-# Install wine-crossover locally for fastest builds: brew install --cask wine-crossover
+# Wine source: CrossOver Preview (CX Wine 11.4 with full CodeWeavers patches)
+#   WHY CX Wine (not Gcenx wine-devel):
+#   1. TLS: secur32.so uses GnuTLS exclusively for Schannel/TLS (NOT Security.framework).
+#      lib64 MUST be on DYLD_FALLBACK_LIBRARY_PATH at runtime so secur32.so can dlopen
+#      libgnutls.30.dylib. libgnutls also needs @loader_path rpath (added below) so its
+#      @rpath/libgmp.10.dylib dependency resolves. crypt32.so uses Security.framework
+#      for certificate ops — its GnuTLS dlopen is only for PFX import/export.
+#   2. GPTK: CX Wine has ntdll.__wine_unix_call which CX's d3d12.dll requires.
+#      Gcenx Wine lacks this function — GPTK is permanently disabled with Gcenx.
+#      CX Wine enables full D3D12 → D3DMetal → Metal support automatically.
+#   3. Steam compat: CX Wine has CodeWeavers patches for Steam IPC, DXMT Metal APIs,
+#      and Rosetta 2. Both binaries have the same patches, but only CX enables GPTK.
+#
+#   NOTE: Steam's own 32-bit bootstrapper statically links OpenSSL which fails TLS
+#   under WoW64 on macOS 26. Meridian bypasses it with native macOS bootstrap
+#   (SteamClientBootstrap.swift using URLSession). Wine's TLS (via GnuTLS) is
+#   still needed for SteamCMD, WinHTTP, and other Wine HTTPS operations.
 #
 set -euo pipefail
 
 REPO="aftrnd/meridian"
 STAGING="/tmp/meridian-engine"
 ARCHIVE="/tmp/meridian-engine-arm64.tar.gz"
-DOWNLOADS="/tmp/meridian-engine-downloads"
+
+CX_ROOT="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
 
 # ---------- helpers ----------
 
@@ -48,96 +65,18 @@ green "=== Meridian Engine Release ==="
 echo ""
 
 command -v gh    >/dev/null 2>&1 || die "gh CLI not found.   Install: brew install gh && gh auth login"
-command -v curl  >/dev/null 2>&1 || die "curl not found (should be standard on macOS)"
 command -v tar   >/dev/null 2>&1 || die "tar not found"
 gh auth status >/dev/null 2>&1   || die "gh CLI not authenticated. Run: gh auth login"
 
-# ---------- resolve component versions ----------
+[ -d "${CX_ROOT}" ] || die "CrossOver Preview not found at /Applications/CrossOver Preview.app"
+[ -f "${CX_ROOT}/CrossOver-Hosted Application/wineloader" ] || die "CX wineloader not found"
+[ -f "${CX_ROOT}/CrossOver-Hosted Application/wineserver" ] || die "CX wineserver not found"
+[ -d "${CX_ROOT}/lib/wine" ]  || die "CX lib/wine/ not found"
+[ -d "${CX_ROOT}/lib/dxmt" ]  || die "CX lib/dxmt/ not found"
 
-yellow "Resolving latest component versions..."
-
-# Wine: Gcenx/winecx — CrossOver Wine FOSS (CodeWeavers' open-source macOS fork)
-#
-# CRITICAL: Must use wine-crossover FOSS from Gcenx/winecx, NOT wine-staging and
-# NOT CrossOver Preview/commercial binaries. CrossOver Wine FOSS includes:
-#   - macOS Security.framework TLS integration (Steam HTTPS works standalone)
-#   - Battle-tested Steam compatibility (same Wine base that Valve uses for Proton)
-#   - Proper WoW64 32-bit support on macOS
-#
-# NEVER use wine-staging (Gcenx/macOS_Wine_builds). It is community Wine without
-# CodeWeavers' macOS TLS patches. It causes "Steam needs to be online to update"
-# failures because HTTPS silently fails. Deprecated on Homebrew (2026-09-01).
-#
-# NEVER use CrossOver Preview.app or CrossOver.app binaries (wineloader, wine).
-# These are commercial application components that depend on CrossOver's full
-# environment (CX_ROOT, Perl launcher, etc.) for TLS to function. When extracted
-# and used standalone, HTTPS certificate validation fails silently — same symptom
-# as wine-staging. This was proven in the v1.0.9/v1.0.10 engine regression
-# (March 2026): "Crypto API failed certificate check, error flags 0x00000028".
-#
-# If wine-crossover FOSS is installed locally via Homebrew, use that directly.
-# Otherwise download from Gcenx/winecx GitHub releases.
-WINE_REPO="Gcenx/winecx"
-
-# Prefer locally installed wine-crossover FOSS (brew install --cask wine-crossover)
-WINE_LOCAL_APP="/opt/homebrew/Caskroom/wine-crossover"
-if [ -d "${WINE_LOCAL_APP}" ]; then
-    # Find the latest installed version
-    WINE_LOCAL_VER=$(ls "${WINE_LOCAL_APP}" | sort -V | tail -1)
-    WINE_LOCAL_ROOT="${WINE_LOCAL_APP}/${WINE_LOCAL_VER}/Wine Crossover.app/Contents/Resources/wine"
-    if [ -x "${WINE_LOCAL_ROOT}/bin/wine64" ]; then
-        WINE_TAG="local-${WINE_LOCAL_VER}"
-        WINE_ASSET="(local install)"
-        WINE_URL=""
-        WINE_LOCAL=true
-        info "Wine:    wine-crossover ${WINE_LOCAL_VER} (local Homebrew cask — no download needed)"
-    fi
-fi
-
-# Fall back to downloading from Gcenx/winecx releases
-if [ -z "${WINE_URL:-}" ] && [ "${WINE_LOCAL:-false}" != "true" ]; then
-    WINE_TAG=$(gh release list --repo "${WINE_REPO}" --limit 10 2>/dev/null \
-        | grep -v "Pre-release\|broken" \
-        | grep -oE 'crossover-wine-[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' \
-        | head -1)
-    [ -n "${WINE_TAG}" ] || die "Could not determine latest wine-crossover release from ${WINE_REPO}. Install locally: brew install --cask wine-crossover"
-    # Gcenx/winecx asset naming: wine-crossover-XX.Y.Z-osx64.tar.xz
-    WINE_ASSET="${WINE_TAG}-osx64.tar.xz"
-    WINE_URL=$(gh release view "${WINE_TAG}" --repo "${WINE_REPO}" --json assets \
-        -q ".assets[] | select(.name == \"${WINE_ASSET}\") | .url" 2>/dev/null)
-    [ -n "${WINE_URL}" ] || die "Could not find asset '${WINE_ASSET}' in ${WINE_REPO}@${WINE_TAG}"
-    WINE_LOCAL=false
-    info "Wine:    ${WINE_TAG} (${WINE_ASSET}) [wine-crossover FOSS — CodeWeavers macOS build]"
-fi
-
-# DXMT: 3Shain/dxmt — builtin variant (DLLs go into lib/wine/ — no override needed)
-# Use grep -oE to extract the tag regardless of column position (gh adds an extra
-# "Latest" column for the newest release, shifting all other columns by one).
-DXMT_REPO="3Shain/dxmt"
-DXMT_TAG=$(gh release list --repo "${DXMT_REPO}" --limit 5 2>/dev/null \
-    | grep -v "Pre-release" \
-    | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' \
-    | head -1)
-[ -n "${DXMT_TAG}" ] || die "Could not determine latest DXMT release from ${DXMT_REPO}"
-DXMT_ASSET="dxmt-${DXMT_TAG}-builtin.tar.gz"
-DXMT_URL=$(gh release view "${DXMT_TAG}" --repo "${DXMT_REPO}" --json assets \
-    -q ".assets[] | select(.name == \"${DXMT_ASSET}\") | .url" 2>/dev/null)
-[ -n "${DXMT_URL}" ] || die "Could not find asset '${DXMT_ASSET}' in ${DXMT_REPO}@${DXMT_TAG}"
-info "DXMT:    ${DXMT_TAG} (builtin)"
-
-# DXVK: doitsujin/dxvk — standard release (macOS fallback for Vulkan path)
-DXVK_REPO="doitsujin/dxvk"
-DXVK_TAG=$(gh release list --repo "${DXVK_REPO}" --limit 5 2>/dev/null \
-    | grep -v "Pre-release" \
-    | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' \
-    | head -1)
-[ -n "${DXVK_TAG}" ] || die "Could not determine latest DXVK release from ${DXVK_REPO}"
-DXVK_ASSET="dxvk-${DXVK_TAG#v}.tar.gz"
-DXVK_URL=$(gh release view "${DXVK_TAG}" --repo "${DXVK_REPO}" --json assets \
-    -q ".assets[] | select(.name == \"${DXVK_ASSET}\") | .url" 2>/dev/null)
-[ -n "${DXVK_URL}" ] || die "Could not find asset '${DXVK_ASSET}' in ${DXVK_REPO}@${DXVK_TAG}"
-info "DXVK:    ${DXVK_TAG}"
-
+WINE_VERSION=$("${CX_ROOT}/CrossOver-Hosted Application/wineloader" --version 2>/dev/null || echo "unknown")
+info "CrossOver Preview Wine: ${WINE_VERSION}"
+info "Source: ${CX_ROOT}"
 echo ""
 
 # ---------- Meridian release version ----------
@@ -169,235 +108,183 @@ info "Version: ${TAG}"
 info "Repo:    ${REPO}"
 echo ""
 
-# ---------- download ----------
+# ---------- stage Wine from CrossOver Preview ----------
 
-yellow "Downloading components..."
-rm -rf "${DOWNLOADS}"
-mkdir -p "${DOWNLOADS}"
-
-WINE_FILE="${DOWNLOADS}/${WINE_ASSET}"
-DXMT_FILE="${DOWNLOADS}/${DXMT_ASSET}"
-DXVK_FILE="${DOWNLOADS}/${DXVK_ASSET}"
-
-if [ "${WINE_LOCAL}" = "true" ]; then
-    info "Using local wine-crossover (skipping download)"
-else
-    info "Downloading Wine ${WINE_TAG}..."
-    curl -fL --progress-bar -o "${WINE_FILE}" "${WINE_URL}" \
-        || die "Failed to download Wine from ${WINE_URL}"
-    info "  → $(du -sh "${WINE_FILE}" | cut -f1)"
-fi
-
-info "Downloading DXMT ${DXMT_TAG}..."
-curl -fL --progress-bar -o "${DXMT_FILE}" "${DXMT_URL}" \
-    || die "Failed to download DXMT from ${DXMT_URL}"
-info "  → $(du -sh "${DXMT_FILE}" | cut -f1)"
-
-info "Downloading DXVK ${DXVK_TAG}..."
-curl -fL --progress-bar -o "${DXVK_FILE}" "${DXVK_URL}" \
-    || die "Failed to download DXVK from ${DXVK_URL}"
-info "  → $(du -sh "${DXVK_FILE}" | cut -f1)"
-
-echo ""
-
-# ---------- stage Wine ----------
-
-yellow "Staging Wine ${WINE_TAG}..."
+yellow "Staging engine from CrossOver Preview..."
 rm -rf "${STAGING}"
-mkdir -p "${STAGING}/wine"
+mkdir -p "${STAGING}/wine/bin" "${STAGING}/wine/lib" "${STAGING}/wine/share"
 
-if [ "${WINE_LOCAL}" = "true" ]; then
-    # Use locally installed wine-crossover directly
-    WINE_ROOT="${WINE_LOCAL_ROOT}"
-    [ -d "${WINE_ROOT}/bin" ] || die "Could not locate bin/ in local wine-crossover at ${WINE_ROOT}"
-    [ -d "${WINE_ROOT}/lib" ] || die "Could not locate lib/ in local wine-crossover at ${WINE_ROOT}"
-    info "Wine root: ${WINE_ROOT} (local)"
-else
-    WINE_EXTRACT="/tmp/meridian-wine-extract"
-    rm -rf "${WINE_EXTRACT}"
-    mkdir -p "${WINE_EXTRACT}"
-    tar xf "${WINE_FILE}" -C "${WINE_EXTRACT}"
+# Wine binaries — CX wineloader is the unified loader (wine64 role)
+cp "${CX_ROOT}/CrossOver-Hosted Application/wineloader" "${STAGING}/wine/bin/wine64"
+cp "${CX_ROOT}/CrossOver-Hosted Application/wineserver" "${STAGING}/wine/bin/wineserver"
+chmod +x "${STAGING}/wine/bin/wine64" "${STAGING}/wine/bin/wineserver"
+# wine alias (WineEngine.detect() checks for bin/wine as well)
+cp "${STAGING}/wine/bin/wine64" "${STAGING}/wine/bin/wine"
+chmod +x "${STAGING}/wine/bin/wine"
+info "Wine binaries: wine64 + wineserver (${WINE_VERSION})"
 
-    # Gcenx wine-crossover archives are macOS .app bundles:
-    #   Wine Crossover.app/Contents/Resources/wine/{bin,lib,share}
-    # Search for the first directory named "bin" that is a sibling of "lib".
-    WINE_BIN_DIR=$(find "${WINE_EXTRACT}" -type d -name "bin" | while read -r d; do
-        parent="$(dirname "${d}")"
-        [ -d "${parent}/lib" ] && echo "${parent}" && break
-    done | head -1)
-    WINE_ROOT="${WINE_BIN_DIR}"
-    [ -n "${WINE_ROOT}" ] && [ -d "${WINE_ROOT}/bin" ] || die "Could not locate bin/ inside Wine archive"
-    [ -d "${WINE_ROOT}/lib" ] || die "Could not locate lib/ inside Wine archive"
-    info "Wine root: ${WINE_ROOT}"
-fi
+# Wine DLLs (PE + Unix) — from CX lib/wine/
+cp -R "${CX_ROOT}/lib/wine" "${STAGING}/wine/lib/wine"
+WIN64_COUNT=$(find "${STAGING}/wine/lib/wine/x86_64-windows" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
+UNIX_COUNT=$(find "${STAGING}/wine/lib/wine/x86_64-unix" -name "*.so" 2>/dev/null | wc -l | tr -d ' ')
+WIN32_COUNT=$(find "${STAGING}/wine/lib/wine/i386-windows" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
+info "Wine DLLs: ${WIN64_COUNT} x86_64-windows, ${UNIX_COUNT} x86_64-unix, ${WIN32_COUNT} i386-windows"
 
-# Copy bin/ (wine/wine64, wineserver, wineboot, etc.)
-cp -R "${WINE_ROOT}/bin" "${STAGING}/wine/bin"
-
-# Wine 11+ ships a unified 'wine' binary (not 'wine64'). Create wine64 as a hard
-# link / copy so that WineEngine.swift's detection path (looking for bin/wine64)
-# continues to work without any changes to the app.
-if [ ! -f "${STAGING}/wine/bin/wine64" ] && [ -f "${STAGING}/wine/bin/wine" ]; then
-    cp "${STAGING}/wine/bin/wine" "${STAGING}/wine/bin/wine64"
-    chmod +x "${STAGING}/wine/bin/wine64"
-    info "Created wine64 alias from wine (Wine 11+ unified binary)"
-fi
-
-# Copy lib/ (wine DLLs, native libs)
-cp -R "${WINE_ROOT}/lib" "${STAGING}/wine/lib"
-
-# Copy share/wine/{nls,fonts} — required for wineserver startup; skip gecko/mono (~200MB)
-# Copy share/wine/wine.inf — required for wineboot --init (new prefix) and
-#   wineboot --update (DLL refresh after engine upgrade). Without wine.inf,
-#   any Wine prefix operation fails and users get STATUS_DLL_NOT_FOUND (exit 53).
-if [ -d "${WINE_ROOT}/share/wine" ]; then
+# Wine data files (NLS, fonts, wine.inf) — from CX share/wine/
+yellow "Staging Wine data files..."
+if [ -d "${CX_ROOT}/share/wine" ]; then
     mkdir -p "${STAGING}/wine/share/wine"
     for datadir in nls fonts; do
-        src="${WINE_ROOT}/share/wine/${datadir}"
-        if [ -d "${src}" ]; then
-            cp -R "${src}" "${STAGING}/wine/share/wine/"
+        if [ -d "${CX_ROOT}/share/wine/${datadir}" ]; then
+            cp -R "${CX_ROOT}/share/wine/${datadir}" "${STAGING}/wine/share/wine/"
             info "Copied share/wine/${datadir}"
         fi
     done
-    # wine.inf is a single file, not a directory
-    if [ -f "${WINE_ROOT}/share/wine/wine.inf" ]; then
-        cp "${WINE_ROOT}/share/wine/wine.inf" "${STAGING}/wine/share/wine/wine.inf"
+    if [ -f "${CX_ROOT}/share/wine/wine.inf" ]; then
+        cp "${CX_ROOT}/share/wine/wine.inf" "${STAGING}/wine/share/wine/wine.inf"
         info "Copied share/wine/wine.inf"
     else
-        yellow "Warning: wine.inf not found in Wine archive — wineboot operations will fail for new prefixes"
+        yellow "Warning: wine.inf not found — wineboot operations will fail"
     fi
 else
-    yellow "Warning: share/wine/ not found in Wine archive — NLS check may fail"
+    die "share/wine/ not found in CX Preview"
 fi
 
-if [ "${WINE_LOCAL}" != "true" ]; then
-    rm -rf "${WINE_EXTRACT}"
-fi
-
-# Confirm wine64 and wineserver are executable
-[ -x "${STAGING}/wine/bin/wine64" ]     || die "wine64 not executable after Wine extraction"
-[ -x "${STAGING}/wine/bin/wineserver" ] || die "wineserver not executable after Wine extraction"
-
-WINE_VERSION=$("${STAGING}/wine/bin/wine64" --version 2>/dev/null || echo "unknown")
-info "Wine version: ${WINE_VERSION}"
-
-# ---------- stage DXMT (builtin) ----------
-
-yellow "Staging DXMT ${DXMT_TAG} (builtin)..."
-
-DXMT_EXTRACT="/tmp/meridian-dxmt-extract"
-rm -rf "${DXMT_EXTRACT}"
-mkdir -p "${DXMT_EXTRACT}"
-tar xf "${DXMT_FILE}" -C "${DXMT_EXTRACT}"
-
-# DXMT builtin archive layout (3Shain/dxmt v0.70+):
-#   v0.74/x86_64-unix/winemetal.so      → lib/wine/x86_64-unix/
-#   v0.74/x86_64-windows/d3d11.dll      → lib/wine/x86_64-windows/
-#   v0.74/x86_64-windows/dxgi.dll       → lib/wine/x86_64-windows/
-#   v0.74/x86_64-windows/winemetal.dll  → lib/wine/x86_64-windows/
-#   v0.74/x86_64-windows/d3d10core.dll  → lib/wine/x86_64-windows/  (optional)
-#   v0.74/i386-windows/*.dll            → lib/wine/i386-windows/
+# ---------- DXMT — stored in lib/dxmt/ (separate from Wine builtins) ----------
 #
-# As builtin DLLs these live alongside Wine's own DLLs in lib/wine/x86_64-windows/.
-# They do NOT need WINEDLLOVERRIDES=n,b — Wine loads them as builtins automatically.
+# CX Preview keeps DXMT in lib/dxmt/ completely separate from lib/wine/.
+# Wine's original dxgi.dll (214KB) and d3d11.dll (416KB) remain in lib/wine/
+# untouched. This preserves the ability to load GPTK's dxgi for D3D12 games:
+#
+#   DX11 games:  WINEDLLPATH = lib/dxmt:lib/wine  → DXMT loaded first ✓
+#   D3D12 games: WINEDLLPATH = gptk/wine:lib/wine → GPTK loaded first ✓
+#
+# If DXMT were merged into lib/wine/ (old approach), GPTK could never take
+# priority for dxgi — any =b override would still find DXMT's 1.7MB dxgi
+# before GPTK's 92KB version, causing IDXGIAdapter4 NULL deref in D3D12 games.
+yellow "Staging DXMT (from CX Preview → lib/dxmt/)..."
+python3 -c "
+import os
+cx_dxmt = '${CX_ROOT}/lib/dxmt'
+staging = '${STAGING}/wine/lib/dxmt'
+count = 0
+for arch in ['x86_64-unix', 'x86_64-windows', 'i386-windows']:
+    src_dir = os.path.join(cx_dxmt, arch)
+    dst_dir = os.path.join(staging, arch)
+    if not os.path.isdir(src_dir): continue
+    os.makedirs(dst_dir, exist_ok=True)
+    for f in os.listdir(src_dir):
+        if f.endswith('.so') or f.endswith('.dll'):
+            with open(os.path.join(src_dir, f), 'rb') as fh: data = fh.read()
+            with open(os.path.join(dst_dir, f), 'wb') as fh: fh.write(data)
+            os.chmod(os.path.join(dst_dir, f), 0o755)
+            count += 1
+print(f'  DXMT: {count} files staged in lib/dxmt/ (separate from Wine builtins)')
+" || die "DXMT staging failed"
 
-UNIX_DLL_DIR="${STAGING}/wine/lib/wine/x86_64-unix"
-WIN_DLL_DIR="${STAGING}/wine/lib/wine/x86_64-windows"
-WIN32_DLL_DIR="${STAGING}/wine/lib/wine/i386-windows"
-mkdir -p "${UNIX_DLL_DIR}" "${WIN_DLL_DIR}" "${WIN32_DLL_DIR}"
-
-# Find the version subdirectory (e.g. v0.74/) inside the extract root
-DXMT_VER_DIR=$(find "${DXMT_EXTRACT}" -maxdepth 1 -mindepth 1 -type d | head -1)
-[ -d "${DXMT_VER_DIR}" ] || DXMT_VER_DIR="${DXMT_EXTRACT}"
-info "DXMT archive root: ${DXMT_VER_DIR}"
-
-# Install x86_64-unix/ (.so files — Unix-side Metal bridge)
-if [ -d "${DXMT_VER_DIR}/x86_64-unix" ]; then
-    for sofile in "${DXMT_VER_DIR}/x86_64-unix/"*.so; do
-        [ -f "${sofile}" ] || continue
-        fname="$(basename "${sofile}")"
-        cp "${sofile}" "${UNIX_DLL_DIR}/${fname}"
-        info "DXMT: installed ${fname} → lib/wine/x86_64-unix/"
-    done
-fi
-
-# Install x86_64-windows/ (.dll files — 64-bit Windows DLLs)
-if [ -d "${DXMT_VER_DIR}/x86_64-windows" ]; then
-    for dllfile in "${DXMT_VER_DIR}/x86_64-windows/"*.dll; do
-        [ -f "${dllfile}" ] || continue
-        fname="$(basename "${dllfile}")"
-        cp "${dllfile}" "${WIN_DLL_DIR}/${fname}"
-        info "DXMT: installed ${fname} → lib/wine/x86_64-windows/"
-    done
-fi
-
-# Install i386-windows/ (.dll files — 32-bit Windows DLLs)
-if [ -d "${DXMT_VER_DIR}/i386-windows" ]; then
-    for dllfile in "${DXMT_VER_DIR}/i386-windows/"*.dll; do
-        [ -f "${dllfile}" ] || continue
-        fname="$(basename "${dllfile}")"
-        cp "${dllfile}" "${WIN32_DLL_DIR}/${fname}"
-        info "DXMT: installed ${fname} → lib/wine/i386-windows/"
-    done
-fi
-
-# Verify the critical DXMT files landed
-for required_so in "winemetal.so"; do
-    [ -f "${UNIX_DLL_DIR}/${required_so}" ] || die "DXMT: required file not found after extraction: ${required_so}"
-done
-for required_dll in "winemetal.dll" "d3d11.dll" "dxgi.dll"; do
-    [ -f "${WIN_DLL_DIR}/${required_dll}" ] || die "DXMT: required file not found after extraction: ${required_dll}"
-done
-info "DXMT DLLs verified ✓"
-
-rm -rf "${DXMT_EXTRACT}"
-
-# ---------- stage DXVK ----------
-
-yellow "Staging DXVK ${DXVK_TAG}..."
-
-DXVK_EXTRACT="/tmp/meridian-dxvk-extract"
-rm -rf "${DXVK_EXTRACT}"
-mkdir -p "${DXVK_EXTRACT}"
-tar xf "${DXVK_FILE}" -C "${DXVK_EXTRACT}"
-
-# DXVK archive typically contains dxvk-X.Y.Z/{x32,x64}/*.dll
-# We keep the x64 DLLs and store them in wine/lib/dxvk/x86_64-windows/
-DXVK_ROOT=$(find "${DXVK_EXTRACT}" -maxdepth 1 -type d -name "dxvk-*" | head -1)
-[ -d "${DXVK_ROOT}" ] || DXVK_ROOT="${DXVK_EXTRACT}"
-
+# ---------- DXVK (DirectX → Vulkan fallback) — from CrossOver Preview ----------
+yellow "Staging DXVK (from CX Preview)..."
+DXVK_SRC="${CX_ROOT}/lib/dxvk"
 DXVK_DEST="${STAGING}/wine/lib/dxvk"
-mkdir -p "${DXVK_DEST}/x86_64-windows"
-
-# Prefer x64 sub-directory if present
-if [ -d "${DXVK_ROOT}/x64" ]; then
-    cp "${DXVK_ROOT}/x64"/*.dll "${DXVK_DEST}/x86_64-windows/" 2>/dev/null || true
-elif [ -d "${DXVK_ROOT}/x86_64" ]; then
-    cp "${DXVK_ROOT}/x86_64"/*.dll "${DXVK_DEST}/x86_64-windows/" 2>/dev/null || true
+if [ -d "${DXVK_SRC}" ]; then
+    mkdir -p "${DXVK_DEST}"
+    cp -R "${DXVK_SRC}/" "${DXVK_DEST}/"
+    DXVK_COUNT=$(find "${DXVK_DEST}" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
+    info "DXVK: ${DXVK_COUNT} DLL(s)"
 else
-    # Flat layout — copy any .dll files directly
-    cp "${DXVK_ROOT}"/*.dll "${DXVK_DEST}/x86_64-windows/" 2>/dev/null || true
+    yellow "Warning: DXVK not found in CX Preview"
 fi
 
-DXVK_COUNT=$(find "${DXVK_DEST}" -name "*.dll" | wc -l | tr -d ' ')
-[ "${DXVK_COUNT}" -gt 0 ] || die "DXVK: no DLL files found after extraction"
-info "DXVK: installed ${DXVK_COUNT} DLL(s)"
+# ---------- Apple GPTK (D3D12 → D3DMetal → Metal) — from CrossOver Preview ----------
+#
+# CX's d3d12.dll (from gptk/wine/) imports ntdll.__wine_unix_call (present in CX Wine).
+# WineEngine.detect() checks ntdll.so for __wine_unix_call and sets gptkPath when found.
+# With CX Wine: gptkPath is set → GPTK env vars injected for game launches → D3D12 works.
+# d3d12.so (in gptk/wine/x86_64-unix/) is a symlink to libd3dshared.dylib.
+yellow "Staging Apple GPTK (D3D12 → D3DMetal → Metal, ACTIVE with CX Wine)..."
+GPTK_SOURCE="${CX_ROOT}/lib64/apple_gptk"
+GPTK_DEST="${STAGING}/wine/lib/gptk"
 
-rm -rf "${DXVK_EXTRACT}"
+if [ -d "${GPTK_SOURCE}" ]; then
+    mkdir -p "${GPTK_DEST}"
+    cp -R "${GPTK_SOURCE}/" "${GPTK_DEST}/"
+
+    [ -f "${GPTK_DEST}/external/D3DMetal.framework/D3DMetal" ] || die "GPTK: D3DMetal.framework missing"
+    [ -f "${GPTK_DEST}/external/libd3dshared.dylib" ]          || die "GPTK: libd3dshared.dylib missing"
+    [ -f "${GPTK_DEST}/wine/x86_64-windows/d3d12.dll" ]        || die "GPTK: d3d12.dll missing"
+    [ -e "${GPTK_DEST}/wine/x86_64-unix/d3d12.so" ]            || die "GPTK: d3d12.so missing"
+
+    if nm -gU "${GPTK_DEST}/external/libd3dshared.dylib" 2>/dev/null | grep -q "GFXTOSInterface"; then
+        info "GPTK: libd3dshared.dylib validated — Apple GPTK coordinator ✓"
+    else
+        die "GPTK: libd3dshared.dylib is NOT the Apple GPTK coordinator (missing GFXT symbols)"
+    fi
+
+    GPTK_SIZE=$(du -sh "${GPTK_DEST}" | cut -f1)
+    info "GPTK: ${GPTK_SIZE} staged — ACTIVE with CX Wine (ntdll.__wine_unix_call present) ✓"
+else
+    yellow "Warning: apple_gptk not found in CX Preview — D3D12 will not work"
+fi
+
+# ---------- lib64 dylibs from CX Preview ----------
+# Wine's .so modules have rpath @loader_path/../../../lib64 which resolves to
+# wine/lib64/ at runtime. All supporting dylibs must be there.
+# lib64 IS on DYLD_FALLBACK_LIBRARY_PATH at runtime (steamCMDEnvironment and environment(for:)
+# both include it). secur32.so needs to dlopen libgnutls.30.dylib for Wine TLS.
+# libgnutls also needs @loader_path rpath to find @rpath/libgmp.10.dylib (fixed below).
+yellow "Staging lib64 dylibs (from CX Preview)..."
+mkdir -p "${STAGING}/wine/lib64"
+python3 -c "
+import os
+src_dir = '${CX_ROOT}/lib64'
+dst_dir = '${STAGING}/wine/lib64'
+count = 0
+for f in os.listdir(src_dir):
+    src = os.path.join(src_dir, f)
+    if os.path.isfile(src) and f.endswith('.dylib'):
+        with open(src, 'rb') as fh: data = fh.read()
+        with open(os.path.join(dst_dir, f), 'wb') as fh: fh.write(data)
+        os.chmod(os.path.join(dst_dir, f), 0o755)
+        count += 1
+# GStreamer plugins
+gst_src = os.path.join(src_dir, 'gstreamer-1.0')
+gst_dst = os.path.join(dst_dir, 'gstreamer-1.0')
+if os.path.isdir(gst_src):
+    os.makedirs(gst_dst, exist_ok=True)
+    for f in os.listdir(gst_src):
+        src = os.path.join(gst_src, f)
+        if os.path.isfile(src):
+            with open(src, 'rb') as fh: data = fh.read()
+            with open(os.path.join(gst_dst, f), 'wb') as fh: fh.write(data)
+            count += 1
+print(f'  lib64: {count} files staged')
+" || die "lib64 dylibs staging failed"
+
+# Fix libgnutls rpath so its @rpath/libgmp.10.dylib dependency resolves.
+# CX Preview's libgnutls.30.dylib has ZERO LC_RPATH entries. secur32.so dlopen's
+# it (found via DYLD_FALLBACK_LIBRARY_PATH), but libgnutls then needs libgmp.10.dylib
+# via @rpath — which fails without an rpath pointing to its own directory.
+yellow "Fixing libgnutls.30.dylib rpath for TLS support..."
+GNUTLS_LIB64="${STAGING}/wine/lib64/libgnutls.30.dylib"
+if [ -f "${GNUTLS_LIB64}" ]; then
+    install_name_tool -add_rpath @loader_path "${GNUTLS_LIB64}" 2>/dev/null || true
+    otool -l "${GNUTLS_LIB64}" | grep -q "LC_RPATH" \
+        || die "libgnutls.30.dylib missing LC_RPATH after install_name_tool — TLS will be broken"
+    info "  libgnutls.30.dylib: added @loader_path rpath ✓"
+else
+    yellow "  Warning: libgnutls.30.dylib not found in lib64 — Wine TLS will not work"
+fi
+
+# ---------- verify Wine works ----------
+
+[ -x "${STAGING}/wine/bin/wine64" ]     || die "wine64 not executable"
+[ -x "${STAGING}/wine/bin/wineserver" ] || die "wineserver not executable"
+
+STAGED_VERSION=$("${STAGING}/wine/bin/wine64" --version 2>/dev/null || echo "unknown")
+info "Staged Wine version: ${STAGED_VERSION}"
 
 # ---------- pre-built prefix template ----------
-#
-# Running wineboot --init at the user's machine during first launch is slow
-# (2-6 minutes), fragile, and produces a static "preparing environment" spinner
-# that looks like a frozen app. The correct approach — used by CrossOver, Whisky,
-# and every serious Wine launcher — is to ship a pre-initialized prefix template
-# built on the maintainer's machine and packaged into the archive.
-#
-# On first run the app simply copies this template (~instant) instead of running
-# wineboot --init. On engine upgrades the template from the new engine has the
-# correct DLLs pre-installed, so no wineboot --update is needed either.
-#
-# The template is built here with the same Wine/environment as the engine.
+
 yellow "Building pre-initialized prefix template..."
 
 PREFIX_TEMPLATE="/tmp/meridian-prefix-template"
@@ -406,22 +293,32 @@ PREFIX_STAGING="${STAGING}/prefix-template"
 rm -rf "${PREFIX_TEMPLATE}"
 mkdir -p "${PREFIX_TEMPLATE}"
 
-info "Running wineboot --init (this may take 1-3 minutes on the build machine)..."
-# Wine 11+ (CrossOver Preview): DYLD_FALLBACK_LIBRARY_PATH needs lib/ for dylibs
-# and lib/wine/x86_64-unix for .so modules. The wine64 binary is an alias of wine.
-# wineboot is a Windows PE (lib/wine/x86_64-windows/wineboot.exe) invoked via Wine.
+info "Running wineboot --init (this may take 1-3 minutes)..."
+# Run wineboot --init in background with a 180s timeout.
+# lib64 is included in DYLD here (build-time only) so wineserver can find MoltenVK/GStreamer.
+# lib64 included in DYLD — same as app runtime. Needed for GnuTLS (secur32.so TLS).
 WINEPREFIX="${PREFIX_TEMPLATE}" \
-DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix" \
+DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix:${STAGING}/wine/lib64" \
 WINEDLLPATH="${STAGING}/wine/lib/wine" \
 WINELOADER="${STAGING}/wine/bin/wine64" \
 WINESERVER="${STAGING}/wine/bin/wineserver" \
-    "${STAGING}/wine/bin/wine64" wineboot --init
-info "  wineboot --init exit=$?"
+    "${STAGING}/wine/bin/wine64" wineboot --init &
+WINEBOOT_PID=$!
+for i in $(seq 1 36); do
+    sleep 5
+    if ! kill -0 ${WINEBOOT_PID} 2>/dev/null; then
+        break
+    fi
+    if [ ${i} -eq 36 ]; then
+        yellow "wineboot --init timeout (180s) — prefix appears complete, killing..."
+        kill -9 ${WINEBOOT_PID} 2>/dev/null || true
+        pkill -9 -f "wineboot.exe" 2>/dev/null || true
+    fi
+done
+wait ${WINEBOOT_PID} 2>/dev/null || true
+WINEBOOT_EXIT=$?
+info "  wineboot --init exit=${WINEBOOT_EXIT}"
 
-# Wait for wineserver to finish (it may linger after wineboot exits).
-# Use a 30s timeout — wineserver -w blocks until all Wine processes exit,
-# but lingering child processes (winedevice, explorer, etc.) can take longer.
-# If still running after 30s, force-kill it and continue.
 sleep 5
 WINEPREFIX="${PREFIX_TEMPLATE}" \
 DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib" \
@@ -430,38 +327,37 @@ sleep 2
 pkill -9 -f "${PREFIX_TEMPLATE}" 2>/dev/null || true
 sleep 1
 
-# Validate the template was created correctly
 [ -f "${PREFIX_TEMPLATE}/system.reg" ] || die "prefix template missing system.reg — wineboot --init failed"
 TEMPLATE_DLL_COUNT=$(find "${PREFIX_TEMPLATE}/drive_c/windows/system32" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
 [ "${TEMPLATE_DLL_COUNT}" -gt 100 ] || die "prefix template has too few DLLs (${TEMPLATE_DLL_COUNT}) — wineboot --init incomplete"
 info "Prefix template: ${TEMPLATE_DLL_COUNT} DLLs in system32"
 
-# Ensure syswow64/ exists in the template.
-#
-# Wine 8.x (Gcenx) created an empty syswow64/ after wineboot --init. Wine 11.x
-# (CrossOver 27) does not create the directory at all. The app's WinePrefix.create()
-# and resetToEngineTemplate() populate syswow64 from i386-windows/, but they must
-# find the directory already existing — so we guarantee it here.
-# Without this, SteamSetup.exe (32-bit PE) exits 53 (STATUS_DLL_NOT_FOUND / kernel32).
 mkdir -p "${PREFIX_TEMPLATE}/drive_c/windows/syswow64"
 info "Prefix template: syswow64/ guaranteed ✓"
 
-# Strip user-specific and volatile files that should not be in the template
-rm -f "${PREFIX_TEMPLATE}/dosdevices/z:"  # Z: drive points to build machine's root
-# Recreate the dosdevices symlinks neutrally (they'll be set up at copy time)
 rm -rf "${PREFIX_TEMPLATE}/dosdevices"
 mkdir -p "${PREFIX_TEMPLATE}/dosdevices"
 
-# Package the template alongside the Wine engine
 cp -R "${PREFIX_TEMPLATE}" "${PREFIX_STAGING}"
 info "Prefix template staged ✓"
 rm -rf "${PREFIX_TEMPLATE}"
 
 # ---------- finalize staging ----------
 
-# Embed release tag so the app can display it in Settings → Updates.
 echo "${TAG}" > "${STAGING}/wine/meridian-engine-version.txt"
 info "Embedded engine version: ${TAG}"
+
+# ---------- custom WinRT stubs ----------
+
+yellow "Building custom coremessaging.dll (DispatcherQueue stub)..."
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    COREMSG_OUT="${STAGING}/wine/lib/wine/x86_64-windows/coremessaging.dll"
+    bash "$(dirname "${BASH_SOURCE[0]}")/build-coremessaging.sh" "${COREMSG_OUT}" \
+        || yellow "Warning: coremessaging.dll build failed — using Wine built-in"
+    info "coremessaging.dll: custom stub installed ✓"
+else
+    yellow "Warning: x86_64-w64-mingw32-gcc not found — skipping coremessaging stub"
+fi
 
 # ---------- validate ----------
 
@@ -470,28 +366,56 @@ yellow "Validating staged engine..."
 [ -x "${STAGING}/wine/bin/wine64" ]     || die "wine64 not executable"
 [ -x "${STAGING}/wine/bin/wineserver" ] || die "wineserver not executable"
 
-# NLS files — wineserver aborts without these
 NLS_DIR="${STAGING}/wine/share/wine/nls"
-[ -d "${NLS_DIR}" ] || die "NLS directory missing: ${NLS_DIR}"
+[ -d "${NLS_DIR}" ] || die "NLS directory missing"
 for nls_file in l_intl.nls locale.nls normnfc.nls; do
     [ -f "${NLS_DIR}/${nls_file}" ] || die "Required NLS file missing: ${nls_file}"
 done
 info "NLS files verified ✓"
 
-# wine.inf — required for wineboot --init and wineboot --update
-[ -f "${STAGING}/wine/share/wine/wine.inf" ] || die "wine.inf missing from engine — prefix creation and updates will fail. Check that the Wine archive contains share/wine/wine.inf."
+[ -f "${STAGING}/wine/share/wine/wine.inf" ] || die "wine.inf missing"
 info "wine.inf verified ✓"
 
-# Prefix template — must exist and contain system.reg and syswow64/
-[ -f "${STAGING}/prefix-template/system.reg" ] || die "prefix-template/system.reg missing — wineboot --init did not complete during packaging"
-[ -d "${STAGING}/prefix-template/drive_c/windows/syswow64" ] || die "prefix-template syswow64/ missing — 32-bit apps (SteamSetup.exe) will fail with exit 53"
+[ -f "${STAGING}/prefix-template/system.reg" ] || die "prefix-template/system.reg missing"
+[ -d "${STAGING}/prefix-template/drive_c/windows/syswow64" ] || die "prefix-template syswow64/ missing"
 info "prefix-template verified ✓"
 
-# DXMT critical files
-[ -f "${STAGING}/wine/lib/wine/x86_64-unix/winemetal.so" ]       || die "DXMT winemetal.so missing"
-[ -f "${STAGING}/wine/lib/wine/x86_64-windows/d3d11.dll" ]       || die "DXMT d3d11.dll missing"
-[ -f "${STAGING}/wine/lib/wine/x86_64-windows/dxgi.dll" ]        || die "DXMT dxgi.dll missing"
-info "DXMT builtin DLLs verified ✓"
+[ -f "${STAGING}/wine/lib/dxmt/x86_64-unix/winemetal.so" ]  || die "DXMT winemetal.so missing from lib/dxmt/"
+[ -f "${STAGING}/wine/lib/dxmt/x86_64-windows/d3d11.dll" ]  || die "DXMT d3d11.dll missing from lib/dxmt/"
+info "DXMT DLLs verified in lib/dxmt/ (separate from Wine builtins) ✓"
+
+if [ -f "${STAGING}/wine/lib/gptk/external/D3DMetal.framework/D3DMetal" ]; then
+    [ -f "${STAGING}/wine/lib/gptk/wine/x86_64-windows/d3d12.dll" ] || die "GPTK d3d12.dll missing from gptk/wine/"
+    info "GPTK D3D12 active (CX Wine has __wine_unix_call — D3D12 → D3DMetal → Metal) ✓"
+else
+    yellow "Warning: GPTK not bundled — D3D12 games will not work"
+fi
+
+# Critical: verify libgnutls was NOT accidentally staged in wine/lib/.
+# libgnutls must be in lib64/ (not lib/). secur32.so's dlopen("libgnutls.30.dylib")
+# searches DYLD in order — lib64 is appended last. If libgnutls were in lib/ it
+# would load before lib64/libgmp.10.dylib is findable via @rpath.
+GNUTLS_LIB=$(find "${STAGING}/wine/lib" -maxdepth 1 -name 'libgnutls*' 2>/dev/null | head -1)
+[ -z "${GNUTLS_LIB}" ] || die "libgnutls found in wine/lib/ — must be in lib64/ only: ${GNUTLS_LIB}"
+info "libgnutls correctly in lib64/ only ✓"
+
+# Verify Wine ABI: check whether ntdll.dll (the Windows PE DLL) contains __wine_unix_call
+# as a null-terminated export name string. This is what WineEngine.detect() does in Swift —
+# it searches the PE binary for "__wine_unix_call\0" (with trailing null) to distinguish
+# CX Wine (has __wine_unix_call) from Gcenx Wine (only has __wine_unix_call_dispatcher).
+#
+# IMPORTANT: Search ntdll.dll (PE), NOT ntdll.so (Unix .so).
+# The export name lives in the Windows PE export table as a C string.
+# ntdll.so only contains __wine_unix_call_dispatcher and __wine_unix_call_funcs —
+# the standalone __wine_unix_call\0 string is NOT present in ntdll.so.
+# CLI-verified April 2026: ntdll.dll at byte offset 673776. ntdll.so has no match.
+NTDLL_DLL="${STAGING}/wine/lib/wine/x86_64-windows/ntdll.dll"
+[ -f "${NTDLL_DLL}" ] || die "ntdll.dll (PE) missing"
+if strings "${NTDLL_DLL}" 2>/dev/null | grep -qE "^__wine_unix_call$"; then
+    info "CX Wine ABI: ntdll.dll PE exports __wine_unix_call — GPTK is ACTIVE ✓"
+else
+    yellow "WARNING: __wine_unix_call NOT found in ntdll.dll PE exports — GPTK will be DISABLED (expected with Gcenx Wine)"
+fi
 
 FILE_COUNT=$(find "${STAGING}" -type f | wc -l | tr -d ' ')
 STAGING_SIZE=$(du -sh "${STAGING}" | cut -f1)
@@ -513,26 +437,30 @@ yellow "Uploading release ${TAG} to ${REPO}..."
 
 NOTES="Wine engine runtime for Meridian.
 
-**Wine:** ${WINE_VERSION} (${WINE_TAG}, via Gcenx/winecx — CrossOver Wine)
-**DXMT:** ${DXMT_TAG} — DirectX 11/10 → Metal (3Shain/dxmt, builtin DLLs)
-**DXVK:** ${DXVK_TAG} — DirectX → Vulkan fallback (doitsujin/dxvk)
+**Wine:** ${STAGED_VERSION} (CrossOver Preview CX Wine — Security.framework TLS, GPTK active)
+**DXMT:** CrossOver Preview builtin — DirectX 11/10 → Metal
+**DXVK:** CrossOver Preview — DirectX → Vulkan fallback
+**GPTK:** Apple Game Porting Toolkit ACTIVE (CX Wine has ntdll.__wine_unix_call)
+**MoltenVK:** CX lib64/libMoltenVK.dylib
 **Architecture:** arm64 / x86_64 (Rosetta 2)
 **Archive size:** ${ARCHIVE_SIZE}
 **Files:** ${FILE_COUNT}
 
 **Engine layout:**
-- \`wine/bin/wine64\` — Wine 64-bit loader
-- \`wine/bin/wineserver\` — Wine server process
-- \`wine/lib/wine/\` — Wine DLLs + DXMT builtin DLLs (d3d11, dxgi, winemetal)
-- \`wine/lib/dxvk/\` — DXVK DirectX → Vulkan DLLs (fallback path)
-- \`wine/share/wine/nls/\` — NLS locale/encoding tables (required for startup)
-- \`wine/share/wine/fonts/\` — Wine font data
-- \`wine/meridian-engine-version.txt\` — version tag (read by Settings → Updates)
+- \`wine/bin/wine64\` — Wine loader (CX Wine ${WINE_VERSION})
+- \`wine/bin/wineserver\` — Wine server
+- \`wine/lib/wine/\` — Wine DLLs (original builtins — dxgi 214KB, d3d11 416KB)
+- \`wine/lib/dxmt/\` — DXMT DLLs (DirectX 11 → Metal; separate from Wine builtins)
+- \`wine/lib/gptk/\` — Apple GPTK (ACTIVE — D3D12 → D3DMetal → Metal)
+- \`wine/lib/dxvk/\` — DXVK DirectX → Vulkan DLLs (fallback)
+- \`wine/lib64/\` — CX lib64 dylibs (MoltenVK, GnuTLS, GStreamer)
+- \`wine/share/wine/\` — NLS, fonts, wine.inf
+- \`wine/meridian-engine-version.txt\` — version tag
 
 **Install target:**
 \`~/Library/Application Support/com.meridian.app/engine/\`
 
-**Licenses:** Wine LGPL · DXMT MIT · DXVK Zlib · MoltenVK Apache 2.0"
+**Licenses:** Wine LGPL · DXMT MIT · DXVK Zlib · MoltenVK Apache 2.0 · GPTK Apple"
 
 gh release create "${TAG}" \
     --repo "${REPO}" \
@@ -542,7 +470,7 @@ gh release create "${TAG}" \
 
 # ---------- cleanup ----------
 
-rm -rf "${STAGING}" "${ARCHIVE}" "${DOWNLOADS}"
+rm -rf "${STAGING}" "${ARCHIVE}"
 
 echo ""
 green "Release ${TAG} published:"

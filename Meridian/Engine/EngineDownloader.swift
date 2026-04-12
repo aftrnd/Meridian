@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "EngineDownloader")
 
@@ -86,8 +85,21 @@ final class EngineDownloader {
             state = .extracting
             log.info("[download] extracting to \(WineEngine.engineDir.path(percentEncoded: false))")
 
+            // Strip quarantine from the archive before extracting — macOS sets
+            // com.apple.quarantine on every file downloaded via URLSession, and
+            // tar propagates the attribute to all extracted files. Quarantined Wine
+            // executables have restricted network access on macOS 26, causing
+            // Wine's TLS (secur32/GnuTLS) to fail silently. SteamCMD hangs
+            // indefinitely at "Loading Steam API..." as a result.
+            stripQuarantine(from: archivePath)
+
             try await extractArchive(at: archivePath, to: WineEngine.engineDir)
             try? FileManager.default.removeItem(at: archivePath)
+
+            // Strip quarantine from all extracted engine files. tar may still
+            // propagate it from archive metadata even after the archive is cleaned.
+            stripQuarantine(from: WineEngine.engineDir)
+            log.info("[download] quarantine attribute stripped from engine ✓")
 
             state = .complete
             log.info("[download] engine installed ✓")
@@ -272,6 +284,31 @@ final class EngineDownloader {
         log.info("[extract] engine directory contents: \(contents)")
     }
 
+    // MARK: - Quarantine Removal
+
+    /// Strips the `com.apple.quarantine` extended attribute from a file or directory tree.
+    ///
+    /// macOS sets quarantine on files downloaded via URLSession. Quarantined executables
+    /// have restricted network access on macOS 26 — Wine's GnuTLS/secur32 TLS connections
+    /// fail silently, causing SteamCMD to hang indefinitely at "Loading Steam API...".
+    ///
+    /// This is identical to what Homebrew, Steam, and other macOS tools do when installing
+    /// downloaded executables. `xattr -rd` is non-destructive for files that don't have
+    /// the attribute, so it is safe to call unconditionally.
+    private func stripQuarantine(from path: URL) {
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/xattr")
+        process.arguments = ["-rd", "com.apple.quarantine", path.path(percentEncoded: false)]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError  = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            log.warning("[stripQuarantine] xattr failed: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Errors
 
     enum DownloadError: LocalizedError {
@@ -343,19 +380,5 @@ private final class DownloadTaskDelegate: NSObject, URLSessionDownloadDelegate {
         guard let error else { return }
         continuation?.resume(throwing: error)
         continuation = nil
-    }
-}
-
-// MARK: - Architecture helper
-
-private extension ProcessInfo {
-    var machineArchitecture: String {
-        var sysinfo = utsname()
-        uname(&sysinfo)
-        return withUnsafePointer(to: &sysinfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 1) {
-                String(cString: $0)
-            }
-        }
     }
 }

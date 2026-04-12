@@ -1,5 +1,4 @@
 import Foundation
-import os.log
 
 private let log = MeridianLog(category: "WinePrefix")
 
@@ -92,11 +91,19 @@ struct WinePrefix: Sendable {
         let exePath = steamExePath.path(percentEncoded: false)
         let result = FileManager.default.fileExists(atPath: exePath)
         log.debug("[isSteamInstalled] steam.exe → \(result)")
-        // Also log steamui.dll presence — its absence means bootstrap is incomplete
-        let dllPath = steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
-        let hasDLL  = FileManager.default.fileExists(atPath: dllPath)
-        log.debug("[isSteamInstalled] steamui.dll → \(hasDLL) (bootstrap complete=\(hasDLL))")
+        log.debug("[isSteamInstalled] steamui.dll → \(isSteamBootstrapped) (bootstrap complete=\(isSteamBootstrapped))")
         return result
+    }
+
+    /// Whether Steam's first-run client download has completed.
+    ///
+    /// `SteamSetup.exe /S` installs only the bootstrapper stub (steam.exe).
+    /// The full client (including steamui.dll) is downloaded when steam.exe
+    /// runs for the first time without `BootStrapperInhibitAll`. This property
+    /// distinguishes "Steam stub installed" from "Steam fully bootstrapped".
+    var isSteamBootstrapped: Bool {
+        let dllPath = steamInstallDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        return FileManager.default.fileExists(atPath: dllPath)
     }
 
     /// Returns `true` when the Wine prefix's Steam install has an authenticated user
@@ -133,8 +140,7 @@ struct WinePrefix: Sendable {
     /// The template is complete: DLLs, registry, and driver stubs are all baked in.
     /// Wine auto-detects the Mac display driver at runtime from winemac.so in the
     /// engine's WINEDLLPATH — no `wineboot --update` is needed on the user's machine.
-    /// This matches how CrossOver creates bottles: instant template copy, zero Wine
-    /// process overhead.
+    /// Instant template copy — zero Wine process overhead on first run.
     ///
     /// Falls back to `wineboot --init` if no template is found (backwards compatibility
     /// with older engine releases that predate the template packaging).
@@ -172,8 +178,8 @@ struct WinePrefix: Sendable {
                 )
                 // Populate syswow64 with 32-bit DLLs from the engine.
                 //
-                // Wine 8.x (Gcenx) left syswow64 empty after wineboot --init; Wine 11.x
-                // (CrossOver 27) does not create the directory at all. Either way we must
+                // Some Wine versions leave syswow64 empty after wineboot --init; others
+                // do not create the directory at all. Either way we must
                 // create it and fill it ourselves from the engine's i386-windows/ directory.
                 // Without the 32-bit builtins, Wine's WoW64 layer cannot load 32-bit
                 // Windows executables (like SteamSetup.exe) and crashes with
@@ -205,8 +211,6 @@ struct WinePrefix: Sendable {
                 // No wineboot --update here. The template built by release-engine.sh is
                 // complete (DLLs, registry, driver stubs). Wine auto-detects the Mac
                 // display driver at runtime from winemac.so in the engine's WINEDLLPATH.
-                // CrossOver also creates bottles from templates without running wineboot
-                // on the user's machine — instant bottle creation.
             } catch {
                 log.error("[create] template copy failed: \(error.localizedDescription) — falling back to wineboot --init")
                 try? fm.removeItem(at: path)
@@ -252,6 +256,10 @@ struct WinePrefix: Sendable {
         }
 
         log.info("[resetToTemplate] saving Steam config before prefix reset")
+
+        // Also write a disk-based backup of the SteamCMD credential cache
+        // as a safety net in case the in-memory restore below fails.
+        backupSteamCMDConfig()
 
         // Save important Steam config files so login session survives the reset.
         // Capture the full URL for each file so the restore step can write back to
@@ -333,6 +341,15 @@ struct WinePrefix: Sendable {
     /// around its absence — if `wineboot --update` fails, the caller receives a clear error.
     func refreshSystemDLLs(engine: WineEngine, engineTag: String) async throws {
         log.info("[refreshSystemDLLs] running wineboot --update for engine \(engineTag)")
+
+        // Remove Steam's autorun registry entry before wineboot --update.
+        // wineboot processes HKCU\...\Run entries and starts any registered programs.
+        // Steam registers itself there during installation — if not removed, wineboot
+        // starts steam.exe which shows its sign-in window when no valid session exists.
+        // Steam re-adds itself the next time it runs normally, so this is safe to strip.
+        let runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        try? await engine.run(args: ["reg", "delete", runKey, "/v", "Steam", "/f"], prefix: self)
+
         let process = try await engine.run(args: ["wineboot", "--update"], prefix: self)
         guard process.terminationStatus == 0 else {
             log.error("[refreshSystemDLLs] wineboot --update failed exit=\(process.terminationStatus) — check engine contains wine/share/wine/wine.inf")
@@ -484,132 +501,96 @@ struct WinePrefix: Sendable {
         log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
     }
 
-    /// Writes `config/config.vdf` with a `ConnectCache` entry containing the
-    /// IAuthenticationService refresh token, enabling auto-login for `steamID`.
+    /// Writes a minimal, well-formed `config/config.vdf` with ConnectCache credentials.
     ///
-    /// Any pre-existing `config.vdf` is replaced. At first-login time the file
-    /// is either absent or minimal (no library-folder settings have been saved
-    /// yet), so overwriting it is safe. Steam regenerates all other settings
-    /// on first authenticated start.
+    /// Always overwrites the existing file. The previous merge approach (upsert into
+    /// steam.exe-generated configs) produced brace-count mismatches in large VDF files,
+    /// causing SteamCMD to hit EOF mid-parse ("got EOF instead of keyname"), report
+    /// "Cached credentials not found", and prompt for a password — blocking forever.
+    ///
+    /// A fresh minimal VDF is always correct: the JWT refresh token stored in AppSettings
+    /// is all SteamCMD needs to log in without Steam Guard.
     func writeConnectCache(steamID: String, refreshToken: String, accountName: String) throws {
         let fm = FileManager.default
         let configDir = steamConfigDir
         try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
 
-        let vdf = """
-        "InstallConfigStore"
-        {
-        \t"Software"
-        \t{
-        \t\t"Valve"
-        \t\t{
-        \t\t\t"Steam"
-        \t\t\t{
-        \t\t\t\t"ConnectCache"
-        \t\t\t\t{
-        \t\t\t\t\t"\(steamID)"\t\t"\(refreshToken)"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"\(accountName)"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"\(steamID)"
-        \t\t\t\t\t}
-        \t\t\t\t}
-        \t\t\t}
-        \t\t}
-        \t}
-        }
-        """
-
         let dest = configDir.appending(path: "config.vdf")
+
+        let jwtEntry         = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
+        let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
+        let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+
+        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
+        let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
+        let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
+
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
-        log.info("[writeConnectCache] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
-    }
-
-    // MARK: - DXMT System32 Deployment
-
-    /// Copies DXMT DLLs from the Gcenx engine into the Wine prefix's system32.
-    ///
-    /// When CrossOver's wineloader is active, it loads DLLs from its own lib path
-    /// before checking WINEDLLPATH. Placing DXMT DLLs directly in the prefix's
-    /// Windows system32 ensures they are found first, enabling Metal rendering.
-    ///
-    /// Required when: CX engine is active AND game uses D3D11/DXGI.
-    /// Safe to call repeatedly — skips if already up to date (size check).
-    func installDXMTInSystem32(engine: WineEngine) throws {
-        let fm = FileManager.default
-        let sys32 = path.appending(path: "drive_c/windows/system32")
-        let engineDxmtDir = WineEngine.engineDir.appending(path: "wine/lib/wine/x86_64-windows")
-
-        guard fm.fileExists(atPath: sys32.path(percentEncoded: false)) else {
-            log.warning("[installDXMTInSystem32] system32 not found — prefix not initialized yet")
-            return
-        }
-
-        let dxmtDLLs = ["d3d11.dll", "dxgi.dll", "d3d12.dll"]
-        var installed = 0
-        for dll in dxmtDLLs {
-            let src = engineDxmtDir.appending(path: dll)
-            let dst = sys32.appending(path: dll)
-            let srcPath = src.path(percentEncoded: false)
-            let dstPath = dst.path(percentEncoded: false)
-            guard fm.fileExists(atPath: srcPath) else { continue }
-
-            // Check if source is DXMT (larger than Wine's built-in; d3d11.dll > 1MB = DXMT)
-            guard let srcSize = try? fm.attributesOfItem(atPath: srcPath)[.size] as? Int,
-                  srcSize > 1_000_000 else { continue }
-
-            // Skip if already installed with same size
-            if let dstSize = try? fm.attributesOfItem(atPath: dstPath)[.size] as? Int,
-               dstSize == srcSize { continue }
-
-            try fm.copyItem(at: src, to: dst)
-            installed += 1
-            log.info("[installDXMTInSystem32] installed \(dll) (\(srcSize / 1024)KB) → system32")
-        }
-        if installed == 0 {
-            log.debug("[installDXMTInSystem32] DXMT already up to date in system32")
-        }
+        log.info("[writeConnectCache] written config.vdf steamID=\(steamID)")
     }
 
     // MARK: - Webhelper Configuration
 
     /// Writes `steam.cfg` in the Steam install directory to disable the CEF sandbox.
     ///
-    /// Steam's webhelper process (steamwebhelper.exe) is a Chromium-based binary that
-    /// renders the entire Steam UI — including game install dialogs. Under Wine, Chrome's
-    /// sandbox fails to initialise because Wine does not fully implement the Windows kernel
-    /// security primitives (job objects, token impersonation) that Chromium's sandbox
-    /// relies on. Without the sandbox bypass the webhelper crashes on every launch, leaving
-    /// Steam without any UI:
-    ///   - Install dialogs cannot be displayed
-    ///   - Steam cannot complete its authenticated login handshake
-    ///   - All IPC commands that trigger UI (e.g. `steam://install/`) silently fail
+    /// Two flags are written:
     ///
-    /// `SteamNoSandbox=1` instructs Steam to spawn the webhelper with `--no-sandbox
-    /// --no-zygote`, bypassing the sandbox entirely. CPU-based (software) rendering
-    /// continues to work, so the full Steam UI renders correctly.
+    /// `SteamNoSandbox=1` — instructs Steam to spawn the webhelper with `--no-sandbox
+    /// --no-zygote`, bypassing Chromium's sandbox which fails under Wine due to missing
+    /// kernel security primitives (job objects, token impersonation). Without this, the
+    /// webhelper crashes on every launch and Steam cannot render any UI.
     ///
-    /// Safe to call repeatedly: it is a no-op when the file already contains the
-    /// required setting.
+    /// `BootStrapperInhibitAll=enable` — prevents Steam's bootstrapper from checking for
+    /// and downloading client updates every time it launches. Without this, every SteamCMD
+    /// batch call starts with a multi-second update check, adding unnecessary latency to
+    /// game installs. This flag is only written once Steam has been fully bootstrapped
+    /// (steamui.dll present), so it never blocks the initial Steam client download.
+    ///
+    /// Safe to call repeatedly — no-op when the file already contains both settings.
     func ensureSteamCFG() throws {
         let fm = FileManager.default
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
 
+        let alreadyBootstrapped = isSteamBootstrapped
+
+        var required = ["SteamNoSandbox=1"]
+        if alreadyBootstrapped {
+            required.append("BootStrapperInhibitAll=enable")
+        }
+
+        let desiredContent = required.joined(separator: "\n") + "\n"
+
+        // Check both that all required settings are present AND that no stale
+        // settings remain (e.g. BootStrapperInhibitAll before bootstrap completes).
         if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
-           existing.contains("SteamNoSandbox=1") {
+           existing == desiredContent {
             log.debug("[ensureSteamCFG] steam.cfg already configured — skipping")
             return
         }
 
         try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
 
-        let cfg = """
-        SteamNoSandbox=1
-        """
-        try cfg.write(to: cfgURL, atomically: true, encoding: .utf8)
-        log.info("[ensureSteamCFG] steam.cfg written with SteamNoSandbox=1 → \(cfgURL.path(percentEncoded: false))")
+        try desiredContent.write(to: cfgURL, atomically: true, encoding: .utf8)
+        log.info("[ensureSteamCFG] steam.cfg written: \(required.joined(separator: ", ")) → \(cfgURL.path(percentEncoded: false))")
+    }
+
+    /// Removes `BootStrapperInhibitAll=enable` from `steam.cfg` if present.
+    ///
+    /// Called defensively before the bootstrap loop to ensure a stale flag from
+    /// a previous failed session does not prevent Steam from downloading its
+    /// client update.
+    func stripBootStrapperInhibit() {
+        let cfgURL = steamInstallDir.appending(path: "steam.cfg")
+        guard let content = try? String(contentsOf: cfgURL, encoding: .utf8),
+              content.contains("BootStrapperInhibitAll") else { return }
+        let cleaned = content
+            .components(separatedBy: .newlines)
+            .filter { !$0.contains("BootStrapperInhibitAll") }
+            .joined(separator: "\n")
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        let final = trimmed.isEmpty ? "" : trimmed + "\n"
+        try? final.write(to: cfgURL, atomically: true, encoding: .utf8)
+        log.info("[stripBootStrapperInhibit] removed BootStrapperInhibitAll from steam.cfg")
     }
 
     // MARK: - Library Setup
@@ -696,10 +677,16 @@ struct WinePrefix: Sendable {
         for line in contents.components(separatedBy: .newlines) {
             guard let (key, value) = vdfKeyValue(from: line), !value.isEmpty else { continue }
 
-            // Accept both: "path" "<winpath>" (new) and "1" "<winpath>" (legacy numeric key)
+            // Accept both: "path" "<winpath>" (new nested format) and "1" "<winpath>" (legacy)
+            // Legacy format: "1" "C:\\some\\path" — numeric key, value is a Windows/Unix path
+            // New format: nested section with "path" key, plus "apps" { "appID" "sizeBytes" }
+            //
+            // Guard: reject pure-numeric values — those are app sizes (e.g. "39590283"),
+            // not paths. A real path always contains a path separator or a drive letter.
             let isPathKey = key == "path"
             let isNumericNonZero = key != "0" && key.allSatisfy(\.isNumber)
             guard isPathKey || isNumericNonZero else { continue }
+            guard value.contains("\\") || value.contains("/") || (value.count >= 3 && value[value.index(value.startIndex, offsetBy: 1)] == ":") else { continue }
 
             // Value is a Windows path (e.g. "C:\\Program Files (x86)\\Steam") or
             // a Unix path on some configurations. Convert to a macOS URL.
@@ -807,6 +794,255 @@ struct WinePrefix: Sendable {
         return nil
     }
 
+    /// Returns true when the game's install directory contains `steam_api64.dll`
+    /// or `steam_api.dll` at the top level, indicating it uses Steam DRM.
+    ///
+    /// Games with Steam DRM call `SteamAPI_Init()` at startup, which connects
+    /// to a running Steam client via IPC. Without a live Steam client the
+    /// game initialises silently and exits within a few seconds. The fix is
+    /// to start `steam.exe -silent` before launching these games.
+    ///
+    /// Searches recursively through the game directory so it correctly handles
+    /// Unity games (DLL in GameName_Data/Plugins/x86_64/), Unreal games
+    /// (DLL in Engine/Binaries/ThirdParty/Steamworks/), and any other layout.
+    func gameRequiresSteamAPI(appID: Int) -> Bool {
+        guard let installDirName = gameInstallDir(appID: appID) else { return false }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            let gameDirPath = gameDir.path(percentEncoded: false)
+            guard fm.fileExists(atPath: gameDirPath) else { continue }
+            guard let enumerator = fm.enumerator(atPath: gameDirPath) else { continue }
+            while let file = enumerator.nextObject() as? String {
+                let lower = (file as NSString).lastPathComponent.lowercased()
+                if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                    log.debug("[gameRequiresSteamAPI] appID=\(appID) → true (found \(file))")
+                    return true
+                }
+            }
+            log.debug("[gameRequiresSteamAPI] appID=\(appID) → false")
+            return false
+        }
+        log.debug("[gameRequiresSteamAPI] appID=\(appID) → false (game dir not found)")
+        return false
+    }
+
+    /// Writes `steam_appid.txt` into the game's install directory and, if
+    /// `steam_api64.dll` is in a subdirectory (e.g. Unity's
+    /// `GameName_Data/Plugins/x86_64/`), also into that subdirectory.
+    ///
+    /// `steam_api64.dll` reads this file at startup to determine the application
+    /// ID when it cannot retrieve it from the Steam client shortcut. Unity games
+    /// load it relative to the DLL, not the exe, so both locations are needed.
+    ///
+    /// Safe to call repeatedly — the file is overwritten each time.
+    func writeSteamAppID(_ appID: Int) {
+        guard let installDirName = gameInstallDir(appID: appID) else {
+            log.warning("[writeSteamAppID] cannot find install dir for appID=\(appID)")
+            return
+        }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            guard fm.fileExists(atPath: gameDir.path(percentEncoded: false)) else { continue }
+
+            // Always write to the root install directory (for most games + exe lookup)
+            let rootFile = gameDir.appending(path: "steam_appid.txt")
+            do {
+                try "\(appID)".write(to: rootFile, atomically: true, encoding: .utf8)
+                log.info("[writeSteamAppID] wrote steam_appid.txt (\(appID)) to \(gameDir.lastPathComponent)")
+            } catch {
+                log.warning("[writeSteamAppID] failed writing to root: \(error.localizedDescription)")
+            }
+
+            // Also write alongside steam_api64.dll if it lives in a subdirectory
+            if let enumerator = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) {
+                while let file = enumerator.nextObject() as? String {
+                    let lower = (file as NSString).lastPathComponent.lowercased()
+                    if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                        let dllDir = gameDir.appending(path: (file as NSString).deletingLastPathComponent)
+                        let dllDirPath = dllDir.path(percentEncoded: false)
+                        if dllDirPath != gameDir.path(percentEncoded: false) {
+                            let sideFile = dllDir.appending(path: "steam_appid.txt")
+                            do {
+                                try "\(appID)".write(to: sideFile, atomically: true, encoding: .utf8)
+                                log.info("[writeSteamAppID] wrote steam_appid.txt (\(appID)) alongside DLL at \(file)")
+                            } catch {
+                                log.warning("[writeSteamAppID] failed writing beside DLL: \(error.localizedDescription)")
+                            }
+                        }
+                        break
+                    }
+                }
+            }
+            return
+        }
+        log.warning("[writeSteamAppID] game dir not found for appID=\(appID)")
+    }
+
+    // MARK: - WinRT Registration
+
+    /// Increment this when new entries are added to `registerWinRTClasses()`.
+    /// BootstrapManager compares `AppSettings.winRTRegistrationAppliedVersion`
+    /// against this value and only re-runs registration when the prefix is behind.
+    static let winRTRegistrationVersion = 2
+
+    // MARK: - Steam Install Path Registration
+
+    /// Increment when the set of HKLM Steam or WoW64 crypto registry keys changes.
+    /// steam.exe writes these on first run; the native bootstrap bypasses steam.exe,
+    /// so we must write them explicitly before steamcmd.exe (32-bit WoW64) starts.
+    static let steamInstallPathRegistrationVersion = 2
+
+    /// Writes registry keys that steam.exe sets on first run, required by steamcmd.exe.
+    ///
+    /// **Steam install paths:** steamcmd.exe is 32-bit. Under WoW64, reads from
+    /// HKLM\SOFTWARE\Valve\Steam are redirected to HKLM\SOFTWARE\WOW6432Node\Valve\Steam.
+    /// If InstallPath is absent there, steamcmd throws a C++ exception at startup.
+    ///
+    /// **WoW64 crypto provider types:** Wine's wine.inf only writes crypto provider
+    /// registry entries to the 64-bit hive (HKLM\SOFTWARE\Microsoft\Cryptography\Defaults).
+    /// The 32-bit WoW64 view (WOW6432Node\...) is absent, causing CryptAcquireContextA
+    /// to fail with NTE_PROV_TYPE_NOT_DEF (0x80090017) in every 32-bit process, including
+    /// steamcmd.exe — which then throws a C++ exception, catches it, checks for mscoree.dll,
+    /// doesn't find it, and calls ExitProcess(3).
+    func writeSteamInstallPathRegistryKeys(engine: WineEngine) async {
+        log.info("[writeSteamInstallPathRegistryKeys] writing Steam HKLM/HKCU + WoW64 crypto keys")
+        let installPath = "C:\\Program Files\\Steam"
+        let installPathFwd = "C:/Program Files/Steam"
+
+        // Steam install path keys
+        let pathKeys: [(String, String, String)] = [
+            ("HKLM\\SOFTWARE\\Valve\\Steam",                "InstallPath", installPath),
+            ("HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam",   "InstallPath", installPath),
+            ("HKCU\\SOFTWARE\\Valve\\Steam",                "SteamPath",   installPathFwd),
+            ("HKCU\\SOFTWARE\\Valve\\Steam",                "SteamExe",    "\(installPathFwd)/steam.exe"),
+        ]
+
+        // WoW64 crypto provider types — mirrors the 64-bit entries that wine.inf writes
+        // to HKLM\SOFTWARE\Microsoft\Cryptography\Defaults but omits from WOW6432Node.
+        let cryptoBase = "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Cryptography\\Defaults"
+        let cryptoTypeKeys: [(String, String, String)] = [
+            ("\(cryptoBase)\\Provider Types\\Type 001", "Name",     "Microsoft Enhanced Cryptographic Provider v1.0"),
+            ("\(cryptoBase)\\Provider Types\\Type 001", "TypeName", "RSA Full (Signature and Key Exchange)"),
+            ("\(cryptoBase)\\Provider Types\\Type 003", "Name",     "Microsoft Base DSS Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 003", "TypeName", "DSS Signature"),
+            ("\(cryptoBase)\\Provider Types\\Type 012", "Name",     "Microsoft RSA SChannel Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 012", "TypeName", "RSA SChannel"),
+            ("\(cryptoBase)\\Provider Types\\Type 013", "Name",     "Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 013", "TypeName", "DSS Signature with Diffie-Hellman Key Exchange"),
+            ("\(cryptoBase)\\Provider Types\\Type 018", "Name",     "Microsoft DH SChannel Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 018", "TypeName", "Diffie-Hellman SChannel"),
+            ("\(cryptoBase)\\Provider Types\\Type 024", "Name",     "Microsoft Enhanced RSA and AES Cryptographic Provider"),
+            ("\(cryptoBase)\\Provider Types\\Type 024", "TypeName", "RSA Full and AES"),
+            ("\(cryptoBase)\\Provider\\Microsoft Base Cryptographic Provider v1.0",               "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced Cryptographic Provider v1.0",           "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Strong Cryptographic Provider",                  "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft RSA SChannel Cryptographic Provider",            "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced RSA and AES Cryptographic Provider",    "Image Path", "C:\\windows\\syswow64\\rsaenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Base DSS Cryptographic Provider",               "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft DH SChannel Cryptographic Provider",            "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider", "Image Path", "C:\\windows\\syswow64\\dssenh.dll"),
+        ]
+
+        for (key, valueName, data) in pathKeys + cryptoTypeKeys {
+            do {
+                try await engine.run(
+                    args: ["reg", "add", key, "/v", valueName, "/t", "REG_SZ", "/d", data, "/f"],
+                    prefix: self
+                )
+                log.debug("[writeSteamInstallPathRegistryKeys] wrote \(key)\\\\\\(valueName)")
+            } catch {
+                log.error("[writeSteamInstallPathRegistryKeys] failed \(key)\\\\\\(valueName): \(error.localizedDescription)")
+            }
+        }
+
+        // Write Type DWORD values for each provider entry
+        let cryptoProviderTypes: [(String, Int)] = [
+            ("\(cryptoBase)\\Provider\\Microsoft Base Cryptographic Provider v1.0",               1),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced Cryptographic Provider v1.0",           1),
+            ("\(cryptoBase)\\Provider\\Microsoft Strong Cryptographic Provider",                  1),
+            ("\(cryptoBase)\\Provider\\Microsoft RSA SChannel Cryptographic Provider",            12),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced RSA and AES Cryptographic Provider",    24),
+            ("\(cryptoBase)\\Provider\\Microsoft Base DSS Cryptographic Provider",               3),
+            ("\(cryptoBase)\\Provider\\Microsoft DH SChannel Cryptographic Provider",            18),
+            ("\(cryptoBase)\\Provider\\Microsoft Enhanced DSS and Diffie-Hellman Cryptographic Provider", 13),
+        ]
+        for (key, typeVal) in cryptoProviderTypes {
+            do {
+                try await engine.run(
+                    args: ["reg", "add", key, "/v", "Type", "/t", "REG_DWORD", "/d", String(typeVal), "/f"],
+                    prefix: self
+                )
+            } catch {
+                log.error("[writeSteamInstallPathRegistryKeys] DWORD failed \(key): \(error.localizedDescription)")
+            }
+        }
+
+        log.info("[writeSteamInstallPathRegistryKeys] Steam install path + WoW64 crypto registry keys written ✓")
+    }
+
+    /// Registers WinRT ActivatableClassId entries that Wine's wineboot does not
+    /// create by default, mapping class names to their implementing DLLs.
+    ///
+    /// Without these entries, `combase!RoGetActivationFactory` returns
+    /// "Failed to find library" even when the DLL (e.g. coremessaging.dll) is
+    /// present and exports `DllGetActivationFactory`. Wine resolves class names
+    /// by looking up `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\<Class>`
+    /// and reading the `DllPath` value.
+    ///
+    /// This is idempotent — `reg add /f` overwrites any existing value.
+    func registerWinRTClasses(engine: WineEngine) async {
+        // Step 1: Copy custom stub DLLs into the prefix system32.
+        //
+        // Prefix system32 has real file copies (not symlinks) of Wine DLLs
+        // written during prefix creation. The custom stubs in the engine's
+        // wine/lib/wine/x86_64-windows/ are NOT automatically propagated into
+        // the prefix — we must copy them explicitly.
+        let dllsToInstall: [(URL, String)] = [
+            // Our extended coremessaging.dll with IDispatcherQueueStatics support
+            (WineEngine.engineDir.appending(path: "wine/lib/wine/x86_64-windows/coremessaging.dll"),
+             "coremessaging.dll"),
+        ]
+        let system32 = path.appending(path: "drive_c/windows/system32")
+        for (src, dllName) in dllsToInstall {
+            let dest = system32.appending(path: dllName)
+            if FileManager.default.fileExists(atPath: src.path(percentEncoded: false)) {
+                do {
+                    if FileManager.default.fileExists(atPath: dest.path(percentEncoded: false)) {
+                        try FileManager.default.removeItem(at: dest)
+                    }
+                    try FileManager.default.copyItem(at: src, to: dest)
+                    log.info("[registerWinRTClasses] installed \(dllName) into prefix system32")
+                } catch {
+                    log.warning("[registerWinRTClasses] failed to install \(dllName): \(error.localizedDescription)")
+                }
+            } else {
+                log.warning("[registerWinRTClasses] engine stub not found: \(src.lastPathComponent) — skipping")
+            }
+        }
+
+        // Step 2: Register ActivatableClassId entries.
+        // Class name -> system32 DLL path
+        let entries: [(String, String)] = [
+            // Unity 6.3+ (and any WinRT app) calls RoGetActivationFactory with
+            // "Windows.System.DispatcherQueue". Our extended coremessaging.dll
+            // handles this class; Wine's shipped version does not.
+            ("Windows.System.DispatcherQueue",
+             "C:\\windows\\system32\\coremessaging.dll"),
+        ]
+        for (className, dllPath) in entries {
+            let key = "HKLM\\SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId\\\(className)"
+            log.info("[registerWinRTClasses] registering \(className)")
+            try? await engine.run(
+                args: ["reg", "add", key,
+                       "/v", "DllPath", "/t", "REG_SZ", "/d", dllPath, "/f"],
+                prefix: self
+            )
+        }
+        log.info("[registerWinRTClasses] WinRT class registration complete ✓")
+    }
+
     // MARK: - VDF / Path Helpers
 
     /// Parses a single VDF line of the form `"key"\t"value"` and returns the pair.
@@ -880,6 +1116,12 @@ struct WinePrefix: Sendable {
     /// Deletes the entire prefix directory. Use when the prefix is corrupted
     /// or Steam install is in a bad state. A fresh prefix will be created
     /// on the next launch.
+    ///
+    /// Backs up SteamCMD's credential cache (`config.vdf`) before wiping.
+    /// The encrypted auth token in that file survives prefix resets, so game
+    /// installs won't require Steam Guard re-confirmation. Call
+    /// `restoreSteamCMDConfig()` after the prefix is recreated and SteamCMD
+    /// is re-installed.
     func reset() {
         let prefixPath = path.path(percentEncoded: false)
         log.info("[reset] removing prefix at \(prefixPath)")
@@ -889,11 +1131,61 @@ struct WinePrefix: Sendable {
             return
         }
 
+        backupSteamCMDConfig()
+
         do {
             try FileManager.default.removeItem(at: path)
             log.info("[reset] prefix removed")
         } catch {
             log.error("[reset] failed to remove prefix: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - SteamCMD Credential Cache Backup
+
+    private static var steamcmdConfigBackupURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appending(path: "com.meridian.app/steamcmd-config-backup.vdf")
+    }
+
+    /// Copies SteamCMD's `config/config.vdf` to a safe location outside the
+    /// prefix. This file contains an encrypted credential token that lets
+    /// SteamCMD log in without a password or Steam Guard confirmation.
+    func backupSteamCMDConfig() {
+        let configVDF = steamInstallDir.appending(path: "config/config.vdf")
+        let backup = Self.steamcmdConfigBackupURL
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: configVDF.path(percentEncoded: false)) else {
+            log.info("[backupSteamCMD] no config.vdf to backup")
+            return
+        }
+        do {
+            try? fm.removeItem(at: backup)
+            try fm.copyItem(at: configVDF, to: backup)
+            log.info("[backupSteamCMD] config.vdf backed up ✓")
+        } catch {
+            log.warning("[backupSteamCMD] backup failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Restores a previously backed-up SteamCMD `config.vdf` into the prefix.
+    /// Call after the prefix is recreated and SteamCMD is installed.
+    func restoreSteamCMDConfig() {
+        let backup = Self.steamcmdConfigBackupURL
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: backup.path(percentEncoded: false)) else {
+            log.info("[restoreSteamCMD] no backup to restore")
+            return
+        }
+        let configDir = steamInstallDir.appending(path: "config")
+        let configVDF = configDir.appending(path: "config.vdf")
+        do {
+            try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: configVDF)
+            try fm.copyItem(at: backup, to: configVDF)
+            log.info("[restoreSteamCMD] config.vdf restored from backup ✓")
+        } catch {
+            log.warning("[restoreSteamCMD] restore failed: \(error.localizedDescription)")
         }
     }
 

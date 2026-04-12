@@ -1,0 +1,837 @@
+---
+description: Engine research findings and architecture documentation. Documents the complete graphics stack, rendering technologies, GPTK architecture, DXMT, DXVK, MoltenVK, Wine internals, and the Meridian engine assembly process. All CX Wine components used in the engine are LGPL-licensed and legally redistributable.
+alwaysApply: true
+---
+
+# Engine Research Findings
+
+Meridian's engine is assembled from LGPL-licensed CX Wine components + open-source rendering layers (DXMT, DXVK, MoltenVK) + Apple's freely-distributed GPTK. `release-engine.sh` copies these from CrossOver Preview into a self-contained engine tarball. End users never need CrossOver installed. This document records architecture decisions and CLI-verified findings so future sessions can build on them.
+
+---
+
+## Engine: CX Wine 11.4 (CrossOver Preview) — Current
+
+**Current Meridian engine:** CX Wine 11.4 from CrossOver Preview.
+**Previous:** Gcenx Wine 11.6 — tried April 2026, broke TLS on macOS 26 (see below). Reverted.
+**Before that:** CX Wine 11.4 — the original working engine.
+**Before that:** Wine 8.0.1 (CrossOverFOSS 23.7.1) — obsolete.
+
+**Why CX Wine over Gcenx Wine (TLS failure, CLI-verified April 2026):**
+Gcenx Wine 11.6 fails HTTPS connections on macOS 26.4 with HTTP error 0 on Steam CDN.
+steam.exe bootstrap_log.txt: `Download failed: http error 0 (cdn.steamstatic.com/...)` →
+`Error: Steam needs to be online to update.` on every attempt. Root cause unknown — possibly
+a macOS 26-specific Security.framework incompatibility with Gcenx Wine's standalone TLS path.
+CX Wine 11.4 bootstraps correctly: CLI-verified April 2026 at 130 MB/s download speed.
+
+**CORRECTED understanding of TLS (April 10, 2026 — CLI-verified):**
+Wine's TLS stack has TWO separate GnuTLS consumers:
+- `crypt32.so` — uses Security.framework (confirmed `otool -L`). Its GnuTLS dlopen is ONLY
+  for PFX import/export, NOT TLS handshake. crypt32 TLS works fine without lib64.
+- `secur32.so` — uses GnuTLS EXCLUSIVELY for all Schannel/TLS. `otool -L` shows NO
+  Security.framework linkage. Contains string "Failed to load libgnutls, secure connections
+  will not be available." If GnuTLS fails to load, ALL Wine HTTPS operations fail.
+
+**lib64 MUST be on DYLD_FALLBACK_LIBRARY_PATH at runtime** so secur32.so can dlopen
+libgnutls.30.dylib. Additionally, libgnutls needs `@loader_path` rpath (added by
+`install_name_tool` in release-engine.sh) so its `@rpath/libgmp.10.dylib` dependency
+resolves. Without BOTH fixes, Wine's SteamCMD/WinHTTP HTTPS connections fail silently.
+
+**Steam's own bootstrapper (steam.exe) does NOT use Wine's TLS at all.** It statically links
+OpenSSL (x86, "CRYPTOGAMS by appro@openssl.org"). Under WoW64 on macOS 26, this OpenSSL
+cannot complete TLS handshakes — produces "http error 0". Meridian bypasses this with native
+macOS-side bootstrap (`SteamClientBootstrap.swift`) using URLSession.
+
+**Previous "CX Wine TLS confirmed working" claims were false.** The wineserver from
+release-engine.sh's `wineboot --init` step (which runs WITH lib64 on DYLD) cached GnuTLS
+state. Subsequent tests reusing that wineserver inherited the cached state. A clean
+prefix wipe (new wineserver) exposed the real failure.
+
+**Why CX Wine also enables GPTK (D3D12):**
+CX Wine has `ntdll.__wine_unix_call` (a CodeWeavers extension). GPTK's d3d12.dll and dxgi.dll
+both import this function. WineEngine.detect() searches for `__wine_unix_call\0` in
+`wine/lib/wine/x86_64-windows/ntdll.dll` (the PE DLL export table) — if found, gptkPath is set
+and GPTK env vars are injected for game launches. With CX Wine: gptkPath set → D3D12 →
+D3DMetal → Metal works.
+**CRITICAL: Search ntdll.dll (PE), NOT ntdll.so (Unix).** The `__wine_unix_call` export lives
+in the Windows PE ntdll.dll — confirmed at byte offset 673776 via PE export table scan. ntdll.so
+only contains `__wine_unix_call_dispatcher` and `__wine_unix_call_funcs`; the standalone
+`__wine_unix_call\0` is absent from ntdll.so. CLI-verified April 2026: searching ntdll.so
+returned no match (cxABI=false, GPTK disabled). Fixed to search ntdll.dll.
+With Gcenx Wine: no `__wine_unix_call` → gptkPath = nil → D3D12 disabled.
+
+**Why CX Wine 11.4 has all the same DX11 patches as Gcenx 11.6:**
+
+| Issue | Wine 8.0.1 | Wine 11.5 |
+|---|---|---|
+| `IsMouseInPointerEnabled` | MISSING → Unity crash | Properly exported |
+| win32u.dll abort stubs | **926** | **0** |
+| user32.dll exports | 782 | 831 (+49) |
+| wiremac.so Metal APIs | Missing | Present |
+| DXMT compatibility | Broken | Works |
+| steam.exe bootstrap | Crash-loops | Bootstraps correctly |
+
+### Wine Source (CLI-verified March 2026)
+
+```
+Source:   CrossOver Preview (/Applications/CrossOver Preview.app)
+Version:  wine-11.4-8785-gbed1d4779d1 (CX Wine 11.4 with full CW patches)
+Copied by: Scripts/release-engine.sh → engine tarball on GitHub Releases
+```
+
+**Why CX Wine and NOT Gcenx wine-devel:**
+- CX Wine has `ntdll.__wine_unix_call` required by CX's d3d12.dll for D3D12
+- CX Wine includes all CodeWeavers patches (CW 22435 DXMT, CW 13322/17315/21883 Steam, CW 20760 Rosetta2)
+- Gcenx wine-devel lacks `__wine_unix_call` — D3D12 games fail to load d3d12.dll
+- `release-engine.sh` copies Wine + DXMT + DXVK + GPTK from CX Preview into the engine tarball
+- End users get everything via Meridian's engine download — no external dependencies
+
+**Wine 11.5 CodeWeavers patches applied:**
+- CW 22435 — exports macdrv Metal view APIs (required by DXMT)
+- CW 13322, 17315, 21883 — Steam compatibility
+- CW 20760 — wow64cpu Rosetta2 thunks for Apple Silicon
+- CW 18947 — toggle_executable_pages_for_rosetta
+- Security.framework TLS in crypt32.so — Steam HTTPS works standalone
+
+### Wine Architecture on macOS
+
+Each Windows DLL has two parts:
+1. **PE .dll** (`lib/wine/x86_64-windows/`) — Windows-facing interface loaded into the Wine process
+2. **Unix .so** (`lib/wine/x86_64-unix/`) — Actual macOS implementation
+
+The PE file's exports resolve to code in the matching .so. Wine loads builtins from its own `lib/wine/` directory, NOT from the prefix `system32/`. The prefix `system32/` copies are only used when `WINEDLLOVERRIDES=dllname=native` is set.
+
+**Key environment variables:**
+- `WINEPREFIX` — path to the Windows environment (bottles/steam/)
+- `WINELOADER` — path to wine64 binary
+- `WINESERVER` — path to wineserver binary
+- `DYLD_FALLBACK_LIBRARY_PATH` — macOS dylib search path (must include Wine's lib/ and lib/wine/x86_64-unix/)
+- `WINEDLLPATH` — Wine search path for **builtin** DLL implementations (`.so` files). **NOT** searched when loading native (`=n`) Windows PE DLLs. For native loading, DLLs must be in system32, the app dir, or Windows PATH.
+- `WINEDLLOVERRIDES` — per-DLL load order (n=native, b=builtin)
+
+---
+
+## Rendering Stack: DXMT (D3D11 → Metal)
+
+### What DXMT Is
+
+DXMT (3Shain/dxmt) translates DirectX 11 and DirectX 10 calls to Apple Metal. It is the primary renderer for DX11 games on macOS.
+
+### DXMT Layout in Meridian Engine (builtin mode)
+
+```
+wine/lib/wine/x86_64-windows/d3d11.dll     (DXMT PE shim, ~5MB)
+wine/lib/wine/x86_64-windows/dxgi.dll      (DXMT DXGI)
+wine/lib/wine/x86_64-windows/d3d10core.dll (DXMT D3D10)
+wine/lib/wine/x86_64-windows/wiremetal.dll (DXMT Metal PE stub)
+wine/lib/wine/x86_64-unix/wiremetal.so     (DXMT Metal bridge, ~33MB, includes LLVM/AIR compiler)
+wine/lib/wine/i386-windows/*.dll           (32-bit variants)
+```
+
+**Builtin mode:** DLLs live alongside Wine's own DLLs in `lib/wine/x86_64-windows/`. Wine loads them automatically as builtins — no `WINEDLLOVERRIDES` needed.
+
+### DXMT Requirements
+
+DXMT's `wiremetal.so` dynamically links to `wiremac.so` and requires these macOS-platform exports:
+- `macdrv_view_create_metal_view`
+- `macdrv_view_get_metal_layer`
+- `macdrv_view_release_metal_view`
+- `macdrv_create_metal_device`
+- `macdrv_release_metal_device`
+- `macdrv_client_surface_*` (Wine 11.x+ only)
+
+**These were added to wiremac.so in Wine ~10.x.** This is why DXMT is completely broken with Wine 8.0.1 — the macOS graphics driver didn't export these symbols.
+
+### DXMT + GPTK Coexistence
+
+DXMT handles D3D11/D3D10. GPTK handles D3D12. They coexist cleanly:
+- d3d11 → DXMT builtin wiremetal.so (no override needed)
+- d3d12, dxgi → GPTK via WINEDLLPATH (`d3d12,dxgi=n,b`)
+
+### DXMT Versions
+
+- DXMT is downloaded from `3Shain/dxmt` GitHub releases
+- Always use the **builtin** variant (not the "override" variant)
+- DXMT must be built against a Wine version that has the `macdrv_*` Metal APIs (Wine 11.x+)
+- CLI-verified March 2026: DXMT v0.74 works with Wine 11.5
+
+---
+
+## Rendering Stack: VKD3D-proton (D3D12 → Vulkan → MoltenVK → Metal)
+
+### What VKD3D-proton Is
+
+VKD3D-proton (`HansKristian-Work/vkd3d-proton`) translates Direct3D 12 to Vulkan, which then goes through MoltenVK to Metal. It is detected in the engine but NOT used on macOS (see below).
+
+**VKD3D-proton is NOT the D3D12 path.** It requires `VK_EXT_transform_feedback` which MoltenVK on Apple Silicon does not support. CLI-verified failing April 2026. GPTK (Apple's D3DMetal.framework) is the active D3D12 path. CX Preview's d3d12.dll + d3d12.so pair is used as-is with Gcenx Wine via WINEDLLPATH.
+
+### VKD3D-proton Layout in Meridian Engine
+
+```
+wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll     (~122KB — native Windows PE DLL)
+wine/lib/vkd3d-proton/x86_64-windows/d3d12core.dll (~3.4MB — native Windows PE DLL)
+```
+
+### CRITICAL: VKD3D-proton is Incompatible with macOS/Apple Silicon
+
+**CLI-verified April 2026:** VKD3D-proton CANNOT be used on macOS/Apple Silicon.
+
+The fatal error:
+```
+vkd3d_init_device_caps: Lacking support for transform feedback.
+```
+
+`VK_EXT_transform_feedback` is a **hard requirement** in VKD3D-proton. MoltenVK 1.4.1 on Apple Silicon (M3 Pro with 153 extensions) does NOT include `VK_EXT_transform_feedback`. Metal has no equivalent. This is a fundamental incompatibility between VKD3D-proton and Apple Silicon via MoltenVK.
+
+**There is no workaround at the app or configuration level.** The correct D3D12 path on macOS is GPTK (see above).
+
+**WINEDLLPATH note:** VKD3D-proton DLLs (pure PE, no .so companion) cannot be loaded via WINEDLLPATH — that is for Wine builtins with .so bridges. They would need system32. But even if correctly placed, they still fail due to transform feedback. Do not attempt VKD3D-proton on macOS.
+
+**CLI verification commands for D3D12 games (using GPTK):**
+```bash
+export WINEPREFIX="$HOME/Library/Application Support/com.meridian.app/bottles/steam/"
+export WINESERVER="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wineserver"
+WINE64="$HOME/Library/Application Support/com.meridian.app/engine/wine/bin/wine64"
+LIB="$HOME/Library/Application Support/com.meridian.app/engine/wine/lib"
+GPTK="$HOME/Library/Application Support/com.meridian.app/engine/wine/lib/gptk"
+
+# GPTK environment (mirrors WineEngine.environment(for:))
+export DYLD_FALLBACK_LIBRARY_PATH="$GPTK/external:$GPTK/wine/x86_64-unix:$LIB:$LIB/wine/x86_64-unix"
+export WINEDLLPATH="$GPTK/wine:$LIB/wine"  # Parent dir, NOT x86_64-windows/ — Wine needs to find both /x86_64-windows/*.dll AND /x86_64-unix/*.so
+export WINEDLLOVERRIDES="d3d12,dxgi=n,b"
+export CX_APPLEGPTK_LIBD3DSHARED_PATH="$GPTK/external/libd3dshared.dylib"
+
+"$WINE64" "path/to/Game.exe" 2>&1 | grep -E "d3d12|err:|info:|warn:"
+```
+
+### VKD3D-proton Versions
+
+- Downloaded from `HansKristian-Work/vkd3d-proton` GitHub releases
+- Always use the latest stable release
+- No Wine version dependency (pure PE, no `.so` bridge)
+
+---
+
+## Rendering Stack: Apple GPTK (D3D12 → D3DMetal.framework → Metal) — ACTIVE
+
+### What GPTK Is
+
+Apple's Game Porting Toolkit (GPTK) translates Direct3D 12 calls to Apple Metal 3 via `D3DMetal.framework`. It is the **active and only working** D3D12 path on macOS/Apple Silicon.
+
+**Why GPTK works where VKD3D-proton fails:** GPTK bypasses Vulkan entirely. It has its own D3D12-to-Metal translator (D3DMetal.framework) and needs no Vulkan extensions. VKD3D-proton requires `VK_EXT_transform_feedback` from Vulkan — MoltenVK on Apple Silicon does not have this extension.
+
+**Why DX12 is harder than DX11:** DX11 uses DXMT — open source, compiled against our exact Wine version, no external dependencies, no callbacks required. DX12 uses GPTK — Apple proprietary, distributed by CodeWeavers, compiled against **CrossOver Wine's internal architecture**. `libd3dshared.dylib` requires CX Wine's `NtQueryVirtualMemory(class=1000)` to register Win32 callbacks. Standard Wine 11.5 doesn't have this extension. We must reverse-engineer the interface contract entirely from `libd3dshared.dylib` disassembly.
+
+### GPTK Architecture (Updated April 2026 — custom bridge required)
+
+**CX's d3d12.dll cannot be used directly with Gcenx Wine.** CLI-verified April 2026: CX's d3d12.dll imports `ntdll.__wine_unix_call` (CX-specific function). Gcenx Wine only has `__wine_unix_call_dispatcher`. Loading CX's d3d12.dll produces: `wine: Call from ... to unimplemented function ntdll.dll.__wine_unix_call, aborting`. However, CX Wine + CX d3d12 was also tested and passed D3D12 init (no crash), confirming the DLLs work in their native environment.
+
+Meridian uses a **custom d3d12 bridge** (`Scripts/build-d3d12-bridge.sh`) that uses `__wine_unix_call_dispatcher`. The bridge d3d12.so forwards to libd3dshared.dylib for D3DMetal integration.
+
+**Bridge (Wine builtin dir):**
+```
+wine/lib/wine/x86_64-windows/d3d12.dll  (PE shim, uses __wine_unix_call_dispatcher via winecrt0)
+wine/lib/wine/x86_64-unix/d3d12.so      (Unix adapter, promotes winemac.so, dlopen libd3dshared.dylib)
+```
+
+**GPTK framework + coordinator (lib/gptk/ — from CX Preview apple_gptk):**
+```
+wine/lib/gptk/external/libd3dshared.dylib  (96KB — MUST export GFXTOSInterface. A Wine artifact at ~84KB
+                                             silently breaks D3D12. Validated in release-engine.sh.)
+wine/lib/gptk/external/D3DMetal.framework/ (Apple Metal translator, ~63MB)
+wine/lib/gptk/wine/x86_64-windows/dxgi.dll, d3d11.dll, atidxx64.dll, nvapi64.dll, nvngx.dll
+wine/lib/gptk/wine/x86_64-unix/*.so        (symlinks → ../../external/libd3dshared.dylib)
+```
+
+CX's `gptk/wine/.../d3d12.dll` is REMOVED by `release-engine.sh` (replaced by bridge in `lib/wine/`). `WineEngine.detect()` checks for bridge `lib/wine/.../d3d12.dll` + `D3DMetal.framework`.
+
+**Opcode 0 dual-purpose buffer protocol (reverse-engineered from libd3dshared.dylib disassembly):**
+
+`WINE_UNIX_CALL(0, gGFXTDispatch)` uses the buffer as BOTH input and output in a single call.
+
+**INPUT** — DllMain pre-populates 43 Win32 function pointers (entries 0-42). `Win32DispatchInit` does `memcpy(gWin32Dispatch, arg, 0x158)`. D3DMetal calls back through these to interact with Wine's window system.
+
+**Complete gWin32Dispatch slot table** (reverse-engineered April 2026 from `objdump -d libd3dshared.dylib`, base address 0x91e8, each slot 8 bytes):
+
+**CRITICAL calling convention:** `rdi` always carries the C++ wrapper object `this` pointer (context). Actual function arguments begin at `rsi` (2nd SysV register) onward. Exception: slot [28] passes the module name in `rcx` (4th register). This was confirmed by disassembling `InitSharedState_block_invoke` and `allocateBytesFromNewPages`.
+
+| Slot | Offset | Windows API / Logical function | Used by | Notes |
+|---|---|---|---|---|
+| [0]  | +0x00 | RegQueryValueExW    | WineRegistry::GetValue     | |
+| [1]  | +0x08 | RegSetValueExW      | WineRegistry::SetValue     | |
+| [2]  | +0x10 | RegOpenKeyExW       | WineRegistry::OpenKey      | |
+| [3]  | +0x18 | RegCreateKeyExW     | WineRegistry::CreateKey    | |
+| [4]  | +0x20 | RegCloseKey         | WineRegistry::CloseKey     | |
+| [5]  | +0x28 | EnumDisplayMonitors | InitSharedState, WineMonitor | rdi=this, rdx=0, rcx=0 |
+| [6]  | +0x30 | GetMonitorInfoW     | WineMonitor::MonitorEnumProc, QueryDescription | |
+| [7]  | +0x38 | (unused)            | —                          | |
+| [8]  | +0x40 | macdrv view op      | WineSwapchainCallbacks::ResizeWindow, SetFullscreen | Metal surface |
+| [9]  | +0x48 | macdrv view op      | WineSwapchainCallbacks::ResizeWindow | Metal surface |
+| [10] | +0x50 | macdrv layer op     | WineSwapchainCallbacks::ResizeWindow, ResizeBacking | |
+| [11] | +0x58 | macdrv op           | WineSwapchainCallbacks::ResizeBacking | |
+| [12] | +0x60 | (unused)            | —                          | |
+| [13] | +0x68 | macdrv op           | WineSwapchainCallbacks::SetFullscreen, ResizeBacking | |
+| [14] | +0x70 | EnumDisplaySettingsW | WineMonitor::MonitorEnumProc, QueryDisplayMode | |
+| [15] | +0x78 | ChangeDisplaySettingsExW | WineMonitor::ChangeDisplayMode | |
+| [16] | +0x80 | macdrv op           | WineSwapchainCallbacks::ResizeBacking | |
+| [17] | +0x88 | (unused)            | —                          | |
+| [18] | +0x90 | CloseHandle         | WineEventCallbacks::CloseEvent, CloseSemaphore | |
+| [19] | +0x98 | SetEvent/ResetEvent | WineEventCallbacks::SetEvent | |
+| [20] | +0xa0 | ResetEvent          | WineEventCallbacks::ClearEvent | |
+| [21] | +0xa8 | PulseEvent          | WineEventCallbacks::PulseEvent | |
+| [22] | +0xb0 | CreateEventExW      | WineEventCallbacks::CreateEvent | Must return non-NULL HANDLE |
+| [23] | +0xb8 | DuplicateHandle     | WineEventCallbacks::DuplicateEvent | |
+| [24] | +0xc0 | CreateSemaphoreExW  | WineEventCallbacks::CreateSemaphore | Must return non-NULL HANDLE |
+| [25] | +0xc8 | ReleaseSemaphore    | WineEventCallbacks::SignalSemaphore | |
+| [26] | +0xd0 | (unused)            | —                          | |
+| [27] | +0xd8 | EnumDisplayDevicesW | WineAdapters::getAdapterLUIDs | GPU LUID enumeration |
+| [28] | +0xe0 | GetModuleHandleA    | InitSharedState (KERNEL32), WineLibraries::getModuleHandle | **rcx=name** (not rdi/rsi!) |
+| [29] | +0xe8 | GetProcAddress      | InitSharedState (wine_get_unix/dos_file_name), WineLibraries::getProcAddress | rsi=hmod, rdx=name |
+| [30] | +0xf0 | GetSystemDirectoryW | WinePaths::windowsSystemDirectoryPath | |
+| [31] | +0xf8 | (unused)            | —                          | |
+| [32] | +0x100 | wine_nt_to_unix/wine_unix_to_nt | WinePaths::windowsToUnixPath, unixToWindowsPath | |
+| [33] | +0x108 | RegDeleteValueW     | WineRegistry::DeleteValue  | |
+| [34] | +0x110 | VirtualAlloc        | WineAllocations::allocateBytesFromNewPages | **CRASH if NULL** — shader JIT memory |
+| [35] | +0x118 | VirtualFree         | WineAllocations::freeBytesFromAllocatedPages | rsi=ptr |
+| [36] | +0x120 | VirtualProtect      | WineAllocations::makeExecutable | rsi=ptr, rdx=size, r8=PAGE_EXECUTE_READ |
+| [37] | +0x128 | GetModuleFileNameW  | WinePaths::getExecutablePath, getModulePath | |
+| [38] | +0x130 | LoadLibraryExW      | WineLibraries::loadLibrary | |
+| [39] | +0x138 | FreeLibrary         | WineLibraries::freeLibrary | |
+| [40] | +0x140 | LoadLibraryFromSystemDir | WineLibraries::loadLibraryFromSystemDirectory | |
+| [41] | +0x148 | (unused)            | —                          | |
+| [42] | +0x150 | (unused)            | —                          | |
+
+**Slots critical for D3D12CreateDevice (confirmed by crash analysis April 2026):**
+- **[34] VirtualAlloc** — returning NULL causes immediate NULL-dereference crash in D3D12Device ctor (shader JIT memory allocation). Must return valid mmap'd PROT_EXEC memory.
+- **[22] CreateEventExW** — returning NULL may crash D3D12Device ctor if it dereferences the handle. Return non-NULL sentinel.
+- **[24] CreateSemaphoreExW** — same as CreateEventExW.
+- **[28] GetModuleHandleA** — returning NULL means wine_get_unix/dos_file_name won't be loaded into WinePaths. WinePaths gracefully handles NULL (checks before calling), so NULL is safe here.
+- **[29] GetProcAddress** — safe to return NULL (WinePaths checks result).
+
+**Meridian implementation** in `Scripts/d3d12-bridge/d3d12_adapter.c`:
+- Slots [34/35/36]: `mmap(MAP_ANON, PROT_EXEC)` allocator with 16-byte header for size tracking
+- Slots [28/29]: `dlopen(NULL)` / `dlsym(RTLD_DEFAULT, name)` for Wine symbol resolution
+- Slots [22/24]: Non-NULL sentinel handles (auto-increment counter 0x10001+, 0x20001+)
+- Slots [18-21, 23, 25]: Return 1 (TRUE) — event operations succeed silently
+- All other slots: Diagnostic logging + return 0 (safe defaults)
+
+**OUTPUT** — after `D3DRMDispatch_Init` calls `GFXT_Initialize` from D3DMetal, opcode 0 does `memcpy(arg, &unix_gGFXTDispatch, 0x160)`. The same buffer now contains 44 D3D12 function pointers:
+- arg[2] = D3D12CreateDevice, arg[3] = SerializeRootSignature, arg[4] = SerializeVersioned
+- arg[5] = CreateRootSignatureDeserializer, arg[6] = CreateVersionedDeserializer
+
+**Unix adapter requirements:**
+1. Promote `winemac.so` to `RTLD_GLOBAL` using full path derived from `WINELOADER` env var so `GetMacDRVFunctions()` in libd3dshared can find `macdrv_functions` via `dlsym(RTLD_DEFAULT, ...)`
+2. Load `libd3dshared.dylib` with `RTLD_NOW | RTLD_GLOBAL`
+3. Copy all non-NULL entries from `__wine_unix_call_funcs` (don't break on NULL — sparse table)
+
+**Why CX uses NtQueryVirtualMemory(1000) and we don't:** CX Wine has a kernel-side handler for class 1000 that populates gWin32Dispatch directly. Standard Wine 11.5 has no such handler. We replicate the same result from the PE side by passing real function pointers in the arg buffer directly.
+
+**Call chain:** d3d12.dll (PE) → `__wine_unix_call_dispatcher` → d3d12.so → libd3dshared.dylib → GFXT_Initialize → D3DMetal.framework → Metal GPU
+
+**CRITICAL: libd3dshared.dylib validation.** Must be real Apple GPTK coordinator (~96KB, exports `GFXTOSInterface`). `release-engine.sh` validates with a `GFXTOSInterface` symbol check after copying from CX Preview.
+
+### GPTK Environment Configuration (as implemented in WineEngine.environment(for:))
+
+```bash
+# Prepend GPTK dirs to DYLD so libd3dshared.dylib and D3DMetal.framework are found
+# The d3d12.so adapter uses CX_APPLEGPTK_LIBD3DSHARED_PATH first, falls back to DYLD search
+DYLD_FALLBACK_LIBRARY_PATH="$GPTK/external:$GPTK/wine/x86_64-unix:$LIB:$LIB/wine/x86_64-unix"
+
+# Framework search path for D3DMetal.framework (Apple framework bundle, not a plain .dylib)
+DYLD_FALLBACK_FRAMEWORK_PATH="$GPTK/external"
+
+# WINEDLLPATH: GPTK's wine/ PARENT dir so Wine finds PE+Unix pairs.
+# Also includes Wine's main lib/wine/ for the bridge d3d12.dll+d3d12.so pair.
+WINEDLLPATH="$GPTK/wine:$LIB/wine"
+
+# d3d12=b: use builtin search — Wine finds bridge d3d12.dll+d3d12.so in lib/wine/ via WINEDLLPATH.
+# dxgi=n,b: GPTK's dxgi.dll implements IDXGIAdapter4 correctly; DXMT's builtin dxgi returns
+# E_NOINTERFACE for IDXGIAdapter4, causing NULL deref crashes in D3D12 games.
+WINEDLLOVERRIDES="d3d12=b;dxgi=n,b"
+
+# Explicit path for d3d12.so adapter to dlopen libd3dshared.dylib without DYLD search
+CX_APPLEGPTK_LIBD3DSHARED_PATH="$GPTK/external/libd3dshared.dylib"
+```
+
+**Detection note:** `WineEngine.detect()` sets `gptkPath` when BOTH `wine/lib/wine/x86_64-windows/d3d12.dll` (bridge) AND `wine/lib/gptk/external/D3DMetal.framework` exist AND `ntdll.dll` exports `__wine_unix_call` (cxABI=true). It does NOT check for `gptk/wine/x86_64-windows/d3d12.dll` (removed by packaging). **IMPORTANT: The cxABI check scans `ntdll.dll` (PE DLL), NOT `ntdll.so` (Unix .so) — the symbol only appears in the PE export table.**
+
+### GPTK Sourcing
+
+GPTK binaries are sourced from CrossOver Preview at:
+`/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib64/apple_gptk/`
+
+Total size: ~63MB. `release-engine.sh` copies this into the engine if CrossOver Preview is installed locally.
+
+### GPTK Critical Finding: IDXGIAdapter4 (CLI-verified March 2026)
+
+D3D12 games querying `IDXGIAdapter4` (UUID `17399d75-964e-4c03-99f8-9d4fd196dd62`) crash with NULL pointer dereference when using DXMT's builtin dxgi.dll. Root cause: DXMT dxgi returns `E_NOINTERFACE` for `IDXGIAdapter4`, and games don't check before dereferencing.
+
+**Fix (global):** `WineEngine.environment(for:)` sets `WINEDLLOVERRIDES=d3d12,dxgi=n,b` when GPTK is present. GPTK's dxgi.dll implements `IDXGIAdapter4` correctly.
+
+CLI-verified March 2026: Animal Well crash eliminated by setting `dxgi=n,b`.
+
+### GPTK Test Results (CLI-verified)
+
+**Animal Well (appID 813230, D3D12, April 2026 — D3D12CreateDevice SUCCESS):**
+- D3D12CreateDevice returns S_OK with valid device pointer — CLI-verified April 2026.
+- Steam DRM passes (SteamAPI_Init connects to running steam.exe IPC).
+- **CRITICAL: D3DMetal's `_D3D12CreateDevice` uses NON-STANDARD 6-argument SysV ABI:**
+  - `rdi, rsi` = ignored (set to NULL)
+  - `rdx` = MinimumFeatureLevel (32-bit D3D_FEATURE_LEVEL)
+  - `rcx` = pAdapter (NULL for default)
+  - `r8`  = riid (REFIID)
+  - `r9`  = ppDevice (void**)
+  - Verified by disassembling D3DMetal's `_D3D12CreateDevice` prologue (April 2026)
+  - Previous failure: standard 4-arg SysV put wrong values in r8/r9 → S_FALSE(1)
+- Bridge fix: `((fn6_t)fn)(NULL, NULL, level, adapter, riid, ppDevice)` in d3d12_adapter.c
+- Also required: load D3DMetal.framework lazily in `forward_0` (Wine PE must be fully ready)
+- Game crashes post-D3D12 init (coreaudio thread, ntdll write-to-NULL). Under investigation.
+
+---
+
+## Rendering Stack: DXVK (D3D → Vulkan → Metal via MoltenVK)
+
+### What DXVK Is
+
+DXVK translates DirectX 9/10/11 calls to Vulkan, which then goes through MoltenVK to Metal. It's the **fallback path** when DXMT fails (unsupported game/shader features, edge cases).
+
+### DXVK Layout in Meridian Engine
+
+```
+wine/lib/dxvk/x86_64-windows/d3d11.dll
+wine/lib/dxvk/x86_64-windows/dxgi.dll
+wine/lib/dxvk/x86_64-windows/d3d10core.dll
+wine/lib/dxvk/x86_64-windows/d3d9.dll
+wine/lib/dxvk/x86_64-windows/d3d8.dll
+```
+
+DXVK is in a separate `lib/dxvk/` directory (not in `lib/wine/`). This is intentional: DXMT is the default (builtin), DXVK requires explicit `WINEDLLOVERRIDES=d3d11,dxgi=n,b` and WINEDLLPATH pointing to `lib/dxvk/`.
+
+**Per-game DXVK activation:** Use `GameCompatibilityDB` to set `dxmtMode: .disabled` for games that need DXVK over DXMT.
+
+### DXVK Source
+
+```
+Repo:  doitsujin/dxvk
+Tag:   v2.7.1 (March 2026)
+Asset: dxvk-2.7.1.tar.gz
+```
+
+---
+
+## Rendering Stack: MoltenVK (Vulkan → Metal)
+
+MoltenVK is bundled with Wine as `lib/libMoltenVK.dylib` (or via `lib64/libMoltenVK.dylib` in CX). It implements the Vulkan API on top of Metal. This is the layer DXVK uses.
+
+Wine 11.5 from Gcenx ships MoltenVK 1.4.1 (CLI-verified: `[mvk-info] MoltenVK version 1.4.1, supporting Vulkan version 1.4.334`). This supports M3 Pro GPU Family Metal 3.
+
+---
+
+## CrossOver Preview 27 vs Meridian Engine Comparison
+
+| Component | CX Preview 27 (reference only) | Meridian Engine |
+|---|---|---|
+| Wine version | wine-11.4 | wine-11.5 |
+| user32 exports | 831 | 831 |
+| win32u abort stubs | 0 | 0 |
+| DXMT | `lib/dxmt/` (separate dir) | `lib/wine/` (builtin mode) |
+| D3D12 | GPTK (`lib64/apple_gptk/`) | GPTK (`lib/gptk/`) |
+| DXVK | `lib/dxvk/` | `lib/dxvk/` |
+| MoltenVK | `lib64/libMoltenVK.dylib` | bundled with Wine |
+| SteamCMD | NOT USED (runs steam.exe) | Batch mode (`+login +app_update +quit`) |
+| steam.exe | Used for all installs | Bootstrap only + DRM games |
+
+**Key architectural difference:** CX Preview runs `steam.exe` for game installs because Wine 11 is new enough that Steam actually authenticates. Meridian uses SteamCMD batch mode — this is a deliberate design choice for our no-Steam-UI architecture. When clicking Install, users never see the Steam client.
+
+---
+
+## Steam Bootstrap Process (CLI-verified March 2026)
+
+### How Steam bootstraps (native macOS method — April 2026)
+
+Steam's 32-bit bootstrapper (steam.exe, PE32, built May 2024) statically links OpenSSL which
+fails TLS under WoW64 on macOS 26 with CX Wine 11.4 ("http error 0"). Meridian bypasses it:
+
+1. `SteamSetup.exe /S` installs the Steam launcher stub (steam.exe + basic files, registry)
+2. `SteamClientBootstrap.swift` downloads manifest from `https://cdn.steamstatic.com/client/steam_client_win32` using URLSession (native macOS TLS)
+3. Downloads ~23 zip packages (~469 MB) with SHA-256 verification
+4. Extracts all packages directly to Steam install directory using `ditto -xk`
+5. `steamui.dll` appears after extraction — Steam is fully bootstrapped
+6. Write `BootStrapperInhibitAll=enable` to `steam.cfg`
+
+The old Wine-based method (`_legacyBootstrap()`) is kept as fallback but not used.
+Key files: `SteamClientBootstrap.swift`, `WineSteamManager.bootstrap()`, `BootstrapManager`.
+
+### SteamCMD Batch Mode (CLI-verified March 2026)
+
+```bash
+wine64 steamcmd.exe +login USERNAME +app_update APPID validate +quit
+# → Login: ~7-13 seconds (cached credentials)
+# → Download: starts immediately after login
+# → Exit: 0 on success
+```
+
+**First-run self-update:** SteamCMD downloads ~300MB of self-updates on its very first invocation. After that, subsequent calls take 7-13 seconds. Meridian runs `+login USERNAME +quit` during bootstrap (warm-up) to trigger this before the user clicks Install.
+
+**SteamCMD interactive mode is broken:** When stdin is a non-TTY pipe, SteamCMD exits immediately with no output. Only batch mode works. CLI-verified: `wine64 steamcmd.exe < /dev/null` → exit 1, zero output.
+
+### steam.cfg Required Contents
+
+```
+SteamNoSandbox=1
+BootStrapperInhibitAll=enable   # Only after steamui.dll is present
+```
+
+- `SteamNoSandbox=1` — disables CEF/Chromium sandbox (required, crashes without it)
+- `BootStrapperInhibitAll=enable` — prevents Steam from downloading updates on every launch (ONLY add after full bootstrap, NOT during first bootstrap or SteamCMD cannot download its self-update)
+
+---
+
+## Game DRM: steam_api64.dll
+
+Games shipping `steam_api64.dll` call `SteamAPI_Init()` which requires a live Steam IPC socket. Without a running `steam.exe`:
+- `SteamAPI_Init()` fails
+- Game exits within 1-5 seconds (no visible error window)
+
+**Solution:** `startSteamForDRM()` in `WineSteamManager` starts `steam.exe -silent` before launching the game, killed after game exits.
+
+**Detection:** `prefix.gameRequiresSteamAPI(appID:)` checks for `steam_api64.dll` in the game's install directory.
+
+---
+
+## Game Compatibility Database
+
+`GameCompatibilityDB.swift` stores per-game fixes. When testing a new game, add an entry documenting:
+- Engine tested against
+- Any crashes and their root cause
+- DLL overrides needed
+- DXMT mode (auto/required/disabled)
+- Graphics API (dx11/dx12/vulkan)
+
+**CLI testing methodology:**
+1. Kill all Wine processes: `pkill -9 -f "meridian.app/engine"`
+2. Set up env matching `WineEngine.environment(for:)` — WINEPREFIX, WINESERVER, WINELOADER, DYLD_FALLBACK_LIBRARY_PATH
+3. For D3D12 games: set GPTK env vars (DYLD paths, WINEDLLPATH, WINEDLLOVERRIDES=`d3d12=b;dxgi=n,b`, CX_APPLEGPTK_LIBD3DSHARED_PATH, DYLD_FALLBACK_FRAMEWORK_PATH)
+4. Run game exe directly: `wine64 "Game.exe"`
+5. Observe crash messages, look for `unimplemented function`, `page fault`, or `failed to create` errors
+6. Document findings in GameCompatibilityDB — classify as engine-wide or game-specific
+
+---
+
+## Process Cleanup Architecture
+
+Wine leaves background processes (wineserver, winedevice.exe, services.exe) that hold wineserver sockets. Orphan processes cause SteamCMD login to hang (connects to degraded wineserver).
+
+**Startup cleanup (BootstrapManager):**
+1. Set `TerminationCleanup.context` from static known paths BEFORE calling cleanup
+2. Run `wineserver -k` (kills all Wine processes for the prefix cleanly)
+3. Two `pkill -9` sweeps (catches processes that changed their argv[0])
+4. Also kill `/tmp/meridian-engine/` orphans from `release-engine.sh`
+
+**Quit cleanup (AppDelegate → TerminationCleanup):**
+1. Kill steamwebhelper FIRST (prevents "not responding" dialog)
+2. Kill steam.exe
+3. `wineserver -k`
+4. Two pkill sweeps
+
+**Why `pkill -f` alone is insufficient:** Wine processes replace their `argv[0]` with the Windows program path (e.g., `C:\windows\system32\winedevice.exe`) after startup. `pkill -f "com.meridian.app/engine"` can't match them. `wineserver -k` is the only reliable way.
+
+---
+
+## Engine Package Layout (Current)
+
+```
+engine/wine/
+├── bin/
+│   ├── wine          (unified Wine binary, Wine 11+)
+│   ├── wine64        (alias/copy of wine, required by WineEngine.detect())
+│   └── wineserver
+├── lib/
+│   ├── wine/
+│   │   ├── x86_64-windows/   (Wine PE DLLs + DXMT builtin DLLs + d3d12 bridge PE)
+│   │   ├── x86_64-unix/      (Wine .so modules including wiremetal.so, wiremac.so, d3d12 bridge adapter)
+│   │   └── i386-windows/     (32-bit Wine PE DLLs + DXMT 32-bit)
+│   ├── vkd3d-proton/
+│   │   └── x86_64-windows/   (d3d12.dll, d3d12core.dll — present but NOT used: VK_EXT_transform_feedback missing in MoltenVK)
+│   ├── gptk/                 (ACTIVE — primary D3D12 path via D3DMetal.framework → Metal)
+│   │   ├── wine/x86_64-windows/  (d3d12.dll, dxgi.dll — loaded via WINEDLLPATH)
+│   │   ├── wine/x86_64-unix/     (d3d12.so etc. — symlinks to libd3dshared.dylib)
+│   │   └── external/             (D3DMetal.framework, libd3dshared.dylib)
+│   └── dxvk/
+│       └── x86_64-windows/   (d3d9.dll, d3d10core.dll, d3d11.dll, dxgi.dll, d3d8.dll)
+├── share/wine/
+│   ├── nls/          (required: l_intl.nls, locale.nls, normnfc.nls)
+│   ├── fonts/
+│   └── wine.inf      (required for wineboot --init and --update)
+└── meridian-engine-version.txt
+```
+
+---
+
+## Known Game Compatibility Matrix (April 2026)
+
+| Game | AppID | Engine | API | Status | Notes |
+|---|---|---|---|---|---|
+| No, I'm not a Human | 3180070 | Wine 11.5 | DX11 | **Verified** | DXMT works, runs 30+ seconds |
+| Animal Well | 813230 | Wine 11.5 | DX12 | **Launches** | D3D12CreateDevice returns S_OK (valid device). Fixed April 2026: D3DMetal uses non-standard 6-arg SysV ABI (rdx=level, rcx=adapter, r8=riid, r9=ppDevice). Bridge calls with corrected arg layout. Steam DRM passes. Post-device init crash (coreaudio/ntdll) under investigation. |
+| PEAK | 3527290 | — | DX12 | Untested | Unity game, DX12 |
+| Super Battle Golf | 4069520 | — | DX12 | Untested | Unity game |
+
+---
+
+## Engine Upgrade Checklist (for future releases)
+
+When building a new engine release via `release-engine.sh`:
+
+1. Download `wine-devel-{VERSION}-osx64.tar.xz` from Gcenx/macOS_Wine_builds
+2. Download DXMT builtin variant from 3Shain/dxmt
+3. Download VKD3D-proton from `HansKristian-Work/vkd3d-proton` — place at `wine/lib/vkd3d-proton/x86_64-windows/`
+4. Download DXVK from doitsujin/dxvk
+5. Run `wineboot --init` to build prefix template
+6. Validate: wine64 --version, NLS files, DXMT files, VKD3D-proton d3d12.dll, prefix template
+7. Tag as vX.Y.Z-engine and publish to GitHub Releases
+
+**DXMT must be version-compatible with Wine:** DXMT's `wiremetal.so` links to `wiremac.so` and requires the macdrv Metal APIs (added in Wine 10.x). Using DXMT built against Wine 11.x with Wine 8.x causes "Failed to create metal view" crash.
+
+**VKD3D-proton DLLs are installed into prefix system32 at runtime** (not bundled in the Wine lib directory) — `WinePrefix.installVKD3DProton` handles this. The engine package ships them at `wine/lib/vkd3d-proton/x86_64-windows/`.
+
+---
+
+## macOS Process Management: Two Patterns Every Session Must Know
+
+### Pattern 1: Pipe Write-End Inheritance → availableData Blocks Forever
+
+When `engine.run()` launches `wine64`, the child process spawns further children (wineserver, winedevice.exe, services.exe). These children **inherit all open file descriptors** from wine64 — including the `stdout` and `stderr` pipe write-ends. When wine64 exits:
+
+- `process.terminationHandler` fires correctly ✓
+- BUT `NSFileHandle.availableData` on the read-end **blocks** — because wineserver still holds the write-end open and has written nothing
+- `availableData` calls POSIX `read()` which blocks when the write end is open with no data pending
+- wineserver runs indefinitely → `read()` never returns → app hangs forever at "Applying new Wine engine…"
+
+**`availableData` is NOT non-blocking on pipes.** Apple's documentation describes it as reading "available data" but `read()` on a pipe blocks when the write-end is open. This only behaves as expected for regular files.
+
+**Fix:** Set `O_NONBLOCK` on the pipe fd before calling `availableData`, then restore. CLI-verified April 2026: `wine64 wineboot --update` exited, but `availableData` blocked for >5 minutes until process was force-killed.
+
+```swift
+private func readNonBlocking(_ pipe: Pipe) -> Data {
+    let fh = pipe.fileHandleForReading
+    let fd = fh.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0 else { return Data() }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK)  // read() returns EAGAIN if no data
+    let data = fh.availableData
+    fcntl(fd, F_SETFL, flags)               // restore
+    return data
+}
+```
+
+### Pattern 2: pkill -f Stops Matching After Wine Replaces argv[0]
+
+Wine processes modify `argv[0]` to the Windows program path shortly after startup:
+
+- **Before:** `/Users/.../com.meridian.app/engine/wine/bin/wine64 steam.exe -silent`
+- **After:**  `C:\Program Files\Steam\steam.exe -silent`
+
+`pkill -f "com.meridian.app/engine"` matches process **argv** (the command line the process reports), NOT the binary path on disk. After replacement, this pattern no longer matches.
+
+**What still works:** The Windows path itself is visible in `ps` output and matchable by `pkill -f`. The process-specific substring is the reliable pattern:
+
+| Process | pkill pattern | Still matches after argv replacement? |
+|---|---|---|
+| steam.exe | `pkill -f "steam.exe"` | ✓ — "steam.exe" in Windows path |
+| steamwebhelper.exe | `pkill -f "steamwebhelper"` | ✓ — present in Windows path |
+| steamservice.exe | `pkill -f "steamservice.exe"` | ✓ — present in Windows path |
+| winedevice.exe | `pkill -f "winedevice.exe"` | ✓ — present in Windows path |
+| wineserver | `pkill -f "com.meridian.app/engine"` | ✓ — wineserver does NOT replace argv[0] |
+
+**Consequence:** Old orphaned Wine processes (from sessions where cleanup failed or the app crashed) accumulate indefinitely. They are invisible to engine-path pkill but catchable by Windows-name pkill. `TerminationCleanup` must include both pattern types.
+
+CLI-verified April 2026: `steamservice.exe` processes from Monday were still running on Thursday, surviving every `pkill -f "com.meridian.app/engine"` sweep.
+
+### Pattern 3: wineboot --update Runs Steam as a Startup Program
+
+`wineboot --update` processes Windows startup registry keys:
+- `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
+
+Steam registers itself in the Run key during `SteamSetup.exe` installation:
+`"C:\Program Files\Steam\steam.exe" -silent`
+
+When `wineboot --update` runs, it starts `steam.exe -silent`. If no valid ConnectCache session exists (e.g. after a prefix rebuild or failed bootstrap session), Steam shows its sign-in window. The `SteamWindowSuppressor` is NOT active during prefix operations (by design — `beginSession()` runs after all prefix work). 
+
+**Fix:** Delete the Steam Run key immediately before every `wineboot --update` call:
+```swift
+try? await engine.run(args: ["reg", "delete",
+    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "/v", "Steam", "/f"], prefix: self)
+```
+Steam re-adds itself the next time it starts normally. This is safe to delete on every wineboot run.
+
+CLI-verified April 2026: without this delete, every engine-change `wineboot --update` started `steam.exe -silent` which showed the sign-in screen once Meridian was closed.
+
+---
+
+## Steam Client Bootstrap: Native macOS Download (April 2026)
+
+### Why native bootstrap was needed
+
+`steam.exe`'s 32-bit bootstrapper statically links OpenSSL which cannot complete TLS handshakes under WoW64 on macOS 26. Meridian bypasses it entirely with `SteamClientBootstrap.swift` using `URLSession`.
+
+### Two manifests, two package sets
+
+| Manifest URL | Content | Required for |
+|---|---|---|
+| `cdn.akamai.steamstatic.com/client/steam_client_win32` | ~20 packages, ~470 MB — Steam client DLLs, SteamUI.dll, steamcmd.exe stub (2013) | Steam client bootstrap (steam.exe running at all) |
+| `cdn.akamai.steamstatic.com/client/steam_cmd_win32` | ~5 packages, ~28 MB — steamconsole.dll, updated steamcmd.exe (4.2 MB), tier0_s, vstdlib_s | SteamCMD game installs |
+
+Both must be downloaded during bootstrap. Skipping `steam_cmd_win32` leaves the 2013 stub steamcmd.exe in place which crashes immediately.
+
+### Steam package ZIP format quirks (CLI-verified April 2026)
+
+Steam's `.zip.HASH` packages have two non-standard properties that defeat `ditto` and `unzip`:
+
+1. **20-byte Valve proprietary header prepended** before the ZIP data. `ditto -xk` requires `PK` magic at byte 0 — fails. `unzip` reads from the end-of-central-directory (tail) — handles it.
+2. **Windows backslash path separators in ZIP entries.** On macOS/Unix, `unzip` treats `\` as a valid filename character and creates files with literal backslashes in their names rather than nested directories. SteamCMD then can't find its CEF binaries.
+
+**Fix:** Use Python `zipfile` which handles both issues:
+```python
+import zipfile
+with zipfile.ZipFile(src) as z:
+    for info in z.infolist():
+        info.filename = info.filename.replace('\\', '/')
+        z.extract(info, dst)
+```
+This is implemented in `SteamClientBootstrap.extractZip()`.
+
+### App Transport Security (ATS) on macOS 26
+
+With `NSAllowsArbitraryLoads = false`, macOS 26 blocks HTTPS connections to unlisted domains even for valid certificates. All Steam/GitHub CDN domains must be in `NSExceptionDomains` in `Info.plist`:
+- `cdn.akamai.steamstatic.com` — Steam client packages (confirmed working)
+- `cdn.steamstatic.com` — fallback CDN
+- `objects.githubusercontent.com` — engine/app update downloads
+- `github.com` — release page fallback
+
+### WoW64 crypto provider registry (CLI-verified April 2026)
+
+Wine's `wine.inf` only writes crypto provider types to the 64-bit registry hive (`HKLM\SOFTWARE\Microsoft\Cryptography\Defaults`). The 32-bit WoW64 view (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Cryptography\Defaults`) is absent.
+
+32-bit applications (steamcmd.exe, any 32-bit game) call `CryptAcquireContextA()` which reads from the WoW64 hive. Without it: `NTE_PROV_TYPE_NOT_DEF` (0x80090017) → C++ exception → exit 3. SteamCMD crashes before loading any Steam DLLs.
+
+**Fix:** `WinePrefix.writeSteamInstallPathRegistryKeys()` writes the WoW64 crypto provider types (Type 001, 003, 012, 013, 018, 024) and provider DLL paths. Called once per prefix via versioned AppSettings key `steamInstallPathRegistrationVersion = 2`.
+
+### Steam install path registry (CLI-verified April 2026)
+
+`steam.exe` writes `HKLM\SOFTWARE\Valve\Steam\InstallPath` on first run. With native bootstrap, steam.exe never runs its initializer. steamcmd.exe reads `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath` (WoW64 redirect) — if absent, throws C++ exception at startup.
+
+**Fix:** Also written by `writeSteamInstallPathRegistryKeys()`.
+
+### steamcmd.exe -overrideminos flag (CLI-verified April 2026)
+
+The updated steamcmd.exe (4.2 MB from `steam_cmd_win32` manifest) checks the Windows OS version and refuses to run under Wine's reported version without the `-overrideminos` flag. This flag must be prepended to ALL steamcmd invocations:
+- `steamcmd.exe -overrideminos +login USERNAME +quit`
+- `steamcmd.exe -overrideminos +login USERNAME +app_update APPID validate +quit`
+- `steamcmd.exe -overrideminos +login USERNAME PASSWORD +quit` (reauthenticate)
+
+### SteamCMD credential architecture (CRITICAL — two separate systems)
+
+There are TWO completely separate credential systems that must NOT be confused:
+
+| System | Written by | Read by | Location | What it contains |
+|---|---|---|---|---|
+| **JWT ConnectCache** | `WinePrefix.writeConnectCache()` | `steam.exe` auto-login | `config/config.vdf` under `ConnectCache` | JWT refresh token from Meridian's OAuth flow |
+| **SteamCMD native cache** | `steamcmd.exe +login USERNAME PASSWORD +quit` | `steamcmd.exe +login USERNAME` (batch mode) | Same `config.vdf`, different encrypted blob | SteamCMD's own encrypted credential blob |
+
+**SteamCMD batch mode (`+login USERNAME`) reads ONLY its native cache, NOT the JWT.** Writing a JWT ConnectCache does not help SteamCMD at all.
+
+**Consequences:**
+- After Meridian onboarding (JWT written), warm-up with `+login USERNAME +quit` reports "Cached credentials not found" — expected, not a bug.
+- The fix: during bootstrap warm-up, when "Cached credentials not found" is detected, immediately run `reestablishCredentials()` with the Keychain password. This runs `+login USERNAME PASSWORD +quit` which creates the native cache. **This is the one 2FA prompt the user sees — it MUST happen during bootstrap (splash screen), not when they click Install.**
+
+**`BootstrapManager` warm-up + re-auth flow (April 2026):**
+1. Warm-up runs `+login USERNAME +quit` — sets `noNativeCredentials = true` if cache absent
+2. After warm-up: `steamCMDService.reestablishCredentials(engine:prefix:onProgress:)` runs
+3. Uses `passwordProvider` (Keychain) to call `reauthenticate(password:engine:prefix:)`
+4. Runs `steamcmd.exe -overrideminos +login USERNAME PASSWORD +quit`
+5. SteamCMD logs in, writes native cache, exits 0 → `backupSteamCMDConfig()` saves it
+6. All future warm-ups and installs find the cache and succeed without password or 2FA
+
+### config.vdf merge corruption (April 2026 — NEVER merge again)
+
+The old `writeConnectCache` tried to upsert entries into existing config.vdf files (steam.exe-generated, ~20KB). The VDF manipulation code placed `"ConnectCache"` at column 0, producing 164 opening vs 163 closing braces. SteamCMD parsed the file, hit EOF mid-structure, printed "Cached credentials not found", and blocked forever on the password prompt (stdin = /dev/null).
+
+**Fix:** `writeConnectCache` now ALWAYS writes a fresh minimal VDF — never merges. The JWT refresh token in AppSettings is sufficient for steam.exe; SteamCMD uses its own native cache. Fresh VDF = no corruption risk.
+
+---
+
+## Pattern 4: Same-tag Engine Republish Stales the Prefix (CLI-verified April 10, 2026)
+
+When `release-engine.sh` is run again with the same engine version tag (no version bump), `BootstrapManager`'s tag-string comparison (`storedTag == currentTag`) passes, so `wineboot --update` / `resetToEngineTemplate` is skipped. The prefix is left with DLL state corresponding to the OLD engine packaging.
+
+**Symptom:** SteamCMD hangs indefinitely at "Logging in user ... to Steam Public..." — not a TLS error, not a credential error. The TLS handshake itself succeeds (GnuTLS cipher negotiated, session ticket received). The hang is in the Steam CM protocol layer, indicating a Wine prefix/DLL state inconsistency.
+
+**CLI-verified April 10, 2026:**
+- Anonymous login (`+login anonymous`) hangs at "Connecting anonymously to Steam Public..." — eliminates credential theory.
+- Using CrossOver Preview's wineserver (byte-identical binary via MD5 comparison) with the same prefix: login completes in ~5s — eliminates network theory.
+- After CX Preview ran `wineboot --update` (system.reg mtime updated at 16:43): Meridian's own engine also works — confirms stale prefix was root cause.
+- 8 orphan Wine processes (explorer.exe dating to prior day, steamcmd.exe from 12:07) survived every startup cleanup sweep because their argv[0] had been replaced.
+
+**Fix (committed April 10, 2026):**
+- `AppSettings.lastPrefixEngineModTime` stores the mtime of `wine/meridian-engine-version.txt` when the prefix was last reset.
+- `BootstrapManager` compares BOTH tag AND modtime: `needsUpdate = storedTag != currentTag || currentEngineModTime != lastPrefixEngineModTime`
+- Even if the tag string is the same, a changed mtime (always true after a `release-engine.sh` run) triggers a prefix reset.
+- `TerminationCleanup` now adds a "Windows-name sweep" (step 8) killing `explorer.exe`, `steamcmd.exe`, `winedevice.exe`, etc. by their Windows argv[0] path.
+- `TerminationCleanup` now cleans stale `/tmp/.wine-<uid>/server-*` socket directories (step 9).
+- `SteamCMDService.warmUp()` now explicitly terminates the process on 5-minute timeout and guards `backupSteamCMDConfig()` to only run on genuine exit-0, not timeout.
+
+**CORRECTION (April 10, 2026 — Pattern 5 below was the real root cause):** The Pattern 4 fix (mtime detection, cleanup improvements) addresses real secondary issues but was NOT the root cause of the SteamCMD hang. The hang was caused by `com.apple.quarantine` on the engine files — see Pattern 5.
+
+---
+
+## Pattern 5: com.apple.quarantine Blocks Wine Network Access (CLI-verified April 10, 2026)
+
+**This was the actual root cause of all SteamCMD "Loading Steam API..." hangs and DX11 game regressions across multiple sessions.**
+
+### What happens
+
+macOS sets the `com.apple.quarantine` extended attribute on every file downloaded via `URLSession`. When `EngineDownloader` extracts the engine `.tar.gz` via `tar`, the quarantine attribute propagates to all extracted files. On macOS 26, quarantined executables have restricted network access — Wine's `secur32.so` cannot dlopen `libgnutls`, and its TLS connections fail silently.
+
+**Symptoms:**
+- SteamCMD hangs at "Loading Steam API..." indefinitely — even with `+login anonymous` (no credentials needed)
+- DX11 games appear to start but Steam DRM connections fail
+- `wine64 --version` works fine (no network) — binary appears healthy
+- `wineboot --update` hangs indefinitely
+- CX Preview's own wineloader (not quarantined) works perfectly
+
+### CLI proof (April 10, 2026)
+
+```bash
+# Meridian's wine64 — quarantined:
+xattr engine/wine/bin/wine64  # → com.apple.quarantine
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# HANGS at "Loading Steam API..." — never prints "Connecting anonymously..."
+
+# CX Preview's wineloader — NOT quarantined:
+xattr "CrossOver Preview.app/.../wineloader"  # → (no output)
+# binaries are BYTE-FOR-BYTE IDENTICAL: MD5 0e1334f181c1dda39e213c7be3e37fef
+# CX wine with identical binary runs to: "Connecting anonymously to Steam Public...OK"
+
+# After stripping quarantine from Meridian's engine:
+xattr -rd com.apple.quarantine engine/
+wine64 steamcmd.exe -overrideminos +login anonymous +quit
+# → "Connecting anonymously to Steam Public...OK" in 12 seconds
+```
+
+### Why previous sessions missed this
+
+1. `wine64 --version` works with quarantine (no network needed) — the binary looked healthy.
+2. When CX Preview's wineloader was used in test runs, it worked because CX installs via a signed `.pkg` which does not apply quarantine. Tests concluded "stale prefix" or "TLS issue" — chasing the wrong root cause for three days.
+3. Every TLS, GnuTLS, lib64, prefix-mtime theory was a symptom of the same underlying restricted network access.
+
+### Fix (April 10, 2026)
+
+1. **`EngineDownloader.stripQuarantine(from:)`** — called (a) on the downloaded `.tar.gz` archive before extraction and (b) on the engine directory after extraction. Both are needed because `tar` may still propagate quarantine from archive metadata.
+2. **`BootstrapManager.stripEngineQuarantine()`** — one-time cleanup (versioned via `AppSettings.quarantineCleanedVersion = 1`) for users with engines downloaded before the fix.
+
+### Key rule going forward
+
+After ANY engine download, immediately call `xattr -rd com.apple.quarantine` on the engine directory. Without this, Wine's network stack is broken on macOS 26.
+

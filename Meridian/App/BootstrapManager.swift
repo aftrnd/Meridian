@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import os.log
 
 private let log = MeridianLog(category: "BootstrapManager")
 
@@ -8,7 +7,11 @@ private let log = MeridianLog(category: "BootstrapManager")
 ///
 /// Runs each phase in order, skipping steps that are already complete
 /// (prefix exists, Steam installed, etc.). The final phase starts a
-/// persistent Steam process so game launches are near-instant via IPC.
+/// persistent SteamCMD interactive session so game installs are instant.
+///
+/// steam.exe is NOT started at bootstrap — steam.exe authentication is unreliable — use SteamCMD batch mode for installs
+/// and its crash-restart loop destabilizes the shared wineserver. steam.exe is only
+/// started on-demand for games that require Steam DRM (steam_api64.dll).
 ///
 /// State is published for the splash screen to display real milestones.
 @Observable
@@ -27,7 +30,6 @@ final class BootstrapManager {
         case bootstrappingSteam
         case syncingSession
         case startingSteam
-        case waitingForSteam
         case ready
         case failed(String)
     }
@@ -63,7 +65,8 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) {
         guard phase == .idle || isFailed else { return }
 
@@ -73,7 +76,8 @@ final class BootstrapManager {
                 engine: engine,
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
-                engineDownloader: engineDownloader
+                engineDownloader: engineDownloader,
+                steamCMDService: steamCMDService
             )
         }
     }
@@ -106,9 +110,10 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) {
-        let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam, .waitingForSteam]
+        let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam]
         if let failed = lastFailedPhase, cleanupPhases.contains(failed) {
             log.info("[retry] previous failure in \(String(describing: failed)) — killing Wine and wiping entire prefix for clean start")
             steamManager.killAll(engine: engine, prefix: prefix)
@@ -118,7 +123,7 @@ final class BootstrapManager {
         phase = .idle
         statusMessage = ""
         engineDownloadState = .idle
-        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader)
+        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader, steamCMDService: steamCMDService)
     }
 
     // MARK: - Pipeline
@@ -130,13 +135,36 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader
+        engineDownloader: EngineDownloader,
+        steamCMDService: SteamCMDService
     ) async {
         let pipelineStart = ContinuousClock.now
 
-        // Pre-flight: kill any orphaned Wine processes from a previous session that
-        // didn't shut down cleanly. Without this, leftover wineserver/steam.exe
-        // processes hold locks that prevent the new bootstrap from succeeding.
+        // Pre-flight: set cleanup context from known static paths BEFORE running cleanup.
+        //
+        // The paths are fixed constants — they never vary per-machine. Setting context here
+        // ensures wineserver -k runs at startup even on the very first call, before
+        // startPersistent ever sets the context in the normal flow.
+        //
+        // Without this, wineserver -k is skipped and pkill -f is the only fallback.
+        // pkill -f cannot find orphan Wine processes because Wine replaces its argv[0]
+        // with the Windows program path (e.g. "C:\...\steamcmd.exe") after startup —
+        // the engine path is no longer visible to pkill. wineserver -k is the only
+        // reliable way to kill all Wine processes for a specific WINEPREFIX.
+        if engine.isReady && TerminationCleanup.context == nil {
+            let engineDir = WineEngine.engineDir
+            TerminationCleanup.context = TerminationCleanup.Context(
+                wineserverPath: engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false),
+                winePrefix: prefix.path.path(percentEncoded: false),
+                engineDirPath: engineDir.path(percentEncoded: false),
+                libraryPath: engineDir.appending(path: "wine/lib").path(percentEncoded: false)
+            )
+            log.info("[bootstrap] cleanup context set from static paths (early, pre-cleanup)")
+        }
+
+        // Kill any orphaned Wine processes from a previous session that didn't shut down
+        // cleanly. Without this, leftover wineserver processes cause SteamCMD to connect
+        // to a stale/corrupt wineserver and hang indefinitely during login.
         await Task.detached(priority: .userInitiated) {
             TerminationCleanup.killAllWineProcesses()
         }.value
@@ -204,6 +232,15 @@ final class BootstrapManager {
             libraryPath: engine.libraryPath
         )
 
+        // One-time quarantine cleanup for engines downloaded before EngineDownloader
+        // started stripping quarantine automatically. Must run before any Wine process
+        // is launched — quarantined Wine binaries have restricted network access on
+        // macOS 26, causing Wine's TLS/secur32 to fail silently and SteamCMD to hang.
+        if settings.quarantineCleanedVersion < Self.quarantineCleanedCurrentVersion {
+            await Self.stripEngineQuarantine()
+            settings.quarantineCleanedVersion = Self.quarantineCleanedCurrentVersion
+        }
+
         guard !Task.isCancelled else { return }
 
         // 1b. Permission gate — block here until Accessibility is granted or user skips.
@@ -248,9 +285,13 @@ final class BootstrapManager {
                 fail("Failed to create Wine environment: \(error.localizedDescription)")
                 return
             }
-            // Record the engine tag used to create this prefix so we can detect
-            // future engine upgrades that require a DLL symlink refresh.
+            // Record the engine tag and content fingerprint used to create this prefix
+            // so we can detect future engine upgrades or same-tag republishes.
             settings.lastPrefixEngineTag = engine.engineVersion ?? ""
+            settings.lastPrefixEngineModTime = Self.engineVersionFileModTime()
+
+            // Register WinRT class mappings that Wine's wineboot doesn't create.
+            await prefix.registerWinRTClasses(engine: engine)
         }
 
         guard !Task.isCancelled else { return }
@@ -266,18 +307,31 @@ final class BootstrapManager {
         //     Falls back to `wineboot --update` for engines without a template.
         let storedTag = settings.lastPrefixEngineTag
         let currentTag = engine.engineVersion ?? ""
-        if prefix.exists && !currentTag.isEmpty && storedTag != currentTag {
-            log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix to new engine template")
+        let currentEngineModTime = Self.engineVersionFileModTime()
+        let needsUpdate = prefix.exists && !currentTag.isEmpty
+            && (storedTag != currentTag || currentEngineModTime != settings.lastPrefixEngineModTime)
+        if needsUpdate {
+            if storedTag != currentTag {
+                log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix to new engine template")
+            } else {
+                log.info("[bootstrap] engine content changed (same tag \(currentTag), mtime \(settings.lastPrefixEngineModTime) → \(currentEngineModTime)) — resetting prefix to new engine template")
+            }
             transition(to: .creatingPrefix, message: "Applying new Wine engine…")
             let t = ContinuousClock.now
             do {
                 try await prefix.resetToEngineTemplate(engine: engine)
+                // Kill Wine processes started by wineboot (wineserver, winedevice, etc.)
+                // before the registration step so it starts a clean new session.
+                steamManager.killAll(engine: engine, prefix: prefix)
+                try? await Task.sleep(for: .seconds(1))
                 settings.lastPrefixEngineTag = currentTag
+                settings.lastPrefixEngineModTime = currentEngineModTime
                 log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
+                await prefix.registerWinRTClasses(engine: engine)
             } catch {
                 log.error("[bootstrap] prefix reset failed (non-fatal): \(error.localizedDescription) — continuing with existing prefix")
             }
-        } else if storedTag == currentTag {
+        } else {
             log.info("[bootstrap] engine tag unchanged (\(currentTag)) — no prefix update needed")
         }
 
@@ -319,12 +373,40 @@ final class BootstrapManager {
         try? prefix.ensureDefaultLibrary()
         log.info("[bootstrap] steam.cfg and libraryfolders.vdf pre-written before bootstrap")
 
+        // Ensure WinRT class registrations are up to date.
+        // Only runs when the stored version is behind the current version — avoids
+        // spawning a Wine process on every launch for an already-configured prefix.
+        if settings.winRTRegistrationAppliedVersion < WinePrefix.winRTRegistrationVersion {
+            log.info("[bootstrap] WinRT registration version \(settings.winRTRegistrationAppliedVersion) < \(WinePrefix.winRTRegistrationVersion) — re-registering")
+            await prefix.registerWinRTClasses(engine: engine)
+            settings.winRTRegistrationAppliedVersion = WinePrefix.winRTRegistrationVersion
+        }
+
+        // Write Steam HKLM install-path registry keys (once per prefix).
+        // steam.exe writes these on first run; our native bootstrap bypasses steam.exe
+        // so they are never created. steamcmd.exe (32-bit WoW64) reads
+        // HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath at startup — if absent,
+        // it throws a C++ exception before loading any Steam DLLs and exits with code 3.
+        if settings.steamInstallPathRegistrationVersion < WinePrefix.steamInstallPathRegistrationVersion {
+            log.info("[bootstrap] Steam install path not registered — writing HKLM keys")
+            await prefix.writeSteamInstallPathRegistryKeys(engine: engine)
+            settings.steamInstallPathRegistrationVersion = WinePrefix.steamInstallPathRegistrationVersion
+        }
+
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
-            transition(to: .bootstrappingSteam, message: "Steam is updating — first launch takes a few minutes…")
+            transition(to: .bootstrappingSteam, message: "Downloading Steam client…")
             let t = ContinuousClock.now
             do {
-                try await steamManager.bootstrap(engine: engine, prefix: prefix)
+                try await steamManager.bootstrap(engine: engine, prefix: prefix) { [weak self] downloaded, total in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        let pct = total > 0 ? Int(downloaded * 100 / total) : 0
+                        let mb = downloaded / 1_048_576
+                        let totalMB = total / 1_048_576
+                        self.statusMessage = "Downloading Steam client… \(mb)/\(totalMB) MB (\(pct)%)"
+                    }
+                }
                 log.info("[bootstrap] Steam client bootstrapped in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
             } catch {
                 fail("Steam update failed: \(error.localizedDescription)")
@@ -339,6 +421,40 @@ final class BootstrapManager {
         // replaced the Steam install directory).
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
+
+        // 4b. Ensure SteamCMD is present (download if missing).
+        // SteamCMD is a ~1.6MB download that self-updates to ~5MB on first run.
+        // It must be in the Steam directory BEFORE any game install is attempted.
+        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
+        if !FileManager.default.fileExists(atPath: steamcmdPath) {
+            log.info("[bootstrap] SteamCMD not found — downloading")
+            do {
+                let steamcmdURL = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip")!
+                let (data, _) = try await URLSession.shared.data(from: steamcmdURL)
+                let tempZip = FileManager.default.temporaryDirectory.appending(path: "steamcmd.zip")
+                try data.write(to: tempZip)
+                let unzipProcess = Process()
+                unzipProcess.executableURL = URL(filePath: "/usr/bin/unzip")
+                unzipProcess.arguments = ["-o", tempZip.path(percentEncoded: false), "-d", prefix.steamInstallDir.path(percentEncoded: false)]
+                unzipProcess.standardOutput = FileHandle.nullDevice
+                unzipProcess.standardError = FileHandle.nullDevice
+                try unzipProcess.run()
+                unzipProcess.waitUntilExit()
+                try? FileManager.default.removeItem(at: tempZip)
+                log.info("[bootstrap] SteamCMD installed ✓")
+            } catch {
+                log.warning("[bootstrap] SteamCMD download failed: \(error.localizedDescription) — game installs may fail")
+            }
+        } else {
+            log.debug("[bootstrap] SteamCMD already present ✓")
+        }
+
+        // 4c. Restore SteamCMD credential cache from backup.
+        // If the prefix was recreated (reset or engine upgrade), the credential
+        // cache is gone. We back it up in WinePrefix.reset() and
+        // resetToEngineTemplate() — restore it here so game installs don't
+        // require Steam Guard re-confirmation.
+        prefix.restoreSteamCMDConfig()
 
         // 5. Sync macOS Steam session for auto-login
         transition(to: .syncingSession, message: "Syncing Steam session…")
@@ -364,60 +480,83 @@ final class BootstrapManager {
         guard !Task.isCancelled else { return }
 
         // 6. Engage window suppression now that all prefix operations are complete.
-        // This must happen BEFORE starting persistent Steam so its windows are hidden.
-        // It must NOT happen earlier — prefix operations (wineboot --init, wineboot --update,
-        // SteamSetup.exe) spawn transient Wine GUI windows that must be allowed to render
-        // and exit naturally.
+        // This must NOT happen earlier — prefix operations (wineboot --init,
+        // wineboot --update, SteamSetup.exe) spawn transient Wine GUI windows that
+        // must be allowed to render and exit naturally.
+        // steam.exe is NOT started at bootstrap. We use SteamCMD batch mode for all
+        // game installs. steam.exe is only started on-demand for DRM games that need
+        // a live Steam IPC socket (startSteamForDRM).
         windowSuppressor?.beginSession()
 
-        // 7. Start persistent Steam — but SKIP when the CX engine is active.
+        // 7. Warm up SteamCMD: run `+login USERNAME +quit` so the self-update and
+        //    credential cache are ready before the user clicks Install.
         //
-        // With the CX engine, Steam's CEF/webhelper works correctly (1,131 stubs fixed),
-        // which means steam.exe -silent still shows its login window (QR code) because
-        // Steam isn't authenticated. We don't need persistent Steam at all:
-        // - Downloads use SteamCMD (separate binary, own auth)
-        // - Game launch uses direct exe via Wine (no steam.exe -applaunch)
+        // On first ever run: SteamCMD downloads ~300MB of self-updates. This takes
+        // 1–3 minutes and happens here on the splash screen ("Preparing game tools…").
         //
-        // Without the CX engine (Gcenx-only), persistent Steam is started as before
-        // for backward compatibility with the old +app_update IPC flow.
-        if engine.cxPreviewLibPath != nil {
-            log.info("[bootstrap] CX engine active — skipping persistent Steam (not needed for SteamCMD + direct launch)")
-            steamManager.isRunning = true
-        } else {
-            transition(to: .startingSteam, message: "Starting Steam…")
-            do {
-                try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                log.info("[bootstrap] persistent Steam process launched")
-            } catch {
-                fail("Failed to start Steam: \(error.localizedDescription)")
-                return
-            }
-
-            if let pid = steamManager.persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
-            }
-
-            steamManager.onSteamRevived = { [weak self, weak steamManager] in
-                guard let pid = steamManager?.persistentProcessIdentifier else { return }
-                self?.windowSuppressor?.resumeSuppressing(pid: pid)
-                log.info("[bootstrap] suppressor re-engaged after Steam revival (pid=\(pid))")
-            }
-
-            guard !Task.isCancelled else { return }
-
-            transition(to: .waitingForSteam, message: "Waiting for Steam to initialize…")
-            do {
-                try await steamManager.waitUntilReady(prefix: prefix) { [weak self] message in
-                    self?.statusMessage = message
-                    log.info("[bootstrap] waitUntilReady status: \(message)")
+        // On subsequent launches: SteamCMD verifies its install in ~7 seconds.
+        //
+        // The warm-up is non-fatal — if it fails (no network, stale credentials),
+        // bootstrap still completes and installGame() will retry on demand.
+        let steamCMDUsername = AppSettings.shared.steamCredentialAccountName
+        if !steamCMDUsername.isEmpty && FileManager.default.fileExists(atPath: steamcmdPath) {
+            // Save credentials first (instantaneous).
+            try? await steamCMDService.start(
+                username: steamCMDUsername,
+                engine: engine,
+                prefix: prefix
+            )
+            // Now warm up — this is where the self-update and login cache happen.
+            transition(to: .startingSteam, message: "Preparing game tools…")
+            log.info("[bootstrap] warming up SteamCMD (+login +quit)…")
+            var noNativeCredentials = false
+            await steamCMDService.warmUp { [weak self] line in
+                guard let self else { return }
+                if line.hasPrefix("[") || line.contains("Logging in") || line.contains("Waiting")
+                    || line.contains("Loading Steam") || line.contains("Verifying") || line.contains("Checking") {
+                    self.statusMessage = line
                 }
-                log.info("[bootstrap] Steam is ready ✓")
-            } catch {
-                fail("Steam failed to start: \(error.localizedDescription)")
-                return
+                if line.contains("password:") || line.contains("Cached credentials not found") {
+                    log.warning("[bootstrap] SteamCMD warm-up: no cached credentials — will re-authenticate")
+                    noNativeCredentials = true
+                    steamCMDService.shutdown()
+                }
+            }
+            log.info("[bootstrap] SteamCMD warm-up complete ✓")
+
+            // If warm-up found no native credential cache, establish it now during
+            // bootstrap so the user only sees one 2FA prompt (here, at onboarding
+            // time) rather than being prompted again when they click Install.
+            //
+            // SteamCMD's native cache is distinct from the JWT ConnectCache written
+            // by writeConnectCache. The JWT is only used by steam.exe for auto-login.
+            // SteamCMD batch mode (+login USERNAME) requires its own encrypted blob
+            // which is only written by a full +login USERNAME PASSWORD run.
+            if noNativeCredentials {
+                log.info("[bootstrap] establishing SteamCMD native credential cache…")
+                transition(to: .startingSteam, message: "Verifying Steam account…")
+                let ok = await steamCMDService.reestablishCredentials(
+                    engine: engine,
+                    prefix: prefix,
+                    onProgress: { [weak self] msg in self?.statusMessage = msg }
+                )
+                if ok {
+                    log.info("[bootstrap] SteamCMD native credentials established ✓")
+                    statusMessage = "Steam account verified ✓"
+                } else {
+                    log.warning("[bootstrap] could not establish credentials — first Install will prompt for Steam Guard")
+                }
             }
 
-            steamManager.enableHealthMonitor(engine: engine, prefix: prefix)
+            // Kill any lingering Wine processes from the SteamCMD PTY session.
+            // The `script -q /dev/null` wrapper leaves the wine64/wineserver alive
+            // after steamcmd.exe exits, causing an orphaned Wine CMD window to
+            // appear in the library. Killing here is safe — warmUp is the last
+            // Wine operation before bootstrap completes.
+            steamManager.killAll(engine: engine, prefix: prefix)
+            try? await Task.sleep(for: .seconds(1))
+        } else {
+            log.info("[bootstrap] skipping SteamCMD setup (username=\(steamCMDUsername.isEmpty ? "empty" : "set"), steamcmd=\(FileManager.default.fileExists(atPath: steamcmdPath)))")
         }
 
         lastFailedPhase = nil
@@ -429,6 +568,47 @@ final class BootstrapManager {
     }
 
     // MARK: - Helpers
+
+    /// Version counter for the one-time quarantine cleanup pass.
+    /// Increment this when a new cleanup action is needed on existing installations.
+    ///
+    /// Version history:
+    ///   1 — strip com.apple.quarantine from the entire engine directory. Engine files
+    ///       downloaded before EngineDownloader started stripping quarantine automatically
+    ///       have restricted network access on macOS 26, breaking Wine TLS.
+    private static let quarantineCleanedCurrentVersion = 1
+
+    /// Strips `com.apple.quarantine` from the entire engine directory.
+    /// Runs off the main actor so it doesn't block the UI during the brief xattr sweep.
+    private static func stripEngineQuarantine() async {
+        await Task.detached(priority: .userInitiated) {
+            let enginePath = WineEngine.engineDir.path(percentEncoded: false)
+            log.info("[bootstrap] stripping com.apple.quarantine from engine (one-time cleanup)…")
+            let process = Process()
+            process.executableURL = URL(filePath: "/usr/bin/xattr")
+            process.arguments = ["-rd", "com.apple.quarantine", enginePath]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError  = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+                log.info("[bootstrap] quarantine stripped from engine ✓")
+            } catch {
+                log.warning("[bootstrap] xattr quarantine strip failed: \(error.localizedDescription)")
+            }
+        }.value
+    }
+
+    /// Returns the filesystem modification time of `wine/meridian-engine-version.txt`
+    /// as a Unix timestamp. This file is written by every `release-engine.sh` run, so
+    /// its mtime changes even when the version tag string is unchanged (same-tag republish).
+    /// Returns 0.0 if the file does not exist.
+    private static func engineVersionFileModTime() -> Double {
+        let versionFile = WineEngine.engineDir.appending(path: "wine/meridian-engine-version.txt")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: versionFile.path(percentEncoded: false)),
+              let modDate = attrs[.modificationDate] as? Date else { return 0.0 }
+        return modDate.timeIntervalSince1970
+    }
 
     private func transition(to newPhase: Phase, message: String) {
         phase = newPhase

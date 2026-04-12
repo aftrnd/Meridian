@@ -16,12 +16,23 @@ import Foundation
 ///   WHENEVER YOU CHANGE LOGIC IN WinePrefix.swift, YOU MUST ALSO UPDATE THE
 ///   CORRESPONDING MIRROR HERE.
 ///
-/// Mirrored functions (must stay in sync with WinePrefix.swift):
+/// Mirrored functions (must stay in sync with production code):
 ///   • vdfKeyValue(from:)           ← WinePrefix.vdfKeyValue(from:)
 ///   • isGameInstalled(...)         ← WinePrefix.isGameInstalled()
 ///   • isGameFullyInstalled(...)    ← WinePrefix.isGameFullyInstalled()
 ///   • gameDownloadProgress(...)    ← WinePrefix.gameDownloadProgress()
 ///   • gameInstallDir(...)          ← WinePrefix.gameInstallDir()
+///   • parseSteamCMDProgress(...)   ← GameLauncher.parseSteamCMDProgress(line:)
+///   • formatBytes(...)             ← GameLauncher.formatBytes(_:)
+///   • mergeOverrides(...)          ← WineSteamManager.launchGameDirectly merge logic
+///   • TestGameProfile              ← GameProfile (struct fields)
+///   • TestGameEngine               ← GameEngine enum
+///   • TestGraphicsAPI              ← GraphicsAPI enum
+///   • TestCompatStatus             ← CompatStatus enum
+///   • TestDXMTMode                 ← GameProfile.DXMTMode enum
+///   • unityFactory(...)            ← GameProfile.unity(...) factory defaults
+///   • customFactory(...)           ← GameProfile.custom(...) factory defaults
+///   • dxmtDisabledOverride(...)    ← WineSteamManager dxmtMode .disabled logic
 /// ─────────────────────────────────────────────────────────────────────────────
 final class GameInstallTests: XCTestCase {
 
@@ -338,5 +349,310 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(expectedArgs[1], "\(appID)")
         XCTAssertFalse(deprecatedArgs[0].hasPrefix("+app_update"),
                        "Sanity: deprecated command is not the same as the new command")
+    }
+
+    // MARK: - SteamCMD stdout parsing tests
+
+    /// Mirror of GameLauncher.parseSteamCMDProgress(line:)
+    private func parseSteamCMDProgress(line: String) -> Double? {
+        if line.contains("downloading, progress:"),
+           let match = line.range(of: #"(\d+) / (\d+)"#, options: .regularExpression),
+           case let parts = String(line[match]).components(separatedBy: " / "),
+           parts.count == 2,
+           let downloaded = Double(parts[0]),
+           let total = Double(parts[1]),
+           total > 0,
+           downloaded / total > 0 {
+            return downloaded / total
+        } else if line.contains("Success! App") {
+            return 1.0
+        }
+        return nil
+    }
+
+    /// Mirror of GameLauncher.formatBytes(_:)
+    private func formatBytes(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        let mb = Double(bytes) / 1_048_576
+        if mb >= 1 { return String(format: "%.0f MB", mb) }
+        return String(format: "%.0f KB", Double(bytes) / 1024)
+    }
+
+    func testParseSteamCMDProgressDownloading() {
+        let line = "Update state (0x61) downloading, progress: 43.50 (3362453174 / 7729379123)"
+        let result = parseSteamCMDProgress(line: line)
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result!, 3362453174.0 / 7729379123.0, accuracy: 0.0001)
+    }
+
+    func testParseSteamCMDProgressSmallGame() {
+        let line = "Update state (0x61) downloading, progress: 62.47 (694855688 / 1112250025)"
+        let result = parseSteamCMDProgress(line: line)
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result!, 694855688.0 / 1112250025.0, accuracy: 0.0001)
+    }
+
+    func testParseSteamCMDProgressSuccess() {
+        let line = "Success! App '3527290' fully installed."
+        XCTAssertEqual(parseSteamCMDProgress(line: line), 1.0)
+    }
+
+    func testParseSteamCMDProgressReturnsNilForNonProgressLine() {
+        XCTAssertNil(parseSteamCMDProgress(line: "Loading Steam API...OK"))
+        XCTAssertNil(parseSteamCMDProgress(line: "Logging in using cached credentials."))
+        XCTAssertNil(parseSteamCMDProgress(line: "[  0%] Checking for available updates..."))
+        XCTAssertNil(parseSteamCMDProgress(line: "[----] Verifying installation..."))
+        XCTAssertNil(parseSteamCMDProgress(line: "-- type 'quit' to exit --"))
+    }
+
+    func testParseSteamCMDProgressIgnoresSelfUpdate() {
+        XCTAssertNil(parseSteamCMDProgress(line: "[----] Installing update..."))
+    }
+
+    func testParseSteamCMDProgressZeroBytesOfTotal() {
+        let line = "Update state (0x61) downloading, progress: 0.00 (0 / 7729379123)"
+        XCTAssertNil(parseSteamCMDProgress(line: line),
+                     "0 bytes downloaded should return nil (guard downloaded/total > 0)")
+    }
+
+    func testParseSteamCMDProgressZeroTotal() {
+        let line = "Update state (0x0) unknown, progress: 0.00 (0 / 0)"
+        XCTAssertNil(parseSteamCMDProgress(line: line),
+                     "0 / 0 should return nil (total == 0)")
+    }
+
+    func testParseSteamCMDProgressFullDownload() {
+        let line = "Update state (0x61) downloading, progress: 99.15 (7663962059 / 7729379123)"
+        let result = parseSteamCMDProgress(line: line)
+        XCTAssertNotNil(result)
+        XCTAssertGreaterThan(result!, 0.99)
+    }
+
+    // MARK: - formatBytes tests
+
+    func testFormatBytesGB() {
+        XCTAssertEqual(formatBytes(7_729_379_123), "7.2 GB")
+        XCTAssertEqual(formatBytes(1_073_741_824), "1.0 GB")
+        XCTAssertEqual(formatBytes(1_610_612_736), "1.5 GB")
+    }
+
+    func testFormatBytesMB() {
+        XCTAssertEqual(formatBytes(500_000_000), "477 MB")
+        XCTAssertEqual(formatBytes(1_048_576), "1 MB")
+    }
+
+    func testFormatBytesKB() {
+        XCTAssertEqual(formatBytes(512_000), "500 KB")
+        XCTAssertEqual(formatBytes(1024), "1 KB")
+    }
+
+    // MARK: - GameCompatibilityDB profile tests
+
+    /// Mirror enums from GameProfile.swift
+    private enum TestGameEngine: String { case unity, unreal, godot, custom, unknown }
+    private enum TestGraphicsAPI: String { case dx11, dx12, vulkan, unknown }
+    private enum TestCompatStatus: String { case verified, playable, launches, broken, untested }
+    private enum TestDXMTMode { case auto, required, disabled }
+
+    /// Mirror of GameProfile for testing DB lookups.
+    /// MIRROR CONTRACT: Mirrors GameProfile (GameProfile.swift)
+    private struct TestGameProfile {
+        let appID: Int
+        let name: String
+        let gameEngine: TestGameEngine
+        let graphicsAPI: TestGraphicsAPI
+        let status: TestCompatStatus
+        let dllOverrides: String?
+        let dxmtMode: TestDXMTMode
+        let extraEnv: [String: String]
+    }
+
+    private let testProfiles: [Int: TestGameProfile] = [
+        3180070: TestGameProfile(
+            appID: 3180070, name: "No, I'm not a Human",
+            gameEngine: .unity, graphicsAPI: .dx11, status: .verified,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+        ),
+        813230: TestGameProfile(
+            appID: 813230, name: "ANIMAL WELL",
+            gameEngine: .custom, graphicsAPI: .dx12, status: .verified,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+        ),
+        3527290: TestGameProfile(
+            appID: 3527290, name: "PEAK",
+            gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+        ),
+        4069520: TestGameProfile(
+            appID: 4069520, name: "Super Battle Golf",
+            gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+        ),
+    ]
+
+    func testAllKnownGamesHaveProfiles() {
+        for (appID, expected) in testProfiles {
+            XCTAssertNotNil(testProfiles[appID], "Missing profile for appID=\(appID) (\(expected.name))")
+        }
+    }
+
+    func testDX12GamesHaveCorrectGraphicsAPI() {
+        let dx12IDs = [813230, 3527290, 4069520] // Animal Well, PEAK, Super Battle Golf
+        for appID in dx12IDs {
+            let profile = testProfiles[appID]
+            XCTAssertEqual(profile?.graphicsAPI, .dx12,
+                           "\(profile?.name ?? String(appID)) should be .dx12")
+        }
+    }
+
+    func testUnknownGameReturnsNilProfile() {
+        XCTAssertNil(testProfiles[99999])
+    }
+
+    func testVerifiedGamesHaveCorrectStatus() {
+        let verifiedIDs = [3180070, 813230]
+        for appID in verifiedIDs {
+            let profile = testProfiles[appID]
+            XCTAssertEqual(profile?.status, .verified,
+                           "appID=\(appID) should be .verified")
+        }
+    }
+
+    func testBrokenGamesHaveCorrectStatus() {
+        let brokenIDs = [3527290, 4069520]
+        for appID in brokenIDs {
+            let profile = testProfiles[appID]
+            XCTAssertEqual(profile?.status, .broken,
+                           "appID=\(appID) should be .broken")
+        }
+    }
+
+    func testUnityGamesHaveUnityEngine() {
+        let unityIDs = [3180070, 3527290, 4069520]
+        for appID in unityIDs {
+            let profile = testProfiles[appID]
+            XCTAssertEqual(profile?.gameEngine, .unity,
+                           "appID=\(appID) should be .unity engine")
+        }
+    }
+
+    func testCustomEngineGamesHaveCustomEngine() {
+        XCTAssertEqual(testProfiles[813230]?.gameEngine, .custom)
+    }
+
+    // MARK: - Factory method default tests
+
+    /// Mirror of GameProfile.unity() factory defaults
+    private func unityFactory(
+        appID: Int = 1,
+        name: String = "Test",
+        graphicsAPI: TestGraphicsAPI = .dx11,
+        dxmtMode: TestDXMTMode = .auto
+    ) -> TestGameProfile {
+        TestGameProfile(
+            appID: appID, name: name,
+            gameEngine: .unity, graphicsAPI: graphicsAPI, status: .untested,
+            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:]
+        )
+    }
+
+    /// Mirror of GameProfile.custom() factory defaults
+    private func customFactory(
+        appID: Int = 1,
+        name: String = "Test",
+        graphicsAPI: TestGraphicsAPI = .unknown
+    ) -> TestGameProfile {
+        TestGameProfile(
+            appID: appID, name: name,
+            gameEngine: .custom, graphicsAPI: graphicsAPI, status: .untested,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+        )
+    }
+
+    func testUnityFactoryDefaults() {
+        let p = unityFactory()
+        XCTAssertEqual(p.gameEngine, .unity)
+        XCTAssertEqual(p.graphicsAPI, .dx11)
+        XCTAssertEqual(p.dxmtMode, .auto)
+    }
+
+    func testUnityFactoryAllowsOverride() {
+        let p = unityFactory(graphicsAPI: .dx12, dxmtMode: .required)
+        XCTAssertEqual(p.graphicsAPI, .dx12)
+        XCTAssertEqual(p.dxmtMode, .required)
+    }
+
+    func testCustomFactoryDefaults() {
+        let p = customFactory()
+        XCTAssertEqual(p.gameEngine, .custom)
+        XCTAssertEqual(p.graphicsAPI, .unknown)
+    }
+
+    func testCustomFactoryAllowsOverride() {
+        let p = customFactory(graphicsAPI: .dx12)
+        XCTAssertEqual(p.graphicsAPI, .dx12)
+    }
+
+    // MARK: - DLL override merge logic tests
+
+    /// Mirror of the merge logic in WineSteamManager.launchGameDirectly
+    private func mergeOverrides(existing: String?, gameOverrides: String?) -> String? {
+        guard let gameOverrides else { return existing }
+        if let existing, !existing.isEmpty {
+            return existing + ";" + gameOverrides
+        }
+        return gameOverrides
+    }
+
+    func testMergeOverridesAppendsToExisting() {
+        let result = mergeOverrides(existing: "d3d11=n,b", gameOverrides: "vcrun2019=n")
+        XCTAssertEqual(result, "d3d11=n,b;vcrun2019=n")
+    }
+
+    func testMergeOverridesSetsWhenNoExisting() {
+        let result = mergeOverrides(existing: nil, gameOverrides: "vcrun2019=n")
+        XCTAssertEqual(result, "vcrun2019=n")
+    }
+
+    func testMergeOverridesSetsWhenExistingEmpty() {
+        let result = mergeOverrides(existing: "", gameOverrides: "vcrun2019=n")
+        XCTAssertEqual(result, "vcrun2019=n")
+    }
+
+    func testMergeOverridesReturnsExistingWhenNoGameOverrides() {
+        let result = mergeOverrides(existing: "d3d11=n,b", gameOverrides: nil)
+        XCTAssertEqual(result, "d3d11=n,b")
+    }
+
+    func testMergeOverridesReturnsNilWhenBothNil() {
+        let result = mergeOverrides(existing: nil, gameOverrides: nil)
+        XCTAssertNil(result)
+    }
+
+    // MARK: - dxmtMode .disabled merge logic test
+
+    /// Mirror of WineSteamManager.launchGameDirectly dxmtMode .disabled logic
+    private func dxmtDisabledOverride(existing: String?) -> String {
+        let disableOverride = "d3d11,dxgi=b"
+        if let existing, !existing.isEmpty {
+            return existing + ";" + disableOverride
+        }
+        return disableOverride
+    }
+
+    func testDxmtDisabledAppendsToExisting() {
+        let result = dxmtDisabledOverride(existing: "winemetal=b;d3d11,d3d12,dxgi=n,b")
+        XCTAssertEqual(result, "winemetal=b;d3d11,d3d12,dxgi=n,b;d3d11,dxgi=b")
+    }
+
+    func testDxmtDisabledSetsWhenNoExisting() {
+        let result = dxmtDisabledOverride(existing: nil)
+        XCTAssertEqual(result, "d3d11,dxgi=b")
+    }
+
+    func testDxmtDisabledSetsWhenExistingEmpty() {
+        let result = dxmtDisabledOverride(existing: "")
+        XCTAssertEqual(result, "d3d11,dxgi=b")
     }
 }

@@ -1,0 +1,252 @@
+---
+description: Version numbering rules for Meridian app releases, engine releases, and GitHub tags. Follow these whenever bumping a version, creating a release, or updating build settings.
+globs: ["**/*.pbxproj", "**/Info.plist", "**/AppUpdateChecker.swift", "Scripts/release-engine.sh"]
+alwaysApply: false
+---
+
+# Versioning & Release Standards
+
+Meridian uses a strict two-track versioning scheme: one for the **app** and one for the **engine**. They are always kept in sync with the GitHub release tags so the auto-update system can compare them correctly.
+
+---
+
+## Branch & Release Structure
+
+Meridian follows a two-tier branch model. This is a rule — follow it on every session.
+
+### Version branches — `vX.Y.Z`
+
+```
+v0.9.7    ← stable release branch (all commits shipped in that version)
+v0.9.8    ← current stable base branch
+v1.0.0    ← next major release base
+```
+
+- Each `vX.Y.Z` branch is the **clean, working base** for that version.
+- It receives only tested, working commits — no experiments, no WIP.
+- GitHub releases and tags are cut from these branches.
+- When ready to ship a new version, bump `MARKETING_VERSION` on this branch and tag it.
+
+### Feature branches — `feature/vX.Y.Z-description`
+
+```
+feature/v0.9.8-dev        ← general development for v0.9.8
+feature/v0.9.8-d3d12      ← specific D3D12 work targeting v0.9.8
+feature/v0.9.8-ui-polish  ← UI work targeting v0.9.8
+```
+
+- Feature branches are **always named after the target version they merge into**.
+- Branched from the corresponding version branch (`v0.9.8`).
+- Merged back to the version branch when the feature is complete and tested.
+- Never merge an untested feature directly to a version branch.
+
+### Workflow
+
+```
+v0.9.8 ──────────────────────────────────────► (stable)
+          \                        /
+           feature/v0.9.8-dev ────
+
+v0.9.9 ──────────────────────────────────────► (next, branched from v0.9.8 when ready)
+```
+
+```bash
+# Start new feature work
+git checkout v0.9.8
+git checkout -b feature/v0.9.8-my-feature
+# ... develop, test ...
+git checkout v0.9.8 && git merge feature/v0.9.8-my-feature
+
+# Cut next version base
+git checkout v0.9.8
+git checkout -b v0.9.9
+```
+
+---
+
+
+
+### Source of truth: `MARKETING_VERSION` in Xcode build settings
+
+The version number lives **only** in the Xcode project build settings:
+
+```
+Meridian.xcodeproj/project.pbxproj
+  MARKETING_VERSION = 0.9.7       ← marketing version (user-facing)
+  CURRENT_PROJECT_VERSION = 7     ← build number (integer, matches minor patch)
+```
+
+`Info.plist` must use the Xcode build setting variables — **never hardcode** a version number in the plist:
+
+```xml
+<key>CFBundleShortVersionString</key>
+<string>$(MARKETING_VERSION)</string>
+<key>CFBundleVersion</key>
+<string>$(CURRENT_PROJECT_VERSION)</string>
+```
+
+### App version format
+
+```
+MAJOR.MINOR.PATCH    e.g. 0.9.7  →  1.0.0  →  1.1.0
+```
+
+- **MAJOR** — breaking change to the Wine prefix format or auth flow
+- **MINOR** — new feature (new game API, new UI section, new bootstrap phase)
+- **PATCH** — bug fix, compatibility update, or game database addition
+
+### Build number
+
+The build number (`CURRENT_PROJECT_VERSION`) must equal `MAJOR * 1000 + MINOR * 100 + PATCH` for single-digit components, or simply the sequential count of releases. For consistency with the current scheme, use the sequential release count:
+
+| MARKETING_VERSION | CURRENT_PROJECT_VERSION |
+|---|---|
+| 0.9.7 | 7 |
+| 0.9.8 | 8 |
+| 1.0.0 | 100 |
+| 1.0.1 | 101 |
+
+### GitHub release tag
+
+App releases are tagged with the bare version (no suffix):
+
+```
+v0.9.7      ← app release
+v0.9.8      ← next app release
+```
+
+`AppUpdateChecker` compares `Bundle.main.infoDictionary["CFBundleShortVersionString"]` against the tag name (after stripping the leading `v`). The tag must exactly match `v{MARKETING_VERSION}`.
+
+---
+
+## Engine Version (the Wine runtime tarball)
+
+Engine releases use the same version number as the paired app release, with a `-engine` suffix:
+
+```
+v0.9.7-engine    ← engine release shipped alongside app v0.9.7
+```
+
+`release-engine.sh` writes the tag into the archive as `wine/meridian-engine-version.txt`. `WineEngine.engineVersion` reads this file; `AppUpdateChecker` strips the `-engine` suffix before comparing.
+
+**The engine version is always set inside `release-engine.sh`:**
+
+```bash
+ENGINE_VERSION="v0.9.7-engine"
+```
+
+Update this variable whenever you cut a new engine release.
+
+---
+
+## How to Bump the Version (checklist)
+
+When incrementing from `X.Y.Z` to `X.Y.Z+1`:
+
+1. **Xcode build settings** (two configurations — Debug and Release):
+   ```
+   MARKETING_VERSION = X.Y.Z+1
+   CURRENT_PROJECT_VERSION = <next integer>
+   ```
+   Update both occurrences in `Meridian.xcodeproj/project.pbxproj`.
+
+2. **Info.plist** — must remain as variable references, never hardcoded:
+   ```xml
+   <string>$(MARKETING_VERSION)</string>
+   <string>$(CURRENT_PROJECT_VERSION)</string>
+   ```
+
+3. **`Scripts/release-engine.sh`** — update `ENGINE_VERSION` if shipping a new engine alongside the app:
+   ```bash
+   ENGINE_VERSION="vX.Y.Z+1-engine"
+   ```
+
+4. **GitHub release tags**:
+   - App: tag commit as `vX.Y.Z+1`
+   - Engine: tag engine release as `vX.Y.Z+1-engine`
+
+5. **Verify** the About panel reads correctly in the built app before shipping.
+
+---
+
+## Publishing an App Release (full checklist)
+
+This is the end-to-end process to ship an update that every user's copy of Meridian will automatically detect and offer to install.
+
+### Prerequisites
+
+- Xcode Developer ID Application certificate in your keychain (for signing)
+- App-specific password or Notary API key configured in `notarytool` (for notarisation)
+- `gh` CLI authenticated (`gh auth login`) for tagging and uploading assets
+
+### Step-by-step
+
+```
+1. Bump the version (see checklist above)
+2. Build → Archive in Xcode (Product → Archive)
+3. Sign & notarise via Xcode Organizer:
+     Distribute App → Direct Distribution → sign → notarise
+     Export the notarised .app to disk
+4. Wrap in a DMG:
+     create-dmg Meridian.app --out Meridian-vX.Y.Z.dmg
+     (or use hdiutil manually — any DMG with Meridian.app at the root works)
+5. Staple the notarisation ticket to the DMG:
+     xcrun stapler staple Meridian-vX.Y.Z.dmg
+6. Tag and push the commit:
+     git tag vX.Y.Z && git push origin vX.Y.Z
+7. Create the GitHub release and attach the DMG:
+     gh release create vX.Y.Z \
+       --title "Meridian vX.Y.Z" \
+       --notes "Release notes here" \
+       Meridian-vX.Y.Z.dmg
+```
+
+### What happens automatically after publish
+
+- Every running copy of Meridian checks GitHub Releases on next launch (rate-limited to once per 24 hours).
+- Users can also trigger an immediate check via **Meridian → Check for Updates…** in the menu bar.
+- `AppUpdateChecker` detects the new `vX.Y.Z` tag (canonical app tag = no suffix, all-numeric semver).
+- If a `.dmg` asset is attached, the Settings → Updates tab shows a **"Download & Install vX.Y.Z"** button.
+- Clicking it: downloads the DMG with a progress bar → mounts via `hdiutil` → copies `.app` over the running bundle → relaunches automatically. No user interaction beyond the button click.
+- If no DMG is attached (rare), the button opens the GitHub release page in the browser instead.
+
+### DMG asset naming
+
+The asset filename must end in `.dmg`. The update checker matches the first asset with a `.dmg` suffix — the rest of the name does not matter. Convention:
+
+```
+Meridian-vX.Y.Z.dmg
+```
+
+### Engine release alongside app release
+
+If the new app ships with a new engine:
+
+```bash
+# Publish engine first (app will auto-download it on first launch after update)
+bash Scripts/release-engine.sh   # tags vX.Y.Z-engine and uploads to GitHub
+```
+
+Then proceed with the app release steps above. The engine update is detected and installed independently of the app update — users see both in Settings → Updates.
+
+---
+
+## Reading the Version in Code
+
+```swift
+// Always use AppUpdateChecker's static accessors — never read Bundle directly.
+AppUpdateChecker.currentVersion   // "0.9.7"   (CFBundleShortVersionString)
+AppUpdateChecker.currentBuild     // "7"        (CFBundleVersion)
+```
+
+These are the canonical accessors used by the update checker, the Settings Updates tab, and log headers. Add no other Bundle.main version reads.
+
+---
+
+## What NOT to Do
+
+- **Never** hardcode a version string in `Info.plist` — it will silently diverge from the build settings.
+- **Never** tag a GitHub release with a different version than `MARKETING_VERSION`.
+- **Never** use `-beta`, `-rc`, or other suffixes in `MARKETING_VERSION` or release tags — the semver comparator in `AppUpdateChecker.isNewer(_:than:)` does not handle pre-release suffixes. Use display strings (e.g. "Beta" in marketing copy) separately from the version number itself.
+- **Never** forget to update `Scripts/release-engine.sh` when the engine changes — a stale engine version string causes the update UI to show a permanent "update available" banner.
+- **Never** attach a DMG that has not been notarised and stapled — macOS Gatekeeper will block the install on the user's machine.
