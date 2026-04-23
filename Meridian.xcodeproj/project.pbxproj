@@ -295,6 +295,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = B0010070 /* Build configuration list for PBXNativeTarget "Meridian" */;
 			buildPhases = (
+				B001DDA1 /* Build meridian-dpapi.exe */,
 				B0010061 /* Sources */,
 				B0010040 /* Frameworks */,
 				B0010062 /* Resources */,
@@ -352,6 +353,31 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		B001DDA1 /* Build meridian-dpapi.exe */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/dpapi/meridian_dpapi.c",
+				"$(SRCROOT)/Scripts/build-dpapi.sh",
+			);
+			name = "Build meridian-dpapi.exe";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-dpapi.exe",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "# Build meridian-dpapi.exe (Wine CryptProtectData wrapper) into the app bundle\n# Resources so the app can copy it into the engine at runtime if it's missing.\n# This protects the DPAPI-based auto-login path from engine auto-refreshes that\n# wipe wine/share/meridian/ before a new engine tarball has been published.\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-dpapi.sh\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-dpapi.exe\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		B0010061 /* Sources */ = {

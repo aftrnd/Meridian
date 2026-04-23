@@ -682,10 +682,14 @@ struct WinePrefix: Sendable {
         let fm = FileManager.default
         let dpapiHelper = WineEngine.engineDir
             .appending(path: "wine/share/meridian/meridian-dpapi.exe")
-        guard fm.fileExists(atPath: dpapiHelper.path(percentEncoded: false)) else {
-            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "meridian-dpapi.exe missing from engine. Re-download the engine."
-            ])
+        if !fm.fileExists(atPath: dpapiHelper.path(percentEncoded: false)) {
+            // Engine tarballs published before April 23 2026 don't ship the
+            // helper. The app bundle always carries it (built into
+            // `.app/Contents/Resources/` by the `Build meridian-dpapi.exe`
+            // build phase), so we can recover transparently. This also
+            // handles the case where an engine auto-refresh wipes
+            // `wine/share/meridian/` between app launches.
+            try Self.installDpapiHelperFromBundle(to: dpapiHelper)
         }
 
         // Stage plaintext + encrypted blob in drive_c/temp so wine64 can reach both
@@ -823,6 +827,37 @@ struct WinePrefix: Sendable {
         // at post-login hydration).
         try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
         log.info("[writeUserNotificationPrefs] wrote \(cfgPath) (accountID=\(accountID))")
+    }
+
+    /// Copies `meridian-dpapi.exe` from the Meridian app bundle's Resources into
+    /// the engine directory. Called by `writeSteamSessionLocalVdf` when the
+    /// engine's own copy is missing — which happens when:
+    ///   - The user is running an engine tarball predating April 23 2026 (the
+    ///     version that first shipped the helper inside `wine/share/meridian/`).
+    ///   - An engine auto-refresh wiped `wine/share/meridian/` before a paired
+    ///     engine release was published (e.g. the 0.9.9 app bump silently
+    ///     re-extracted the 0.9.8 engine tarball, which had no helper).
+    ///
+    /// The helper is re-built into the app bundle on every Xcode build via the
+    /// `Build meridian-dpapi.exe` script phase, so it's always current with the
+    /// source in `Scripts/dpapi/meridian_dpapi.c`.
+    ///
+    /// Throws a clear error if the bundle copy is also missing (which should
+    /// never happen for a properly-built app and indicates a bundle integrity
+    /// issue worth surfacing).
+    private static func installDpapiHelperFromBundle(to destination: URL) throws {
+        let fm = FileManager.default
+        guard let bundleHelper = Bundle.main.url(forResource: "meridian-dpapi", withExtension: "exe") else {
+            throw NSError(domain: "WinePrefix.installDpapiHelper", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe is missing from both the engine and the Meridian app bundle. Reinstall Meridian."
+            ])
+        }
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fm.fileExists(atPath: destination.path(percentEncoded: false)) {
+            try fm.removeItem(at: destination)
+        }
+        try fm.copyItem(at: bundleHelper, to: destination)
+        log.info("[installDpapiHelper] copied bundled meridian-dpapi.exe → \(destination.path(percentEncoded: false))")
     }
 
     /// Steam's ConnectCache map key format: `(crc32(accountName) << 4) | slot_number`.
