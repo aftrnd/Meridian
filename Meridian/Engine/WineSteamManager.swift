@@ -1068,9 +1068,29 @@ final class WineSteamManager {
         (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
     }
 
-    /// Gracefully shuts down the persistent Steam process.
+    /// Gracefully shuts down the persistent Steam process and **waits until the
+    /// process has actually exited** before returning.
+    ///
+    /// Previously this method sent `-shutdown` and slept a fixed 3 s, which is
+    /// shorter than Steam's real shutdown time (Steam takes ~5–10 s to flush
+    /// caches, tear down CM connections, and write tokens). A second steam.exe
+    /// launched during that gap detects the still-running old instance via
+    /// Wine's registry / IPC state, forwards its args as a "second instance",
+    /// and exits with code 0 in under a second — surfacing to the caller as
+    /// `SteamError.steamExitedEarly(exitCode: 0)`.
+    ///
+    /// CLI-verified against the live connection_log.txt on April 23 2026:
+    /// original Steam received `LogOff()` 5 s after the `-shutdown` signal and
+    /// wrote `Log session ended` 7 s after that — a full 12 s after our
+    /// `-shutdown` command returned, which was when the new steam.exe had
+    /// already given up and exited.
+    ///
+    /// Fix: track the actual `persistentProcess` handle and poll `isRunning`
+    /// until false, with a 15 s hard cap and an SIGTERM fallback if Steam
+    /// refuses to exit cleanly. 15 s is 2× the observed P99 shutdown time and
+    /// is still comfortably under the install UI's overall timeout budget.
     func stopPersistent(engine: WineEngine, prefix: WinePrefix) async {
-        guard persistentProcess?.isRunning ?? false else {
+        guard let process = persistentProcess, process.isRunning else {
             log.info("[stopPersistent] no persistent process running")
             persistentProcess = nil
             return
@@ -1078,6 +1098,27 @@ final class WineSteamManager {
 
         log.info("[stopPersistent] sending -shutdown")
         await stop(engine: engine, prefix: prefix)
+
+        // Block until the tracked process actually exits — NOT just 3 seconds
+        // after the shutdown command. See the doc comment above for the race
+        // this prevents.
+        let deadline = ContinuousClock.now + .seconds(15)
+        var waitedMs = 0
+        while process.isRunning && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(250))
+            waitedMs += 250
+        }
+
+        if process.isRunning {
+            log.warning("[stopPersistent] Steam still alive after 15s — force-terminating")
+            process.terminate()
+            // Give SIGTERM a second to land, then give up — the caller will
+            // handle the fallout (typically via `killAll` at a higher layer).
+            try? await Task.sleep(for: .seconds(1))
+        } else {
+            log.info("[stopPersistent] Steam fully exited after \(waitedMs)ms")
+        }
+
         persistentProcess = nil
     }
 
