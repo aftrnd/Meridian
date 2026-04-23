@@ -813,7 +813,30 @@ final class WineSteamManager {
             run(["reg", "add", "HKCU\\Software\\Valve\\Steam",
                  "/v", "WebProcessCmdLine", "/t", "REG_SZ",
                  "/d", "--no-sandbox --disable-gpu", "/f"])
+
+            // Silence the "download complete" system notification + chime that
+            // Steam plays when a game finishes downloading. These keys match
+            // Steam's toggles in `Settings → Interface → Notifications` and
+            // `Settings → Interface → Sounds` — writing them here pre-empts the
+            // user having to dig through hidden Steam settings. Meridian owns
+            // all user-facing notifications; Steam's parallel UI layer would be
+            // confusing ("Download Complete" + Steam logo + "ba-doop" chime
+            // popping over a Meridian app the user didn't know was Steam).
+            run(["reg", "add", "HKCU\\Software\\Valve\\Steam",
+                 "/v", "DesktopNotifications", "/t", "REG_DWORD", "/d", "0", "/f"])
+            run(["reg", "add", "HKCU\\Software\\Valve\\Steam",
+                 "/v", "NotifyAvailableGames", "/t", "REG_DWORD", "/d", "0", "/f"])
+            run(["reg", "add", "HKCU\\Software\\Valve\\Steam",
+                 "/v", "SoundPlayEvents", "/t", "REG_DWORD", "/d", "0", "/f"])
+            run(["reg", "add", "HKCU\\Software\\Valve\\Steam",
+                 "/v", "PlayDownloadCompleteSound", "/t", "REG_DWORD", "/d", "0", "/f"])
         }.value
+
+        // Mute notifications + sounds in the user's localconfig.vdf too.
+        // Steam reads this file (not the registry) for its HTML5 UI preferences;
+        // the registry keys above cover the native-Win32 paths, and localconfig
+        // covers the CEF/webhelper paths. Belt + suspenders.
+        _ = try? await prefix.writeUserNotificationPreferences(steamID64: AppSettings.shared.steamCredentialSteamID)
     }
 
     /// Whether the persistent Steam process is still alive.
@@ -891,6 +914,13 @@ final class WineSteamManager {
         let startOffset = persistentConnectionLogOffset
         // Snapshot webhelper_js.txt at launch so we only count THIS session's retries.
         let webhelperStartOffset = Self.fileSize(at: webhelperJSPath)
+        // Snapshot bootstrap_log.txt at launch too. Steam's `bootstrap_log.txt` is
+        // cumulative — it retains every "Downloading update (...)" line from every
+        // prior launch. Without this snapshot, the "Steam is updating…" signal
+        // fires spuriously on EVERY subsequent `waitUntilReady` call (e.g. during
+        // `installGame`'s Steam restart) because the old line is still in the file.
+        // CLI-verified April 23 2026.
+        let bootstrapStartOffset = Self.fileSize(at: bootstrapLogPath)
         log.info("[waitUntilReady] watching \(connLogPath) from offset=\(startOffset) (timeout=\(timeout) authTimeout=\(authTimeout))")
 
         let started = ContinuousClock.now
@@ -898,7 +928,7 @@ final class WineSteamManager {
         var lastConnLogSize = startOffset
         var lastConnGrowthAt = ContinuousClock.now
         var reportedUpdating = false
-        var bootstrapLogLastSize = 0
+        var bootstrapLogLastSize = bootstrapStartOffset
         var poll = 0
 
         var connectedObservedAt: ContinuousClock.Instant?
@@ -980,15 +1010,24 @@ final class WineSteamManager {
             }
 
             // Secondary progress signal: Steam is downloading an update.
+            // Read only bytes APPENDED since this waitUntilReady call started —
+            // bootstrap_log.txt is cumulative across sessions, so scanning the
+            // whole file would re-fire "Steam is updating…" on every launch that
+            // previously saw an update (even when Steam is NOT updating this run).
             if !reportedUpdating {
                 let bootstrapSize = Self.fileSize(at: bootstrapLogPath)
                 if bootstrapSize > bootstrapLogLastSize {
-                    bootstrapLogLastSize = bootstrapSize
-                    if let tail = try? String(contentsOfFile: bootstrapLogPath, encoding: .utf8),
-                       tail.contains("Downloading update (") {
-                        reportedUpdating = true
-                        log.info("[waitUntilReady] signal: Steam is downloading an update")
-                        statusUpdate?("Steam is updating…")
+                    if let fh = try? FileHandle(forReadingFrom: URL(filePath: bootstrapLogPath)) {
+                        try? fh.seek(toOffset: UInt64(bootstrapLogLastSize))
+                        let data = (try? fh.readToEnd()) ?? Data()
+                        try? fh.close()
+                        bootstrapLogLastSize = bootstrapSize
+                        if let tail = String(data: data, encoding: .utf8),
+                           tail.contains("Downloading update (") {
+                            reportedUpdating = true
+                            log.info("[waitUntilReady] signal: Steam is downloading an update")
+                            statusUpdate?("Steam is updating…")
+                        }
                     }
                 }
             }

@@ -755,6 +755,76 @@ struct WinePrefix: Sendable {
         log.info("[writeSteamSession] local.vdf written key=\(key) blob=\(cipher.count) bytes → \(dest.path(percentEncoded: false))")
     }
 
+    /// Disables Steam's download-complete desktop notification and chime for
+    /// the signed-in user by writing to `userdata/<accountID>/config/localconfig.vdf`.
+    ///
+    /// Steam uses a split config model:
+    ///   - `HKCU\Software\Valve\Steam` for the Win32/native-UI toggles
+    ///   - `localconfig.vdf` for the HTML5/CEF webhelper toggles
+    ///
+    /// Both need to be set — the "Download Complete" popup and chime come from
+    /// the webhelper, not the native UI. Writing only the registry leaves the
+    /// popup audible and visible when a game finishes downloading.
+    ///
+    /// `localconfig.vdf` is also overwritten by Steam itself at shutdown, but
+    /// Steam merges existing keys with its in-memory view rather than replacing
+    /// the whole file, so our values stick as long as we write them before any
+    /// download completes in the current session. `WineSteamManager.startPersistent`
+    /// calls this right before launching `steam.exe -silent`.
+    ///
+    /// Pass an empty `steamID64` to skip (user not signed in yet — no userdata
+    /// directory exists).
+    func writeUserNotificationPreferences(steamID64: String) throws {
+        guard !steamID64.isEmpty, let sid = UInt64(steamID64) else {
+            log.debug("[writeUserNotificationPrefs] no SteamID64 — skipping")
+            return
+        }
+        // Steam's userdata/ uses the 32-bit account ID, not the full 64-bit ID.
+        // AccountID = SteamID64 - 76561197960265728 (the public-universe base).
+        let accountID = sid &- 76561197960265728
+        let userDir = steamInstallDir.appending(path: "userdata/\(accountID)/config")
+        let cfgPath = userDir.appending(path: "localconfig.vdf").path(percentEncoded: false)
+        let fm = FileManager.default
+        try fm.createDirectory(at: userDir, withIntermediateDirectories: true)
+
+        // Minimal VDF overriding the notification + sound toggles. Steam merges
+        // this with any existing file at launch. Keys confirmed in Steam's
+        // HTML5 UI source (`steamui/chunk~*.js`) as the settings backing:
+        //
+        //   • `UserLocalConfigStore > Notifications > DownloadCompleted`
+        //     — Settings → Interface → "Desktop notifications" → "Download complete"
+        //   • `UserLocalConfigStore > Sounds > PlaySoundDownload`
+        //     — Settings → Interface → "Sounds" → "Play sound when download completes"
+        //   • `EnableCustomSounds = 0` turns off Steam's entire sound pack, a
+        //     defence-in-depth belt-and-suspenders against Valve renaming the
+        //     specific key above.
+        let vdf = """
+        "UserLocalConfigStore"
+        {
+        \t"Notifications"
+        \t{
+        \t\t"DownloadCompleted"\t\t"0"
+        \t\t"ShowDesktopToast"\t\t"0"
+        \t\t"ShowInGameToast"\t\t"0"
+        \t\t"EnableCustomSounds"\t\t"0"
+        \t}
+        \t"Sounds"
+        \t{
+        \t\t"PlaySoundDownload"\t\t"0"
+        \t\t"PlaySoundDownloadComplete"\t\t"0"
+        \t\t"EnableStandardSounds"\t\t"0"
+        \t\t"EnableCustomSounds"\t\t"0"
+        \t}
+        }
+        """
+
+        // Atomic write so Steam never reads a partial file if it happens to be
+        // scanning userdata while we write (rare — Steam reads localconfig only
+        // at post-login hydration).
+        try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
+        log.info("[writeUserNotificationPrefs] wrote \(cfgPath) (accountID=\(accountID))")
+    }
+
     /// Steam's ConnectCache map key format: `(crc32(accountName) << 4) | slot_number`.
     /// The slot number is `1` for the only user in this bottle — Meridian never signs
     /// two accounts into the same bottle, so slot is always `1`.
@@ -1125,25 +1195,117 @@ struct WinePrefix: Sendable {
     /// Reads download progress from the ACF manifest.
     /// Returns (bytesDownloaded, bytesToDownload, stateFlags) or nil if the ACF is missing.
     func gameDownloadProgress(appID: Int) -> (downloaded: Int64, total: Int64, stateFlags: String)? {
+        guard let details = gameDownloadDetails(appID: appID) else { return nil }
+        return (details.bytesDownloaded, details.bytesToDownload, details.stateFlags)
+    }
+
+    /// Richer variant of `gameDownloadProgress`: includes staging progress and
+    /// derives a logical install phase from the ACF's `StateFlags` bitmap.
+    ///
+    /// Valve's `StateFlags` is a bitmask. The values Meridian cares about:
+    ///
+    /// | bit | flag | meaning |
+    /// |---|---|---|
+    /// | 0x0004 | FullyInstalled    | files on disk, playable |
+    /// | 0x0002 | UpdateRequired    | needs content sync |
+    /// | 0x0008 | UpdateStarted     | Steam has begun the update |
+    /// | 0x0010 | UpdateRunning     | download in flight |
+    /// | 0x0040 | Staging           | downloaded chunks being assembled under `downloading/` |
+    /// | 0x0080 | Committing        | moving staged files from `downloading/` into `common/` |
+    /// | 0x0400 | Validating        | verifying file hashes |
+    /// | 0x4000 | Reconfiguring     | Steam is updating depot state |
+    ///
+    /// CLI-verified against Super Battle Golf (April 23 2026): fresh pre-seeded
+    /// ACF starts at `1026` (UpdateRequired | Validating), transitions through
+    /// `1042` (Running + Downloading + Validating), `1106` (Running + Staging),
+    /// `1154` (Running + Committing), ends at `4` (FullyInstalled).
+    func gameDownloadDetails(appID: Int) -> GameDownloadDetails? {
         guard let manifest = acfURL(for: appID),
               let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
         else { return nil }
 
         var bytesDownloaded: Int64 = 0
         var bytesToDownload: Int64 = 0
-        var stateFlags = ""
+        var bytesStaged: Int64 = 0
+        var bytesToStage: Int64 = 0
+        var stateFlagsStr = ""
 
         for line in contents.components(separatedBy: "\n") {
             guard let (key, value) = vdfKeyValue(from: line) else { continue }
             switch key {
             case "BytesDownloaded": bytesDownloaded = Int64(value) ?? 0
             case "BytesToDownload": bytesToDownload = Int64(value) ?? 0
-            case "StateFlags": stateFlags = value
+            case "BytesStaged":     bytesStaged     = Int64(value) ?? 0
+            case "BytesToStage":    bytesToStage    = Int64(value) ?? 0
+            case "StateFlags":      stateFlagsStr   = value
             default: break
             }
         }
 
-        return (bytesDownloaded, bytesToDownload, stateFlags)
+        let raw = Int(stateFlagsStr) ?? 0
+        let phase: InstallPhase
+        if raw & 0x4 != 0 && raw == 0x4 {
+            phase = .installed
+        } else if raw & 0x80 != 0 {
+            phase = .committing
+        } else if raw & 0x40 != 0 {
+            phase = .staging
+        } else if raw & 0x400 != 0 && raw & 0x10 == 0 {
+            phase = .validating
+        } else if raw & 0x10 != 0 || raw & 0x8 != 0 {
+            phase = .downloading
+        } else if raw & 0x2 != 0 {
+            phase = .pending
+        } else {
+            phase = .unknown
+        }
+
+        return GameDownloadDetails(
+            bytesDownloaded: bytesDownloaded,
+            bytesToDownload: bytesToDownload,
+            bytesStaged: bytesStaged,
+            bytesToStage: bytesToStage,
+            stateFlags: stateFlagsStr,
+            phase: phase
+        )
+    }
+
+    /// Logical install phase derived from Valve's `StateFlags` bitmask. The app
+    /// maps these to user-facing strings via `InstallPhase.userDescription`.
+    enum InstallPhase: String, Sendable {
+        case pending      // ACF exists with UpdateRequired, Steam hasn't started yet
+        case downloading  // transferring chunks from CDN
+        case staging      // assembling downloaded chunks under downloading/
+        case validating   // verifying staged file hashes
+        case committing   // moving from downloading/ to common/
+        case installed    // StateFlags == 4
+        case unknown      // flags don't match any known pattern (log and fall back)
+
+        /// One-word gerund shown in the UI alongside the current progress.
+        var userDescription: String {
+            switch self {
+            case .pending:     return "Preparing"
+            case .downloading: return "Downloading"
+            case .staging:     return "Staging"
+            case .validating:  return "Validating"
+            case .committing:  return "Finalising"
+            case .installed:   return "Installed"
+            case .unknown:     return "Working"
+            }
+        }
+    }
+
+    /// Full ACF snapshot used by the install-progress UI. Stage bytes are
+    /// distinct from download bytes — Steam downloads compressed chunks, then
+    /// "stages" them into their on-disk layout, and finally "commits" the
+    /// staged tree into `steamapps/common/`.
+    struct GameDownloadDetails: Sendable {
+        let bytesDownloaded: Int64
+        let bytesToDownload: Int64
+        let bytesStaged: Int64
+        let bytesToStage: Int64
+        let stateFlags: String
+        let phase: InstallPhase
     }
 
     /// Reads the Steam appmanifest for a game and returns the `installdir` value.

@@ -387,7 +387,18 @@ final class GameLauncher {
             // wait needed — we go straight to progress polling.
 
             // ACF exists — we're downloading. Poll for progress until done.
+            //
+            // Progress is broken into four phases mirroring Steam's own
+            // StateFlags: download → staging → validating → committing →
+            // installed. We remap each phase's raw counters into a single
+            // 0-100% progress bar split 0-85 / 85-92 / 92-97 / 97-100 so the
+            // bar moves through every phase. Pure-download percentage jumping
+            // 0 → 100 made small games (say 200 MB on a 200 Mbps connection)
+            // appear to "just finish" because the download completed between
+            // two 2-second polls. Staging + commit add several more seconds
+            // of observable progress even on fast connections.
             var lastLoggedPercent = -1
+            var lastPhase: WinePrefix.InstallPhase?
             while !prefix.isGameFullyInstalled(appID: game.id) {
                 guard !Task.isCancelled else {
                     downloadProgress = nil
@@ -396,22 +407,57 @@ final class GameLauncher {
                     return
                 }
 
-                if let progress = prefix.gameDownloadProgress(appID: game.id),
-                   progress.total > 0 {
-                    let fraction = Double(progress.downloaded) / Double(progress.total)
+                if let d = prefix.gameDownloadDetails(appID: game.id) {
+                    let dlFrac: Double = d.bytesToDownload > 0
+                        ? Double(d.bytesDownloaded) / Double(d.bytesToDownload)
+                        : 0
+                    let stageFrac: Double = d.bytesToStage > 0
+                        ? Double(d.bytesStaged) / Double(d.bytesToStage)
+                        : 0
+
+                    // Per-phase bar weights: most wall-clock time is download.
+                    let fraction: Double
+                    switch d.phase {
+                    case .pending:      fraction = 0.00
+                    case .downloading:  fraction = dlFrac * 0.85
+                    case .staging:      fraction = 0.85 + stageFrac * 0.07
+                    case .validating:   fraction = 0.92 + stageFrac * 0.05
+                    case .committing:   fraction = 0.97
+                    case .installed:    fraction = 1.00
+                    case .unknown:      fraction = max(dlFrac, stageFrac)
+                    }
                     downloadProgress = fraction
                     let pct = Int(fraction * 100)
-                    currentActivity = pct > 0
-                        ? "Downloading \(game.name) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total)) (\(pct)%)"
-                        : "Downloading \(game.name)…"
 
-                    // Log progress at 5% increments to keep the log useful without spam.
+                    // User-facing activity string reflects the actual phase.
+                    let verb = d.phase.userDescription
+                    let bytesText: String = {
+                        switch d.phase {
+                        case .downloading where d.bytesToDownload > 0:
+                            return " — \(Self.formatBytes(d.bytesDownloaded)) / \(Self.formatBytes(d.bytesToDownload)) (\(pct)%)"
+                        case .staging, .validating where d.bytesToStage > 0:
+                            return " — \(Self.formatBytes(d.bytesStaged)) / \(Self.formatBytes(d.bytesToStage)) (\(pct)%)"
+                        case .committing, .installed:
+                            return " (\(pct)%)"
+                        default:
+                            return pct > 0 ? " (\(pct)%)" : "…"
+                        }
+                    }()
+                    currentActivity = "\(verb) \(game.name)\(bytesText)"
+
+                    // Log at phase transitions + every 5% within a phase.
+                    if lastPhase != d.phase {
+                        appendLog("\(verb) \(game.name)")
+                        log.info("[launch] appID=\(game.id) phase=\(d.phase.rawValue) stateFlags=\(d.stateFlags)")
+                        lastPhase = d.phase
+                        lastLoggedPercent = -1
+                    }
                     if pct / 5 > lastLoggedPercent / 5 {
-                        appendLog("Downloading \(game.name) — \(pct)%")
+                        appendLog("\(verb) \(game.name) — \(pct)%")
                         lastLoggedPercent = pct
                     }
                 } else {
-                    currentActivity = "Downloading \(game.name)…"
+                    currentActivity = "Preparing \(game.name)…"
                 }
 
                 try? await Task.sleep(for: .seconds(2))
