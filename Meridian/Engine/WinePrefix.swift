@@ -1234,26 +1234,33 @@ struct WinePrefix: Sendable {
         return (details.bytesDownloaded, details.bytesToDownload, details.stateFlags)
     }
 
-    /// Richer variant of `gameDownloadProgress`: includes staging progress and
-    /// derives a logical install phase from the ACF's `StateFlags` bitmap.
+    /// Richer variant of `gameDownloadProgress`: includes staging byte counts
+    /// and a coarse install phase derived from actual bytes (not Valve's
+    /// opaque `StateFlags` bitmask).
     ///
-    /// Valve's `StateFlags` is a bitmask. The values Meridian cares about:
+    /// ## Why bytes, not StateFlags
     ///
-    /// | bit | flag | meaning |
-    /// |---|---|---|
-    /// | 0x0004 | FullyInstalled    | files on disk, playable |
-    /// | 0x0002 | UpdateRequired    | needs content sync |
-    /// | 0x0008 | UpdateStarted     | Steam has begun the update |
-    /// | 0x0010 | UpdateRunning     | download in flight |
-    /// | 0x0040 | Staging           | downloaded chunks being assembled under `downloading/` |
-    /// | 0x0080 | Committing        | moving staged files from `downloading/` into `common/` |
-    /// | 0x0400 | Validating        | verifying file hashes |
-    /// | 0x4000 | Reconfiguring     | Steam is updating depot state |
+    /// CLI-verified April 23 2026: `StateFlags` is NOT a reliable
+    /// continuous progress signal. On a Super Battle Golf install the ACF's
+    /// StateFlags stayed at `1026` (UpdateStarted | UpdateRequired) for the
+    /// entire 27-second download, then flipped atomically to `4`
+    /// (FullyInstalled) when done — no intermediate values observed at 2 s
+    /// polling. The community-documented "Downloading / Staging / Committing"
+    /// bits (0x400000, 0x1000000, 0x200000) aren't set until the very last
+    /// millisecond before the final flip, so any phase-from-flags decoder
+    /// picks "Validating 92%" from bit 0x400 (which Valve actually uses for
+    /// `UpdateStarted`) and shows the user a bar stuck at 92% for 27 s.
     ///
-    /// CLI-verified against Super Battle Golf (April 23 2026): fresh pre-seeded
-    /// ACF starts at `1026` (UpdateRequired | Validating), transitions through
-    /// `1042` (Running + Downloading + Validating), `1106` (Running + Staging),
-    /// `1154` (Running + Committing), ends at `4` (FullyInstalled).
+    /// `BytesDownloaded` / `BytesToDownload` / `BytesStaged` / `BytesToStage`,
+    /// in contrast, update continuously as Steam writes chunks. Same source,
+    /// higher resolution, no bitmask guessing.
+    ///
+    /// ## Phase derivation
+    ///
+    /// - `StateFlags == "4"`                          → `.installed`
+    /// - `bytesToDownload > 0` AND `bytesDownloaded < bytesToDownload`  → `.downloading`
+    /// - `bytesToStage > 0` AND `bytesStaged < bytesToStage`            → `.installing` (staging + committing + validating all map here — user doesn't care about the difference)
+    /// - everything else (pre-start, unknown)                            → `.preparing`
     func gameDownloadDetails(appID: Int) -> GameDownloadDetails? {
         guard let manifest = acfURL(for: appID),
               let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
@@ -1277,22 +1284,15 @@ struct WinePrefix: Sendable {
             }
         }
 
-        let raw = Int(stateFlagsStr) ?? 0
         let phase: InstallPhase
-        if raw & 0x4 != 0 && raw == 0x4 {
+        if stateFlagsStr == "4" {
             phase = .installed
-        } else if raw & 0x80 != 0 {
-            phase = .committing
-        } else if raw & 0x40 != 0 {
-            phase = .staging
-        } else if raw & 0x400 != 0 && raw & 0x10 == 0 {
-            phase = .validating
-        } else if raw & 0x10 != 0 || raw & 0x8 != 0 {
+        } else if bytesToDownload > 0 && bytesDownloaded < bytesToDownload {
             phase = .downloading
-        } else if raw & 0x2 != 0 {
-            phase = .pending
+        } else if bytesToStage > 0 && bytesStaged < bytesToStage {
+            phase = .installing
         } else {
-            phase = .unknown
+            phase = .preparing
         }
 
         return GameDownloadDetails(
@@ -1305,35 +1305,28 @@ struct WinePrefix: Sendable {
         )
     }
 
-    /// Logical install phase derived from Valve's `StateFlags` bitmask. The app
-    /// maps these to user-facing strings via `InstallPhase.userDescription`.
+    /// Byte-driven install phase — see `gameDownloadDetails(appID:)` doc for
+    /// why we derive this from byte counts instead of Valve's StateFlags.
     enum InstallPhase: String, Sendable {
-        case pending      // ACF exists with UpdateRequired, Steam hasn't started yet
-        case downloading  // transferring chunks from CDN
-        case staging      // assembling downloaded chunks under downloading/
-        case validating   // verifying staged file hashes
-        case committing   // moving from downloading/ to common/
-        case installed    // StateFlags == 4
-        case unknown      // flags don't match any known pattern (log and fall back)
+        case preparing    // ACF exists, byte counts not yet written by Steam
+        case downloading  // transferring compressed chunks from CDN
+        case installing   // decompressing / staging / committing chunks to `common/`
+        case installed    // StateFlags == 4, ready to play
 
-        /// One-word gerund shown in the UI alongside the current progress.
+        /// Verb shown in the UI alongside the current progress.
         var userDescription: String {
             switch self {
-            case .pending:     return "Preparing"
+            case .preparing:   return "Preparing"
             case .downloading: return "Downloading"
-            case .staging:     return "Staging"
-            case .validating:  return "Validating"
-            case .committing:  return "Finalising"
+            case .installing:  return "Installing"
             case .installed:   return "Installed"
-            case .unknown:     return "Working"
             }
         }
     }
 
-    /// Full ACF snapshot used by the install-progress UI. Stage bytes are
-    /// distinct from download bytes — Steam downloads compressed chunks, then
-    /// "stages" them into their on-disk layout, and finally "commits" the
-    /// staged tree into `steamapps/common/`.
+    /// Full ACF snapshot used by the install-progress UI. `stateFlags` is
+    /// retained as a string for logging / debugging but is NOT used to drive
+    /// the progress bar — see `gameDownloadDetails(appID:)` for the rationale.
     struct GameDownloadDetails: Sendable {
         let bytesDownloaded: Int64
         let bytesToDownload: Int64

@@ -386,17 +386,20 @@ final class GameLauncher {
             // already scanned the ACF and queued the download. No "ACF appears"
             // wait needed — we go straight to progress polling.
 
-            // ACF exists — we're downloading. Poll for progress until done.
+            // ACF exists — poll for progress until `StateFlags == 4`.
             //
-            // Progress is broken into four phases mirroring Steam's own
-            // StateFlags: download → staging → validating → committing →
-            // installed. We remap each phase's raw counters into a single
-            // 0-100% progress bar split 0-85 / 85-92 / 92-97 / 97-100 so the
-            // bar moves through every phase. Pure-download percentage jumping
-            // 0 → 100 made small games (say 200 MB on a 200 Mbps connection)
-            // appear to "just finish" because the download completed between
-            // two 2-second polls. Staging + commit add several more seconds
-            // of observable progress even on fast connections.
+            // Progress bar is driven by byte counts from the ACF, not by
+            // Valve's StateFlags bitmask (which only flips at phase
+            // boundaries — useless as a continuous progress signal; see
+            // `WinePrefix.gameDownloadDetails` doc for the CLI evidence).
+            //
+            // Bar mapping:
+            //   0 – 90%  = download phase      (bytesDownloaded / bytesToDownload)
+            //   90 – 99% = install phase       (bytesStaged / bytesToStage)
+            //   100%     = StateFlags == 4
+            //
+            // 1 s polling gives smooth updates even on sub-GB games that
+            // finish in 5 – 10 s on a fast connection.
             var lastLoggedPercent = -1
             var lastPhase: WinePrefix.InstallPhase?
             while !prefix.isGameFullyInstalled(appID: game.id) {
@@ -409,46 +412,39 @@ final class GameLauncher {
 
                 if let d = prefix.gameDownloadDetails(appID: game.id) {
                     let dlFrac: Double = d.bytesToDownload > 0
-                        ? Double(d.bytesDownloaded) / Double(d.bytesToDownload)
+                        ? min(Double(d.bytesDownloaded) / Double(d.bytesToDownload), 1.0)
                         : 0
-                    let stageFrac: Double = d.bytesToStage > 0
-                        ? Double(d.bytesStaged) / Double(d.bytesToStage)
+                    let installFrac: Double = d.bytesToStage > 0
+                        ? min(Double(d.bytesStaged) / Double(d.bytesToStage), 1.0)
                         : 0
 
-                    // Per-phase bar weights: most wall-clock time is download.
                     let fraction: Double
                     switch d.phase {
-                    case .pending:      fraction = 0.00
-                    case .downloading:  fraction = dlFrac * 0.85
-                    case .staging:      fraction = 0.85 + stageFrac * 0.07
-                    case .validating:   fraction = 0.92 + stageFrac * 0.05
-                    case .committing:   fraction = 0.97
-                    case .installed:    fraction = 1.00
-                    case .unknown:      fraction = max(dlFrac, stageFrac)
+                    case .preparing:    fraction = 0.0
+                    case .downloading:  fraction = dlFrac * 0.9
+                    case .installing:   fraction = 0.9 + installFrac * 0.09
+                    case .installed:    fraction = 1.0
                     }
                     downloadProgress = fraction
                     let pct = Int(fraction * 100)
-
-                    // User-facing activity string reflects the actual phase.
                     let verb = d.phase.userDescription
-                    let bytesText: String = {
-                        switch d.phase {
-                        case .downloading where d.bytesToDownload > 0:
-                            return " — \(Self.formatBytes(d.bytesDownloaded)) / \(Self.formatBytes(d.bytesToDownload)) (\(pct)%)"
-                        case .staging, .validating where d.bytesToStage > 0:
-                            return " — \(Self.formatBytes(d.bytesStaged)) / \(Self.formatBytes(d.bytesToStage)) (\(pct)%)"
-                        case .committing, .installed:
-                            return " (\(pct)%)"
-                        default:
-                            return pct > 0 ? " (\(pct)%)" : "…"
-                        }
-                    }()
-                    currentActivity = "\(verb) \(game.name)\(bytesText)"
 
-                    // Log at phase transitions + every 5% within a phase.
+                    let activity: String
+                    switch d.phase {
+                    case .downloading:
+                        activity = "\(verb) \(game.name) — \(Self.formatBytes(d.bytesDownloaded)) / \(Self.formatBytes(d.bytesToDownload)) (\(pct)%)"
+                    case .installing:
+                        activity = "\(verb) \(game.name) — \(Self.formatBytes(d.bytesStaged)) / \(Self.formatBytes(d.bytesToStage)) (\(pct)%)"
+                    case .installed:
+                        activity = "\(verb) \(game.name)"
+                    case .preparing:
+                        activity = "\(verb) \(game.name)…"
+                    }
+                    currentActivity = activity
+
                     if lastPhase != d.phase {
                         appendLog("\(verb) \(game.name)")
-                        log.info("[launch] appID=\(game.id) phase=\(d.phase.rawValue) stateFlags=\(d.stateFlags)")
+                        log.info("[launch] appID=\(game.id) phase=\(d.phase.rawValue) bytesDl=\(d.bytesDownloaded)/\(d.bytesToDownload) bytesStage=\(d.bytesStaged)/\(d.bytesToStage) stateFlags=\(d.stateFlags)")
                         lastPhase = d.phase
                         lastLoggedPercent = -1
                     }
@@ -460,7 +456,7 @@ final class GameLauncher {
                     currentActivity = "Preparing \(game.name)…"
                 }
 
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(1))
             }
 
             appendLog("Download complete")

@@ -495,72 +495,93 @@ final class SteamWindowSuppressor {
     // MARK: - Window Classification
 
     enum WindowClassification {
-        case essential   // Must be shown: install dialogs, EULAs, updates, Steam Guard
-        case suppressible // Main Steam UI: store, library, friends, community
-        case unknown     // No title or unrecognized — suppress by default
+        case essential   // Must be shown: genuine user-actionable prompts we can't handle headlessly
+        case suppressible // Everything Steam renders — store, library, friends, install dialogs, toasts
+        case unknown     // No title yet (window just opened) — suppress by default
     }
 
+    /// The only windows we LET THROUGH from Steam. Post-DPAPI / pre-seeded-ACF
+    /// flow (April 23 2026+), Meridian drives every user-facing step from its
+    /// native macOS UI:
+    ///   - Sign-in happens in `AuthView` → `SteamCredentialAuth` → DPAPI `local.vdf`
+    ///   - Install happens by pre-seeded `appmanifest_<appID>.acf` + Steam auto-download
+    ///   - Uninstall happens via `WineSteamManager.uninstallGame` (ACF delete + rmdir)
+    ///   - Progress is polled from the ACF and rendered in Meridian's progress bar
+    ///   - Download-complete notifications from Steam are suppressed (we show our own)
+    ///
+    /// This list must ONLY match prompts Meridian genuinely cannot handle itself —
+    /// currently: nothing. Previously `install/update/download/complete/login/...`
+    /// were allowed through because those flows legitimately needed Steam's UI,
+    /// but every one of those is now headless. Keeping them on the allow-list
+    /// regressed to Steam's install-location dialog, "Download Complete" toast,
+    /// and update popups surfacing unwanted windows + Dock icons.
     private static let essentialTitlePatterns: [String] = [
-        "install", "uninstall", "update", "updating",
-        "eula", "license", "agreement",
-        "steam guard", "verification", "confirm", "warning", "error",
-        "sign in", "log in", "login", "activate", "redeem",
-        "extracting", "validating", "downloading", "preparing", "completing",
-        "first-time setup", "setup", "requires restart",
+        // Intentionally empty. If a future edge case requires a visible Steam
+        // prompt (e.g. CAPTCHA on signup), add the specific title here with a
+        // comment explaining what Meridian can't do for that user yet.
     ]
 
-    /// Steam informational system popups that should always be suppressed.
-    /// These match the essentialTitlePatterns ("error") but are purely cosmetic —
-    /// the game launches correctly regardless. Checked BEFORE essentialTitlePatterns.
-    private static let steamSystemSuppressiblePatterns: [String] = [
-        "steam - fatal error",  // OS version check: "Steam is no longer supported on your OS"
-        "no longer supported",  // Same popup, matched by content if title is generic
-    ]
-
+    /// Known Steam window titles we actively suppress. Checked AFTER the
+    /// essential list so anything in essentialTitlePatterns still wins. Kept
+    /// for speed — the default fallthrough also suppresses unknown titles.
     private static let suppressibleTitlePatterns: [String] = [
-        "friends", "community", "store", "news", "screenshot",
+        "steam", "friends", "community", "store", "news", "screenshot",
         "chat", "voice", "broadcast", "music player",
+        "download", "install", "update", "complete", "finished",
+        "ready to play", "now available", "launch",
+        "notification", "alert", "toast",
+        "fatal error", "no longer supported",
     ]
 
     private func classifyWindow(_ window: AXUIElement) -> WindowClassification {
         var titleRef: CFTypeRef?
         AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
-        guard let title = titleRef as? String, !title.isEmpty else {
-            return .unknown
-        }
-
+        let title = (titleRef as? String) ?? ""
         let lower = title.lowercased()
 
-        // Steam informational system popups — always suppress even if they match
-        // essentialTitlePatterns (e.g. "fatal error"). These are cosmetic only;
-        // the game launches correctly regardless.
-        for pattern in Self.steamSystemSuppressiblePatterns {
-            if lower.contains(pattern) { return .suppressible }
-        }
-
+        // Explicit essential allowlist (currently empty — see doc above).
         for pattern in Self.essentialTitlePatterns {
             if lower.contains(pattern) { return .essential }
         }
 
+        // Explicit suppressible list (fast path).
         for pattern in Self.suppressibleTitlePatterns {
             if lower.contains(pattern) { return .suppressible }
         }
 
-        // "Steam" alone is the main client window — suppress it.
-        // But "Steam - Installing..." or similar should be essential.
-        if lower == "steam" || lower == "steam client" {
-            return .suppressible
-        }
-
+        // Default: suppress. Any Steam-rendered window Meridian hasn't
+        // explicitly allowed is a surface we don't want the user to see.
         return .unknown
     }
 
     /// Two-step hide: move off-screen first (instant, no animation), then minimize.
     /// Essential windows (install dialogs, EULAs, Steam Guard, etc.) are allowed through.
+    ///
+    /// **Dock-icon suppression.** After hiding windows we also call
+    /// `NSRunningApplication.hide()` on the owning Wine process. This is
+    /// equivalent to the user pressing ⌘H — macOS demotes the app to a
+    /// hidden state and removes the red dot / focus ring from its Dock tile.
+    /// Without this call, minimizing the AX windows leaves the Dock icon
+    /// visible (and `steamwebhelper.exe`'s Dock presence was the most
+    /// user-reported suppression failure after the window itself).
+    ///
+    /// `hide()` is idempotent and cheap — we call it on every pass so that
+    /// Wine processes briefly un-hiding themselves (e.g. when Steam shows
+    /// a download-complete toast that tries to steal focus) get re-hidden
+    /// within the next 250 ms polling cycle.
     private func hideWindows(for pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         var val: CFTypeRef?
         let fetchResult = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &val)
+
+        // Always demote the app from "regular" Dock visibility, even when
+        // AXWindows hasn't populated yet. This kills the Dock-flash that
+        // happens when a Wine child process (steamwebhelper.exe) briefly
+        // activates itself before any window is queryable via AX.
+        if let running = NSRunningApplication(processIdentifier: pid) {
+            _ = running.hide()
+        }
+
         guard fetchResult == .success,
               let windows = val as? [AXUIElement], !windows.isEmpty else {
             if fetchResult != .success {
