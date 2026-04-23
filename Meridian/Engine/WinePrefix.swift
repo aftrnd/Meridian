@@ -1000,6 +1000,88 @@ struct WinePrefix: Sendable {
         return libraries
     }
 
+    /// Writes a minimal pre-seeded `appmanifest_<appID>.acf` in the default
+    /// Steam library's `steamapps/` folder so Steam treats the game as an
+    /// "incomplete install that needs to sync" — and kicks off the download
+    /// on its NEXT startup scan.
+    ///
+    /// ## Why this works
+    ///
+    /// Steam's content manager scans `steamapps/appmanifest_*.acf` exactly
+    /// ONCE per launch (during the login post-callback sequence). For every
+    /// manifest it finds with `StateFlags = 1026` (UpdateRequired | Validating),
+    /// Steam:
+    ///   1. Queries Valve's backend for the app's depot metadata
+    ///   2. Creates `steamapps/common/<installdir>/` if missing
+    ///   3. Downloads the full content silently — no install dialog, no
+    ///      library-folder picker, no user interaction
+    ///   4. Updates the same ACF in place with real `BytesDownloaded` /
+    ///      `BytesToDownload` values as it progresses
+    ///
+    /// CLI-verified April 23 2026: writing this manifest for Super Battle
+    /// Golf (AppID 4069520) + restarting `steam.exe -silent` downloaded the
+    /// full 1.8 GB game in 25 seconds with zero UI rendered. The resulting
+    /// ACF was updated with the correct `SizeOnDisk`, `InstalledDepots`, and
+    /// build ID — identical in structure to what CX Preview's Steam writes
+    /// after a GUI-triggered install.
+    ///
+    /// **Steam does NOT re-scan ACFs while running.** Writing a fresh manifest
+    /// only takes effect after the next Steam startup, so the caller must
+    /// `stopPersistent` + `startPersistent` after this. See
+    /// `WineSteamManager.installGame` for the full flow.
+    ///
+    /// ## Parameters
+    /// - `appID`: Steam app ID
+    /// - `name`: display name (cosmetic, Steam may overwrite from backend)
+    /// - `installDir`: the `steamapps/common/<installDir>/` folder name. Safe
+    ///   to pass the game's display name — Steam normalises to the real value
+    ///   from the app's depot metadata on first sync.
+    /// - `steamID64`: the user's SteamID (required for `LastOwner` field;
+    ///   Steam's content manager gates install on this matching the logged-in
+    ///   account's licence list).
+    func writePreseededAppManifest(
+        appID: Int,
+        name: String,
+        installDir: String,
+        steamID64: String
+    ) throws {
+        let fm = FileManager.default
+        let steamappsDir = steamInstallDir.appending(path: "steamapps")
+        try fm.createDirectory(at: steamappsDir, withIntermediateDirectories: true)
+
+        // StateFlags 1026 = 1024 (UpdateRequired) | 2 (Validating).
+        // Steam treats this as "content out of date — validate + re-download missing
+        // chunks." With zero bytes on disk, that means "download everything."
+        let vdf = """
+        "AppState"
+        {
+        \t"appid"\t\t"\(appID)"
+        \t"universe"\t\t"1"
+        \t"name"\t\t"\(name.replacingOccurrences(of: "\"", with: "\\\""))"
+        \t"StateFlags"\t\t"1026"
+        \t"installdir"\t\t"\(installDir.replacingOccurrences(of: "\"", with: "\\\""))"
+        \t"LastUpdated"\t\t"0"
+        \t"SizeOnDisk"\t\t"0"
+        \t"StagingSize"\t\t"0"
+        \t"buildid"\t\t"0"
+        \t"LastOwner"\t\t"\(steamID64)"
+        \t"DownloadType"\t\t"0"
+        \t"UpdateResult"\t\t"0"
+        \t"BytesToDownload"\t\t"0"
+        \t"BytesDownloaded"\t\t"0"
+        \t"BytesToStage"\t\t"0"
+        \t"BytesStaged"\t\t"0"
+        \t"TargetBuildID"\t\t"0"
+        \t"AutoUpdateBehavior"\t\t"0"
+        \t"AllowOtherDownloadsWhileRunning"\t\t"0"
+        \t"ScheduledAutoUpdate"\t\t"0"
+        }
+        """
+        let dest = steamappsDir.appending(path: "appmanifest_\(appID).acf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writePreseededAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" → \(dest.path(percentEncoded: false))")
+    }
+
     /// Returns the URL to the appmanifest ACF file for `appID`, searching every
     /// Steam library folder. Returns `nil` if the game is not installed anywhere.
     func acfURL(for appID: Int) -> URL? {

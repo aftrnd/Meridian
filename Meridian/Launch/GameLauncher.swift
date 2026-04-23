@@ -359,36 +359,32 @@ final class GameLauncher {
             transition(to: .awaitingInstallConfirmation,
                        activity: "Preparing download for \(game.name)…")
             appendLog("Preparing download for \(game.name)")
-            log.info("[launch] dispatching install for appID=\(game.id) via Steam IPC")
+            log.info("[launch] pre-seeding appmanifest for appID=\(game.id) and restarting Steam")
 
-            do {
-                try steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
-            } catch {
-                fail("Could not dispatch install: \(error.localizedDescription)", error: error)
+            let steamID64 = steamAuth?.steamID ?? ""
+            guard !steamID64.isEmpty else {
+                fail("Not signed into Steam — please sign in and try again.")
                 return
             }
 
-            // Poll the ACF manifest for progress. Steam writes BytesDownloaded /
-            // BytesToDownload continuously during the download — the same fields
-            // Steam's own progress UI reads. 2s polling is plenty for a smooth bar.
-            //
-            // The ACF typically appears within a few seconds after Steam receives
-            // the +app_update command. Before it appears we show "Preparing…".
-            let acfWaitDeadline = ContinuousClock.now + .seconds(30)
-            while prefix.acfURL(for: game.id) == nil {
-                guard !Task.isCancelled else {
-                    downloadProgress = nil
-                    currentActivity = nil
-                    log.info("[launch] install dispatch cancelled before ACF appeared")
-                    return
-                }
-                if ContinuousClock.now > acfWaitDeadline {
-                    fail("Steam didn't start the download within 30 seconds. Try again.")
-                    return
-                }
-                currentActivity = "Preparing download for \(game.name)…"
-                try? await Task.sleep(for: .seconds(1))
+            do {
+                try await steamManager.installGame(
+                    appID: game.id,
+                    name: game.name,
+                    installDir: game.name,
+                    steamID64: steamID64,
+                    engine: engine,
+                    prefix: prefix
+                )
+            } catch {
+                fail("Could not start install: \(error.localizedDescription)", error: error)
+                return
             }
+
+            // The pre-seeded ACF is already on disk before steam.exe restarted.
+            // By the time `installGame` returns (Steam is logged on), Steam has
+            // already scanned the ACF and queued the download. No "ACF appears"
+            // wait needed — we go straight to progress polling.
 
             // ACF exists — we're downloading. Poll for progress until done.
             var lastLoggedPercent = -1

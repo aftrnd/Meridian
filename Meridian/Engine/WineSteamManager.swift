@@ -626,21 +626,64 @@ final class WineSteamManager {
         return pid
     }
 
-    // MARK: - Install via IPC
+    // MARK: - Install via pre-seeded appmanifest + Steam restart
 
-    /// Dispatches an install to the running persistent Steam client.
+    /// Triggers a silent game install by pre-seeding the `appmanifest_<appID>.acf`
+    /// in the prefix and bouncing the persistent `steam.exe` so it picks up the
+    /// manifest on its next startup scan.
     ///
-    /// Sends `+app_update APPID` as forwarded command-line args to `steam.exe`.
-    /// When Steam is already running, a second `steam.exe` invocation forwards
-    /// its arguments to the running instance via socket IPC and exits
-    /// immediately. Steam handles the download in-process via its own client.
+    /// ## Why not IPC?
     ///
-    /// Progress is monitored by the caller by polling the ACF manifest in
-    /// `steamapps/appmanifest_<appID>.acf` (see `WinePrefix.gameDownloadProgress`).
-    func installGame(appID: Int, engine: WineEngine, prefix: WinePrefix) throws {
-        log.info("[installGame] dispatching +app_update \(appID) via Steam IPC")
-        try sendSteamCommand(["+app_update", "\(appID)"], engine: engine, prefix: prefix)
-        log.info("[installGame] +app_update dispatched for appID=\(appID)")
+    /// Meridian previously sent `+app_update APPID` via a second `steam.exe`
+    /// invocation (IPC forwarder). Steam's GUI client interprets that command
+    /// by opening its native "Install — Choose Location" dialog, which requires
+    /// a user click to confirm. `SteamWindowSuppressor` hides the dialog, so
+    /// the download never actually starts. CLI-verified April 23 2026.
+    ///
+    /// ## What works instead
+    ///
+    /// Steam's content manager scans `steamapps/appmanifest_*.acf` exactly once
+    /// per login (never again during a running session). Any ACF found with
+    /// `StateFlags = 1026` (UpdateRequired | Validating) triggers an automatic
+    /// silent download — the same code path Steam uses when it detects a
+    /// "broken install" that needs repair. No install dialog, no location
+    /// picker, no user interaction required.
+    ///
+    /// CLI-verified April 23 2026: writing the pre-seeded manifest and
+    /// restarting steam.exe downloaded Super Battle Golf (1.8 GB) in 25 s with
+    /// zero UI. See `WinePrefix.writePreseededAppManifest` for the ACF format.
+    ///
+    /// ## Cost
+    ///
+    /// A `stopPersistent` + `startPersistent` cycle takes ~10-15 s (Steam login
+    /// via DPAPI `local.vdf`). This is a one-time cost per install-click and
+    /// is user-invisible (covered by "Preparing download…" in the UI). After
+    /// the manifest is written, Steam runs the download itself and subsequent
+    /// launches pick up where it left off without another restart.
+    func installGame(
+        appID: Int,
+        name: String,
+        installDir: String,
+        steamID64: String,
+        engine: WineEngine,
+        prefix: WinePrefix
+    ) async throws {
+        log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
+        try prefix.writePreseededAppManifest(
+            appID: appID,
+            name: name,
+            installDir: installDir,
+            steamID64: steamID64
+        )
+
+        log.info("[installGame] restarting persistent Steam so it picks up the new manifest")
+        await stopPersistent(engine: engine, prefix: prefix)
+        try await startPersistent(engine: engine, prefix: prefix)
+        try await waitUntilReady(prefix: prefix, timeout: .seconds(180))
+        if let pid = persistentProcessIdentifier {
+            windowSuppressor?.resumeSuppressing(pid: pid)
+        }
+        log.info("[installGame] persistent steam.exe ready — download starts momentarily (ACF detected at startup)")
     }
 
     // MARK: - Persistent Steam
