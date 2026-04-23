@@ -89,7 +89,7 @@ final class WineEngine {
 
     // MARK: - Known Paths
 
-    nonisolated(unsafe) static let engineDir: URL = {
+    nonisolated static let engineDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appending(path: "com.meridian.app/engine", directoryHint: .isDirectory)
     }()
@@ -441,8 +441,11 @@ private func readNonBlocking(_ pipe: Pipe) -> Data {
     let fd = fh.fileDescriptor
     let flags = fcntl(fd, F_GETFL)
     guard flags >= 0 else { return Data() }
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-    defer { fcntl(fd, F_SETFL, flags) }
+    // fcntl return value is discarded — we only care that O_NONBLOCK was set/restored
+    // (errors here would surface as unexpected blocking behaviour in the read loop
+    // below, which we'd see immediately during development).
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    defer { _ = fcntl(fd, F_SETFL, flags) }
 
     var result = Data()
     var buf = [UInt8](repeating: 0, count: 65536)

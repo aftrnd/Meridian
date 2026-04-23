@@ -22,11 +22,10 @@ struct GameDetailView: View {
     @Environment(WineEngine.self)         private var engine
     @Environment(WineSteamManager.self)   private var steamManager
     @Environment(SteamAuthService.self)   private var steamAuth
-    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(GameLauncher.self)       private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
-    @Environment(SteamCMDService.self)    private var steamCMDService
+    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
@@ -228,8 +227,7 @@ struct GameDetailView: View {
                         engine: engine,
                         steamManager: steamManager,
                         sessionBridge: sessionBridge,
-                        engineDownloader: engineDownloader,
-                        steamCMDService: steamCMDService
+                        engineDownloader: engineDownloader
                     )
                 }
             }
@@ -851,7 +849,6 @@ struct GameDetailView: View {
             game: currentGame,
             engine: engine,
             steamManager: steamManager,
-            sessionBridge: sessionBridge,
             steamAuth: steamAuth,
             library: library
         )
@@ -866,11 +863,11 @@ struct GameDetailView: View {
             game: currentGame,
             engine: engine,
             steamManager: steamManager,
-            sessionBridge: sessionBridge,
             steamAuth: steamAuth,
             library: library
         )
     }
+
 }
 
 // MARK: - Detail Row helpers

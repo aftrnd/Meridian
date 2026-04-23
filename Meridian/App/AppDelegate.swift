@@ -20,9 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Set by MeridianApp so the bootstrap pipeline is cancelled before Wine cleanup.
     var bootstrap: BootstrapManager?
 
-    /// Set by MeridianApp so the persistent SteamCMD session is shut down at termination.
-    var steamCMDService: SteamCMDService?
-
     /// Prevents `killAllWineProcesses` from running concurrently or twice.
     private var cleanupDone = false
 
@@ -125,7 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationWillTerminate(_ notification: Notification) {
         suppressor?.stopSuppressing()
-        runCleanupOnce()
+        // Final safety-net cleanup — `applicationShouldTerminate` is the primary
+        // path and normally runs first with background cleanup; this handles the
+        // edge case of a force-quit that skips ShouldTerminate (e.g. SIGTERM).
+        if !cleanupDone {
+            cleanupDone = true
+            TerminationCleanup.killAllWineProcesses()
+        }
         if let observer = readyObserver {
             NotificationCenter.default.removeObserver(observer)
             readyObserver = nil
@@ -143,31 +146,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // before the cleanup kills them — prevents race conditions with partial state.
         bootstrap?.cancelForTermination()
 
-        // Shut down the persistent SteamCMD session cleanly (sends "quit" to the process).
-        steamCMDService?.shutdown()
-
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             log.warning("[AppDelegate] cleanup timed out — forcing quit")
             sender.reply(toApplicationShouldTerminate: true)
         }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.runCleanupOnce()
+        // Flip the flag on the main actor before dispatching — `cleanupDone` is
+        // a @MainActor-isolated property and the actual cleanup work runs off
+        // the main actor. If cleanup is already in progress, skip redispatch.
+        guard !cleanupDone else {
+            log.info("[AppDelegate] cleanup already ran — skipping")
+            return .terminateNow
+        }
+        cleanupDone = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            TerminationCleanup.killAllWineProcesses()
             DispatchQueue.main.async {
                 sender.reply(toApplicationShouldTerminate: true)
             }
         }
 
         return .terminateLater
-    }
-
-    private func runCleanupOnce() {
-        guard !cleanupDone else {
-            log.info("[AppDelegate] cleanup already ran — skipping")
-            return
-        }
-        cleanupDone = true
-        TerminationCleanup.killAllWineProcesses()
     }
 
     // MARK: - UNUserNotificationCenterDelegate

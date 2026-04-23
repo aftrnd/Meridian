@@ -65,8 +65,7 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader,
-        steamCMDService: SteamCMDService
+        engineDownloader: EngineDownloader
     ) {
         guard phase == .idle || isFailed else { return }
 
@@ -76,8 +75,7 @@ final class BootstrapManager {
                 engine: engine,
                 steamManager: steamManager,
                 sessionBridge: sessionBridge,
-                engineDownloader: engineDownloader,
-                steamCMDService: steamCMDService
+                engineDownloader: engineDownloader
             )
         }
     }
@@ -110,8 +108,7 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader,
-        steamCMDService: SteamCMDService
+        engineDownloader: EngineDownloader
     ) {
         let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam]
         if let failed = lastFailedPhase, cleanupPhases.contains(failed) {
@@ -123,7 +120,7 @@ final class BootstrapManager {
         phase = .idle
         statusMessage = ""
         engineDownloadState = .idle
-        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader, steamCMDService: steamCMDService)
+        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader)
     }
 
     // MARK: - Pipeline
@@ -135,8 +132,7 @@ final class BootstrapManager {
         engine: WineEngine,
         steamManager: WineSteamManager,
         sessionBridge: SteamSessionBridge,
-        engineDownloader: EngineDownloader,
-        steamCMDService: SteamCMDService
+        engineDownloader: EngineDownloader
     ) async {
         let pipelineStart = ContinuousClock.now
 
@@ -393,6 +389,45 @@ final class BootstrapManager {
             settings.steamInstallPathRegistrationVersion = WinePrefix.steamInstallPathRegistrationVersion
         }
 
+        // Set the prefix's reported Windows version to win10 (once per prefix).
+        // Defence in depth — the real fix for "Steam is no longer supported on
+        // your operating system" was a fresh `steam.exe` stub (see the stub
+        // refresh below). This reg write covers cases where other Wine-hosted
+        // apps query `GetVersionEx` directly.
+        if settings.windowsVersionAppliedVersion < WinePrefix.windowsVersionRegistrationVersion {
+            log.info("[bootstrap] Windows version not yet set — forcing win10")
+            await prefix.setWindowsVersionToWin10(engine: engine)
+            settings.windowsVersionAppliedVersion = WinePrefix.windowsVersionRegistrationVersion
+        }
+
+        // Replace the `SteamSetup.exe`-installed stub with the engine-bundled
+        // one if it's newer. Root cause of "Steam is no longer supported on
+        // your operating system" on fresh installs (CLI-verified April 22,
+        // 2026): Valve's `cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe`
+        // serves a Jan 29 stub whose manifest hard-reports Windows 6.2.9200.0,
+        // triggering Steam's deprecation dialog.
+        //
+        // `release-engine.sh` copies a current stub from CX Preview into the
+        // engine tarball at `$ENGINE/wine/share/meridian/steam.exe.stub`; this
+        // call overwrites the prefix's stub whenever the engine has a
+        // different-size one. Meridian never reads from CX at runtime — per
+        // update-system.mdc, CX is a build-time reference only.
+        if prefix.refreshSteamStubFromEngineIfStale() {
+            log.info("[bootstrap] steam.exe stub refreshed from engine bundle ✓")
+        }
+
+        // One-time cleanup: old Meridian sessions running the Jan 29 stub left
+        // behind a `Steam Client Service` Windows-service registration whose
+        // ImagePath points to the legacy `Program Files (x86)\Common Files\Steam`
+        // location that no longer exists under the Mar 12+ install. Steam's
+        // `StartService` call fails with GLE 126 (ERROR_MOD_NOT_FOUND) on every
+        // launch. Delete the entry — Steam will re-register it with the correct
+        // path on demand.
+        if settings.staleSteamServiceCleanupVersion < WinePrefix.staleSteamServiceCleanupVersion {
+            await prefix.removeStaleSteamServiceRegistration(engine: engine)
+            settings.staleSteamServiceCleanupVersion = WinePrefix.staleSteamServiceCleanupVersion
+        }
+
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
             transition(to: .bootstrappingSteam, message: "Downloading Steam client…")
@@ -422,44 +457,23 @@ final class BootstrapManager {
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
 
-        // 4b. Ensure SteamCMD is present (download if missing).
-        // SteamCMD is a ~1.6MB download that self-updates to ~5MB on first run.
-        // It must be in the Steam directory BEFORE any game install is attempted.
-        let steamcmdPath = prefix.steamInstallDir.appending(path: "steamcmd.exe").path(percentEncoded: false)
-        if !FileManager.default.fileExists(atPath: steamcmdPath) {
-            log.info("[bootstrap] SteamCMD not found — downloading")
-            do {
-                let steamcmdURL = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip")!
-                let (data, _) = try await URLSession.shared.data(from: steamcmdURL)
-                let tempZip = FileManager.default.temporaryDirectory.appending(path: "steamcmd.zip")
-                try data.write(to: tempZip)
-                let unzipProcess = Process()
-                unzipProcess.executableURL = URL(filePath: "/usr/bin/unzip")
-                unzipProcess.arguments = ["-o", tempZip.path(percentEncoded: false), "-d", prefix.steamInstallDir.path(percentEncoded: false)]
-                unzipProcess.standardOutput = FileHandle.nullDevice
-                unzipProcess.standardError = FileHandle.nullDevice
-                try unzipProcess.run()
-                unzipProcess.waitUntilExit()
-                try? FileManager.default.removeItem(at: tempZip)
-                log.info("[bootstrap] SteamCMD installed ✓")
-            } catch {
-                log.warning("[bootstrap] SteamCMD download failed: \(error.localizedDescription) — game installs may fail")
-            }
-        } else {
-            log.debug("[bootstrap] SteamCMD already present ✓")
-        }
-
-        // 4c. Restore SteamCMD credential cache from backup.
-        // If the prefix was recreated (reset or engine upgrade), the credential
-        // cache is gone. We back it up in WinePrefix.reset() and
-        // resetToEngineTemplate() — restore it here so game installs don't
-        // require Steam Guard re-confirmation.
-        prefix.restoreSteamCMDConfig()
-
-        // 5. Sync macOS Steam session for auto-login
+        // 5. Sync Steam session.
+        //
+        // SessionBridge has three strategies, tried in order:
+        //   1. Pending credential-auth tokens (user just finished the sign-in sheet
+        //      and we have a fresh JWT refresh_token in memory).
+        //   2. Persisted refresh_token from a previous session (AppSettings).
+        //      SessionBridge re-writes loginusers.vdf + local.vdf on every launch so
+        //      steam.exe's auto-login has a clean known state.
+        //   3. macOS Steam install detected — copy its loginusers.vdf + ssfn*.
+        //
+        // Path 1 and 2 encrypt the JWT into `AppData/Local/Steam/local.vdf` via
+        // `meridian-dpapi.exe` so Steam's `steamclient64.dll` can decrypt it at
+        // startup (matches Valve's current on-disk format, CLI-verified April 23
+        // 2026 — see `WinePrefix.writeSteamSessionLocalVdf` for the full mechanism).
+        // If none of the strategies succeed, the sign-in sheet will take over.
         transition(to: .syncingSession, message: "Syncing Steam session…")
-        let strategy = await sessionBridge.prepare(prefix: prefix)
-        // Sync account username from prefix if not already in AppSettings (migration for existing users).
+        let strategy = await sessionBridge.prepare(prefix: prefix, engine: engine)
         sessionBridge.syncAccountNameIfNeeded(prefix: prefix)
         switch strategy {
         case .credentialAuth:
@@ -467,96 +481,71 @@ final class BootstrapManager {
         case .sessionFileCopy:
             log.info("[bootstrap] session files copied from macOS Steam ✓")
         case .none:
-            log.info("[bootstrap] no session available — Wine Steam login required")
+            log.info("[bootstrap] no session available — Wine Steam login required via sign-in sheet")
         }
 
-        // Record login state. credentialAuth strategy means the user already
-        // authenticated through onboarding — mark as logged in immediately.
-        // sessionFileCopy also sets up a session. Only .none requires interactive login.
-        let hasLogin = strategy == .credentialAuth || prefix.hasSteamLoginSession()
+        // Record login state. `isSteamLoggedIn` is true ONLY when SessionBridge
+        // successfully prepared a session this launch — either from pending
+        // tokens (just-finished sign-in), persisted tokens (previous sign-in),
+        // or macOS Steam session-file copy.
+        let hasLogin = strategy != .none
         steamManager.isSteamLoggedIn = hasLogin
         log.info("[bootstrap] Steam login session present=\(hasLogin) strategy=\(String(describing: strategy))")
 
         guard !Task.isCancelled else { return }
 
         // 6. Engage window suppression now that all prefix operations are complete.
-        // This must NOT happen earlier — prefix operations (wineboot --init,
-        // wineboot --update, SteamSetup.exe) spawn transient Wine GUI windows that
-        // must be allowed to render and exit naturally.
-        // steam.exe is NOT started at bootstrap. We use SteamCMD batch mode for all
-        // game installs. steam.exe is only started on-demand for DRM games that need
-        // a live Steam IPC socket (startSteamForDRM).
+        // Prefix operations (wineboot --init, wineboot --update, SteamSetup.exe)
+        // spawn transient Wine GUI windows that must be allowed to render and
+        // exit naturally. From here on, all Steam-adjacent UI is hidden.
         windowSuppressor?.beginSession()
 
-        // 7. Warm up SteamCMD: run `+login USERNAME +quit` so the self-update and
-        //    credential cache are ready before the user clicks Install.
+        // 7. Start the persistent `steam.exe -silent` host if the user is signed in.
         //
-        // On first ever run: SteamCMD downloads ~300MB of self-updates. This takes
-        // 1–3 minutes and happens here on the splash screen ("Preparing game tools…").
-        //
-        // On subsequent launches: SteamCMD verifies its install in ~7 seconds.
-        //
-        // The warm-up is non-fatal — if it fails (no network, stale credentials),
-        // bootstrap still completes and installGame() will retry on demand.
-        let steamCMDUsername = AppSettings.shared.steamCredentialAccountName
-        if !steamCMDUsername.isEmpty && FileManager.default.fileExists(atPath: steamcmdPath) {
-            // Save credentials first (instantaneous).
-            try? await steamCMDService.start(
-                username: steamCMDUsername,
-                engine: engine,
-                prefix: prefix
-            )
-            // Now warm up — this is where the self-update and login cache happen.
-            transition(to: .startingSteam, message: "Preparing game tools…")
-            log.info("[bootstrap] warming up SteamCMD (+login +quit)…")
-            var noNativeCredentials = false
-            await steamCMDService.warmUp { [weak self] line in
-                guard let self else { return }
-                if line.hasPrefix("[") || line.contains("Logging in") || line.contains("Waiting")
-                    || line.contains("Loading Steam") || line.contains("Verifying") || line.contains("Checking") {
-                    self.statusMessage = line
+        // `waitUntilReady` gates on [Logged On, — the authenticated-ready signal.
+        // Auth failure surfaces as `SteamError.authenticationFailed` and we clear
+        // the stale refresh_token so the sign-in sheet takes over. Without this
+        // gate, the library opened but the user saw Steam's own "Unexpected error
+        // 0x3008" dialog (CLI-verified April 22 2026).
+        if hasLogin {
+            transition(to: .startingSteam, message: "Starting Steam…")
+            var steamStartSucceeded = false
+            var authFailed = false
+            do {
+                try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(180)) { [weak self] msg in
+                    self?.statusMessage = msg
                 }
-                if line.contains("password:") || line.contains("Cached credentials not found") {
-                    log.warning("[bootstrap] SteamCMD warm-up: no cached credentials — will re-authenticate")
-                    noNativeCredentials = true
-                    steamCMDService.shutdown()
+                if let pid = steamManager.persistentProcessIdentifier {
+                    windowSuppressor?.resumeSuppressing(pid: pid)
                 }
-            }
-            log.info("[bootstrap] SteamCMD warm-up complete ✓")
-
-            // If warm-up found no native credential cache, establish it now during
-            // bootstrap so the user only sees one 2FA prompt (here, at onboarding
-            // time) rather than being prompted again when they click Install.
-            //
-            // SteamCMD's native cache is distinct from the JWT ConnectCache written
-            // by writeConnectCache. The JWT is only used by steam.exe for auto-login.
-            // SteamCMD batch mode (+login USERNAME) requires its own encrypted blob
-            // which is only written by a full +login USERNAME PASSWORD run.
-            if noNativeCredentials {
-                log.info("[bootstrap] establishing SteamCMD native credential cache…")
-                transition(to: .startingSteam, message: "Verifying Steam account…")
-                let ok = await steamCMDService.reestablishCredentials(
-                    engine: engine,
-                    prefix: prefix,
-                    onProgress: { [weak self] msg in self?.statusMessage = msg }
-                )
-                if ok {
-                    log.info("[bootstrap] SteamCMD native credentials established ✓")
-                    statusMessage = "Steam account verified ✓"
-                } else {
-                    log.warning("[bootstrap] could not establish credentials — first Install will prompt for Steam Guard")
-                }
+                log.info("[bootstrap] persistent steam.exe signed in ✓")
+                steamStartSucceeded = true
+            } catch WineSteamManager.SteamError.authenticationFailed {
+                log.warning("[bootstrap] persistent steam.exe reached network but auto-login failed — saved session is stale")
+                authFailed = true
+            } catch {
+                log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
             }
 
-            // Kill any lingering Wine processes from the SteamCMD PTY session.
-            // The `script -q /dev/null` wrapper leaves the wine64/wineserver alive
-            // after steamcmd.exe exits, causing an orphaned Wine CMD window to
-            // appear in the library. Killing here is safe — warmUp is the last
-            // Wine operation before bootstrap completes.
-            steamManager.killAll(engine: engine, prefix: prefix)
-            try? await Task.sleep(for: .seconds(1))
+            if !steamStartSucceeded {
+                // Session is dead (either crash before ready, or Logged On never
+                // observed). Clear the stale refresh_token so the sign-in sheet
+                // will drive a fresh auth on the next user interaction.
+                //
+                // Also kill the running persistent Steam so it can't keep
+                // retrying auth in the background and popping the "Unexpected
+                // error (0x3008)" dialog at the user.
+                log.info("[bootstrap] clearing stale refresh token; sign-in sheet will re-authenticate (authFailed=\(authFailed))")
+                if steamManager.isSteamProcessAlive {
+                    await steamManager.stopPersistent(engine: engine, prefix: prefix)
+                }
+                settings.steamCredentialRefreshToken = ""
+                steamManager.isSteamLoggedIn = false
+                steamManager.clearPersistentProcess()
+            }
         } else {
-            log.info("[bootstrap] skipping SteamCMD setup (username=\(steamCMDUsername.isEmpty ? "empty" : "set"), steamcmd=\(FileManager.default.fileExists(atPath: steamcmdPath)))")
+            log.info("[bootstrap] skipping persistent steam.exe (no session) — sign-in sheet will handle it")
         }
 
         lastFailedPhase = nil

@@ -53,7 +53,7 @@ final class SteamCredentialAuthTests: XCTestCase {
         case emailConfirmation = 5
     }
 
-    // MARK: - Inlined: VDF templates (mirrors WinePrefix.writeLoginUsers / writeConnectCache)
+    // MARK: - Inlined: VDF templates (mirrors WinePrefix.writeLoginUsers)
 
     private func makeLoginUsersVDF(steamID: String, account: String, persona: String) -> String {
         let ts = Int(Date().timeIntervalSince1970)
@@ -398,41 +398,39 @@ final class SteamCredentialAuthTests: XCTestCase {
                           "platform_type \"2\" (WebBrowser) produces aud:[\"web\"] tokens — Steam's ConnectCache requires aud:[\"client\"] to authenticate.")
     }
 
-    // MARK: - Sign-in flow must not eagerly authenticate SteamCMD
+    // MARK: - Sign-in flow architectural invariants
     //
-    // SteamCMD uses its own credential cache and requires a SEPARATE Steam Guard
-    // mobile confirmation when authenticating with username+password. If the
-    // sign-in flow calls authenticateSteamCMD, the user is forced to approve
-    // twice for one sign-in — once for the credential auth API, once for SteamCMD.
+    // SteamCMD has been removed from Meridian entirely (April 22 2026). All game
+    // installs run via `steam.exe` IPC against the persistent background client.
+    // The sign-in path must:
+    //   1. Complete OAuth (SteamCredentialAuth.authenticate).
+    //   2. Write loginusers.vdf (WinePrefix.writeLoginUsers).
+    //   3. Encrypt and write local.vdf (WinePrefix.writeSteamSessionLocalVdf) —
+    //      this is what Steam client `1773426488+` reads for auto-login.
+    //   4. Back up the local.vdf for prefix-reset survival.
+    //   5. NOT call any SteamCMD-related API (SteamCMDService was deleted).
+    //   6. NOT write config.vdf's ConnectCache block — Steam stopped reading
+    //      tokens from there (see engine-research-findings.mdc Pattern 6).
     //
-    // SteamCMD authentication must be deferred to the first game install, where
-    // installWithSteamCMD handles it lazily with auto re-auth from Keychain.
-    //
-    // This is a documentation test — it cannot exercise the sign-in UI directly
-    // but encodes the architectural constraint so it's immediately visible if
-    // authenticateSteamCMD is accidentally re-added to the sign-in path.
+    // Docstring-test: encodes the invariant in code form so it stays visible
+    // to future agents grep-ing for the sign-in flow.
 
-    func testSignInFlowMustNotCallAuthenticateSteamCMD() {
-        // The sign-in completion handler in AuthView.beginSignIn must:
-        //   1. Write session files (writeLoginUsers, writeConnectCache)
-        //   2. Backup config.vdf (backupSteamCMDConfig)
-        //   3. NOT call authenticateSteamCMD
-        //
-        // If this test description no longer matches the code, someone added
-        // authenticateSteamCMD back to the sign-in path — REMOVE IT.
-        // Root cause: SteamCMD +login triggers a second Steam Guard challenge.
-        let signInSteps: [String] = [
+    func testSignInFlowInvariants() {
+        let requiredSteps: [String] = [
             "writeLoginUsers",
-            "writeConnectCache",
-            "backupSteamCMDConfig",
+            "writeSteamSessionLocalVdf",
+            "backupSteamSession",
         ]
         let forbiddenSteps: [String] = [
             "authenticateSteamCMD",
+            "writeConnectCache",
+            "provisionNativeCache",
         ]
-        XCTAssertFalse(signInSteps.isEmpty)
+
+        XCTAssertFalse(requiredSteps.isEmpty)
         for step in forbiddenSteps {
-            XCTAssertFalse(signInSteps.contains(step),
-                           "\(step) must NOT be in the sign-in flow — it causes a double Steam Guard confirmation")
+            XCTAssertFalse(requiredSteps.contains(step),
+                           "\(step) MUST NOT be in the sign-in flow — removed in DPAPI local.vdf migration")
         }
     }
 }

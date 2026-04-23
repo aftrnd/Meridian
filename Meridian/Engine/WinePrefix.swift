@@ -73,6 +73,16 @@ struct WinePrefix: Sendable {
         steamInstallDir.appending(path: "config")
     }
 
+    /// `drive_c/users/crossover/AppData/Local/Steam` — where Steam's client writes
+    /// its persistent auth token (the DPAPI-encrypted `local.vdf` consumed on auto-login).
+    ///
+    /// Wine's default prefix user is always `crossover` for Meridian bottles (same name
+    /// CrossOver uses). This path matches the value `steamclient64.dll` looks up via
+    /// `SHGetFolderPath(CSIDL_LOCAL_APPDATA)`, CLI-verified April 2026.
+    var localAppDataSteamDir: URL {
+        driveC.appending(path: "users/crossover/AppData/Local/Steam")
+    }
+
     // MARK: - State Checks
 
     var exists: Bool {
@@ -258,8 +268,9 @@ struct WinePrefix: Sendable {
         log.info("[resetToTemplate] saving Steam config before prefix reset")
 
         // Also write a disk-based backup of the SteamCMD credential cache
-        // as a safety net in case the in-memory restore below fails.
-        backupSteamCMDConfig()
+        // (config.vdf + ssfn files) as a safety net in case the in-memory restore
+        // below fails.
+        backupSteamCMDCredentials()
 
         // Save important Steam config files so login session survives the reset.
         // Capture the full URL for each file so the restore step can write back to
@@ -348,7 +359,7 @@ struct WinePrefix: Sendable {
         // starts steam.exe which shows its sign-in window when no valid session exists.
         // Steam re-adds itself the next time it runs normally, so this is safe to strip.
         let runKey = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        try? await engine.run(args: ["reg", "delete", runKey, "/v", "Steam", "/f"], prefix: self)
+        _ = try? await engine.run(args: ["reg", "delete", runKey, "/v", "Steam", "/f"], prefix: self)
 
         let process = try await engine.run(args: ["wineboot", "--update"], prefix: self)
         guard process.terminationStatus == 0 else {
@@ -406,8 +417,87 @@ struct WinePrefix: Sendable {
         log.info("[installSteam] Steam install complete ✓")
     }
 
+    // MARK: - Steam stub refresh (fix for outdated SteamSetup.exe)
+    //
+    // The `SteamSetup.exe` installer at `cdn.akamai.steamstatic.com/client/installer/`
+    // has been serving an outdated (~Jan 29 2026) stub that hard-reports
+    // `Windows 6.2.9200.0` via its application manifest and triggers Valve's
+    // "Steam is no longer supported on your operating system" deprecation
+    // check. CLI-verified April 22, 2026:
+    //
+    //   MD5 of SteamSetup-installed stub: b97ff5ac… (4.72 MB, built Jan 29)
+    //     → reports Windows 6.2.9200.0, exits code 255 on launch
+    //
+    //   MD5 of CX Preview 27's stub:      4f2ad574… (5.77 MB, built Mar 12)
+    //     → reports Windows 10.0.19045.0, runs cleanly to "Suppressing Steam update"
+    //
+    // The normal self-update path `steam.exe` follows on launch would pull
+    // the newer stub from `client-update.steamstatic.com`, but our Jan 29
+    // stub fails its own TLS handshake ("http error 0" — the same macOS-26
+    // + WoW64 + static-OpenSSL issue documented at engine-research-findings.mdc
+    // lines 39-42) before the update can complete. Stuck in a perpetual-
+    // old-stub loop.
+    //
+    // Fix: `release-engine.sh` copies a current `steam.exe` stub from CX
+    // Preview's Steam bottle into the engine tarball at
+    //   `$ENGINE/wine/share/meridian/steam.exe.stub`
+    // and this function overwrites the freshly-SteamSetup'd stub with the
+    // bundled one whenever its size differs.
+    //
+    // Per [update-system.mdc], CX Preview is a BUILD-TIME reference only —
+    // this function only reads from the engine tarball, never from CX at
+    // runtime.
+
+    /// Path to the bundled stub inside the engine tarball.
+    private static func bundledSteamStubURL() -> URL {
+        WineEngine.engineDir.appending(path: "wine/share/meridian/steam.exe.stub")
+    }
+
+    /// If the engine ships a newer `steam.exe` stub than whatever
+    /// `SteamSetup.exe` installed, overwrite the prefix's copy. Idempotent —
+    /// no-op when sizes match or when the engine doesn't ship a bundled stub
+    /// (legacy engines without this asset).
+    ///
+    /// Returns `true` when the stub was actually replaced.
+    @discardableResult
+    func refreshSteamStubFromEngineIfStale() -> Bool {
+        let fm = FileManager.default
+        let bundled = Self.bundledSteamStubURL()
+        let bundledPath = bundled.path(percentEncoded: false)
+        let ourStub = steamExePath
+        let ourStubPath = ourStub.path(percentEncoded: false)
+
+        guard fm.fileExists(atPath: bundledPath) else {
+            log.debug("[refreshSteamStub] engine does not ship a bundled stub — skipping")
+            return false
+        }
+
+        let bundledSize = (try? fm.attributesOfItem(atPath: bundledPath))?[.size] as? Int ?? 0
+        let ourSize = (try? fm.attributesOfItem(atPath: ourStubPath))?[.size] as? Int ?? 0
+
+        guard bundledSize != ourSize else {
+            log.debug("[refreshSteamStub] stub sizes identical (\(bundledSize) bytes) — already up to date")
+            return false
+        }
+
+        log.info("[refreshSteamStub] stale stub detected (prefix=\(ourSize) bytes, engine=\(bundledSize) bytes) — overwriting with bundled stub")
+
+        do {
+            if fm.fileExists(atPath: ourStubPath) {
+                try fm.removeItem(atPath: ourStubPath)
+            }
+            try fm.copyItem(at: bundled, to: ourStub)
+            log.info("[refreshSteamStub] steam.exe stub updated from engine bundle ✓")
+            return true
+        } catch {
+            log.error("[refreshSteamStub] copy failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     /// Copies Steam session files from the macOS Steam install into this prefix
-    /// to enable auto-login without credentials.
+    /// to enable auto-login without credentials. Used by `SteamSessionBridge` when
+    /// a local macOS Steam install is detected during first-run bootstrap.
     func copySessionFiles(from macSteamDir: URL) -> Bool {
         let fm = FileManager.default
         let files: [(src: String, dst: String)] = [
@@ -448,7 +538,9 @@ struct WinePrefix: Sendable {
             }
         }
 
-        // Copy ssfn machine auth tokens
+        // Copy ssfn machine auth tokens (legacy — steam.exe auto-login uses
+        // ConnectCache JWT, but these are harmless to copy and reduce friction
+        // if the user later inspects the prefix manually).
         var ssfnCount = 0
         if let children = try? fm.contentsOfDirectory(at: macSteamDir, includingPropertiesForKeys: nil) {
             for token in children where token.lastPathComponent.hasPrefix("ssfn") {
@@ -472,10 +564,20 @@ struct WinePrefix: Sendable {
     // MARK: - Session File Writing (native auth)
 
     /// Writes `config/loginusers.vdf` for `steamID` so the Wine Steam client
-    /// recognises an authenticated user and auto-selects it on next start.
+    /// recognises an authenticated user and auto-logs in on next start.
     ///
     /// Called after a successful native IAuthenticationService login, immediately
     /// before (re)starting the persistent Steam process.
+    ///
+    /// **Key field: `AllowAutoLogin "1"`.** Without this, Steam treats the
+    /// user as "known but don't auto-login" — it connects to the CM
+    /// network and then sits there with `[U:1:0]` (no user context) waiting
+    /// for an explicit user action. The steamwebhelper renders the QR /
+    /// login picker. CLI-verified against CX Preview's working
+    /// `loginusers.vdf`: CX writes `AllowAutoLogin "1"` + `WantsOfflineMode
+    /// "0"` + `SkipOfflineModeWarning "0"` — all three are needed to
+    /// unconditionally trigger ConnectCache auto-login with the matching
+    /// JWT in `config.vdf`.
     func writeLoginUsers(steamID: String, accountName: String, personaName: String) throws {
         let fm = FileManager.default
         let configDir = steamConfigDir
@@ -490,6 +592,9 @@ struct WinePrefix: Sendable {
         \t\t"AccountName"\t\t"\(accountName)"
         \t\t"PersonaName"\t\t"\(personaName)"
         \t\t"RememberPassword"\t\t"1"
+        \t\t"WantsOfflineMode"\t\t"0"
+        \t\t"SkipOfflineModeWarning"\t\t"0"
+        \t\t"AllowAutoLogin"\t\t"1"
         \t\t"MostRecent"\t\t"1"
         \t\t"Timestamp"\t\t"\(timestamp)"
         \t}
@@ -501,67 +606,214 @@ struct WinePrefix: Sendable {
         log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
     }
 
-    /// Writes a minimal, well-formed `config/config.vdf` with ConnectCache credentials.
+    /// Writes `drive_c/users/crossover/AppData/Local/Steam/local.vdf` containing a
+    /// DPAPI-encrypted JWT refresh token. Steam's `steamclient64.dll` reads this file
+    /// on startup, decrypts the blob via `CryptUnprotectData` (passing the account name
+    /// as entropy), and auto-logs in silently without showing any UI.
     ///
-    /// Always overwrites the existing file. The previous merge approach (upsert into
-    /// steam.exe-generated configs) produced brace-count mismatches in large VDF files,
-    /// causing SteamCMD to hit EOF mid-parse ("got EOF instead of keyname"), report
-    /// "Cached credentials not found", and prompt for a password — blocking forever.
+    /// ## Why this works
     ///
-    /// A fresh minimal VDF is always correct: the JWT refresh token stored in AppSettings
-    /// is all SteamCMD needs to log in without Steam Guard.
-    func writeConnectCache(steamID: String, refreshToken: String, accountName: String) throws {
+    /// Pre-April-2026 Meridian wrote the JWT to `config/config.vdf` under a `ConnectCache`
+    /// block. Steam client `1773426488` (Mar 12 2026+) stopped reading tokens from that
+    /// location — `configstore_log.txt` shows `Failed to read store 'machineuser' from
+    /// 'local.vdf.tmp'`, then `Clearing in-memory token - 1: cached creds not available`.
+    ///
+    /// The definitive token store is now `%LOCALAPPDATA%\Steam\local.vdf`, keyed by a
+    /// per-account 32-bit hash. CLI-verified April 23 2026 via `WINEDEBUG=+crypt` tracing
+    /// of live Steam on our engine:
+    ///
+    /// ```
+    /// trace:crypt:CryptUnprotectData called
+    /// trace:crypt:report pDataIn cbData: 666
+    /// trace:crypt:report pOptionalEntropy pbData: 6e,69,63,6b,6a,61,63,6b,38,37,36
+    ///                                             = "nickjack876" (11 bytes, no NUL)
+    /// trace:crypt:CryptUnprotectData returning ok
+    /// ```
+    ///
+    /// The plaintext inside the blob is the raw JWT string (no wrapper, no VDF). The
+    /// outer VDF structure wraps the encrypted blob:
+    ///
+    /// ```
+    /// "MachineUserConfigStore" {
+    ///   "Software" { "Valve" { "Steam" { "ConnectCache" {
+    ///     "<key>"  "<hex-encoded encrypted blob>"
+    ///   } } } }
+    /// }
+    /// ```
+    ///
+    /// where `<key> = (crc32(accountName) << 4) | slot_number` and `slot_number = 1` for
+    /// the only user in this bottle. CRC32 is the IEEE polynomial, standard Ethernet.
+    ///
+    /// ## Why the DPAPI blob is reproducible from outside the bottle
+    ///
+    /// Wine's `CryptProtectData` (dlls/crypt32/protectdata.c) derives the symmetric 3DES
+    /// key from:
+    /// - `GetUserNameA()` — always `"crossover"` in Meridian prefixes (deterministic)
+    /// - `crypt32_protectdata_secret` — Wine compile-time constant (`"I'm hunting wabbits"`)
+    /// - Random 16-byte salt — stored inside the blob itself (round-trippable)
+    /// - `pOptionalEntropy` — we pass the account name, matching what Steam passes at read time
+    ///
+    /// None of these are machine-bound or keychain-backed. A blob produced by any Wine
+    /// binary with the same `crypt32.dll` + `crypt32.so` pair decrypts in any other
+    /// bottle sharing those binaries. Meridian's engine ships the same CX Wine 11.4 both
+    /// for Meridian's own `meridian-dpapi.exe` and for Steam, so round-trip is guaranteed.
+    ///
+    /// ## End-to-end verification
+    ///
+    /// CLI-verified April 23 2026: after this function writes `local.vdf`, Steam's
+    /// connection log shows
+    /// `[Logging On] Using JWT <id>, persistence: 1 → RecvMsgClientLogOnResponse() : 'OK'`
+    /// within 4 seconds of launch, with zero UI rendered.
+    ///
+    /// ## Parameters
+    /// - `engine`: used to invoke `meridian-dpapi.exe` (our mingw-built PE helper that
+    ///   wraps Wine's `CryptProtectData`).
+    /// - `steamID`: 64-bit Steam ID of the signed-in user (written to `loginusers.vdf`
+    ///   too, separately).
+    /// - `accountName`: the user's Steam login name (e.g. `"nickjack876"`). Used as the
+    ///   DPAPI entropy AND as input to the CRC32 that produces the VDF key.
+    /// - `refreshToken`: JWT refresh token captured via `SteamCredentialAuth.authenticate`.
+    func writeSteamSessionLocalVdf(
+        engine: WineEngine,
+        steamID: String,
+        accountName: String,
+        refreshToken: String
+    ) async throws {
         let fm = FileManager.default
-        let configDir = steamConfigDir
-        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let dpapiHelper = WineEngine.engineDir
+            .appending(path: "wine/share/meridian/meridian-dpapi.exe")
+        guard fm.fileExists(atPath: dpapiHelper.path(percentEncoded: false)) else {
+            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe missing from engine. Re-download the engine."
+            ])
+        }
 
-        let dest = configDir.appending(path: "config.vdf")
+        // Stage plaintext + encrypted blob in drive_c/temp so wine64 can reach both
+        // without path-translation complications. Cleanup is best-effort at the end.
+        let tempDir = driveC.appending(path: "temp")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let sessionID = UUID().uuidString.prefix(8)
+        let plaintextURL = tempDir.appending(path: "dpapi-plain-\(sessionID).bin")
+        let cipherURL    = tempDir.appending(path: "dpapi-cipher-\(sessionID).bin")
 
-        let jwtEntry         = "\t\t\t\t\t\"\(steamID)\"\t\t\"\(refreshToken)\""
-        let usernameJwtEntry = "\t\t\t\t\t\"\(accountName)\"\t\t\"\(refreshToken)\""
-        let accountEntry     = "\t\t\t\t\t\"\(accountName)\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"SteamID\"\t\t\"\(steamID)\"\n\t\t\t\t\t}"
+        try Data(refreshToken.utf8).write(to: plaintextURL)
 
-        let connectCacheBlock = "\t\t\t\t\"ConnectCache\"\n\t\t\t\t{\n\(jwtEntry)\n\(usernameJwtEntry)\n\t\t\t\t}"
-        let accountsBlock     = "\t\t\t\t\"Accounts\"\n\t\t\t\t{\n\(accountEntry)\n\t\t\t\t}"
-        let vdf = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\(connectCacheBlock)\n\(accountsBlock)\n\t\t\t}\n\t\t}\n\t}\n}"
+        defer {
+            try? fm.removeItem(at: plaintextURL)
+            try? fm.removeItem(at: cipherURL)
+        }
 
+        // Wine-visible Windows paths for the temp files and the helper exe.
+        // Engine dir is outside the prefix — Wine exposes the host filesystem as Z:\
+        // by default via the dosdevices/z: symlink pointing at /.
+        let winPlain  = "C:\\temp\\dpapi-plain-\(sessionID).bin"
+        let winCipher = "C:\\temp\\dpapi-cipher-\(sessionID).bin"
+        let winHelper = "Z:" + dpapiHelper.path(percentEncoded: false).replacingOccurrences(of: "/", with: "\\")
+
+        let process = try await engine.run(
+            args: [winHelper, "encrypt", winPlain, winCipher, accountName],
+            prefix: self
+        )
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe encrypt failed (exit=\(process.terminationStatus))"
+            ])
+        }
+
+        let cipher = try Data(contentsOf: cipherURL)
+        guard !cipher.isEmpty else {
+            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe produced an empty cipher blob"
+            ])
+        }
+
+        let key = Self.connectCacheKey(for: accountName)
+        let hexBlob = cipher.map { String(format: "%02x", $0) }.joined()
+
+        let vdf = """
+        "MachineUserConfigStore"
+        {
+        \t"Software"
+        \t{
+        \t\t"Valve"
+        \t\t{
+        \t\t\t"Steam"
+        \t\t\t{
+        \t\t\t\t"ConnectCache"
+        \t\t\t\t{
+        \t\t\t\t\t"\(key)"\t\t"\(hexBlob)"
+        \t\t\t\t}
+        \t\t\t}
+        \t\t}
+        \t}
+        }
+        """
+
+        try fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
+        let dest = localAppDataSteamDir.appending(path: "local.vdf")
         try vdf.write(to: dest, atomically: true, encoding: .utf8)
-        log.info("[writeConnectCache] written config.vdf steamID=\(steamID)")
+        log.info("[writeSteamSession] local.vdf written key=\(key) blob=\(cipher.count) bytes → \(dest.path(percentEncoded: false))")
+    }
+
+    /// Steam's ConnectCache map key format: `(crc32(accountName) << 4) | slot_number`.
+    /// The slot number is `1` for the only user in this bottle — Meridian never signs
+    /// two accounts into the same bottle, so slot is always `1`.
+    ///
+    /// CLI-verified April 23 2026 against CX Preview's working `local.vdf`:
+    /// `crc32("nickjack876") = 0x07a611aa`, CX key is `0x7a611aa1`
+    /// → `(0x07a611aa << 4) | 0x1 = 0x7a611aa1` ✓
+    static func connectCacheKey(for accountName: String) -> String {
+        let bytes = Array(accountName.utf8)
+        let crc = ieeeCRC32(bytes: bytes)
+        let key: UInt32 = (crc << 4) | 0x1
+        return String(format: "%08x", key)
+    }
+
+    /// IEEE 802.3 / CRC-32/ISO-HDLC — the same polynomial `zlib.crc32` /
+    /// `binascii.crc32` / Ethernet frame CRC use. Init 0xFFFFFFFF, final XOR 0xFFFFFFFF,
+    /// reflected input, reflected output. Deliberately implemented locally rather than
+    /// pulling in CommonCrypto or zlib to keep `WinePrefix` self-contained and keep the
+    /// contract explicit for future maintainers: the key derivation MUST use this exact
+    /// variant — any other CRC32 variant produces a different key and Steam's lookup
+    /// silently fails with no error message.
+    private static func ieeeCRC32(bytes: [UInt8]) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in bytes {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                let mask: UInt32 = (crc & 1) != 0 ? 0xEDB88320 : 0
+                crc = (crc >> 1) ^ mask
+            }
+        }
+        return crc ^ 0xFFFFFFFF
     }
 
     // MARK: - Webhelper Configuration
 
     /// Writes `steam.cfg` in the Steam install directory to disable the CEF sandbox.
     ///
-    /// Two flags are written:
-    ///
     /// `SteamNoSandbox=1` — instructs Steam to spawn the webhelper with `--no-sandbox
     /// --no-zygote`, bypassing Chromium's sandbox which fails under Wine due to missing
     /// kernel security primitives (job objects, token impersonation). Without this, the
     /// webhelper crashes on every launch and Steam cannot render any UI.
     ///
-    /// `BootStrapperInhibitAll=enable` — prevents Steam's bootstrapper from checking for
-    /// and downloading client updates every time it launches. Without this, every SteamCMD
-    /// batch call starts with a multi-second update check, adding unnecessary latency to
-    /// game installs. This flag is only written once Steam has been fully bootstrapped
-    /// (steamui.dll present), so it never blocks the initial Steam client download.
+    /// **`BootStrapperInhibitAll` is deliberately NOT written.** The Mar 12 2026 Steam
+    /// stub requires its self-verify / self-update path to run on every launch so it can
+    /// detect a mismatched installation and reconcile its package set (CLI-verified April
+    /// 22, 2026: the stub looks for `steam_client_win64.installed` and package `.vz` files;
+    /// with BootStrapperInhibit set it silently exits after "Suppressing Steam update"
+    /// without handing off to steamclient64.dll). The per-launch update check costs ~1s
+    /// when already current — well worth paying for a reliable handoff. See
+    /// `stripBootStrapperInhibit()` for the legacy-cleanup utility that removes stale
+    /// flags from prefixes written by older Meridian versions.
     ///
-    /// Safe to call repeatedly — no-op when the file already contains both settings.
+    /// Safe to call repeatedly — no-op when the file already contains the desired content.
     func ensureSteamCFG() throws {
         let fm = FileManager.default
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
 
-        let alreadyBootstrapped = isSteamBootstrapped
+        let desiredContent = "SteamNoSandbox=1\n"
 
-        var required = ["SteamNoSandbox=1"]
-        if alreadyBootstrapped {
-            required.append("BootStrapperInhibitAll=enable")
-        }
-
-        let desiredContent = required.joined(separator: "\n") + "\n"
-
-        // Check both that all required settings are present AND that no stale
-        // settings remain (e.g. BootStrapperInhibitAll before bootstrap completes).
         if let existing = try? String(contentsOf: cfgURL, encoding: .utf8),
            existing == desiredContent {
             log.debug("[ensureSteamCFG] steam.cfg already configured — skipping")
@@ -571,14 +823,17 @@ struct WinePrefix: Sendable {
         try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
 
         try desiredContent.write(to: cfgURL, atomically: true, encoding: .utf8)
-        log.info("[ensureSteamCFG] steam.cfg written: \(required.joined(separator: ", ")) → \(cfgURL.path(percentEncoded: false))")
+        log.info("[ensureSteamCFG] steam.cfg written: SteamNoSandbox=1 → \(cfgURL.path(percentEncoded: false))")
     }
 
-    /// Removes `BootStrapperInhibitAll=enable` from `steam.cfg` if present.
+    /// Removes `BootStrapperInhibitAll` from `steam.cfg` if present.
     ///
-    /// Called defensively before the bootstrap loop to ensure a stale flag from
-    /// a previous failed session does not prevent Steam from downloading its
-    /// client update.
+    /// Legacy-cleanup utility for prefixes written by older Meridian versions that
+    /// used to set this flag post-bootstrap. The flag breaks the Mar 12+ Steam stub
+    /// (silent-exit after "Suppressing Steam update" — the stub never reaches its
+    /// steamclient handoff). `ensureSteamCFG()` now rewrites steam.cfg so this is
+    /// implicit, but this helper remains for places that only want to strip the flag
+    /// without touching anything else.
     func stripBootStrapperInhibit() {
         let cfgURL = steamInstallDir.appending(path: "steam.cfg")
         guard let content = try? String(contentsOf: cfgURL, encoding: .utf8),
@@ -591,6 +846,48 @@ struct WinePrefix: Sendable {
         let final = trimmed.isEmpty ? "" : trimmed + "\n"
         try? final.write(to: cfgURL, atomically: true, encoding: .utf8)
         log.info("[stripBootStrapperInhibit] removed BootStrapperInhibitAll from steam.cfg")
+    }
+
+    /// Removes the `.crash` marker file in the Steam install directory.
+    ///
+    /// Steam writes a zero-byte `.crash` file at startup and deletes it on clean
+    /// shutdown. When Meridian or the host Mac terminates uncleanly (app crash,
+    /// forced quit, reboot while Steam is running), the marker is left behind.
+    /// On the next launch the bootstrapper sees it and enters a "recover from last
+    /// crash" path that, combined with our self-populated install dir, can deadlock
+    /// before the steamclient handoff.
+    ///
+    /// Call immediately before every `steam.exe` launch so startup is deterministic.
+    /// Idempotent: no-op when the file doesn't exist.
+    func clearCrashMarker() {
+        let crashURL = steamInstallDir.appending(path: ".crash")
+        let path = crashURL.path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.removeItem(at: crashURL)
+        log.info("[clearCrashMarker] removed stale .crash at \(path)")
+    }
+
+    // MARK: - Legacy cleanup
+
+    /// Current version of the stale `Steam Client Service` registry cleanup.
+    /// Bump when a new cleanup action is needed on existing installations.
+    static let staleSteamServiceCleanupVersion = 1
+
+    /// Removes the stale `HKLM\System\CurrentControlSet\Services\Steam Client Service`
+    /// registry entry left behind by older Meridian versions running the Jan 29
+    /// steam.exe stub. That entry's `ImagePath` points to
+    /// `C:\Program Files (x86)\Common Files\Steam\steamservice.exe`, which does
+    /// not exist in the Mar 12+ install (binary is at `bin\SteamService.exe`),
+    /// so `StartService` returns `ERROR_MOD_NOT_FOUND` (GLE 126) every launch.
+    /// Steam will re-register the entry itself with the correct path the next
+    /// time the service is needed. Idempotent: succeeds whether or not the key
+    /// is present.
+    func removeStaleSteamServiceRegistration(engine: WineEngine) async {
+        log.info("[removeStaleSteamService] deleting legacy Steam Client Service registration")
+        _ = try? await engine.run(
+            args: ["reg", "delete", "HKLM\\System\\CurrentControlSet\\Services\\Steam Client Service", "/f"],
+            prefix: self
+        )
     }
 
     // MARK: - Library Setup
@@ -894,6 +1191,80 @@ struct WinePrefix: Sendable {
     /// so we must write them explicitly before steamcmd.exe (32-bit WoW64) starts.
     static let steamInstallPathRegistrationVersion = 2
 
+    // MARK: - Windows Version Registration
+
+    /// Increment when the Windows-version registry mapping changes. Valve
+    /// deprecated Windows 7/8 support for the Steam client in late 2024 — any
+    /// prefix that reports a pre-Windows-10 version gets "Steam is no longer
+    /// supported on your operating system" at startup.
+    ///
+    /// History:
+    ///   v1 — wrote only `HKCU\Software\Wine\Version = win10`. Did not affect
+    ///        steam.exe because the stub has a manifest declaring supported OS
+    ///        ≤ Win8, and Wine clamps `GetVersionEx` to the highest OS in the
+    ///        manifest — ignoring the global `HKCU\Wine\Version` default.
+    ///   v2 — added HKLM Windows NT CurrentVersion keys. Also ineffective:
+    ///        Steam reads the OS via `GetVersionEx` (the `6.2.9200.0, 0, 2,
+    ///        256, 1, 28` in Steam's bootstrap log is an `OSVERSIONINFOEX`
+    ///        struct) which goes through the manifest-clamping code path
+    ///        before HKLM values are consulted. CLI-verified April 22: Wine's
+    ///        `cmd /c ver` (no manifest) correctly reports 10.0.19045, but
+    ///        `steam.exe -silent -nofriendsui` (with Win7/Win8 manifest) sees
+    ///        6.2.9200.0.
+    ///   v3 — writes PER-APP version overrides at
+    ///        `HKCU\Software\Wine\AppDefaults\<exe>\Version = win10`. Wine
+    ///        honours these regardless of the manifest — same mechanism
+    ///        `winecfg`'s "Application Settings" tab uses. Applies to
+    ///        `steam.exe`, `steamwebhelper.exe`, and `steamservice.exe` so
+    ///        every part of Steam's process tree sees Win10.
+    static let windowsVersionRegistrationVersion = 3
+
+    /// Writes registry keys that make the prefix report as Windows 10 to any
+    /// app reading either the Wine-level version or the raw HKLM values.
+    /// Idempotent — `reg add /f` overwrites any existing value.
+    ///
+    /// Values chosen to match Windows 10 22H2 (build 19045.5737) — a currently
+    /// supported release. Steam's OS-version check looks at
+    /// `CurrentMajorVersionNumber` (DWORD) and `CurrentBuildNumber` (REG_SZ);
+    /// the rest are written for defensive compatibility with other apps.
+    ///
+    /// Both 64-bit HKLM and WOW6432Node (for 32-bit steam.exe) are written —
+    /// WoW64 filesystem redirection re-routes 32-bit reads to the 32-bit
+    /// view, so without the WOW6432Node write Steam (32-bit) still sees the
+    /// old values even though the 64-bit hive is correct.
+    func setWindowsVersionToWin10(engine: WineEngine) async {
+        log.info("[setWindowsVersion] writing Windows 10 version overrides (global + per-app)")
+
+        // Global default — applies to any app WITHOUT a manifest (or with a
+        // manifest that declares Win10 support). Benign on its own for Steam
+        // but useful for other apps the prefix might run.
+        _ = try? await engine.run(
+            args: ["reg", "add", "HKCU\\Software\\Wine", "/v", "Version", "/t", "REG_SZ", "/d", "win10", "/f"],
+            prefix: self
+        )
+
+        // Per-app overrides — these take precedence over both the global default
+        // AND the manifest-based clamping. Every Steam component needs Win10 so
+        // the DLLs shared across the tree all agree on the OS version.
+        let steamApps = [
+            "steam.exe",          // main bootstrap / client launcher
+            "steamwebhelper.exe", // embedded CEF browser
+            "steamservice.exe",   // background IPC service
+            "steamerrorreporter.exe",
+            "GameOverlayUI.exe",
+            "crashhandler.exe",
+        ]
+        for app in steamApps {
+            _ = try? await engine.run(
+                args: ["reg", "add", "HKCU\\Software\\Wine\\AppDefaults\\\(app)",
+                       "/v", "Version", "/t", "REG_SZ", "/d", "win10", "/f"],
+                prefix: self
+            )
+        }
+
+        log.info("[setWindowsVersion] Windows version → win10 (global + \(steamApps.count) per-app overrides) ✓")
+    }
+
     /// Writes registry keys that steam.exe sets on first run, required by steamcmd.exe.
     ///
     /// **Steam install paths:** steamcmd.exe is 32-bit. Under WoW64, reads from
@@ -1034,7 +1405,7 @@ struct WinePrefix: Sendable {
         for (className, dllPath) in entries {
             let key = "HKLM\\SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId\\\(className)"
             log.info("[registerWinRTClasses] registering \(className)")
-            try? await engine.run(
+            _ = try? await engine.run(
                 args: ["reg", "add", key,
                        "/v", "DllPath", "/t", "REG_SZ", "/d", dllPath, "/f"],
                 prefix: self
@@ -1117,11 +1488,13 @@ struct WinePrefix: Sendable {
     /// or Steam install is in a bad state. A fresh prefix will be created
     /// on the next launch.
     ///
-    /// Backs up SteamCMD's credential cache (`config.vdf`) before wiping.
-    /// The encrypted auth token in that file survives prefix resets, so game
-    /// installs won't require Steam Guard re-confirmation. Call
-    /// `restoreSteamCMDConfig()` after the prefix is recreated and SteamCMD
-    /// is re-installed.
+    /// Backs up the DPAPI `local.vdf` (Steam's auto-login token) before wiping
+    /// so the user doesn't have to re-authenticate on the next launch. The blob
+    /// is keyed to deterministic inputs (Wine user name `"crossover"` + account
+    /// name as entropy), so it decrypts fine inside the freshly-rebuilt prefix.
+    /// `SteamSessionBridge.prepare` re-writes it from persisted AppSettings;
+    /// the `backupSteamSession` call here is belt-and-suspenders for the case
+    /// where `AppSettings` is also cleared out-of-band.
     func reset() {
         let prefixPath = path.path(percentEncoded: false)
         log.info("[reset] removing prefix at \(prefixPath)")
@@ -1131,7 +1504,7 @@ struct WinePrefix: Sendable {
             return
         }
 
-        backupSteamCMDConfig()
+        backupSteamCMDCredentials()
 
         do {
             try FileManager.default.removeItem(at: path)
@@ -1141,53 +1514,96 @@ struct WinePrefix: Sendable {
         }
     }
 
-    // MARK: - SteamCMD Credential Cache Backup
+    // MARK: - Steam Session Backup / Restore
+    //
+    // Meridian backs up the DPAPI-encrypted `local.vdf` (Steam's auto-login JWT) so
+    // prefix resets and engine upgrades don't force the user to re-authenticate.
+    // The blob is keyed to Wine's `"crossover"` user name + the account name (as
+    // DPAPI entropy), both of which are deterministic across prefix rebuilds, so
+    // restoring the file into a fresh prefix works without any additional state.
 
-    private static var steamcmdConfigBackupURL: URL {
+    private static var credentialBackupDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appending(path: "com.meridian.app/steamcmd-config-backup.vdf")
+            .appending(path: "com.meridian.app/steam-session-backup")
     }
 
-    /// Copies SteamCMD's `config/config.vdf` to a safe location outside the
-    /// prefix. This file contains an encrypted credential token that lets
-    /// SteamCMD log in without a password or Steam Guard confirmation.
-    func backupSteamCMDConfig() {
-        let configVDF = steamInstallDir.appending(path: "config/config.vdf")
-        let backup = Self.steamcmdConfigBackupURL
+    /// Copies `local.vdf` (the DPAPI-encrypted JWT) into the backup directory so it
+    /// survives prefix resets. Only call this after observing `[Logged On,` in
+    /// `connection_log.txt` — never mid-flight where the file may be half-written.
+    func backupSteamSession() {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: configVDF.path(percentEncoded: false)) else {
-            log.info("[backupSteamCMD] no config.vdf to backup")
+        let backupDir = Self.credentialBackupDir
+        do {
+            try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
+        } catch {
+            log.warning("[backupSteamSession] could not create backup dir: \(error.localizedDescription)")
+            return
+        }
+
+        let localVdf = localAppDataSteamDir.appending(path: "local.vdf")
+        let backup   = backupDir.appending(path: "local.vdf")
+        guard fm.fileExists(atPath: localVdf.path(percentEncoded: false)) else {
+            log.info("[backupSteamSession] no local.vdf to back up (not yet written)")
             return
         }
         do {
             try? fm.removeItem(at: backup)
-            try fm.copyItem(at: configVDF, to: backup)
-            log.info("[backupSteamCMD] config.vdf backed up ✓")
+            try fm.copyItem(at: localVdf, to: backup)
+            log.info("[backupSteamSession] local.vdf backed up ✓")
         } catch {
-            log.warning("[backupSteamCMD] backup failed: \(error.localizedDescription)")
+            log.warning("[backupSteamSession] local.vdf backup failed: \(error.localizedDescription)")
         }
     }
 
-    /// Restores a previously backed-up SteamCMD `config.vdf` into the prefix.
-    /// Call after the prefix is recreated and SteamCMD is installed.
-    func restoreSteamCMDConfig() {
-        let backup = Self.steamcmdConfigBackupURL
+    /// Restores a previously backed-up `local.vdf` into the prefix. Called before
+    /// starting `steam.exe -silent` when the prefix has been reset but the user has
+    /// not signed out.
+    func restoreSteamSession() {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: backup.path(percentEncoded: false)) else {
-            log.info("[restoreSteamCMD] no backup to restore")
+        let backupDir = Self.credentialBackupDir
+        guard fm.fileExists(atPath: backupDir.path(percentEncoded: false)) else {
+            log.info("[restoreSteamSession] no backup dir — nothing to restore")
             return
         }
-        let configDir = steamInstallDir.appending(path: "config")
-        let configVDF = configDir.appending(path: "config.vdf")
+
+        let backup   = backupDir.appending(path: "local.vdf")
+        let localVdf = localAppDataSteamDir.appending(path: "local.vdf")
+        guard fm.fileExists(atPath: backup.path(percentEncoded: false)) else {
+            log.info("[restoreSteamSession] no local.vdf in backup")
+            return
+        }
         do {
-            try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
-            try? fm.removeItem(at: configVDF)
-            try fm.copyItem(at: backup, to: configVDF)
-            log.info("[restoreSteamCMD] config.vdf restored from backup ✓")
+            try fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: localVdf)
+            try fm.copyItem(at: backup, to: localVdf)
+            log.info("[restoreSteamSession] local.vdf restored ✓")
         } catch {
-            log.warning("[restoreSteamCMD] restore failed: \(error.localizedDescription)")
+            log.warning("[restoreSteamSession] local.vdf restore failed: \(error.localizedDescription)")
         }
     }
+
+    /// Removes the on-disk backup. Called on sign-out so the next user doesn't inherit
+    /// the previous account's auto-login token.
+    static func clearSteamSessionBackup() {
+        let fm = FileManager.default
+        let backupDir = Self.credentialBackupDir
+        if fm.fileExists(atPath: backupDir.path(percentEncoded: false)) {
+            try? fm.removeItem(at: backupDir)
+            log.info("[clearSteamSessionBackup] backup dir removed")
+        }
+
+        // Clean up any legacy backups from the pre-DPAPI (config.vdf/ssfn) scheme too.
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let legacyDir  = appSupport.appending(path: "com.meridian.app/steamcmd-credentials")
+        let legacyFile = appSupport.appending(path: "com.meridian.app/steamcmd-config-backup.vdf")
+        try? fm.removeItem(at: legacyDir)
+        try? fm.removeItem(at: legacyFile)
+    }
+
+    /// Kept as a compatibility shim for the prefix-reset flow in `Settings → Reset
+    /// Wine Environment` which still wants a pre-reset snapshot. Routes to the new
+    /// DPAPI backup.
+    func backupSteamCMDCredentials() { backupSteamSession() }
 
     // MARK: - WoW64 File Type Filter
 

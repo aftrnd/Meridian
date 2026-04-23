@@ -431,39 +431,45 @@ private struct SteamLoginStepContent: View {
         let prefix   = WinePrefix.defaultPrefix
         let eng      = engine
         let mgr      = steamManager
-        let sup      = suppressor
         let auth_    = steamAuth
         // Capture onSignedIn directly — called after all state is set.
         // This is more reliable than relying on .onChange(of: auth.step)
         // which can race with view lifecycle events.
         let advance  = onSignedIn
-        let savedPassword = password
-        // Store password in Keychain for SteamCMD auto-re-authentication after prefix resets.
+        // Store the password in Keychain for future recovery flows (e.g. a
+        // token-rotation path that needs to re-run OAuth without prompting).
+        // No longer used for SteamCMD — SteamCMD was removed April 22 2026.
         auth_.saveSteamPassword(password)
         auth.authenticate(
             username: username.trimmingCharacters(in: .whitespaces),
             password: password
         ) { steamID, accountName, refreshToken in
-            // Prefix exists at this point (bootstrap is done before the sheet appears).
-            // Write session files into the prefix so SteamCMD auto-logs in.
-            // No steam.exe is started here — it cannot authenticate under Wine 8.0.1.
-            // SteamCMD credentials are established lazily on first game install attempt
-            // (SteamCMDService.installGame() fix2 recovery path with Keychain password).
+            // Prefix exists at this point — bootstrap runs before the sheet appears.
+            // Kill any previous persistent steam.exe so our freshly-written local.vdf
+            // isn't stomped, then write both session files. `startPersistent` runs
+            // later (from `BootstrapManager` on the next engage, or the library view
+            // as soon as the sheet dismisses). The background steam.exe reads
+            // local.vdf and auto-logs in silently.
             mgr.killAll(engine: eng, prefix: prefix)
             mgr.clearPersistentProcess()
             try? await Task.sleep(for: .seconds(1))
-            try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
-            try? prefix.writeConnectCache(steamID: steamID, refreshToken: refreshToken, accountName: accountName)
-            prefix.backupSteamCMDConfig()
-            // Persist credentials to AppSettings so SteamSessionBridge.prepare()
-            // can re-write ConnectCache on every subsequent launch without re-auth.
+            do {
+                try prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
+                try await prefix.writeSteamSessionLocalVdf(
+                    engine: eng,
+                    steamID: steamID,
+                    accountName: accountName,
+                    refreshToken: refreshToken
+                )
+                prefix.backupSteamSession()
+            } catch {
+                setupLog.error("[beginSignIn] writing Steam session failed: \(error.localizedDescription)")
+            }
+            // Persist credentials to AppSettings so `SteamSessionBridge.prepare`
+            // can re-encrypt and re-write local.vdf on every subsequent launch.
             sessionBridge.setPendingTokens(steamID: steamID, accountName: accountName, refreshToken: refreshToken)
-            // Mark as authenticated so needsAPIKey returns true when advance() runs.
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true
-            // Advance the sheet step now — all state is set.
-            // Note: .onChange(of: isSteamLoggedIn) in SetupSheet is the PRIMARY
-            // advancement mechanism. This call is a belt-and-suspenders backup.
             let needs = auth_.needsAPIKey
             setupLog.info("[beginSignIn] advance: isAuthenticated=\(auth_.isAuthenticated) needsAPIKey=\(needs) → \(needs ? "apiKey" : "complete")")
             advance()
@@ -471,18 +477,15 @@ private struct SteamLoginStepContent: View {
     }
 
     private func beginInteractiveLogin() {
+        // FIXME(April 22 2026): `WineSteamManager.loginToSteamInteractive` was
+        // removed in an earlier refactor but this fallback button still points
+        // at it. The native-Steam-UI login path IS the correct long-term fix
+        // (see `engine-research-findings.mdc` Pattern 6), but wiring it up
+        // was reverted tonight to keep the UI stable until we do the rewrite
+        // properly with testing. Surface a helpful error in the meantime.
         auth.cancel()
         showFallback = false
-        interactiveError = nil
-        let prefix = WinePrefix.defaultPrefix
-        interactiveTask = Task { @MainActor in
-            do {
-                try await steamManager.loginToSteamInteractive(engine: engine, prefix: prefix, suppressor: suppressor)
-            } catch is CancellationError {
-            } catch {
-                interactiveError = "Steam login failed: \(error.localizedDescription)"
-            }
-        }
+        interactiveError = "Interactive Steam sign-in is temporarily unavailable. Please sign in using the form above — if auto-login fails the session will retry on next launch."
     }
 
     private func submitFallback() {

@@ -58,22 +58,18 @@ final class GameLauncher {
     /// around install and game-process confirmation.
     var windowSuppressor: SteamWindowSuppressor?
 
-    /// Set by `MeridianApp` for persistent SteamCMD game installs.
-    var steamCMDService: SteamCMDService?
-
     // MARK: - Public API
 
     func launch(
         game: Game,
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService? = nil,
         library: SteamLibraryStore? = nil
     ) {
         // Must be async for stopGame; run in Task if called from sync context
         Task {
-            await launchImpl(game: game, engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, steamAuth: steamAuth, library: library)
+            await launchImpl(game: game, engine: engine, steamManager: steamManager, steamAuth: steamAuth, library: library)
         }
     }
 
@@ -83,12 +79,11 @@ final class GameLauncher {
         game: Game,
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService? = nil,
         library: SteamLibraryStore? = nil
     ) {
         Task {
-            await installOnlyImpl(game: game, engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, steamAuth: steamAuth, library: library)
+            await installOnlyImpl(game: game, engine: engine, steamManager: steamManager, steamAuth: steamAuth, library: library)
         }
     }
 
@@ -96,7 +91,6 @@ final class GameLauncher {
         game: Game,
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService?,
         library: SteamLibraryStore?
     ) async {
@@ -118,7 +112,6 @@ final class GameLauncher {
                 game: game,
                 engine: engine,
                 steamManager: steamManager,
-                sessionBridge: sessionBridge,
                 steamAuth: steamAuth,
                 library: library,
                 launchAfterInstall: true
@@ -130,7 +123,6 @@ final class GameLauncher {
         game: Game,
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService?,
         library: SteamLibraryStore?
     ) async {
@@ -152,7 +144,6 @@ final class GameLauncher {
                 game: game,
                 engine: engine,
                 steamManager: steamManager,
-                sessionBridge: sessionBridge,
                 steamAuth: steamAuth,
                 library: library,
                 launchAfterInstall: false
@@ -166,9 +157,9 @@ final class GameLauncher {
         launchTask?.cancel()
         launchTask = nil
 
-        // Immediately terminate any active SteamCMD download before the broader cleanup.
-        steamCMDService?.shutdown()
-
+        // Install was dispatched to `steam.exe` via IPC; `steam.exe` itself
+        // notices when the user cancels from its own UI. We don't try to
+        // pre-empt it here — just drop our polling loop and move on.
         steamManager.gameIsRunning = false
         await cleanupProcesses(engine: engine, steamManager: steamManager)
 
@@ -298,7 +289,6 @@ final class GameLauncher {
         game: Game,
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         steamAuth: SteamAuthService?,
         library: SteamLibraryStore?,
         launchAfterInstall: Bool
@@ -340,127 +330,100 @@ final class GameLauncher {
             log.info("[launch] game profile appID=\(game.id): \(compat.fixSummary(for: game.id))")
         }
 
-        // If the game isn't installed yet, download it via the persistent SteamCMD session.
-        // All installs go through SteamCMDService — never spawn a separate steamcmd.exe
-        // process, as two instances deadlock on SteamCMD's file locks.
+        // If the game isn't installed yet, ask the running `steam.exe` to install it
+        // via IPC and poll the ACF manifest for progress. Steam runs its own native
+        // downloader — same path, same CDN, same verification as Steam Desktop.
+        // `SteamWindowSuppressor` hides any confirmation dialogs Steam renders.
         if !prefix.isGameInstalled(appID: game.id) {
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
 
-            transition(to: .awaitingInstallConfirmation,
-                       activity: "Preparing download for \(game.name)…")
-            appendLog("Preparing download for \(game.name)")
-            log.info("[launch] beginning SteamCMD install appID=\(game.id)")
-
-            guard let cmdService = steamCMDService else {
-                fail("Game tools not available. Restart Meridian.")
-                return
-            }
-
-            // Poll the ACF manifest to update the status text during download.
-            // The PTY stream (onProgress callback below) is the authoritative source
-            // for the progress bar fraction — the ACF BytesDownloaded lags behind the
-            // real-time SteamCMD output and overwrites it with stale lower values,
-            // causing the bar to oscillate backward. This task only touches currentActivity.
-            let pollingTask = Task { [weak self, prefix] in
-                let gameName = game.name
-                let appID = game.id
-                let startTime = ContinuousClock.now
-                var hasSeenGameProgress = false
-                var pollCount = 0
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard !Task.isCancelled else { break }
-                    pollCount += 1
-                    if let progress = prefix.gameDownloadProgress(appID: appID),
-                       progress.total > 0 {
-                        let fraction = Double(progress.downloaded) / Double(progress.total)
-                        if fraction > 0 {
-                            hasSeenGameProgress = true
-                            self?.currentActivity = "Downloading \(gameName) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total))"
-                        } else {
-                            self?.currentActivity = "Downloading \(gameName)…"
-                        }
-                    } else if !hasSeenGameProgress {
-                        let elapsed = ContinuousClock.now - startTime
-                        if elapsed > .seconds(10) {
-                            self?.currentActivity = "Warming up game tools — this may take a minute…"
-                        }
+            // Make sure Steam is actually running. Normally `BootstrapManager` started
+            // it, but if the sign-in sheet ran later (first launch after install), or
+            // Steam crashed, we restart it here.
+            if !steamManager.isSteamProcessAlive {
+                log.info("[launch] persistent Steam not alive — starting")
+                transition(to: .bootstrappingSteam, activity: "Starting Steam…")
+                do {
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                    try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(120))
+                    if let pid = steamManager.persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
                     }
+                } catch {
+                    fail("Steam is not ready: \(error.localizedDescription)", error: error)
+                    return
                 }
             }
 
+            transition(to: .awaitingInstallConfirmation,
+                       activity: "Preparing download for \(game.name)…")
+            appendLog("Preparing download for \(game.name)")
+            log.info("[launch] dispatching install for appID=\(game.id) via Steam IPC")
+
             do {
-                log.info("[launch] installing via persistent SteamCMD session")
-                try await cmdService.installGame(
-                    appID: game.id,
-                    onProgress: { [weak self] line in
-                        guard let self else { return }
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        guard !trimmed.isEmpty else { return }
-
-                        // Download progress — update bar + activity label, do NOT append raw line
-                        if let fraction = Self.parseSteamCMDProgress(line: trimmed) {
-                            self.downloadProgress = fraction
-                            let pct = Int(fraction * 100)
-                            self.currentActivity = pct > 0
-                                ? "Downloading \(game.name) — \(pct)%"
-                                : "Downloading \(game.name)…"
-                            return
-                        }
-
-                        // SteamCMD self-update progress (first run only)
-                        if trimmed.hasPrefix("[----]") || trimmed.hasPrefix("[  0%]") {
-                            if self.currentActivity != "Updating Steam tools…" {
-                                self.currentActivity = "Updating Steam tools…"
-                            }
-                            self.appendLog(trimmed)
-                            return
-                        }
-
-                        // Meaningful SteamCMD status lines — show in log + update activity
-                        if trimmed.contains("Logging in using cached credentials") {
-                            self.currentActivity = "Signing in to Steam…"
-                            return
-                        }
-                        if trimmed.contains("Logging in user") {
-                            self.currentActivity = "Signing in to Steam…"
-                            return
-                        }
-                        if trimmed.contains("Waiting for user info") || trimmed.contains("Waiting for client config") {
-                            return // silent — already shown via currentActivity
-                        }
-                        if trimmed.contains("Success! App") {
-                            self.downloadProgress = 1.0
-                            return // success handled by post-install guard
-                        }
-
-                        // Append all other meaningful lines that made it past shouldShowLine
-                        self.appendLog(trimmed)
-                    }
-                )
-            } catch is CancellationError {
-                pollingTask.cancel()
-                downloadProgress = nil
-                currentActivity = nil
-                log.info("[launch] download cancelled by user")
-                return
+                try steamManager.installGame(appID: game.id, engine: engine, prefix: prefix)
             } catch {
-                pollingTask.cancel()
-                fail("Download failed: \(error.localizedDescription)", error: error)
+                fail("Could not dispatch install: \(error.localizedDescription)", error: error)
                 return
             }
 
-            pollingTask.cancel()
+            // Poll the ACF manifest for progress. Steam writes BytesDownloaded /
+            // BytesToDownload continuously during the download — the same fields
+            // Steam's own progress UI reads. 2s polling is plenty for a smooth bar.
+            //
+            // The ACF typically appears within a few seconds after Steam receives
+            // the +app_update command. Before it appears we show "Preparing…".
+            let acfWaitDeadline = ContinuousClock.now + .seconds(30)
+            while prefix.acfURL(for: game.id) == nil {
+                guard !Task.isCancelled else {
+                    downloadProgress = nil
+                    currentActivity = nil
+                    log.info("[launch] install dispatch cancelled before ACF appeared")
+                    return
+                }
+                if ContinuousClock.now > acfWaitDeadline {
+                    fail("Steam didn't start the download within 30 seconds. Try again.")
+                    return
+                }
+                currentActivity = "Preparing download for \(game.name)…"
+                try? await Task.sleep(for: .seconds(1))
+            }
 
-            guard prefix.isGameFullyInstalled(appID: game.id) else {
-                fail("Download appeared to complete but game files are incomplete. Try again.")
-                return
+            // ACF exists — we're downloading. Poll for progress until done.
+            var lastLoggedPercent = -1
+            while !prefix.isGameFullyInstalled(appID: game.id) {
+                guard !Task.isCancelled else {
+                    downloadProgress = nil
+                    currentActivity = nil
+                    log.info("[launch] download cancelled by user")
+                    return
+                }
+
+                if let progress = prefix.gameDownloadProgress(appID: game.id),
+                   progress.total > 0 {
+                    let fraction = Double(progress.downloaded) / Double(progress.total)
+                    downloadProgress = fraction
+                    let pct = Int(fraction * 100)
+                    currentActivity = pct > 0
+                        ? "Downloading \(game.name) — \(Self.formatBytes(progress.downloaded)) / \(Self.formatBytes(progress.total)) (\(pct)%)"
+                        : "Downloading \(game.name)…"
+
+                    // Log progress at 5% increments to keep the log useful without spam.
+                    if pct / 5 > lastLoggedPercent / 5 {
+                        appendLog("Downloading \(game.name) — \(pct)%")
+                        lastLoggedPercent = pct
+                    }
+                } else {
+                    currentActivity = "Downloading \(game.name)…"
+                }
+
+                try? await Task.sleep(for: .seconds(2))
             }
 
             appendLog("Download complete")
             library?.setInstalled(true, for: game.id)
-            downloadProgress = nil
+            downloadProgress = 1.0
         }
 
         // Install-only mode: stop here without proceeding to launch.
@@ -484,38 +447,34 @@ final class GameLauncher {
         steamManager.gameIsRunning = true
 
         // Steam DRM: some games ship `steam_api64.dll` which calls SteamAPI_Init()
-        // at startup. Without a live Steam client providing the IPC socket, the DLL
-        // returns failure and the game exits silently within a few seconds.
-        //
-        // Detect this before launch and start steam.exe -silent so the IPC endpoint
-        // is available. The SteamWindowSuppressor hides Steam's windows. After the
-        // game exits we kill the Steam process we started.
+        // at startup and requires a live Steam IPC socket. Persistent `steam.exe`
+        // is already running (started by BootstrapManager or the sign-in sheet),
+        // so the IPC socket exists. We just write `steam_appid.txt` so the DLL
+        // can look up its own appID without a round trip through the client.
         let needsSteamForDRM = prefix.gameRequiresSteamAPI(appID: game.id)
             && !(GameCompatibilityDB.shared.profile(for: game.id)?.skipSteamDRM ?? false)
         if needsSteamForDRM {
-            log.info("[launch] Steam DRM detected (steam_api64.dll present) — starting Steam IPC host")
-            appendLog("Initialising Steam…")
-
-            // Write steam_appid.txt so steam_api64.dll knows the appID immediately,
-            // without waiting for the Steam client to provide it over IPC.
+            log.info("[launch] Steam DRM detected — writing steam_appid.txt and verifying Steam is ready")
             prefix.writeSteamAppID(game.id)
 
-            // Start steam.exe in silent mode. It auto-logs in via ConnectCache
-            // and opens the IPC socket without showing any persistent UI.
-            // The window suppressor is already active and hides any transient windows.
-            do {
-                try steamManager.startSteamForDRM(engine: engine, prefix: prefix,
-                                                   windowSuppressor: windowSuppressor)
-            } catch {
-                log.warning("[launch] could not start Steam for DRM: \(error.localizedDescription) — launching anyway")
+            // If Steam somehow isn't running (edge case — user quit it manually or
+            // it crashed since bootstrap), restart it now. Otherwise the game will
+            // fail SteamAPI_Init and exit within seconds.
+            if !steamManager.isSteamProcessAlive {
+                log.warning("[launch] Steam DRM required but persistent Steam not alive — restarting")
+                appendLog("Starting Steam…")
+                do {
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                    try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(60))
+                    if let pid = steamManager.persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
+                    }
+                } catch {
+                    log.warning("[launch] Steam restart failed: \(error.localizedDescription) — launching game anyway, it may fail DRM init")
+                }
             }
 
-            // Give the Steam IPC socket time to initialise before the game exe
-            // tries to connect. Under Wine, steam.exe needs 5-15 seconds to start,
-            // authenticate via ConnectCache, and open the IPC named pipe.
-            // 8 seconds is a conservative minimum.
             appendLog("Starting game…")
-            try? await Task.sleep(for: .seconds(8))
         }
 
         // Pause window suppression BEFORE launching the game exe.
@@ -625,12 +584,10 @@ final class GameLauncher {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }
 
-        // If we started Steam for DRM, kill it now that the game has exited.
-        // We don't want a silent Steam process lingering in the background.
-        if needsSteamForDRM {
-            log.info("[launch] killing DRM Steam process after game exit")
-            steamManager.killAll(engine: engine, prefix: prefix)
-        }
+        // `steam.exe` is a persistent process — we do NOT kill it on game exit.
+        // It handles future installs, launches, DRM handshakes, and Steam Cloud
+        // sync. The app-termination path (`AppDelegate.applicationShouldTerminate`
+        // → `TerminationCleanup.killAllWineProcesses`) cleans it up on quit.
 
         // Determine final state based on how the monitor exited
         switch gameProcess.monitorPhase {

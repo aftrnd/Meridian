@@ -342,6 +342,50 @@ cp -R "${PREFIX_TEMPLATE}" "${PREFIX_STAGING}"
 info "Prefix template staged ✓"
 rm -rf "${PREFIX_TEMPLATE}"
 
+# ---------- bundled steam.exe stub ----------
+#
+# Valve's `cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe` has
+# been serving an outdated stub (CLI-verified April 22, 2026: Jan 29 build,
+# 4.72 MB, MD5 b97ff5ac…) whose application manifest hard-reports Windows
+# 6.2.9200.0. Steam's server-side deprecation check rejects Windows 8
+# clients with "Steam is no longer supported on your operating system" and
+# exits immediately — before its own self-update can run.
+#
+# CX Preview ships a newer stub (Mar 12 build, 5.77 MB, MD5 4f2ad574…)
+# whose manifest reports Windows 10.0.19045.0 and runs cleanly. We include
+# that stub in the engine tarball; `WinePrefix.refreshSteamStubFromEngineIfStale`
+# overwrites the freshly-SteamSetup'd stub in the user's prefix with this
+# bundled copy on every bootstrap.
+#
+# This is the same "harvest from CX at build time, ship to end users in the
+# engine tarball" pattern we use for Wine, DXMT, DXVK, and GPTK. End users
+# never need CrossOver installed (update-system.mdc line 102).
+
+yellow "Staging bundled steam.exe stub (from CX Preview Steam bottle)..."
+CX_STEAM_STUB="${HOME}/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steam.exe"
+STUB_DEST_DIR="${STAGING}/wine/share/meridian"
+STUB_DEST="${STUB_DEST_DIR}/steam.exe.stub"
+
+if [ -f "${CX_STEAM_STUB}" ]; then
+    mkdir -p "${STUB_DEST_DIR}"
+    cp "${CX_STEAM_STUB}" "${STUB_DEST}"
+    STUB_SIZE=$(stat -f%z "${STUB_DEST}" 2>/dev/null || stat -c%s "${STUB_DEST}")
+    STUB_MD5=$(md5 -q "${STUB_DEST}" 2>/dev/null || md5sum "${STUB_DEST}" | cut -d' ' -f1)
+    info "Bundled steam.exe stub: ${STUB_SIZE} bytes, MD5=${STUB_MD5}"
+
+    # Sanity check: the stub must be a PE32 executable, must be > 4 MB
+    # (old Jan stub is 4.7 MB; anything smaller is suspicious), and must
+    # include Steam's build metadata. Minimum-viable regression guard.
+    [ "${STUB_SIZE}" -gt 4000000 ] || die "steam.exe stub is suspiciously small (${STUB_SIZE} bytes)"
+    file "${STUB_DEST}" | grep -q "PE32" || die "bundled steam.exe is not a PE32 executable"
+else
+    yellow "Warning: CX Preview Steam bottle not found at ${CX_STEAM_STUB}"
+    yellow "  → engine tarball will NOT include a fresh stub"
+    yellow "  → end users will fall back to the SteamSetup.exe-installed stub"
+    yellow "  → THIS MEANS users may hit 'Steam is no longer supported' if the stub is stale"
+    yellow "  → install Steam in CrossOver Preview first, then re-run this script"
+fi
+
 # ---------- finalize staging ----------
 
 echo "${TAG}" > "${STAGING}/wine/meridian-engine-version.txt"
@@ -357,6 +401,25 @@ if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     info "coremessaging.dll: custom stub installed ✓"
 else
     yellow "Warning: x86_64-w64-mingw32-gcc not found — skipping coremessaging stub"
+fi
+
+# ---------- meridian-dpapi.exe (Wine CryptProtectData wrapper) ----------
+# Used by WinePrefix.writeSteamSessionLocalVdf to encrypt Steam's JWT refresh
+# token into the bottle's local.vdf (AppData/Local/Steam). Steam's own
+# CryptUnprotectData at sign-in time decrypts it. Reproduces what the
+# Windows Steam client writes itself, byte-for-byte format-compatible.
+# See Scripts/dpapi/meridian_dpapi.c + build-dpapi.sh.
+
+yellow "Building meridian-dpapi.exe (Wine DPAPI wrapper for Steam local.vdf)..."
+if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    DPAPI_DEST_DIR="${STAGING}/wine/share/meridian"
+    mkdir -p "${DPAPI_DEST_DIR}"
+    DPAPI_OUT="${DPAPI_DEST_DIR}/meridian-dpapi.exe"
+    bash "$(dirname "${BASH_SOURCE[0]}")/build-dpapi.sh" "${DPAPI_OUT}" \
+        || die "meridian-dpapi.exe build failed"
+    info "meridian-dpapi.exe: $(stat -f%z "${DPAPI_OUT}") bytes ✓"
+else
+    die "x86_64-w64-mingw32-gcc not found — cannot build meridian-dpapi.exe (required)"
 fi
 
 # ---------- validate ----------

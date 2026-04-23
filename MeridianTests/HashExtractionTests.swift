@@ -32,11 +32,6 @@ final class HashExtractionTests: XCTestCase {
         return nil
     }
 
-    /// Mirror of WinePrefix.hasSteamLoginSession() detection logic.
-    private func hasSteamLoginSession(vdfContent: String) -> Bool {
-        vdfContent.contains("\"MostRecent\"") && vdfContent.contains("\"1\"")
-    }
-
     // MARK: - extractHash: new CDN path format (hash is in the middle)
 
     func testExtractHashFromFullSteamCDNPath() {
@@ -135,62 +130,4 @@ final class HashExtractionTests: XCTestCase {
         XCTAssertEqual(searchForHashInString(matching: "library_hero", in: str), hash)
     }
 
-    // MARK: - hasSteamLoginSession
-
-    func testLoginSessionDetectedWhenMostRecentPresent() {
-        let vdf = """
-        "users"
-        {
-            "76561198047018335"
-            {
-                "AccountName"   "testuser"
-                "PersonaName"   "Test User"
-                "MostRecent"    "1"
-                "Timestamp"     "1700000000"
-            }
-        }
-        """
-        XCTAssertTrue(hasSteamLoginSession(vdfContent: vdf))
-    }
-
-    func testLoginSessionNotDetectedWithEmptyFile() {
-        XCTAssertFalse(hasSteamLoginSession(vdfContent: ""))
-    }
-
-    func testLoginSessionNotDetectedWithoutMostRecent() {
-        let vdf = """
-        "users"
-        {
-            "76561198047018335"
-            {
-                "AccountName"   "testuser"
-                "PersonaName"   "Test User"
-                "Timestamp"     "1700000000"
-            }
-        }
-        """
-        XCTAssertFalse(hasSteamLoginSession(vdfContent: vdf))
-    }
-
-    func testLoginSessionNotDetectedWhenMostRecentIsZero() {
-        // File has MostRecent but not "1" — user previously logged out
-        let vdf = """
-        "users"
-        {
-            "76561198047018335"
-            {
-                "AccountName"   "testuser"
-                "MostRecent"    "0"
-            }
-        }
-        """
-        // Our detection: checks for "MostRecent" AND "1" both present.
-        // A file with MostRecent "0" contains both strings, so this is a
-        // known limitation of the simple text-search approach. The real
-        // implementation's check is conservative and correct for the common case.
-        // This test documents the current behaviour:
-        XCTAssertFalse(hasSteamLoginSession(vdfContent: vdf),
-            "File with MostRecent=0 should not be treated as logged in — " +
-            "note: this would only fail if \"1\" appears elsewhere in the file")
-    }
 }
