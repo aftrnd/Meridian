@@ -219,7 +219,7 @@ struct GameDetailView: View {
             EngineSetupView().environment(engine)
         }
         .sheet(item: $selectedAchievement) { ach in
-            AchievementDetailSheet(achievement: ach, gameName: currentGame.name)
+            AchievementDetailSheet(achievement: ach)
         }
         .alert("Reset Wine Environment?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -1140,12 +1140,16 @@ private struct AchievementRow: View {
 
 // MARK: - Achievement Detail Sheet
 
-/// Modal that shows the full details for a single Steam achievement. Reuses
-/// the same fixed-width / padded-card shape as `SetupSheet` (sign-in) so the
-/// app's modal vocabulary stays consistent.
+/// Modal that shows the essentials for a single Steam achievement: glyph,
+/// name, unlock status + date, description. Follows Apple HIG — a focused
+/// sheet with a clear hierarchy and no developer metadata.
+///
+/// Hidden-achievement handling mirrors Steam's own behaviour: if the
+/// achievement is flagged hidden AND the user hasn't unlocked it, we show
+/// a generic "Hidden Achievement" title + locked glyph and no description.
+/// Once unlocked, all fields render normally.
 private struct AchievementDetailSheet: View {
     let achievement: GameAchievement
-    let gameName: String
 
     @Environment(\.dismiss) private var dismiss
 
@@ -1153,86 +1157,55 @@ private struct AchievementDetailSheet: View {
         achievement.isHidden && !achievement.achieved
     }
 
-    private var headlineTitle: String {
+    private var title: String {
         isLockedHidden ? "Hidden Achievement" : achievement.displayName
     }
 
-    private var descriptionText: String? {
-        if isLockedHidden {
-            // Steam explicitly hides the description until unlocked — mirror
-            // that behaviour rather than showing the Steam-schema hint.
-            return "This achievement's description is hidden until you unlock it."
-        }
+    private var description: String? {
+        guard !isLockedHidden else { return nil }
         let text = achievement.description?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (text?.isEmpty == false) ? text : nil
     }
 
-    private var unlockDateFormatted: String? {
-        guard let date = achievement.unlockDate else { return nil }
-        return date.formatted(date: .long, time: .shortened)
+    private var statusText: String {
+        if let date = achievement.unlockDate {
+            return "Unlocked \(date.formatted(date: .long, time: .shortened))"
+        }
+        return "Locked"
     }
 
     var body: some View {
-        VStack(spacing: 24) {
-            // Close button aligned top-trailing, same row as a grabber for
-            // consistency with macOS sheet conventions.
-            HStack {
-                Spacer()
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 20, weight: .regular))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.cancelAction)
-                .help("Close")
-            }
-
-            // Hero icon
+        VStack(spacing: 20) {
             AchievementDetailIcon(
                 url: achievement.iconURL,
                 grayURL: achievement.iconGrayURL,
                 achieved: achievement.achieved
             )
 
-            // Title + status badge
-            VStack(spacing: 8) {
-                Text(headlineTitle)
+            VStack(spacing: 6) {
+                Text(title)
                     .font(.title2).fontWeight(.bold)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
 
-                StatusBadge(achieved: achievement.achieved)
-
-                Text(gameName)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 5) {
+                    Image(systemName: achievement.achieved ? "checkmark.seal.fill" : "lock.fill")
+                        .font(.caption2)
+                        .foregroundStyle(achievement.achieved ? .green : .secondary)
+                    Text(statusText)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            // Description (full, wrap-friendly)
-            if let desc = descriptionText {
+            if let desc = description {
                 Text(desc)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.primary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: 380)
             }
-
-            // Facts table — only non-empty rows rendered
-            VStack(spacing: 0) {
-                if let when = unlockDateFormatted {
-                    detailRow(label: "Unlocked", value: when)
-                }
-                if achievement.isHidden {
-                    detailRow(label: "Hidden", value: "Steam hides this until unlocked")
-                }
-                detailRow(label: "API name", value: achievement.apiName, monospaced: true)
-            }
-            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
 
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
@@ -1240,32 +1213,8 @@ private struct AchievementDetailSheet: View {
                 .frame(maxWidth: .infinity)
                 .keyboardShortcut(.defaultAction)
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 16)
-        .padding(.bottom, 28)
-        .frame(width: 460)
-    }
-
-    @ViewBuilder
-    private func detailRow(label: String, value: String, monospaced: Bool = false) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(width: 90, alignment: .leading)
-            Text(value)
-                .font(monospaced ? .caption.monospaced() : .callout)
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)  // API name is useful to copy for debugging
-                .lineLimit(2)
-                .truncationMode(.middle)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .overlay(alignment: .bottom) {
-            Divider().padding(.leading, 90)
-        }
+        .padding(28)
+        .frame(width: 420)
     }
 }
 
@@ -1305,28 +1254,6 @@ private struct AchievementDetailIcon: View {
     }
 }
 
-/// Pill-style achievement-status badge (Unlocked / Locked) shown under the
-/// achievement title in the detail sheet. Deliberately subtler than a
-/// bordered label so the heading stays the focal point.
-private struct StatusBadge: View {
-    let achieved: Bool
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: achieved ? "checkmark.seal.fill" : "lock.fill")
-                .font(.caption2)
-            Text(achieved ? "Unlocked" : "Locked")
-                .font(.caption).fontWeight(.medium)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .foregroundStyle(achieved ? .green : .secondary)
-        .background(
-            Capsule()
-                .fill((achieved ? Color.green : Color.secondary).opacity(0.12))
-        )
-    }
-}
 
 private struct AchievementIcon: View {
     let url: URL?
