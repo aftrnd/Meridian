@@ -46,13 +46,49 @@
  */
 
 #import <AppKit/AppKit.h>
+#import <objc/runtime.h>
+
+/*
+ * Category that swizzles `-[NSApplication setActivationPolicy:]` to force
+ * every call — regardless of argument — to apply `.accessory`. Wine's
+ * `winemac.drv` calls `setActivationPolicy:NSApplicationActivationPolicyRegular`
+ * during its init to get a Dock tile, which would undo the single
+ * `.accessory` call we make at load time. Swizzling means even winemac.drv's
+ * call gets rewritten to `.accessory`, so the Dock tile never appears.
+ *
+ * Applied unconditionally — any Wine subprocess this dylib loads into wants
+ * to be Dock-less (we only inject into Steam admin paths, never into games).
+ */
+@interface NSApplication (MeridianAccessoryOverride)
+@end
+
+@implementation NSApplication (MeridianAccessoryOverride)
+
+- (BOOL)meridian_forceAccessorySetActivationPolicy:(NSApplicationActivationPolicy)policy {
+    // Swizzled selector; `self` really is NSApplication. Forward to the
+    // original implementation (now at this selector via method_exchangeImplementations)
+    // with the accessory constant — NOT whatever winemac.drv passed.
+    return [self meridian_forceAccessorySetActivationPolicy:
+             NSApplicationActivationPolicyAccessory];
+}
+
++ (void)load {
+    Method original  = class_getInstanceMethod(self, @selector(setActivationPolicy:));
+    Method swizzled  = class_getInstanceMethod(self, @selector(meridian_forceAccessorySetActivationPolicy:));
+    if (original && swizzled) {
+        method_exchangeImplementations(original, swizzled);
+    }
+}
+
+@end
 
 __attribute__((constructor))
 static void meridian_wine_accessory_init(void) {
-    // NSApplication is thread-safe to access via sharedApplication from the
-    // dyld constructor (which is always the main thread at load time), but
-    // Wine's winemac driver spawns threads later that may touch NSApp. To
-    // be safe, force main-thread execution if we're ever called elsewhere.
+    // Trigger NSApp initialisation + apply accessory policy immediately.
+    // After swizzling, even a call with `.regular` will end up as `.accessory`
+    // via the swapped implementation. The explicit call here is belt-and-
+    // suspenders for cases where winemac.drv reads the policy back before
+    // setting it.
     dispatch_block_t apply = ^{
         [[NSApplication sharedApplication]
             setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -63,10 +99,9 @@ static void meridian_wine_accessory_init(void) {
         dispatch_sync(dispatch_get_main_queue(), apply);
     }
 
-    // Wine's `winemac.drv` initialises NSApp later and may reset the
-    // activation policy to `.regular`. Re-assert accessory on the
-    // `NSApplicationDidFinishLaunching` notification — by that point
-    // winemac.drv has finished its own NSApp setup.
+    // Re-assert on `NSApplicationDidFinishLaunching` in case something
+    // bypasses the swizzled setter (e.g. a private API that mutates
+    // activation policy without calling setActivationPolicy:).
     [[NSNotificationCenter defaultCenter]
         addObserverForName:NSApplicationDidFinishLaunchingNotification
                     object:nil

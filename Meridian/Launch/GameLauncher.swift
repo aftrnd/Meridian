@@ -484,6 +484,16 @@ final class GameLauncher {
                 try? await Task.sleep(for: .milliseconds(500))
             }
 
+            // Silence Steam's download-complete chime by killing
+            // steamwebhelper at the exact moment `StateFlags` flips to 4.
+            // The chime rides Steam's audio-queue path, which CEF / webhelper
+            // owns — the DYLD_INSERT accessory dylib kills the toast window
+            // but the sound is a separate code path the dylib doesn't hook.
+            // Killing steamwebhelper severs the audio path before the chime
+            // can fire; the main `steam.exe` (needed for DRM game launches)
+            // is untouched and automatically respawns webhelper a few
+            // seconds later for the next operation.
+            Self.silenceSteamChime()
             appendLog("Download complete")
             library?.setInstalled(true, for: game.id)
             downloadProgress = 1.0
@@ -709,6 +719,32 @@ final class GameLauncher {
         let mb = Double(bytes) / 1_048_576
         if mb >= 1 { return String(format: "%.0f MB", mb) }
         return String(format: "%.0f KB", Double(bytes) / 1024)
+    }
+
+    /// Kills every `steamwebhelper.exe` Wine process. Used at the instant an
+    /// install completes to prevent Steam's download-complete chime + toast
+    /// from firing — both of those paths run through the webhelper (CEF +
+    /// HTML5 audio). The main `steam.exe` process is untouched, so DRM game
+    /// launches continue to work; Steam automatically respawns webhelper a
+    /// few seconds later for the next UI operation.
+    ///
+    /// This is a pragmatic workaround for Valve not exposing a
+    /// "silence notifications for this session" API. The DYLD_INSERT
+    /// accessory dylib suppresses the toast WINDOW; this kill covers the
+    /// parallel audio-queue path.
+    fileprivate static func silenceSteamChime() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-9", "-f", "steamwebhelper"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError  = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            log.info("[launch] silenceSteamChime: pkill steamwebhelper exit=\(task.terminationStatus)")
+        } catch {
+            log.warning("[launch] silenceSteamChime: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Private helpers
