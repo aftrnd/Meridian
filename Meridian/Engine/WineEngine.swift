@@ -417,11 +417,23 @@ final class WineEngine {
 
         let codesign = Process()
         codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        // CRITICAL: do NOT preserve `team-identifier` from CrossOver's original
+        // signature. Ad-hoc signing (`--sign -`) produces a signature with no
+        // team identifier by design; keeping CW's "9C6B7X7Z8E" leaves the
+        // binary with a contradictory `Signature=adhoc` + `TeamIdentifier=…`
+        // state. The kernel SIGKILLs such binaries at exec time with
+        // exit 137 (= 128 + 9). CLI-verified April 23 2026.
+        //
+        // `flags` must be preserved so the hardened-runtime flag survives
+        // the re-sign (without it, our dyld-env entitlement would be
+        // applied to a non-hardened-runtime binary, which macOS accepts
+        // but means `DYLD_INSERT_LIBRARIES` would work even without the
+        // entitlement — harmless, just wastes the re-sign work).
         codesign.arguments = [
             "--force",
             "--sign", "-",
             "--entitlements", plistURL.path(percentEncoded: false),
-            "--preserve-metadata=flags,runtime,team-identifier",
+            "--preserve-metadata=flags,runtime",
             wine64Path,
         ]
         let stderrPipe = Pipe()

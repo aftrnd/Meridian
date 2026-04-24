@@ -476,7 +476,7 @@ cat > "${ENTITLEMENTS_PLIST}" <<'PLIST_EOF'
 PLIST_EOF
 codesign --force --sign - \
     --entitlements "${ENTITLEMENTS_PLIST}" \
-    --preserve-metadata=flags,runtime,team-identifier \
+    --preserve-metadata=flags,runtime \
     "${WINE64_BIN}" \
     || die "wine64 re-sign failed"
 rm -f "${ENTITLEMENTS_PLIST}"
