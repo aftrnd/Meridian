@@ -296,6 +296,7 @@
 			buildConfigurationList = B0010070 /* Build configuration list for PBXNativeTarget "Meridian" */;
 			buildPhases = (
 				B001DDA1 /* Build meridian-dpapi.exe */,
+				B001DDA2 /* Build meridian-wine-accessory.dylib */,
 				B0010061 /* Sources */,
 				B0010040 /* Frameworks */,
 				B0010062 /* Resources */,
@@ -376,6 +377,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
 			shellScript = "# Build meridian-dpapi.exe (Wine CryptProtectData wrapper) into the app bundle\n# Resources so the app can copy it into the engine at runtime if it's missing.\n# This protects the DPAPI-based auto-login path from engine auto-refreshes that\n# wipe wine/share/meridian/ before a new engine tarball has been published.\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-dpapi.sh\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-dpapi.exe\"\n";
+		};
+		B001DDA2 /* Build meridian-wine-accessory.dylib */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Scripts/wine-accessory/meridian_wine_accessory.m",
+				"$(SRCROOT)/Scripts/build-wine-accessory.sh",
+			);
+			name = "Build meridian-wine-accessory.dylib";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-wine-accessory.dylib",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "# Build meridian-wine-accessory.dylib — DYLD_INSERT_LIBRARIES payload that\n# demotes every Wine subprocess to NSApplicationActivationPolicyAccessory,\n# preventing Dock tiles and self-activation for download-complete toasts.\n# See Scripts/wine-accessory/meridian_wine_accessory.m for the full rationale.\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-wine-accessory.sh\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-wine-accessory.dylib\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
