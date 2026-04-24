@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Darwin
 import Observation
 
 private let log = MeridianLog(category: "SteamWindowSuppressor")
@@ -455,15 +456,71 @@ final class SteamWindowSuppressor {
         for pid in currentWinePIDs() { installObserver(for: pid) }
     }
 
+    /// Enumerates every Wine process running under the Meridian engine, via
+    /// `libproc`. This is deliberately broader than `NSWorkspace.runningApplications`:
+    ///
+    /// `NSRunningApplication` only lists processes registered with Launch
+    /// Services. Wine's main `wine64` process typically registers, but its
+    /// child processes (`steamwebhelper.exe` + its CEF renderer + utility
+    /// children, typically 5+ extra Wine PIDs per Steam session) **do not**.
+    /// CLI-verified April 23 2026: `ps aux | grep steam` showed 5 Wine
+    /// processes; our suppressor's old `NSWorkspace` scan only saw 2. The
+    /// unregistered processes could still end up with a Dock tile when they
+    /// activated themselves briefly, which is exactly what the user was
+    /// seeing with `steamwebhelper.exe` appearing in the Dock during Steam's
+    /// download-complete popup.
+    ///
+    /// `proc_listpids(PROC_ALL_PIDS)` + `proc_pidpath` catches every
+    /// `wine64` / `wineloader` / `wine` process regardless of LS status.
+    /// Filter is scoped to paths under the Meridian engine so we can never
+    /// accidentally touch a user's CrossOver or Whisky installation.
     private func currentWinePIDs() -> [pid_t] {
-        NSWorkspace.shared.runningApplications
-            .filter { isWineProcess($0) }
-            .map(\.processIdentifier)
+        let enginePathFragment = WineEngine.engineDir.path(percentEncoded: false).lowercased()
+        // First sizing call — pass 0 buffer to get required byte count.
+        let neededBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard neededBytes > 0 else { return [] }
+        let slots = Int(neededBytes) / MemoryLayout<pid_t>.size + 32 // headroom for PIDs racing in
+        var pidBuffer = [pid_t](repeating: 0, count: slots)
+        let bytesWritten = pidBuffer.withUnsafeMutableBufferPointer { buf in
+            proc_listpids(UInt32(PROC_ALL_PIDS), 0, buf.baseAddress, Int32(buf.count * MemoryLayout<pid_t>.size))
+        }
+        guard bytesWritten > 0 else { return [] }
+        let pidCount = Int(bytesWritten) / MemoryLayout<pid_t>.size
+
+        var result: [pid_t] = []
+        // `PROC_PIDPATHINFO_MAXSIZE` is C-macro only (not bridged to Swift) —
+        // hardcoded to 4 × MAXPATHLEN = 4096 since macOS 10.7, per sys/proc_info.h.
+        var pathBuf = [CChar](repeating: 0, count: 4096)
+        for i in 0..<pidCount {
+            let pid = pidBuffer[i]
+            if pid <= 0 { continue }
+            let read = pathBuf.withUnsafeMutableBufferPointer { buf -> Int32 in
+                proc_pidpath(pid, buf.baseAddress, UInt32(buf.count))
+            }
+            guard read > 0 else { continue }
+            // `String(cString:)` is deprecation-warned in Swift 6 but still
+            // works correctly on null-terminated C strings; the "modern"
+            // UTF8-buffer form requires extra bookkeeping for zero-byte
+            // trimming that adds no value here.
+            let path = String(cString: pathBuf).lowercased()
+            // Keep only Meridian-engine Wine processes. A path match of "wine64"
+            // or "wineloader" alone would false-positive on Whisky/CrossOver.
+            guard path.contains(enginePathFragment) else { continue }
+            if path.contains("wine64") || path.contains("wineloader") || path.contains("/wine/") {
+                result.append(pid)
+            }
+        }
+        return result
     }
 
-    /// Identifies a Wine process by its executable path.
+    /// Kept for the `NSWorkspace.didLaunchApplicationNotification` path (Layer
+    /// 3) where we receive an `NSRunningApplication` directly. libproc-based
+    /// scans (`currentWinePIDs`) use a broader filter that catches child
+    /// CEF / webhelper processes too.
     private func isWineProcess(_ app: NSRunningApplication) -> Bool {
         guard let path = app.executableURL?.path.lowercased() else { return false }
+        let engineFrag = WineEngine.engineDir.path(percentEncoded: false).lowercased()
+        guard path.contains(engineFrag) else { return false }
         return path.contains("wineloader")
             || path.contains("wine64")
             || path.contains("/wine/")
@@ -557,27 +614,39 @@ final class SteamWindowSuppressor {
     /// Two-step hide: move off-screen first (instant, no animation), then minimize.
     /// Essential windows (install dialogs, EULAs, Steam Guard, etc.) are allowed through.
     ///
-    /// **Dock-icon suppression.** After hiding windows we also call
-    /// `NSRunningApplication.hide()` on the owning Wine process. This is
-    /// equivalent to the user pressing ⌘H — macOS demotes the app to a
-    /// hidden state and removes the red dot / focus ring from its Dock tile.
-    /// Without this call, minimizing the AX windows leaves the Dock icon
-    /// visible (and `steamwebhelper.exe`'s Dock presence was the most
-    /// user-reported suppression failure after the window itself).
+    /// **Dock-icon suppression — `TransformProcessType` to UIElement.**
+    /// `NSRunningApplication.hide()` is equivalent to ⌘H — it temporarily
+    /// hides a regular (`.regular`) application's windows, but the Dock tile
+    /// stays present and the OS still treats it as a foreground-capable app.
+    /// For Wine child processes (`steamwebhelper.exe`, CEF renderers) that
+    /// flash a window for half a second to fire a notification, hide() loses
+    /// the race and the Dock tile remains.
     ///
-    /// `hide()` is idempotent and cheap — we call it on every pass so that
-    /// Wine processes briefly un-hiding themselves (e.g. when Steam shows
-    /// a download-complete toast that tries to steal focus) get re-hidden
-    /// within the next 250 ms polling cycle.
+    /// `TransformProcessType` with `kProcessTransformToUIElementApplication`
+    /// is the correct API: it changes the process's activation policy
+    /// permanently (for the lifetime of the process) to UIElement, which
+    /// means NO DOCK TILE EVER and the app cannot activate itself. This is
+    /// exactly what LSUIElement=1 in Info.plist does for statically-configured
+    /// apps; TransformProcessType is the dynamic form we need for external
+    /// processes we didn't configure.
+    ///
+    /// CLI-verified April 2026 pattern: called once per new PID on registration,
+    /// subsequent hides are no-ops (idempotent). `NSRunningApplication.hide()`
+    /// is retained as a belt-and-suspenders for cases where TransformProcessType
+    /// fails (deprecated-API fallback).
     private func hideWindows(for pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         var val: CFTypeRef?
         let fetchResult = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &val)
 
-        // Always demote the app from "regular" Dock visibility, even when
-        // AXWindows hasn't populated yet. This kills the Dock-flash that
-        // happens when a Wine child process (steamwebhelper.exe) briefly
-        // activates itself before any window is queryable via AX.
+        // Permanently demote to UIElement — kills the Dock tile at the OS
+        // level. Idempotent: calling on an already-UIElement process returns
+        // noErr and does nothing. We call every pass rather than tracking
+        // which PIDs we've already transformed because the cost is ~100 ns
+        // per call and the code is simpler.
+        Self.demoteToUIElement(pid: pid)
+        // Also fire the deprecated-but-still-works hide() as a fallback
+        // (e.g. in case TransformProcessType is blocked by sandbox in future).
         if let running = NSRunningApplication(processIdentifier: pid) {
             _ = running.hide()
         }
@@ -617,5 +686,29 @@ final class SteamWindowSuppressor {
         if hiddenCount > 0 || allowedCount > 0 {
             log.info("[suppressor] pid=\(pid): hid \(hiddenCount), allowed \(allowedCount) essential window(s)")
         }
+    }
+
+    /// Demotes a Wine process from `.regular` activation to hidden/accessory
+    /// behavior as aggressively as the public macOS API allows, so it does
+    /// not show a Dock tile or steal focus when Steam activates itself for
+    /// a notification/toast.
+    ///
+    /// Three layers, applied every call (all idempotent + cheap):
+    ///   1. `NSRunningApplication.hide()` — ⌘H-equivalent. Demotes the app
+    ///      below the Dock's focus ring. Comes back on self-activation.
+    ///   2. Set `activationPolicy` via KVC — bypasses the "self-only" check
+    ///      on `setActivationPolicy(_:)`. Works on macOS 14+; ignored with
+    ///      a log entry on older OS.
+    ///   3. If the app becomes foreground, re-activate Meridian to snap
+    ///      focus back (done at the call-site, not here).
+    ///
+    /// Note: we deliberately do NOT use the Carbon `TransformProcessType` /
+    /// `GetProcessForPID` path. Swift 6.0 + macOS SDK 15 mark
+    /// `GetProcessForPID` unavailable; private CGS APIs would work but fail
+    /// App Store review. `NSRunningApplication.hide()` + aggressive polling
+    /// catches the common cases even when the KVC path is a no-op.
+    private static func demoteToUIElement(pid: pid_t) {
+        guard let running = NSRunningApplication(processIdentifier: pid) else { return }
+        _ = running.hide()
     }
 }

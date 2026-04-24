@@ -1234,6 +1234,83 @@ struct WinePrefix: Sendable {
         return (details.bytesDownloaded, details.bytesToDownload, details.stateFlags)
     }
 
+    /// Returns the on-disk bytes written into `steamapps/downloading/<appID>/`
+    /// so far — the authoritative live-progress signal during a Steam install.
+    ///
+    /// ## Why not the ACF?
+    ///
+    /// Steam buffers ACF writes in memory and only flushes to disk at phase
+    /// boundaries. CLI-verified April 23 2026 on a Super Battle Golf install:
+    /// `BytesDownloaded` stayed at `0` in the ACF for the full 23-second
+    /// download, then the file was rewritten in one shot at completion with
+    /// the final byte counts. A 1-second polling loop against `BytesDownloaded`
+    /// reads `0 / 1.27 GB` twenty-three times in a row, then `1.27 GB / 1.27 GB`
+    /// — no useful progress.
+    ///
+    /// ## What Steam actually does
+    ///
+    /// `content_log.txt` for the same install showed:
+    /// ```
+    /// [19:51:27] update started : download 0/1274955600
+    /// [19:51:34] Detected write gap 119 MB in file "Super Battle Golf_Data\data.unity3d"
+    /// [19:51:36] Detected write gap 168 MB in file "Super Battle Golf_Data\data.unity3d"
+    /// [19:51:40] Increasing target connections to 4 (rate was 0.000, now 427.288)
+    /// [19:51:50] starting commit from downloading/4069520 to common/Super Battle Golf
+    /// ```
+    /// i.e. Steam writes chunks directly into files under
+    /// `steamapps/downloading/<appID>/` as they arrive from the CDN. The
+    /// directory's on-disk usage grows in lockstep with download progress,
+    /// at high temporal resolution (sub-second).
+    ///
+    /// After download finishes, Steam "commits" by moving the files from
+    /// `downloading/<appID>/` into `common/<installdir>/`. During that
+    /// (typically very short) window this method may return briefly-low
+    /// values as files are renamed; the caller should treat values as
+    /// monotonic non-decreasing and clamp accordingly.
+    func bytesOnDiskForDownload(appID: Int) -> Int64 {
+        let fm = FileManager.default
+        let dir = steamInstallDir.appending(path: "steamapps/downloading/\(appID)")
+        guard let enumerator = fm.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]),
+                  let size = values.totalFileAllocatedSize else { continue }
+            total += Int64(size)
+        }
+        return total
+    }
+
+    /// On-disk bytes currently committed under `steamapps/common/<installdir>/`.
+    /// Used to track post-download progress: after Steam moves files from
+    /// `downloading/<appID>/` to `common/<installdir>/`, this climbs from
+    /// 0 to the full installed size over a few seconds. Combined with
+    /// `bytesOnDiskForDownload` it covers the full download → install window
+    /// without ever reading Steam's laggy ACF.
+    func bytesOnDiskForInstall(appID: Int, installDir: String) -> Int64 {
+        let fm = FileManager.default
+        let dir = steamInstallDir.appending(path: "steamapps/common/\(installDir)")
+        guard let enumerator = fm.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]),
+                  let size = values.totalFileAllocatedSize else { continue }
+            total += Int64(size)
+        }
+        return total
+    }
+
     /// Richer variant of `gameDownloadProgress`: includes staging byte counts
     /// and a coarse install phase derived from actual bytes (not Valve's
     /// opaque `StateFlags` bitmask).

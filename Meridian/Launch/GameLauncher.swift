@@ -386,22 +386,21 @@ final class GameLauncher {
             // already scanned the ACF and queued the download. No "ACF appears"
             // wait needed — we go straight to progress polling.
 
-            // ACF exists — poll for progress until `StateFlags == 4`.
-            //
-            // Progress bar is driven by byte counts from the ACF, not by
-            // Valve's StateFlags bitmask (which only flips at phase
-            // boundaries — useless as a continuous progress signal; see
-            // `WinePrefix.gameDownloadDetails` doc for the CLI evidence).
+            // Poll real disk usage under `steamapps/downloading/<appID>/` for
+            // live progress. The ACF's `BytesDownloaded` is buffered in Steam's
+            // memory and only flushed to disk at phase boundaries — useless as
+            // a live signal (see `WinePrefix.bytesOnDiskForDownload` doc). The
+            // directory's on-disk size, by contrast, grows at the CDN's rate as
+            // Steam writes chunks.
             //
             // Bar mapping:
-            //   0 – 90%  = download phase      (bytesDownloaded / bytesToDownload)
-            //   90 – 99% = install phase       (bytesStaged / bytesToStage)
-            //   100%     = StateFlags == 4
-            //
-            // 1 s polling gives smooth updates even on sub-GB games that
-            // finish in 5 – 10 s on a fast connection.
+            //   0 – 90 %  download (diskBytes / bytesToDownload from ACF)
+            //   90 – 99 % install (bytesOnDiskForInstall / bytesToStage)
+            //   100 %     StateFlags == 4
             var lastLoggedPercent = -1
             var lastPhase: WinePrefix.InstallPhase?
+            var maxSeenDownloadBytes: Int64 = 0
+            var maxSeenInstallBytes: Int64 = 0
             while !prefix.isGameFullyInstalled(appID: game.id) {
                 guard !Task.isCancelled else {
                     downloadProgress = nil
@@ -410,53 +409,79 @@ final class GameLauncher {
                     return
                 }
 
-                if let d = prefix.gameDownloadDetails(appID: game.id) {
-                    let dlFrac: Double = d.bytesToDownload > 0
-                        ? min(Double(d.bytesDownloaded) / Double(d.bytesToDownload), 1.0)
-                        : 0
-                    let installFrac: Double = d.bytesToStage > 0
-                        ? min(Double(d.bytesStaged) / Double(d.bytesToStage), 1.0)
-                        : 0
+                // Target sizes come from the ACF (set once, at download start,
+                // so always reliable even though incremental BytesDownloaded
+                // isn't). Live progress comes from disk.
+                let d = prefix.gameDownloadDetails(appID: game.id)
+                let bytesToDownload = d?.bytesToDownload ?? 0
+                let bytesToStage    = d?.bytesToStage ?? 0
 
-                    let fraction: Double
-                    switch d.phase {
-                    case .preparing:    fraction = 0.0
-                    case .downloading:  fraction = dlFrac * 0.9
-                    case .installing:   fraction = 0.9 + installFrac * 0.09
-                    case .installed:    fraction = 1.0
-                    }
-                    downloadProgress = fraction
-                    let pct = Int(fraction * 100)
-                    let verb = d.phase.userDescription
+                let diskDl = prefix.bytesOnDiskForDownload(appID: game.id)
+                let diskInstall = prefix.bytesOnDiskForInstall(appID: game.id, installDir: game.name)
 
-                    let activity: String
-                    switch d.phase {
-                    case .downloading:
-                        activity = "\(verb) \(game.name) — \(Self.formatBytes(d.bytesDownloaded)) / \(Self.formatBytes(d.bytesToDownload)) (\(pct)%)"
-                    case .installing:
-                        activity = "\(verb) \(game.name) — \(Self.formatBytes(d.bytesStaged)) / \(Self.formatBytes(d.bytesToStage)) (\(pct)%)"
-                    case .installed:
-                        activity = "\(verb) \(game.name)"
-                    case .preparing:
-                        activity = "\(verb) \(game.name)…"
-                    }
-                    currentActivity = activity
+                // Clamp to monotonic non-decreasing. Steam briefly moves files
+                // from downloading/ into common/ during commit — without
+                // clamping, our bar would dip during that handoff.
+                if diskDl > maxSeenDownloadBytes { maxSeenDownloadBytes = diskDl }
+                if diskInstall > maxSeenInstallBytes { maxSeenInstallBytes = diskInstall }
 
-                    if lastPhase != d.phase {
-                        appendLog("\(verb) \(game.name)")
-                        log.info("[launch] appID=\(game.id) phase=\(d.phase.rawValue) bytesDl=\(d.bytesDownloaded)/\(d.bytesToDownload) bytesStage=\(d.bytesStaged)/\(d.bytesToStage) stateFlags=\(d.stateFlags)")
-                        lastPhase = d.phase
-                        lastLoggedPercent = -1
-                    }
-                    if pct / 5 > lastLoggedPercent / 5 {
-                        appendLog("\(verb) \(game.name) — \(pct)%")
-                        lastLoggedPercent = pct
-                    }
+                let phase: WinePrefix.InstallPhase
+                if d?.phase == .installed {
+                    phase = .installed
+                } else if bytesToDownload > 0 && maxSeenDownloadBytes < bytesToDownload {
+                    phase = .downloading
+                } else if bytesToStage > 0 && maxSeenInstallBytes < bytesToStage {
+                    phase = .installing
                 } else {
-                    currentActivity = "Preparing \(game.name)…"
+                    phase = .preparing
                 }
 
-                try? await Task.sleep(for: .seconds(1))
+                let dlFrac = bytesToDownload > 0
+                    ? min(Double(maxSeenDownloadBytes) / Double(bytesToDownload), 1.0)
+                    : 0
+                let installFrac = bytesToStage > 0
+                    ? min(Double(maxSeenInstallBytes) / Double(bytesToStage), 1.0)
+                    : 0
+
+                let fraction: Double
+                switch phase {
+                case .preparing:    fraction = 0.0
+                case .downloading:  fraction = dlFrac * 0.9
+                case .installing:   fraction = 0.9 + installFrac * 0.09
+                case .installed:    fraction = 1.0
+                }
+                downloadProgress = fraction
+                let pct = Int(fraction * 100)
+                let verb = phase.userDescription
+
+                let activity: String
+                switch phase {
+                case .downloading:
+                    activity = "\(verb) \(game.name) — \(Self.formatBytes(maxSeenDownloadBytes)) / \(Self.formatBytes(bytesToDownload)) (\(pct)%)"
+                case .installing:
+                    activity = "\(verb) \(game.name) — \(Self.formatBytes(maxSeenInstallBytes)) / \(Self.formatBytes(bytesToStage)) (\(pct)%)"
+                case .installed:
+                    activity = "\(verb) \(game.name)"
+                case .preparing:
+                    activity = "\(verb) \(game.name)…"
+                }
+                currentActivity = activity
+
+                if lastPhase != phase {
+                    appendLog("\(verb) \(game.name)")
+                    log.info("[launch] appID=\(game.id) phase=\(phase.rawValue) diskDl=\(maxSeenDownloadBytes)/\(bytesToDownload) diskInstall=\(maxSeenInstallBytes)/\(bytesToStage)")
+                    lastPhase = phase
+                    lastLoggedPercent = -1
+                }
+                if pct / 5 > lastLoggedPercent / 5 {
+                    appendLog("\(verb) \(game.name) — \(pct)%")
+                    lastLoggedPercent = pct
+                }
+
+                // 500 ms polling: smoother bar on fast connections without
+                // burning CPU. Directory enumeration is cheap for a single
+                // subtree (<1 ms for a 300-file install).
+                try? await Task.sleep(for: .milliseconds(500))
             }
 
             appendLog("Download complete")
