@@ -234,6 +234,14 @@ final class WineEngine {
 
     /// Reads the engine release tag from the version file written by `release-engine.sh`.
     private func readEngineVersion() -> String? {
+        Self.installedEngineTagOnDisk()
+    }
+
+    /// Reads the installed engine tag (e.g. `v3.0.6-engine`) directly from disk
+    /// without needing a `WineEngine` instance. Used by `EngineDownloader` to
+    /// short-circuit no-op downloads before extraction wipes the engine
+    /// directory and races with any in-flight Wine process.
+    static func installedEngineTagOnDisk() -> String? {
         let versionFile = Self.engineDir.appending(path: "wine/meridian-engine-version.txt")
         return try? String(contentsOf: versionFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)

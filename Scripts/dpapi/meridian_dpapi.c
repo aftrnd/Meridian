@@ -102,8 +102,18 @@ int main(int argc, char **argv) {
     LPWSTR descr_out = NULL;
 
     if (do_encrypt) {
+        /* szDataDescr MUST be "BObfuscateBuffer" — Steam validates this string
+         * inside the DPAPI blob during CryptUnprotectData. With any other
+         * description (including empty), Steam silently abandons auto-login:
+         * connection_log shows [Connected] but never [Logging on], and
+         * configstore_log never logs `Loaded store 'machineuser'`.
+         *
+         * CLI-confirmed April 25, 2026 by bit-comparing CX Preview's working
+         * local.vdf against ours — only the embedded UTF-16 description string
+         * differed (offset ~80 in the hex blob). Adding it produced byte-for-
+         * byte identical structure and Steam accepted the resulting cache. */
         ok = CryptProtectData(&in_blob,
-                              L"",         /* szDataDescr — empty, Steam writes "" */
+                              L"BObfuscateBuffer",
                               entropy_ptr,
                               NULL,        /* reserved */
                               NULL,        /* pPromptStruct */

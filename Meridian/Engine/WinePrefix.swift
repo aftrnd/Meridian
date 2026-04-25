@@ -341,6 +341,82 @@ struct WinePrefix: Sendable {
         log.info("[resetToTemplate] prefix reset to new engine template ✓")
     }
 
+    /// Ensures the `nsiproxy` Wine service is registered in `system.reg`.
+    ///
+    /// **Why this matters:** `nsiproxy.sys` is Wine's Network Subsystem Interface
+    /// proxy driver — the kernel-side backend for `iphlpapi.dll`'s
+    /// `GetAdaptersAddresses` / `GetIfTable` and friends. Without it,
+    /// `\\.\Nsi` (the device the Win32 API talks to) is never created, so
+    /// every network-enumeration call inside the prefix returns
+    /// `ERROR_FILE_NOT_FOUND` (2).
+    ///
+    /// **Why we have to write it ourselves:** The CrossOver-Wine FOSS engine
+    /// we ship registers `nsiproxy` via `wine.inf` during `wineboot --init`,
+    /// but the prefix template built by `release-engine.sh` (using
+    /// `wineboot --init` against a Linux-host build) doesn't materialise the
+    /// service entry on this machine. The result: Steam launches, completes
+    /// `Connectivity test: result=Connected`, then **rejects every webhelper
+    /// WebSocket** because `CalcUnIPThisBox` (in `net_misc.cpp`) can't
+    /// recognise 127.0.0.1 as a local interface — auto-login machinery (which
+    /// runs inside the rejected webhelper) never starts. CLI-confirmed
+    /// April 25, 2026: appending the registration below to `system.reg`
+    /// flipped a fresh prefix from "0 adapters, ret=2" to "24 adapters, ret=0".
+    ///
+    /// Idempotent — fast-paths out when the entry is already present.
+    /// Writes directly to `system.reg` rather than via `wine reg add` because
+    /// invoking wine64 here would race the very wineserver we're trying to
+    /// fix and add ~5 seconds of bootstrap latency.
+    func ensureNsiproxyService() {
+        let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
+        guard let current = try? String(contentsOfFile: regPath, encoding: .utf8) else {
+            log.warning("[ensureNsiproxy] system.reg unreadable at \(regPath) — skipping")
+            return
+        }
+        // The exact key marker (must be the section header line). Single backslash
+        // pairs in source → escaped backslashes inside the .reg text.
+        let marker = #"[System\\CurrentControlSet\\Services\\nsiproxy]"#
+        if current.contains(marker) {
+            log.debug("[ensureNsiproxy] already registered — skipping")
+            return
+        }
+
+        // Reg-format service entry copied byte-for-byte from a CX Preview bottle
+        // where Steam auto-login is known to work. Values match Wine's wine.inf
+        // [NsiProxyService] section. The trailing blank line is required —
+        // Wine's .reg parser uses blank lines as section terminators.
+        let nsiproxyEntry = """
+
+        [System\\\\CurrentControlSet\\\\Services\\\\nsiproxy] 1774236148
+        #time=1dcba7446e99492
+        "Description"="NSI proxy service"
+        "DisplayName"="NSI Proxy"
+        "ErrorControl"=dword:00000001
+        "Group"="System Bus Extender"
+        "ImagePath"=str(2):"C:\\\\windows\\\\system32\\\\drivers\\\\nsiproxy.sys"
+        "ObjectName"="LocalSystem"
+        "PreshutdownTimeout"=dword:0002bf20
+        "Start"=dword:00000002
+        "Tag"=dword:00000001
+        "Type"=dword:00000001
+
+
+        """
+
+        do {
+            // Append to the file — system.reg sections can appear in any order;
+            // Wine merges by key path on read.
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: regPath))
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            if let data = nsiproxyEntry.data(using: .utf8) {
+                try handle.write(contentsOf: data)
+            }
+            log.info("[ensureNsiproxy] registered nsiproxy service in system.reg ✓ (Wine network enumeration enabled)")
+        } catch {
+            log.error("[ensureNsiproxy] write failed: \(error.localizedDescription)")
+        }
+    }
+
     /// Refreshes system DLL symlinks in an existing prefix after a Wine engine upgrade.
     ///
     /// Runs `wineboot --update`, which reads `wine/share/wine/wine.inf` from the engine

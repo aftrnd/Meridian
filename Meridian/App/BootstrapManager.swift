@@ -333,6 +333,15 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
+        // 2c. Ensure Wine's nsiproxy service is registered. Without it,
+        //     `\\.\Nsi` is never created, `iphlpapi::GetAdaptersAddresses`
+        //     returns ERROR_FILE_NOT_FOUND, and Steam's `CalcUnIPThisBox`
+        //     can't recognise 127.0.0.1 as local — every webhelper WebSocket
+        //     gets rejected and auto-login never starts. Our prefix template
+        //     ships without the service registration (release-engine.sh
+        //     limitation); this self-heals at runtime. Idempotent + cheap.
+        prefix.ensureNsiproxyService()
+
         // 3. Install Steam if needed
         if !prefix.isSteamInstalled {
             transition(to: .installingSteam, message: "Downloading and installing Steam…")
