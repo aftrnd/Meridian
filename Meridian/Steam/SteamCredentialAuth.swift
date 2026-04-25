@@ -275,14 +275,26 @@ final class SteamCredentialAuth {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+        // device_friendly_name matches what Valve's official Steam client sends
+        // (`<hostname>` from gethostname(2)). Including it tells Valve's auth service
+        // that this is a desktop device-bound flow rather than a generic web token,
+        // which in turn produces a JWT that Steam's CM accepts for desktop login.
+        // Without this hint, Valve issues a more conservative token that's valid for
+        // `aud=web` API calls but rejected by `CMsgClientLogon` with `Invalid Password`.
+        let rawHostName = ProcessInfo.processInfo.hostName
+            .replacingOccurrences(of: ".local", with: "")
+        let deviceName = rawHostName.isEmpty ? "Meridian" : rawHostName
+
         request.httpBody = formEncode([
             "account_name":          accountName,
             "encrypted_password":    encryptedPassword,
             "encryption_timestamp":  encryptionTimestamp,
             "remember_login":        "1",
-            "platform_type":         "1",
-            "persistence":           "1",
+            "platform_type":         "1",          // k_EAuthTokenPlatformType_SteamClient
+            "persistence":           "1",          // k_ESessionPersistence_Persistent
             "website_id":            "Client",
+            "device_friendly_name":  deviceName,
         ]).data(using: .utf8)
 
         let (data, response) = try await URLSession.shared.data(for: request)
