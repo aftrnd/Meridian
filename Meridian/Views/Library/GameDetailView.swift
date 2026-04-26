@@ -679,8 +679,15 @@ struct GameDetailView: View {
             }
 
         case .bootstrappingSteam:
+            // Use the live activity message from `GameLauncher.transition(to:activity:)`
+            // — it accurately reflects the current phase ("Starting Steam…",
+            // "Steam is updating…" only when an actual self-update is detected
+            // via `WineSteamManager.waitUntilReady`'s `statusUpdate` callback).
+            // The previous hardcoded "Updating Steam…" was misleading whenever
+            // we were just waking the persistent process — which is the common
+            // case post-auth-success.
             HStack(spacing: 8) {
-                ProgressButton("Updating Steam…")
+                ProgressButton(launcher.currentActivity ?? "Starting Steam…")
                 cancelButton
             }
 
@@ -1032,7 +1039,12 @@ private struct StatusCard: View {
         case .preparingPrefix:
             return launcher.currentActivity ?? "Preparing Wine environment…"
         case .bootstrappingSteam:
-            return "Updating Steam — first launch takes a few minutes"
+            // Live activity reflects what's actually happening: typically
+            // "Starting Steam…" (waking the persistent process) and only
+            // "Steam is updating…" if `waitUntilReady` detects a real
+            // bootstrap_log "Downloading update" line. Falls back to a
+            // generic message if `currentActivity` is unset.
+            return launcher.currentActivity ?? "Starting Steam…"
         case .awaitingInstallConfirmation:
             return "Downloading…"
         case .launching:

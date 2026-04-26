@@ -973,6 +973,29 @@ final class WineSteamManager {
                 return
             }
 
+            // Fast-fail on Valve CM token rejection. When the JWT is rejected,
+            // Steam logs `'Invalid Password'` and `LogonFailureReceived` to
+            // `connection_log.txt` within ~1 s of presenting the token —
+            // typically 6-10 s after Connected. Without this check we'd wait
+            // the full `authTimeout` (default 60 s) for a result Steam already
+            // gave us. Catches:
+            //   - Account cooldown from too many recent failures (most common)
+            //   - Genuinely revoked / invalid stored token
+            //   - Token bound to a machine_id Valve no longer recognises
+            // The user's path forward in all three is the same: re-OAuth.
+            if newConnContent.contains("LogonFailureReceived")
+                || newConnContent.contains("Sending SteamServerConnectFailure_t Invalid Password") {
+                let elapsed = ContinuousClock.now - started
+                log.error("[waitUntilReady] signal: Valve CM rejected JWT with 'Invalid Password' after \(elapsed) — failing fast (saved \(authTimeout - (ContinuousClock.now - (connectedObservedAt ?? ContinuousClock.now))) of wait)")
+                // Kill webhelper IMMEDIATELY so Steam's fallback "Who's Playing"
+                // / login UI (which is CEF-rendered) doesn't get a chance to
+                // appear. Window suppression catches the AX window but Steam's
+                // UI loop keeps re-focusing it, leaking past suppression. The
+                // webhelper respawns automatically next time Steam needs UI.
+                Self.killWebhelper()
+                throw SteamError.authenticationFailed
+            }
+
             // Intermediate "connected" signal — starts the auth-window clock.
             if connectedObservedAt == nil, newConnContent.contains("Connectivity test: result=Connected") {
                 connectedObservedAt = ContinuousClock.now
@@ -997,6 +1020,7 @@ final class WineSteamManager {
                     let attemptFailures = text.components(separatedBy: "SteamUI: WARNING: connect attempt failed").count - 1
                     if attemptFailures >= 2 {
                         log.error("[waitUntilReady] signal: webhelper connect failed ×\(attemptFailures) — auth rejected, failing fast")
+                        Self.killWebhelper()
                         throw SteamError.authenticationFailed
                     }
                 }
@@ -1006,6 +1030,7 @@ final class WineSteamManager {
             if let connectedAt = connectedObservedAt,
                ContinuousClock.now - connectedAt > authTimeout {
                 log.error("[waitUntilReady] signal: Connected \(authTimeout) ago but Logged On never observed — auth failed")
+                Self.killWebhelper()
                 throw SteamError.authenticationFailed
             }
 
@@ -1188,6 +1213,32 @@ final class WineSteamManager {
         }
 
         isRunning = false
+    }
+
+    /// Kills any running `steamwebhelper.exe` (the CEF process that renders
+    /// Steam's UI) without touching the main `steam.exe` host.
+    ///
+    /// Used on auth-failure fast-fail to preempt Steam's "Who's Playing /
+    /// User Picker" window from rendering. After Valve rejects our JWT, the
+    /// main `steam.exe` falls back to its login UI — which is webhelper-rendered.
+    /// Window suppression catches the AX window but Steam's UI loop keeps
+    /// re-focusing it, leaking past suppression. Killing the webhelper at the
+    /// auth-fail moment removes the source entirely. Idempotent — `pkill`
+    /// returns non-zero when no matching process is running, which we ignore.
+    /// Steam respawns webhelper automatically when it next needs UI.
+    static func killWebhelper() {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        task.arguments = ["-9", "-f", "steamwebhelper"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError  = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            log.debug("[killWebhelper] pkill steamwebhelper exit=\(task.terminationStatus)")
+        } catch {
+            log.warning("[killWebhelper] \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Errors
