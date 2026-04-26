@@ -32,34 +32,6 @@ final class SteamSessionBridge {
     /// Populated from loginusers.vdf when macOS Steam is detected.
     private(set) var detectedAccountName: String?
 
-    /// Pending credential-auth tokens written by onboarding before prefix exists.
-    /// Bootstrap writes these into the prefix during syncingSession and clears them.
-    private(set) var pendingSteamID: String = ""
-    private(set) var pendingAccountName: String = ""
-    private(set) var pendingRefreshToken: String = ""
-
-    /// Called from AuthView after successful credential auth, before bootstrap.
-    func setPendingTokens(steamID: String, accountName: String, refreshToken: String) {
-        pendingSteamID = steamID
-        pendingAccountName = accountName
-        pendingRefreshToken = refreshToken
-        // Persist the credentials so subsequent sessions can re-write the ConnectCache
-        // before each persistent Steam startup, ensuring the minimal config.vdf format
-        // that Steam expects for ConnectCache auto-login is always present.
-        AppSettings.shared.steamCredentialSteamID = steamID
-        AppSettings.shared.steamCredentialAccountName = accountName
-        AppSettings.shared.steamCredentialRefreshToken = refreshToken
-        log.info("[setPendingTokens] stored pending session for steamID=\(steamID) accountName=\(accountName)")
-    }
-
-    func clearPendingTokens() {
-        pendingSteamID = ""
-        pendingAccountName = ""
-        pendingRefreshToken = ""
-    }
-
-    var hasPendingTokens: Bool { !pendingRefreshToken.isEmpty }
-
     /// Ensures `AppSettings.steamCredentialAccountName` is populated.
     /// When the user re-authenticated but the new credential storage code wasn't active,
     /// the username lives in `loginusers.vdf` but not in AppSettings. This syncs it.
@@ -85,76 +57,49 @@ final class SteamSessionBridge {
 
     /// Prepares the Wine prefix with Steam session data before launching `steam.exe`.
     ///
-    /// The current (April 23 2026+) authentication path uses a DPAPI-encrypted
-    /// `local.vdf` written into `drive_c/users/crossover/AppData/Local/Steam/`.
-    /// See `WinePrefix.writeSteamSessionLocalVdf` for the full mechanism; see
-    /// `engine-research-findings.mdc` Pattern 6 for why `config.vdf`'s
-    /// `ConnectCache` block stopped working with Steam client `1773426488`.
+    /// **April 25 2026 architecture:** Steam owns its own auth state inside the
+    /// bottle. After `SteamExeSignIn` drives `steam.exe -login`, Steam writes
+    /// `loginusers.vdf` + a DPAPI-encrypted `local.vdf` whose JWT carries the
+    /// Wine bottle's `machine_id` HMAC binding. CMsgClientLogon at next launch
+    /// echoes the same `machine_id`, so Valve's CM accepts the token. Meridian
+    /// MUST NOT touch that file — earlier versions injected an externally-minted
+    /// JWT into `local.vdf` that lacked the `machine_id` claim, and Valve
+    /// rejected the resulting CM logon with `Invalid Password`.
     ///
-    /// The function:
-    ///   1. Writes `loginusers.vdf` so Steam knows which user to auto-select.
-    ///   2. Calls `meridian-dpapi.exe encrypt` (via `wine64`) on the JWT refresh
-    ///      token, then writes the resulting encrypted blob to `local.vdf`.
-    ///   3. Returns a `SessionStrategy` indicating which data source won.
+    /// Strategies in priority order:
+    ///   1. `steamSelfManagedSession` — the user has signed in via
+    ///       `SteamExeSignIn`; Steam owns its on-disk state. We just refresh
+    ///       `loginusers.vdf` to pin the auto-login user and otherwise stay out
+    ///       of Steam's way.
+    ///   2. macOS Steam present — copy its `loginusers.vdf` + `ssfn*` so the
+    ///       Wine Steam reuses the desktop client's session.
+    ///   3. Nothing usable — the user signs in through the AuthView sheet.
     @discardableResult
     func prepare(prefix: WinePrefix, engine: WineEngine) async -> SessionStrategy {
         hasMacSteamSession = false
         detectedAccountName = nil
 
-        // Priority 1: Pending credential-auth tokens from the just-finished sign-in.
-        if hasPendingTokens {
-            log.info("[prepare] strategy=credentialAuth — writing pending tokens to prefix")
-            let sid    = pendingSteamID
-            let name   = pendingAccountName
-            let token  = pendingRefreshToken
-            do {
-                try prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
-                try await prefix.writeSteamSessionLocalVdf(
-                    engine: engine,
-                    steamID: sid,
-                    accountName: name,
-                    refreshToken: token
-                )
-                clearPendingTokens()
-                log.info("[prepare] strategy=credentialAuth ✓")
-                return .credentialAuth
-            } catch {
-                log.error("[prepare] failed to write credential-auth session: \(error.localizedDescription)")
-                clearPendingTokens()
-            }
-        }
-
-        // Priority 1b: Persisted credentials from a prior session. Re-write
-        // loginusers.vdf + local.vdf on every launch so the prefix is in a
-        // known-good state regardless of what Steam itself did last time.
         let settings = AppSettings.shared
-        if settings.hasSteamCredentials {
-            log.info("[prepare] strategy=credentialAuthRefresh — re-writing loginusers.vdf + local.vdf from stored credentials")
-            let sid   = settings.steamCredentialSteamID
-            let name  = settings.steamCredentialAccountName
-            let token = settings.steamCredentialRefreshToken
-            do {
-                try prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
-                try await prefix.writeSteamSessionLocalVdf(
-                    engine: engine,
-                    steamID: sid,
-                    accountName: name,
-                    refreshToken: token
-                )
-                log.info("[prepare] strategy=credentialAuthRefresh ✓")
-                return .credentialAuth
-            } catch {
-                log.warning("[prepare] could not re-write session files from stored credentials: \(error.localizedDescription)")
+
+        // Strategy 1: Steam self-managed session (post-April-25-2026).
+        if settings.steamSelfManagedSession {
+            let localVdf = prefix.localAppDataSteamDir.appending(path: "local.vdf").path(percentEncoded: false)
+            let exists = FileManager.default.fileExists(atPath: localVdf)
+            log.info("[prepare] strategy=steamSelfManaged — Steam owns local.vdf (exists=\(exists))")
+            if !settings.steamCredentialSteamID.isEmpty {
+                let sid  = settings.steamCredentialSteamID
+                let name = settings.steamCredentialAccountName
+                try? prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
             }
+            return .credentialAuth
         }
 
+        // Strategy 2: macOS Steam install detected — copy its session files.
         log.info("[prepare] checking for macOS Steam install")
-
         guard let steamDataDir = macSteamDataDirectory() else {
             log.info("[prepare] no macOS Steam install found at ~/Library/Application Support/Steam")
             return .none
         }
-
         log.info("[prepare] macOS Steam found at \(steamDataDir.path(percentEncoded: false))")
 
         if let accountName = parseAccountName(from: steamDataDir) {

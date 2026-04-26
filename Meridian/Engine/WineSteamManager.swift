@@ -698,8 +698,15 @@ final class WineSteamManager {
     /// `steam.exe -applaunch` invocations use IPC to the running instance
     /// instead of cold-starting a new one.
     ///
-    /// Used on-demand for DRM games (`startSteamForDRM`) and `showSteamUI`.
-    func startPersistent(engine: WineEngine, prefix: WinePrefix) async throws {
+    /// Used on-demand for DRM games (`startSteamForDRM`) and `showSteamUI`).
+    ///
+    /// `extraArgs` are appended after `-silent -nofriendsui`. `SteamExeSignIn`
+    /// passes `-login <user> <pass>` so SteamUI's own start-up code drives the
+    /// CM auth handshake — the only path whose `CMsgClientLogon machine_id`
+    /// matches the JWT Valve issues. Externally-minted JWTs (from our
+    /// `IAuthenticationService` OAuth) never matched, so CM rejected them
+    /// with `Invalid Password`. See `engine-research-findings.mdc` Pattern 7.
+    func startPersistent(engine: WineEngine, prefix: WinePrefix, extraArgs: [String] = []) async throws {
         guard persistentProcess == nil || !(persistentProcess?.isRunning ?? false) else {
             log.info("[startPersistent] Steam already running — skipping")
             return
@@ -728,8 +735,12 @@ final class WineSteamManager {
         persistentConnectionLogOffset = Self.connectionLogSize(prefix: prefix)
 
         let steamExe = prefix.steamExePath.path(percentEncoded: false)
-        let args = [steamExe, "-silent", "-nofriendsui"]
-        log.info("[startPersistent] launching: wine64 \(args.joined(separator: " "))")
+        var args = [steamExe, "-silent", "-nofriendsui"]
+        args.append(contentsOf: extraArgs)
+        // Sanitize for log: never echo the password / guard code captured by
+        // `-login` to the log file. Only the flag and the masked positionals.
+        let logArgs = Self.sanitizedArgsForLogging(args)
+        log.info("[startPersistent] launching: wine64 \(logArgs.joined(separator: " "))")
 
         let process = Process()
         process.executableURL = engine.wine64URL
@@ -1091,6 +1102,19 @@ final class WineSteamManager {
 
     private static func fileSize(at path: String) -> Int {
         (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+    }
+
+    /// Returns a copy of the wine64 argument list with credential-bearing
+    /// positionals (`-login <user> <pass>`) replaced with placeholders so the
+    /// launch command can be written to `MeridianLog` without leaking the
+    /// user's password into log files / Console.app.
+    private static func sanitizedArgsForLogging(_ args: [String]) -> [String] {
+        guard let i = args.firstIndex(of: "-login") else { return args }
+        var sanitized = args
+        // -login <user> <pass> [<code>]
+        if sanitized.indices.contains(i + 2) { sanitized[i + 2] = "<password>" }
+        if sanitized.indices.contains(i + 3) { sanitized[i + 3] = "<guard>" }
+        return sanitized
     }
 
     /// Gracefully shuts down the persistent Steam process and **waits until the

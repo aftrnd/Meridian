@@ -261,6 +261,7 @@ final class AppSettings: @unchecked Sendable {
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
         steamCredentialRefreshToken = ""
+        steamSelfManagedSession = false
     }
 
     // MARK: - Steam Credential Cache
@@ -293,6 +294,19 @@ final class AppSettings: @unchecked Sendable {
 
     var hasSteamCredentials: Bool {
         !steamCredentialRefreshToken.isEmpty && !steamCredentialSteamID.isEmpty
+    }
+
+    /// Set to true once `SteamExeSignIn` (April 25 2026+) drives a successful
+    /// `steam.exe -login` round-trip. From that point on, Meridian must NEVER
+    /// rewrite `local.vdf` — Steam owns the file and our DPAPI-encrypted
+    /// JWT lacks the `machine_id` HMAC binding Valve's CM requires (Pattern 7
+    /// rejection cascade).
+    ///
+    /// Cleared on sign-out so the next sign-in starts clean. Persisted to
+    /// UserDefaults so Steam keeps owning its session across launches.
+    var steamSelfManagedSession: Bool {
+        get { UserDefaults.standard.bool(forKey: "steamSelfManagedSession") }
+        set { UserDefaults.standard.set(newValue, forKey: "steamSelfManagedSession") }
     }
 
     private init() {}
