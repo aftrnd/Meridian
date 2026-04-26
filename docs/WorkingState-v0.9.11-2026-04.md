@@ -81,15 +81,37 @@ Why this is the right architecture (vs the deleted JWT-injection path):
 - Future Valve protocol changes don't break us; Steam handles its own
   upgrades.
 
-### 2. Network plumbing: `nsiproxy` registered in `system.reg`
+### 2. Network plumbing: core Wine services registered via `wine64 reg add`
 
-`WinePrefix.ensureNsiproxyService()` (`Meridian/Engine/WinePrefix.swift`)
-injects the `nsiproxy` service registration directly into `system.reg`.
-Without it Steam's main process asserts `WebUITransportController` and
-crash-loops before reaching auth — see `engine-research-findings.mdc`
-"Pattern 7" for the original failure signature. With it, Wine's
-`iphlpapi.dll` enumerates loopback adapters, the webhelper handshake
-succeeds, and Steam reaches `[Logged On,`.
+`WinePrefix.ensureCoreServices(engine:)`
+(`Meridian/Engine/WinePrefix.swift`) registers `nsiproxy`, `RpcSs`,
+`EventLog`, and `PlugPlay` via `wine64 reg add
+HKLM\System\CurrentControlSet\Services\<svc>` on every fresh prefix.
+Without `nsiproxy`, Wine's `\\.\Nsi` device is never created,
+`iphlpapi::GetAdaptersAddresses` returns `ERROR_FILE_NOT_FOUND`, Steam's
+`CalcUnIPThisBox` (`net_misc.cpp:252`) asserts, and the
+`WebUITransportController` (`webuitransportcontroller.cpp:165`) websocket
+handshake fails — Steam's main process enters an assert/auto-restart loop
+that produces a macOS "wine64 unexpected error" dialog before reaching
+auth. See `engine-research-findings.mdc` "Pattern 7" for the full failure
+signature.
+
+The runtime self-heal exists because `Scripts/release-engine.sh`'s
+`wineboot --init` step is killed by its 180 s timeout
+(`rundll32 setupapi InstallHinfSection` runaway recursion in `ntdll.so`
+on macOS hosts), leaving the shipped prefix template with only 2
+services (`MountMgr`, `Tcpip\Parameters`) instead of the 12+ a
+Linux-host wineboot would register.
+
+`wine64 reg add` is required (instead of file-surgery on `system.reg`)
+because Wine's `[System\\CurrentControlSet]` is a registry symlink to
+`[System\\ControlSet001]`. Direct file writes under
+`CurrentControlSet\Services\<svc>` are dropped on the next `wineserver`
+save when the symlink is resolved. The legacy `ensureNsiproxyService`
+(file-surgery) approach was unreliable for exactly this reason.
+
+Guard tests in `MeridianTests/EnsureCoreServicesTests.swift` keep this
+invariant in place.
 
 ### 3. Session persistence: wait for `local.vdf` to actually flush
 

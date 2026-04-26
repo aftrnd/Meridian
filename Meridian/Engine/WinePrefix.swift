@@ -341,80 +341,142 @@ struct WinePrefix: Sendable {
         log.info("[resetToTemplate] prefix reset to new engine template ✓")
     }
 
-    /// Ensures the `nsiproxy` Wine service is registered in `system.reg`.
+    /// Ensures the four core Wine services Steam needs are registered:
+    /// `nsiproxy`, `RpcSs`, `EventLog`, `PlugPlay`.
     ///
-    /// **Why this matters:** `nsiproxy.sys` is Wine's Network Subsystem Interface
-    /// proxy driver — the kernel-side backend for `iphlpapi.dll`'s
-    /// `GetAdaptersAddresses` / `GetIfTable` and friends. Without it,
-    /// `\\.\Nsi` (the device the Win32 API talks to) is never created, so
-    /// every network-enumeration call inside the prefix returns
-    /// `ERROR_FILE_NOT_FOUND` (2).
+    /// **Why this matters (CLI-verified April 25 2026 on a truly fresh prefix):**
     ///
-    /// **Why we have to write it ourselves:** The CrossOver-Wine FOSS engine
-    /// we ship registers `nsiproxy` via `wine.inf` during `wineboot --init`,
-    /// but the prefix template built by `release-engine.sh` (using
-    /// `wineboot --init` against a Linux-host build) doesn't materialise the
-    /// service entry on this machine. The result: Steam launches, completes
-    /// `Connectivity test: result=Connected`, then **rejects every webhelper
-    /// WebSocket** because `CalcUnIPThisBox` (in `net_misc.cpp`) can't
-    /// recognise 127.0.0.1 as a local interface — auto-login machinery (which
-    /// runs inside the rejected webhelper) never starts. CLI-confirmed
-    /// April 25, 2026: appending the registration below to `system.reg`
-    /// flipped a fresh prefix from "0 adapters, ret=2" to "24 adapters, ret=0".
+    /// Without `nsiproxy`, Wine's `\\.\Nsi` device is never created and
+    /// `iphlpapi::GetAdaptersAddresses` returns `ERROR_FILE_NOT_FOUND` (2).
+    /// Steam's `CalcUnIPThisBox` (in `net_misc.cpp:252`) asserts on it,
+    /// then `WebUITransportController:165` asserts when the main↔webhelper
+    /// loopback websocket can't bind 127.0.0.1, and steam.exe enters an
+    /// assert/auto-restart loop that produces a macOS "wine64 unexpected
+    /// error" dialog. Without `RpcSs`, OLE class registration warns at
+    /// every Wine command (`err:ole:start_rpcss Failed to open RpcSs service`)
+    /// and some Steam IPC paths fail. `EventLog` and `PlugPlay` are
+    /// dependencies of the above and the rest of the Wine service stack.
     ///
-    /// Idempotent — fast-paths out when the entry is already present.
-    /// Writes directly to `system.reg` rather than via `wine reg add` because
-    /// invoking wine64 here would race the very wineserver we're trying to
-    /// fix and add ~5 seconds of bootstrap latency.
-    func ensureNsiproxyService() {
+    /// **Why we have to write these ourselves:** The prefix template that
+    /// `release-engine.sh` ships ships with **only 2 services in
+    /// `system.reg`** (`MountMgr`, `Tcpip\Parameters`) because the
+    /// `wineboot --init` step inside that script is killed by its 180 s
+    /// timeout — `rundll32 setupapi InstallHinfSection` against `wine.inf`
+    /// hits a runaway recursion in `ntdll.so` on macOS hosts (CLI-confirmed
+    /// April 25 2026 via `sample` showing 568 frames at the same address).
+    /// Re-running `wineboot --update` from the host is not a fix because the
+    /// same recursion stalls there too. We register the minimum set Steam
+    /// needs at runtime via short, well-formed `wine64 reg add` invocations
+    /// that complete in seconds.
+    ///
+    /// **Why `wine64 reg add` and NOT direct `system.reg` file surgery:**
+    /// Wine's `[System\\CurrentControlSet]` is a registry symlink to
+    /// `[System\\ControlSet001]`. Writing directly under
+    /// `[System\\CurrentControlSet\\Services\\<svc>]` to the .reg file
+    /// looks correct in source but on the next `wineserver` save the symlink
+    /// is resolved and the orphan section is dropped. CLI-verified April 25
+    /// 2026: file-surgery left zero new services in `system.reg` after the
+    /// first subsequent `wine64 reg add`. Using `wine64 reg add
+    /// HKLM\\System\\CurrentControlSet\\Services\\<svc>` lets wineserver
+    /// resolve the symlink correctly and persist the entry under
+    /// `[System\\ControlSet001\\Services\\<svc>]`.
+    ///
+    /// Idempotent — `wine64 reg add /f` overwrites without error if the
+    /// section exists. Total cost: ~3-5 wineserver round-trips per service,
+    /// ~10-15 s on a cold prefix, near-zero once wineserver is warm.
+    func ensureCoreServices(engine: WineEngine) async {
+        // Each tuple: (HKLM key path, [(value name, type, value as string)])
+        // Values match what `wine.inf` [<Svc>Service] sections install on a
+        // working CX Preview bottle. Order: nsiproxy first so that even if a
+        // later registration fails the network-enumeration assertion path is
+        // unblocked.
+        let services: [(name: String, key: String, vals: [(String, String, String)])] = [
+            (
+                "nsiproxy",
+                #"HKLM\System\CurrentControlSet\Services\nsiproxy"#,
+                [
+                    ("Description",  "REG_SZ",        "NSI proxy service"),
+                    ("DisplayName",  "REG_SZ",        "NSI Proxy"),
+                    ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\drivers\nsiproxy.sys"#),
+                    ("ObjectName",   "REG_SZ",        "LocalSystem"),
+                    ("Start",        "REG_DWORD",     "2"),       // SERVICE_AUTO_START
+                    ("Type",         "REG_DWORD",     "1"),       // SERVICE_KERNEL_DRIVER
+                    ("ErrorControl", "REG_DWORD",     "1"),       // SERVICE_ERROR_NORMAL
+                    ("Group",        "REG_SZ",        "System Bus Extender"),
+                ]
+            ),
+            (
+                "RpcSs",
+                #"HKLM\System\CurrentControlSet\Services\RpcSs"#,
+                [
+                    ("Description",  "REG_SZ",        "Provides the endpoint mapper and other miscellaneous RPC services."),
+                    ("DisplayName",  "REG_SZ",        "Remote Procedure Call (RPC)"),
+                    ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\rpcss.exe"#),
+                    ("ObjectName",   "REG_SZ",        #"NT AUTHORITY\NetworkService"#),
+                    ("Start",        "REG_DWORD",     "2"),       // SERVICE_AUTO_START
+                    ("Type",         "REG_DWORD",     "0x110"),   // SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS
+                    ("ErrorControl", "REG_DWORD",     "1"),
+                    ("Group",        "REG_SZ",        "COM Infrastructure"),
+                ]
+            ),
+            (
+                "EventLog",
+                #"HKLM\System\CurrentControlSet\Services\EventLog"#,
+                [
+                    ("Description",  "REG_SZ",        "Manages event logging."),
+                    ("DisplayName",  "REG_SZ",        "Event Log"),
+                    ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\svchost.exe -k LocalServiceNetworkRestricted"#),
+                    ("ObjectName",   "REG_SZ",        #"NT AUTHORITY\LocalService"#),
+                    ("Start",        "REG_DWORD",     "2"),
+                    ("Type",         "REG_DWORD",     "0x10"),    // SERVICE_WIN32_OWN_PROCESS
+                    ("ErrorControl", "REG_DWORD",     "1"),
+                ]
+            ),
+            (
+                "PlugPlay",
+                #"HKLM\System\CurrentControlSet\Services\PlugPlay"#,
+                [
+                    ("Description",  "REG_SZ",        "Enables a computer to recognize and adapt to hardware changes."),
+                    ("DisplayName",  "REG_SZ",        "Plug and Play"),
+                    ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\plugplay.exe"#),
+                    ("ObjectName",   "REG_SZ",        "LocalSystem"),
+                    ("Start",        "REG_DWORD",     "2"),
+                    ("Type",         "REG_DWORD",     "0x110"),
+                    ("ErrorControl", "REG_DWORD",     "0"),       // SERVICE_ERROR_IGNORE
+                    ("Group",        "REG_SZ",        "PlugPlay"),
+                ]
+            ),
+        ]
+
+        // Cheap fast-path: if all four services are already present in
+        // system.reg under ControlSet001 (where wineserver actually stores
+        // them after symlink resolution), skip the work entirely.
         let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
-        guard let current = try? String(contentsOfFile: regPath, encoding: .utf8) else {
-            log.warning("[ensureNsiproxy] system.reg unreadable at \(regPath) — skipping")
-            return
-        }
-        // The exact key marker (must be the section header line). Single backslash
-        // pairs in source → escaped backslashes inside the .reg text.
-        let marker = #"[System\\CurrentControlSet\\Services\\nsiproxy]"#
-        if current.contains(marker) {
-            log.debug("[ensureNsiproxy] already registered — skipping")
-            return
-        }
-
-        // Reg-format service entry copied byte-for-byte from a CX Preview bottle
-        // where Steam auto-login is known to work. Values match Wine's wine.inf
-        // [NsiProxyService] section. The trailing blank line is required —
-        // Wine's .reg parser uses blank lines as section terminators.
-        let nsiproxyEntry = """
-
-        [System\\\\CurrentControlSet\\\\Services\\\\nsiproxy] 1774236148
-        #time=1dcba7446e99492
-        "Description"="NSI proxy service"
-        "DisplayName"="NSI Proxy"
-        "ErrorControl"=dword:00000001
-        "Group"="System Bus Extender"
-        "ImagePath"=str(2):"C:\\\\windows\\\\system32\\\\drivers\\\\nsiproxy.sys"
-        "ObjectName"="LocalSystem"
-        "PreshutdownTimeout"=dword:0002bf20
-        "Start"=dword:00000002
-        "Tag"=dword:00000001
-        "Type"=dword:00000001
-
-
-        """
-
-        do {
-            // Append to the file — system.reg sections can appear in any order;
-            // Wine merges by key path on read.
-            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: regPath))
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            if let data = nsiproxyEntry.data(using: .utf8) {
-                try handle.write(contentsOf: data)
+        if let current = try? String(contentsOfFile: regPath, encoding: .utf8) {
+            let allPresent = services.allSatisfy { svc in
+                current.contains(#"[System\\ControlSet001\\Services\\"# + svc.name + "]")
             }
-            log.info("[ensureNsiproxy] registered nsiproxy service in system.reg ✓ (Wine network enumeration enabled)")
-        } catch {
-            log.error("[ensureNsiproxy] write failed: \(error.localizedDescription)")
+            if allPresent {
+                log.debug("[ensureCoreServices] all 4 services already present — skipping")
+                return
+            }
         }
+
+        log.info("[ensureCoreServices] registering core Wine services (nsiproxy, RpcSs, EventLog, PlugPlay)")
+        for svc in services {
+            for (valname, valtype, val) in svc.vals {
+                let args = ["reg", "add", svc.key, "/v", valname, "/t", valtype, "/d", val, "/f"]
+                do {
+                    let process = try await engine.run(args: args, prefix: self)
+                    if process.terminationStatus != 0 {
+                        log.warning("[ensureCoreServices] reg add \(svc.name).\(valname) failed exit=\(process.terminationStatus)")
+                    }
+                } catch {
+                    log.warning("[ensureCoreServices] reg add \(svc.name).\(valname) threw: \(error.localizedDescription)")
+                }
+            }
+        }
+        log.info("[ensureCoreServices] core service registration complete ✓ (nsiproxy + RpcSs + EventLog + PlugPlay)")
     }
 
     /// Refreshes system DLL symlinks in an existing prefix after a Wine engine upgrade.

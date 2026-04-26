@@ -297,6 +297,29 @@ info "Running wineboot --init (this may take 1-3 minutes)..."
 # Run wineboot --init in background with a 180s timeout.
 # lib64 is included in DYLD here (build-time only) so wineserver can find MoltenVK/GStreamer.
 # lib64 included in DYLD — same as app runtime. Needed for GnuTLS (secur32.so TLS).
+#
+# KNOWN LIMITATION (CLI-confirmed April 25 2026): on macOS hosts,
+# `rundll32 setupapi InstallHinfSection DefaultInstall 128 wine.inf` (the
+# step that registers Wine services from wine.inf) hits a runaway recursion
+# in ntdll.so and never returns within 180s. `sample` showed 568 frames
+# stacked at the same address. The 180 s timeout below kills it; the
+# resulting `system.reg` ships with only 2 services (MountMgr,
+# Tcpip\Parameters) instead of the 12+ a Linux-host wineboot would
+# register — RpcSs, EventLog, PlugPlay, nsiproxy etc. are all absent.
+#
+# WHY THE TARBALL IS STILL SAFE: the runtime self-heal
+# `WinePrefix.ensureCoreServices(engine:)` (called from BootstrapManager
+# before Steam install) registers nsiproxy + RpcSs + EventLog + PlugPlay
+# via `wine64 reg add` on every fresh prefix. That is the only set Steam
+# actually depends on for Pattern-7-free startup. Do NOT add an
+# app-level fallback that registers more services without first
+# confirming a real-world need — `wine.inf`'s full set is documented
+# in engine-research-findings.mdc.
+#
+# Future option: replace this block with a Linux Docker stage that
+# runs wineboot natively, exports `system.reg`, and copies it into the
+# tarball — eliminates the recursion entirely and yields a fully
+# pre-initialised prefix. Tracked but not blocking.
 WINEPREFIX="${PREFIX_TEMPLATE}" \
 DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix:${STAGING}/wine/lib64" \
 WINEDLLPATH="${STAGING}/wine/lib/wine" \

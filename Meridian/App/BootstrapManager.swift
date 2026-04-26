@@ -333,14 +333,23 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
-        // 2c. Ensure Wine's nsiproxy service is registered. Without it,
-        //     `\\.\Nsi` is never created, `iphlpapi::GetAdaptersAddresses`
-        //     returns ERROR_FILE_NOT_FOUND, and Steam's `CalcUnIPThisBox`
-        //     can't recognise 127.0.0.1 as local — every webhelper WebSocket
-        //     gets rejected and auto-login never starts. Our prefix template
-        //     ships without the service registration (release-engine.sh
-        //     limitation); this self-heals at runtime. Idempotent + cheap.
-        prefix.ensureNsiproxyService()
+        // 2c. Ensure Wine's core services are registered: nsiproxy, RpcSs,
+        //     EventLog, PlugPlay. Without nsiproxy, `\\.\Nsi` is never
+        //     created → `iphlpapi::GetAdaptersAddresses` returns
+        //     ERROR_FILE_NOT_FOUND → Steam's `CalcUnIPThisBox` asserts and
+        //     the main↔webhelper websocket fails → steam.exe enters an
+        //     assert/auto-restart loop showing the macOS "wine64 unexpected
+        //     error" dialog. Without RpcSs, OLE class registration fails
+        //     and some Steam IPC paths break. Our prefix template ships
+        //     without these services because `release-engine.sh`'s
+        //     `wineboot --init` step is killed by its 180 s timeout
+        //     (rundll32 setupapi InstallHinfSection runaway recursion on
+        //     macOS hosts, CLI-confirmed April 25 2026). This self-heals
+        //     at runtime via `wine64 reg add`, which correctly resolves
+        //     the `CurrentControlSet` registry symlink (file-surgery on
+        //     `system.reg` would be discarded on the next wineserver
+        //     save). Idempotent — fast-paths when all 4 already present.
+        await prefix.ensureCoreServices(engine: engine)
 
         // 3. Install Steam if needed
         if !prefix.isSteamInstalled {
