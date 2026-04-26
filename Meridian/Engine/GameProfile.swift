@@ -6,6 +6,7 @@ enum GameEngine: String {
     case unity
     case unreal
     case godot
+    case source
     case custom
     case unknown
 }
@@ -13,6 +14,7 @@ enum GameEngine: String {
 /// What DirectX/Vulkan API the game renders with.
 /// Drives DXMT vs DXVK selection at launch.
 enum GraphicsAPI: String {
+    case dx9       // DirectX 9 → DXVK (d3d9) or DXMT where supported → Metal
     case dx11      // DirectX 11 → DXMT → Metal
     case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
@@ -70,6 +72,11 @@ struct GameProfile {
     /// Steam IPC socket. Verified by running the game directly without steam.exe.
     let skipSteamDRM: Bool
 
+    /// When true, launch via Steam's own `-applaunch` IPC instead of invoking the
+    /// game executable directly. Source games rely on Steam to supply the right
+    /// app context and `-game` arguments.
+    let launchViaSteam: Bool
+
     /// Engine tag when this profile was last verified (e.g. "v1.0.11-engine").
     let verifiedWith: String?
 
@@ -87,6 +94,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
         verifiedWith: String? = nil,
         notes: String = ""
     ) {
@@ -100,6 +108,7 @@ struct GameProfile {
         self.extraEnv = extraEnv
         self.launchArgs = launchArgs
         self.skipSteamDRM = skipSteamDRM
+        self.launchViaSteam = launchViaSteam
         self.verifiedWith = verifiedWith
         self.notes = notes
     }
@@ -111,6 +120,7 @@ struct GameProfile {
         case .unity:   return "Unity"
         case .unreal:  return "Unreal Engine"
         case .godot:   return "Godot"
+        case .source:  return "Source"
         case .custom:  return "Custom Engine"
         case .unknown: return "Unknown"
         }
@@ -118,6 +128,7 @@ struct GameProfile {
 
     var graphicsAPIDisplayName: String {
         switch graphicsAPI {
+        case .dx9:     return "DirectX 9"
         case .dx11:    return "DirectX 11"
         case .dx12:    return "DirectX 12"
         case .vulkan:  return "Vulkan"
@@ -127,6 +138,7 @@ struct GameProfile {
 
     var translationLayerDescription: String {
         switch graphicsAPI {
+        case .dx9:     return "DXVK → MoltenVK → Metal"
         case .dx11:    return "DXMT → Metal"
         case .dx12:    return "GPTK → D3DMetal → Metal"
         case .vulkan:  return "MoltenVK"
@@ -148,6 +160,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -158,6 +171,7 @@ struct GameProfile {
             dxmtMode: dxmtMode,
             extraEnv: extraEnv, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
         )
     }
@@ -172,6 +186,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -182,6 +197,33 @@ struct GameProfile {
             dxmtMode: dxmtMode,
             extraEnv: extraEnv, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
+            verifiedWith: verifiedWith, notes: notes
+        )
+    }
+
+    static func source(
+        appID: Int,
+        name: String,
+        status: CompatStatus = .untested,
+        graphicsAPI: GraphicsAPI = .unknown,
+        dxmtMode: DXMTMode = .auto,
+        dllOverrides: String? = nil,
+        extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
+        verifiedWith: String? = nil,
+        notes: String
+    ) -> GameProfile {
+        GameProfile(
+            appID: appID, name: name,
+            gameEngine: .source, graphicsAPI: graphicsAPI, status: status,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
+            extraEnv: extraEnv, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
         )
     }
@@ -196,6 +238,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
         verifiedWith: String? = nil,
         notes: String
     ) -> GameProfile {
@@ -206,6 +249,7 @@ struct GameProfile {
             dxmtMode: dxmtMode,
             extraEnv: extraEnv, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
         )
     }

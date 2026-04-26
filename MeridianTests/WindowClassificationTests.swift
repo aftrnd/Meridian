@@ -196,13 +196,16 @@ final class WindowClassificationTests: XCTestCase {
         XCTAssertFalse(src.contains("silenceSteamChime"))
     }
 
-    func testBootstrapKillsWebhelperAfterReady() throws {
+    func testBootstrapDoesNotKillWebhelperAfterReady() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let url = root.appendingPathComponent("Meridian/App/BootstrapManager.swift")
         let src = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(src.contains("steamManager.startHeadlessWebhelperKillBurst(reason: \"bootstrap ready\", duration: .seconds(12))"))
+        XCTAssertFalse(
+            src.contains("startHeadlessWebhelperKillBurst(reason: \"bootstrap ready\""),
+            "Do not kill steamwebhelper after bootstrap: Steam's game-launch IPC can be clicked immediately after readiness and needs webhelper for LaunchApp interstitial/CreatingProcess flow."
+        )
     }
 
     func testWineSteamManagerExposesHeadlessWebhelperKillBurst() throws {

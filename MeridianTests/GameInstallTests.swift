@@ -17,11 +17,13 @@ import Foundation
 ///   CORRESPONDING MIRROR HERE.
 ///
 /// Mirrored functions (must stay in sync with production code):
-///   • vdfKeyValue(from:)           ← WinePrefix.vdfKeyValue(from:)
-///   • isGameInstalled(...)         ← WinePrefix.isGameInstalled()
-///   • isGameFullyInstalled(...)    ← WinePrefix.isGameFullyInstalled()
-///   • gameDownloadProgress(...)    ← WinePrefix.gameDownloadProgress()
-///   • gameInstallDir(...)          ← WinePrefix.gameInstallDir()
+///   • vdfKeyValue(from:)                          ← WinePrefix.vdfKeyValue(from:)
+///   • isGameInstalled(...)                        ← WinePrefix.isGameInstalled()
+///   • isGameFullyInstalled(...)                   ← WinePrefix.isGameFullyInstalled()
+///   • gameDownloadProgress(...)                   ← WinePrefix.gameDownloadProgress()
+///   • gameInstallDir(...)                         ← WinePrefix.gameInstallDir()
+///   • flipFullyInstalledToUpdateRequired(in:)     ← WinePrefix.flipFullyInstalledToUpdateRequired(in:)
+///   • markInstalledGamesForUpdate(in:)            ← WinePrefix.markInstalledGamesForUpdate()
 ///   • parseSteamCMDProgress(...)   ← GameLauncher.parseSteamCMDProgress(line:)
 ///   • formatBytes(...)             ← GameLauncher.formatBytes(_:)
 ///   • installActivityMessage(...)  ← GameLauncher.installActivityMessage(...)
@@ -32,6 +34,7 @@ import Foundation
 ///   • TestCompatStatus             ← CompatStatus enum
 ///   • TestDXMTMode                 ← GameProfile.DXMTMode enum
 ///   • unityFactory(...)            ← GameProfile.unity(...) factory defaults
+///   • sourceFactory(...)           ← GameProfile.source(...) factory defaults
 ///   • customFactory(...)           ← GameProfile.custom(...) factory defaults
 ///   • dxmtDisabledOverride(...)    ← WineSteamManager dxmtMode .disabled logic
 /// ─────────────────────────────────────────────────────────────────────────────
@@ -587,8 +590,8 @@ final class GameInstallTests: XCTestCase {
     // MARK: - GameCompatibilityDB profile tests
 
     /// Mirror enums from GameProfile.swift
-    private enum TestGameEngine: String { case unity, unreal, godot, custom, unknown }
-    private enum TestGraphicsAPI: String { case dx11, dx12, vulkan, unknown }
+    private enum TestGameEngine: String { case unity, unreal, godot, source, custom, unknown }
+    private enum TestGraphicsAPI: String { case dx9, dx11, dx12, vulkan, unknown }
     private enum TestCompatStatus: String { case verified, playable, launches, broken, untested }
     private enum TestDXMTMode { case auto, required, disabled }
 
@@ -603,28 +606,34 @@ final class GameInstallTests: XCTestCase {
         let dllOverrides: String?
         let dxmtMode: TestDXMTMode
         let extraEnv: [String: String]
+        let launchViaSteam: Bool
     }
 
     private let testProfiles: [Int: TestGameProfile] = [
         3180070: TestGameProfile(
             appID: 3180070, name: "No, I'm not a Human",
             gameEngine: .unity, graphicsAPI: .dx11, status: .verified,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
         ),
         813230: TestGameProfile(
             appID: 813230, name: "ANIMAL WELL",
             gameEngine: .custom, graphicsAPI: .dx12, status: .verified,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
         ),
         3527290: TestGameProfile(
             appID: 3527290, name: "PEAK",
             gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
         ),
         4069520: TestGameProfile(
             appID: 4069520, name: "Super Battle Golf",
             gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+        ),
+        220: TestGameProfile(
+            appID: 220, name: "Half-Life 2",
+            gameEngine: .source, graphicsAPI: .dx9, status: .verified,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
         ),
     ]
 
@@ -678,6 +687,31 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(testProfiles[813230]?.gameEngine, .custom)
     }
 
+    func testHalfLife2UsesDirectExecProfile() throws {
+        let profile = testProfiles[220]
+        XCTAssertEqual(profile?.gameEngine, .source)
+        XCTAssertFalse(profile?.launchViaSteam ?? true,
+                       "HL2 must use direct-exec (launchViaSteam=false) to avoid the Wine 11.4 loader page-fault under steam.exe -applaunch")
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceProfiles = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Engine/GameCompatibilityDB+Source.swift"),
+            encoding: .utf8
+        )
+        let gameProfile = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Engine/GameProfile.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(sourceProfiles.contains("appID: 220"), "HL2 profile must be in +Source.swift")
+        XCTAssertTrue(sourceProfiles.contains("hl2_complete"), "HL2 profile must target hl2_complete content folder")
+        // The .source() factory must NOT default to launchViaSteam: true — guard against regression
+        XCTAssertFalse(gameProfile.contains("launchViaSteam: Bool = true"),
+                       ".source() factory must default launchViaSteam: false (same as all other factories)")
+    }
+
     // MARK: - Factory method default tests
 
     /// Mirror of GameProfile.unity() factory defaults
@@ -690,7 +724,21 @@ final class GameInstallTests: XCTestCase {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:], launchViaSteam: false
+        )
+    }
+
+    /// Mirror of GameProfile.source() factory defaults
+    private func sourceFactory(
+        appID: Int = 1,
+        name: String = "Test",
+        graphicsAPI: TestGraphicsAPI = .unknown,
+        launchViaSteam: Bool = false
+    ) -> TestGameProfile {
+        TestGameProfile(
+            appID: appID, name: name,
+            gameEngine: .source, graphicsAPI: graphicsAPI, status: .untested,
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: launchViaSteam
         )
     }
 
@@ -703,7 +751,7 @@ final class GameInstallTests: XCTestCase {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:]
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
         )
     }
 
@@ -724,6 +772,15 @@ final class GameInstallTests: XCTestCase {
         let p = customFactory()
         XCTAssertEqual(p.gameEngine, .custom)
         XCTAssertEqual(p.graphicsAPI, .unknown)
+        XCTAssertFalse(p.launchViaSteam)
+    }
+
+    func testSourceFactoryDefaultsToDirectExec() {
+        let p = sourceFactory()
+        XCTAssertEqual(p.gameEngine, .source)
+        XCTAssertEqual(p.graphicsAPI, .unknown)
+        XCTAssertFalse(p.launchViaSteam,
+                       ".source() factory must default launchViaSteam: false — same as .unity() and .custom()")
     }
 
     func testCustomFactoryAllowsOverride() {
@@ -791,5 +848,180 @@ final class GameInstallTests: XCTestCase {
     func testDxmtDisabledSetsWhenExistingEmpty() {
         let result = dxmtDisabledOverride(existing: "")
         XCTAssertEqual(result, "d3d11,dxgi=b")
+    }
+
+    // MARK: - markInstalledGamesForUpdate tests
+
+    /// Mirror of WinePrefix.flipFullyInstalledToUpdateRequired(in:)
+    private static func flipFullyInstalledToUpdateRequired(in acfContents: String) -> String? {
+        let lines = acfContents.components(separatedBy: "\n")
+        var changed = false
+        var output: [String] = []
+        output.reserveCapacity(lines.count)
+        for line in lines {
+            if !changed,
+               let kv = vdfKeyValueStatic(from: line),
+               kv.key == "StateFlags",
+               kv.value == "4"
+            {
+                output.append(line.replacingOccurrences(of: "\"4\"", with: "\"1026\""))
+                changed = true
+            } else {
+                output.append(line)
+            }
+        }
+        return changed ? output.joined(separator: "\n") : nil
+    }
+
+    /// Static mirror of vdfKeyValue so the static `flip…` helper above can use it.
+    private static func vdfKeyValueStatic(from line: String) -> (key: String, value: String)? {
+        var s = line.trimmingCharacters(in: .whitespaces)
+        guard s.hasPrefix("\"") else { return nil }
+        s = String(s.dropFirst())
+        guard let keyEnd = s.firstIndex(of: "\"") else { return nil }
+        let key = String(s[s.startIndex..<keyEnd])
+        s = String(s[s.index(after: keyEnd)...]).trimmingCharacters(in: .whitespaces)
+        guard s.hasPrefix("\"") else { return nil }
+        s = String(s.dropFirst())
+        guard let valueEnd = s.firstIndex(of: "\"") else { return nil }
+        let value = String(s[s.startIndex..<valueEnd])
+        return (key, value)
+    }
+
+    /// Mirror of WinePrefix.markInstalledGamesForUpdate() restricted to the
+    /// single steamapps directory used by the tests (no multi-library walk).
+    @discardableResult
+    private func markInstalledGamesForUpdate(in steamappsDir: URL) -> Int {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: steamappsDir.path(percentEncoded: false)) else {
+            return 0
+        }
+        var marked = 0
+        for name in entries where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
+            let acfURL = steamappsDir.appending(path: name)
+            guard let contents = try? String(contentsOfFile: acfURL.path(percentEncoded: false), encoding: .utf8),
+                  let updated = Self.flipFullyInstalledToUpdateRequired(in: contents)
+            else { continue }
+            if (try? updated.write(to: acfURL, atomically: true, encoding: .utf8)) != nil {
+                marked += 1
+            }
+        }
+        return marked
+    }
+
+    func testFlipFullyInstalledFlipsExactlyTheStateFlagsLine() {
+        let acf = """
+        "AppState"
+        {
+        \t"appid"\t\t"220"
+        \t"StateFlags"\t\t"4"
+        \t"installdir"\t\t"Half-Life 2"
+        \t"buildid"\t\t"19307283"
+        }
+        """
+        let result = Self.flipFullyInstalledToUpdateRequired(in: acf)
+        XCTAssertNotNil(result)
+        // StateFlags must flip 4 → 1026
+        XCTAssertTrue(result!.contains("\"StateFlags\"\t\t\"1026\""))
+        // Other keys must be preserved verbatim
+        XCTAssertTrue(result!.contains("\"appid\"\t\t\"220\""))
+        XCTAssertTrue(result!.contains("\"installdir\"\t\t\"Half-Life 2\""))
+        XCTAssertTrue(result!.contains("\"buildid\"\t\t\"19307283\""))
+    }
+
+    func testFlipFullyInstalledReturnsNilForQueuedManifest() {
+        let acf = """
+        "AppState"
+        {
+        \t"StateFlags"\t\t"1026"
+        \t"BytesDownloaded"\t\t"100"
+        }
+        """
+        XCTAssertNil(Self.flipFullyInstalledToUpdateRequired(in: acf),
+                     "Manifest already at StateFlags=1026 must not be rewritten.")
+    }
+
+    func testFlipFullyInstalledReturnsNilWhenNoStateFlagsLine() {
+        let acf = """
+        "AppState"
+        {
+        \t"appid"\t\t"220"
+        }
+        """
+        XCTAssertNil(Self.flipFullyInstalledToUpdateRequired(in: acf))
+    }
+
+    func testFlipFullyInstalledIgnoresUnrelatedFlagValues() {
+        for flags in ["0", "1", "2", "16", "1024", "1026", "4096"] {
+            let acf = "\"AppState\"\n{\n\t\"StateFlags\"\t\t\"\(flags)\"\n}\n"
+            XCTAssertNil(Self.flipFullyInstalledToUpdateRequired(in: acf),
+                         "StateFlags=\(flags) must not be flipped — only \"4\" is the legal source state.")
+        }
+    }
+
+    func testMarkInstalledGamesForUpdateFlipsFullyInstalledOnly() throws {
+        try writeACF(appID: 220, stateFlags: "4")
+        try writeACF(appID: 813230, stateFlags: "4")
+        try writeACF(appID: 3527290, stateFlags: "1026", bytesDownloaded: 100, bytesToDownload: 1000)
+
+        let count = markInstalledGamesForUpdate(in: steamappsDir)
+        XCTAssertEqual(count, 2, "Only the two StateFlags=4 manifests should be rewritten.")
+
+        // The two installed ACFs flipped to 1026
+        XCTAssertFalse(isGameFullyInstalled(appID: 220, steamInstallDir: tempDir))
+        XCTAssertFalse(isGameFullyInstalled(appID: 813230, steamInstallDir: tempDir))
+
+        // The mid-download ACF stays at 1026 (no double-flip, no regression)
+        let p = try XCTUnwrap(gameDownloadProgress(appID: 3527290, steamInstallDir: tempDir))
+        XCTAssertEqual(p.stateFlags, "1026")
+    }
+
+    func testMarkInstalledGamesForUpdatePreservesOtherFields() throws {
+        try writeACF(appID: 220, name: "Half-Life 2", installDir: "Half-Life 2", stateFlags: "4")
+        _ = markInstalledGamesForUpdate(in: steamappsDir)
+
+        // Name + installDir are preserved across the rewrite — only StateFlags changes.
+        XCTAssertEqual(gameInstallDir(appID: 220, steamInstallDir: tempDir), "Half-Life 2")
+        let acfContents = try String(
+            contentsOfFile: steamappsDir.appending(path: "appmanifest_220.acf").path(percentEncoded: false),
+            encoding: .utf8
+        )
+        XCTAssertTrue(acfContents.contains("\"name\"\t\t\"Half-Life 2\""))
+        XCTAssertTrue(acfContents.contains("\"StateFlags\"\t\t\"1026\""))
+    }
+
+    func testMarkInstalledGamesForUpdateReturnsZeroOnEmptySteamapps() {
+        let count = markInstalledGamesForUpdate(in: steamappsDir)
+        XCTAssertEqual(count, 0)
+    }
+
+    /// Guard test: the bootstrap pipeline MUST call
+    /// `markInstalledGamesForUpdate()` before `startPersistent` so Steam's
+    /// single startup ACF scan picks up the marks. Without this, every
+    /// installed game stays pinned to whatever build was current when the
+    /// user first installed it (CLI-confirmed April 26 2026 with Half-Life 2:
+    /// `appmanifest_220.acf` had `StateFlags=4` + `buildid=19307283` and never
+    /// updated despite Steam being online).
+    func testBootstrapManagerMarksInstalledGamesForUpdate() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/App/BootstrapManager.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains("prefix.markInstalledGamesForUpdate()"),
+                      "BootstrapManager must call markInstalledGamesForUpdate() so Steam's startup scan validates installed games against current PICS manifests.")
+        // Must run BEFORE startPersistent (Steam scans manifests exactly once
+        // per startup). Asserting source order via substring positions.
+        if let markRange = src.range(of: "prefix.markInstalledGamesForUpdate()"),
+           let startRange = src.range(of: "steamManager.startPersistent")
+        {
+            XCTAssertLessThan(markRange.lowerBound, startRange.lowerBound,
+                              "markInstalledGamesForUpdate() must be called before startPersistent so Steam picks up the marks.")
+        } else {
+            XCTFail("Could not locate both markInstalledGamesForUpdate and startPersistent in BootstrapManager source.")
+        }
     }
 }

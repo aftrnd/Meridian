@@ -1215,7 +1215,7 @@ struct WinePrefix: Sendable {
         }
 
         for line in contents.components(separatedBy: .newlines) {
-            guard let (key, value) = vdfKeyValue(from: line), !value.isEmpty else { continue }
+            guard let (key, value) = Self.vdfKeyValue(from: line), !value.isEmpty else { continue }
 
             // Accept both: "path" "<winpath>" (new nested format) and "1" "<winpath>" (legacy)
             // Legacy format: "1" "C:\\some\\path" — numeric key, value is a Windows/Unix path
@@ -1325,6 +1325,99 @@ struct WinePrefix: Sendable {
         log.info("[writePreseededAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" → \(dest.path(percentEncoded: false))")
     }
 
+    /// Flips every `appmanifest_*.acf` whose `StateFlags == "4"` (fully installed)
+    /// to `StateFlags == "1026"` (UpdateRequired | Validating) across ALL Steam
+    /// library folders. Returns the number of manifests rewritten.
+    ///
+    /// ## Why
+    ///
+    /// Steam scans `steamapps/appmanifest_*.acf` exactly ONCE per launch (during
+    /// the login post-callback sequence). For every manifest it finds with
+    /// `StateFlags = 1026`, Steam queries Valve's PICS for the current depot
+    /// manifest, compares against `InstalledDepots`, and silently downloads any
+    /// delta — same code path as Steam's "Verify integrity of game files" but
+    /// without the user-visible UI. When the install is already current, the
+    /// PICS round-trip completes within 1-2 seconds and `StateFlags` flips back
+    /// to `4` with no download. When out of date, the existing install/progress
+    /// loop in `GameLauncher` catches the `1026` state and surfaces the update
+    /// download.
+    ///
+    /// CLI-verified April 23 2026 (`writePreseededAppManifest` doc): writing
+    /// `StateFlags=1026` + restarting `steam.exe -silent` triggers the silent
+    /// download path. Same mechanism applied to existing manifests gives us a
+    /// no-UI, in-bottle update guarantee.
+    ///
+    /// ## Cost
+    ///
+    /// One file rewrite per installed game. The actual update check happens
+    /// inside Steam after `startPersistent` — no Wine processes spawned by
+    /// this function. Call BEFORE starting the persistent `steam.exe -silent`
+    /// host so Steam scans the modified manifests on its single startup pass.
+    ///
+    /// ## Idempotency
+    ///
+    /// Manifests already at `StateFlags=1026` (mid-download / queued) are left
+    /// untouched. Manifests with any other `StateFlags` value are also untouched
+    /// — we only flip `4 → 1026`, the well-defined "installed → please re-validate"
+    /// transition.
+    @discardableResult
+    func markInstalledGamesForUpdate() -> Int {
+        let fm = FileManager.default
+        var marked = 0
+        for library in steamLibraryFolders {
+            let steamappsDir = library.appending(path: "steamapps")
+            guard let entries = try? fm.contentsOfDirectory(atPath: steamappsDir.path(percentEncoded: false)) else {
+                continue
+            }
+            for name in entries where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
+                let acfURL = steamappsDir.appending(path: name)
+                guard let contents = try? String(contentsOfFile: acfURL.path(percentEncoded: false), encoding: .utf8) else {
+                    continue
+                }
+                guard let updated = Self.flipFullyInstalledToUpdateRequired(in: contents) else {
+                    continue
+                }
+                do {
+                    try updated.write(to: acfURL, atomically: true, encoding: .utf8)
+                    marked += 1
+                    log.info("[markInstalledGamesForUpdate] flipped StateFlags 4 → 1026 for \(name)")
+                } catch {
+                    log.warning("[markInstalledGamesForUpdate] failed to write \(name): \(error.localizedDescription)")
+                }
+            }
+        }
+        if marked > 0 {
+            log.info("[markInstalledGamesForUpdate] marked \(marked) game(s) for Steam update check")
+        } else {
+            log.debug("[markInstalledGamesForUpdate] no fully-installed manifests to mark")
+        }
+        return marked
+    }
+
+    /// Returns a copy of `acfContents` with the first `StateFlags="4"` line
+    /// rewritten to `StateFlags="1026"`, or `nil` if no such line exists.
+    /// Pure string transformation — extracted as a static helper so the test
+    /// mirror in `GameInstallTests.swift` can stay byte-for-byte equivalent.
+    static func flipFullyInstalledToUpdateRequired(in acfContents: String) -> String? {
+        let lines = acfContents.components(separatedBy: "\n")
+        var changed = false
+        var output: [String] = []
+        output.reserveCapacity(lines.count)
+        for line in lines {
+            if !changed,
+               let kv = Self.vdfKeyValue(from: line),
+               kv.key == "StateFlags",
+               kv.value == "4"
+            {
+                output.append(line.replacingOccurrences(of: "\"4\"", with: "\"1026\""))
+                changed = true
+            } else {
+                output.append(line)
+            }
+        }
+        return changed ? output.joined(separator: "\n") : nil
+    }
+
     /// Returns the URL to the appmanifest ACF file for `appID`, searching every
     /// Steam library folder. Returns `nil` if the game is not installed anywhere.
     func acfURL(for appID: Int) -> URL? {
@@ -1361,7 +1454,7 @@ struct WinePrefix: Sendable {
               let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
         else { return false }
         for line in contents.components(separatedBy: "\n") {
-            guard let (key, value) = vdfKeyValue(from: line), key == "StateFlags" else { continue }
+            guard let (key, value) = Self.vdfKeyValue(from: line), key == "StateFlags" else { continue }
             let fullyInstalled = value == "4"
             log.debug("[isGameFullyInstalled] appID=\(appID) StateFlags=\(value) → \(fullyInstalled)")
             return fullyInstalled
@@ -1492,7 +1585,7 @@ struct WinePrefix: Sendable {
         var stateFlagsStr = ""
 
         for line in contents.components(separatedBy: "\n") {
-            guard let (key, value) = vdfKeyValue(from: line) else { continue }
+            guard let (key, value) = Self.vdfKeyValue(from: line) else { continue }
             switch key {
             case "BytesDownloaded": bytesDownloaded = Int64(value) ?? 0
             case "BytesToDownload": bytesToDownload = Int64(value) ?? 0
@@ -1573,7 +1666,7 @@ struct WinePrefix: Sendable {
         }
 
         for line in contents.components(separatedBy: "\n") {
-            guard let (key, value) = vdfKeyValue(from: line), key == "installdir", !value.isEmpty else { continue }
+            guard let (key, value) = Self.vdfKeyValue(from: line), key == "installdir", !value.isEmpty else { continue }
             log.info("[gameInstallDir] appID=\(appID) → \"\(value)\"")
             return value
         }
@@ -1680,7 +1773,7 @@ struct WinePrefix: Sendable {
     /// Increment when the set of HKLM Steam or WoW64 crypto registry keys changes.
     /// steam.exe writes these on first run; the native bootstrap bypasses steam.exe,
     /// so we must write them explicitly before steamcmd.exe (32-bit WoW64) starts.
-    static let steamInstallPathRegistrationVersion = 2
+    static let steamInstallPathRegistrationVersion = 3
 
     // MARK: - Windows Version Registration
 
@@ -1908,7 +2001,10 @@ struct WinePrefix: Sendable {
     // MARK: - VDF / Path Helpers
 
     /// Parses a single VDF line of the form `"key"\t"value"` and returns the pair.
-    private func vdfKeyValue(from line: String) -> (key: String, value: String)? {
+    ///
+    /// Static so static helpers (e.g. `flipFullyInstalledToUpdateRequired`) can
+    /// share the same parser as instance ACF methods. Pure logic — no `self`.
+    static func vdfKeyValue(from line: String) -> (key: String, value: String)? {
         var s = line.trimmingCharacters(in: .whitespaces)
         guard s.hasPrefix("\"") else { return nil }
         s = String(s.dropFirst())

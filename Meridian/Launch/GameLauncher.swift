@@ -529,8 +529,9 @@ final class GameLauncher {
         // is already running (started by BootstrapManager or the sign-in sheet),
         // so the IPC socket exists. We just write `steam_appid.txt` so the DLL
         // can look up its own appID without a round trip through the client.
+        let profile = GameCompatibilityDB.shared.profile(for: game.id)
         let needsSteamForDRM = prefix.gameRequiresSteamAPI(appID: game.id)
-            && !(GameCompatibilityDB.shared.profile(for: game.id)?.skipSteamDRM ?? false)
+            && !(profile?.skipSteamDRM ?? false)
         if needsSteamForDRM {
             log.info("[launch] Steam DRM detected — writing steam_appid.txt and verifying Steam is ready")
             prefix.writeSteamAppID(game.id)
@@ -567,14 +568,28 @@ final class GameLauncher {
         transition(to: .launching, activity: "Launching \(game.name)…")
         appendLog("Launching \(game.name)…")
 
-        let launchResult: WineSteamManager.GameLaunchResult
+        let launchedPID: Int32
+        let directProcess: Process?
         do {
-            launchResult = try await steamManager.launchGameDirectly(
-                appID: game.id,
-                engine: engine,
-                prefix: prefix
-            )
-            log.info("[launch] dispatched pid=\(launchResult.pid)")
+            if profile?.launchViaSteam == true {
+                appendLog("Launching through Steam…")
+                launchedPID = try await steamManager.launchGame(
+                    appID: game.id,
+                    engine: engine,
+                    prefix: prefix
+                )
+                directProcess = nil
+                log.info("[launch] dispatched via Steam pid=\(launchedPID)")
+            } else {
+                let result = try await steamManager.launchGameDirectly(
+                    appID: game.id,
+                    engine: engine,
+                    prefix: prefix
+                )
+                launchedPID = result.pid
+                directProcess = result.process
+                log.info("[launch] dispatched pid=\(launchedPID)")
+            }
         } catch {
             fail("Launch failed: \(error.localizedDescription)", error: error)
             return
@@ -587,8 +602,8 @@ final class GameLauncher {
         try? await Task.sleep(for: .seconds(3))
         guard !Task.isCancelled else { return }
 
-        if !launchResult.process.isRunning {
-            let exitCode = launchResult.process.terminationStatus
+        if let directProcess, !directProcess.isRunning {
+            let exitCode = directProcess.terminationStatus
             log.error("[launch] game process exited immediately (code=\(exitCode)) — aborting before monitor")
             let msg: String
             switch exitCode {
@@ -611,11 +626,11 @@ final class GameLauncher {
         let gamePattern = prefix.gameInstallDir(appID: game.id)
         log.info("[launch] resolved game pattern: \(gamePattern ?? "nil")")
         appendLog("Waiting for \(game.name) to start…")
-        log.info("[launch] state=LAUNCHING appID=\(game.id) | monitoring pid=\(launchResult.pid)")
+        log.info("[launch] state=LAUNCHING appID=\(game.id) | monitoring pid=\(launchedPID)")
 
         gameProcess.startMonitoring(
             appID: game.id,
-            launchedPID: launchResult.pid,
+            launchedPID: launchedPID,
             engine: engine,
             prefix: prefix,
             gamePattern: gamePattern,

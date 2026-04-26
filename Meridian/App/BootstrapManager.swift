@@ -322,6 +322,13 @@ final class BootstrapManager {
                 try? await Task.sleep(for: .seconds(1))
                 settings.lastPrefixEngineTag = currentTag
                 settings.lastPrefixEngineModTime = currentEngineModTime
+                // Reset versioned setup counters so they re-run against the new prefix.
+                // system.reg is wiped by resetToEngineTemplate, so registry keys that
+                // were previously written (WoW64 crypto providers, Steam install paths,
+                // WinRT classes) must be re-applied even if their version counters are
+                // already at the current value.
+                settings.steamInstallPathRegistrationVersion = 0
+                settings.winRTRegistrationAppliedVersion = 0
                 log.info("[bootstrap] prefix reset to new engine template in \(String(format: "%.1f", Double((ContinuousClock.now - t).components.seconds)))s")
                 await prefix.registerWinRTClasses(engine: engine)
             } catch {
@@ -523,6 +530,26 @@ final class BootstrapManager {
         // its polling/observer layers.
         windowSuppressor?.beginSession()
 
+        // 6b. Mark every fully-installed game's appmanifest as `StateFlags=1026`
+        // (UpdateRequired | Validating) so Steam's content manager performs its
+        // single startup ACF scan against the current PICS manifests and silently
+        // pulls any deltas. Steam writes `StateFlags=4` back as soon as each
+        // game is up to date — when nothing has changed server-side, this is a
+        // 1-2 second PICS round-trip with no download. When a game IS out of
+        // date (e.g. a manifest was preseeded before depot 220 was added in
+        // HL2's 20th Anniversary Update), the existing install/progress loop in
+        // `GameLauncher` catches the `1026` state on launch and surfaces the
+        // delta download.
+        //
+        // Must run AFTER session sync (loginusers.vdf written → Steam knows the
+        // user) and BEFORE `startPersistent` (Steam scans manifests exactly
+        // once per startup). Skipped when no session is available — Steam won't
+        // start, so the marks would just be stale flags on disk.
+        if hasLogin {
+            let marked = prefix.markInstalledGamesForUpdate()
+            log.info("[bootstrap] marked \(marked) installed game(s) for Steam update check")
+        }
+
         // 7. Start the persistent `steam.exe -silent` host if the user is signed in.
         //
         // `waitUntilReady` gates on [Logged On, — the authenticated-ready signal.
@@ -542,7 +569,6 @@ final class BootstrapManager {
                 if let pid = steamManager.persistentProcessIdentifier {
                     windowSuppressor?.resumeSuppressing(pid: pid)
                 }
-                steamManager.startHeadlessWebhelperKillBurst(reason: "bootstrap ready", duration: .seconds(12))
                 log.info("[bootstrap] persistent steam.exe signed in ✓")
                 steamStartSucceeded = true
             } catch WineSteamManager.SteamError.authenticationFailed {

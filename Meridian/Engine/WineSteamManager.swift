@@ -534,7 +534,7 @@ final class WineSteamManager {
             let stderr = String(data: data, encoding: .utf8) ?? ""
             if !stderr.isEmpty {
                 let filtered = filterWineStderr(stderr)
-                let lines = filtered.components(separatedBy: .newlines).prefix(40)
+                let lines = filtered.components(separatedBy: .newlines).prefix(200)
                 for line in lines where !line.isEmpty {
                     log.info("[launchGameDirectly:stderr] \(line)")
                 }
