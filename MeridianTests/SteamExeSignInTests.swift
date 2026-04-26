@@ -4,9 +4,6 @@ import XCTest
 ///
 /// MIRROR CONTRACT:
 ///   - `extractSteamID(from:)` mirrors `SteamExeSignIn.extractSteamID(from:)`.
-///   - `hasPlausibleLocalVdf(steamLocalDir:)` mirrors
-///     `SteamExeSignIn.hasPlausibleLocalVdf(steamLocalDir:)`.
-///     Update both whenever the on-disk `local.vdf` heuristics change.
 ///
 /// We mirror rather than `@testable import` because Meridian is an
 /// executableTarget — see testing-standards.mdc → "Why Inlined Logic".
@@ -48,37 +45,16 @@ final class SteamExeSignInTests: XCTestCase {
         XCTAssertNil(extractSteamID(from: line))
     }
 
-    // MARK: - hasPlausibleLocalVdf
-
-    func testHasPlausibleLocalVdf_falseWhenMissing() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        XCTAssertFalse(hasPlausibleLocalVdf(steamLocalDir: dir))
-    }
-
-    func testHasPlausibleLocalVdf_falseWhenTooSmall() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let url = dir.appending(path: "local.vdf")
-        try Data(repeating: 0, count: 32).write(to: url)
-        XCTAssertFalse(hasPlausibleLocalVdf(steamLocalDir: dir))
-    }
-
-    func testHasPlausibleLocalVdf_trueAtMinimumSize() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let url = dir.appending(path: "local.vdf")
-        try Data(repeating: 0, count: 64).write(to: url)
-        XCTAssertTrue(hasPlausibleLocalVdf(steamLocalDir: dir))
+    func testSignInFlow_noLongerWaitsForLocalVdf() throws {
+        let src = try readSource("Meridian/Steam/SteamExeSignIn.swift")
+        XCTAssertFalse(
+            src.contains("ensureLocalVdfOnDisk"),
+            "SteamExeSignIn must complete on `[Logged On, ` and must not wait for local.vdf; current steam.exe -login sessions may log `persistence: 0` and never write it."
+        )
+        XCTAssertFalse(
+            src.contains("hasPlausibleLocalVdf"),
+            "The old local.vdf size heuristic was part of the obsolete post-login wait and must not be reintroduced."
+        )
     }
 
     // MARK: - Mirror of SteamExeSignIn.extractSteamID
@@ -102,17 +78,13 @@ final class SteamExeSignInTests: XCTestCase {
         return String(steamID64)
     }
 
-    // MARK: - Mirror of SteamExeSignIn.hasPlausibleLocalVdf
-
-    private let minimumLocalVdfByteCount = 64
-
-    /// Mirror of `SteamExeSignIn.hasPlausibleLocalVdf(steamLocalDir:)`.
-    private func hasPlausibleLocalVdf(steamLocalDir: URL) -> Bool {
-        localVdfByteCount(steamLocalDir: steamLocalDir) >= minimumLocalVdfByteCount
+    private var repoRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 
-    private func localVdfByteCount(steamLocalDir: URL) -> Int {
-        let path = steamLocalDir.appending(path: "local.vdf").path(percentEncoded: false)
-        return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+    private func readSource(_ relativePath: String) throws -> String {
+        try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
     }
 }

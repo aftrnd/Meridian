@@ -57,23 +57,21 @@ final class SteamSessionBridge {
 
     /// Prepares the Wine prefix with Steam session data before launching `steam.exe`.
     ///
-    /// **April 25 2026 architecture:** Steam owns its own auth state inside the
-    /// bottle. After `SteamExeSignIn` drives `steam.exe -login`, Steam writes
-    /// `loginusers.vdf` + a DPAPI-encrypted `local.vdf` whose JWT carries the
-    /// Wine bottle's `machine_id` HMAC binding. CMsgClientLogon at next launch
-    /// echoes the same `machine_id`, so Valve's CM accepts the token. Meridian
-    /// MUST NOT touch that file — earlier versions injected an externally-minted
-    /// JWT into `local.vdf` that lacked the `machine_id` claim, and Valve
-    /// rejected the resulting CM logon with `Invalid Password`.
+    /// **April 26 2026 architecture:** the setup sheet uses Steam's HTTPS
+    /// credential flow with `remember_login=1` / `persistence=1`, then writes the
+    /// returned refresh token into Steam's DPAPI-backed `local.vdf`. This is the
+    /// durable path. A plain `steam.exe -login` can report `persistence: 0`, which
+    /// authenticates only the currently running process and leaves no token for
+    /// the next launch.
     ///
     /// Strategies in priority order:
-    ///   1. `steamSelfManagedSession` — the user has signed in via
-    ///       `SteamExeSignIn`; Steam owns its on-disk state. We just refresh
-    ///       `loginusers.vdf` to pin the auto-login user and otherwise stay out
-    ///       of Steam's way.
-    ///   2. macOS Steam present — copy its `loginusers.vdf` + `ssfn*` so the
+    ///   1. Persisted credential token — rewrite `loginusers.vdf` + `local.vdf`
+    ///      on every launch so Steam has a durable silent-login token.
+    ///   2. `steamSelfManagedSession` — legacy/fallback Steam-owned state. Only
+    ///      considered valid if a `local.vdf` is actually present.
+    ///   3. macOS Steam present — copy its `loginusers.vdf` + `ssfn*` so the
     ///       Wine Steam reuses the desktop client's session.
-    ///   3. Nothing usable — the user signs in through the AuthView sheet.
+    ///   4. Nothing usable — the user signs in through the AuthView sheet.
     @discardableResult
     func prepare(prefix: WinePrefix, engine: WineEngine) async -> SessionStrategy {
         hasMacSteamSession = false
@@ -81,7 +79,29 @@ final class SteamSessionBridge {
 
         let settings = AppSettings.shared
 
-        // Strategy 1: Steam self-managed session (post-April-25-2026).
+        // Strategy 1: persisted credential token from Meridian's HTTPS auth.
+        if settings.hasSteamCredentials {
+            let sid = settings.steamCredentialSteamID
+            let name = settings.steamCredentialAccountName
+            let refreshToken = settings.steamCredentialRefreshToken
+            do {
+                try prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
+                try await prefix.writeSteamSessionLocalVdf(
+                    engine: engine,
+                    steamID: sid,
+                    accountName: name,
+                    refreshToken: refreshToken
+                )
+                prefix.backupSteamSession()
+                settings.steamSelfManagedSession = false
+                log.info("[prepare] strategy=credentialAuth — local.vdf refreshed from persisted token ✓")
+                return .credentialAuth
+            } catch {
+                log.warning("[prepare] persisted credential token could not be written: \(error.localizedDescription)")
+            }
+        }
+
+        // Strategy 2: legacy Steam self-managed session.
         if settings.steamSelfManagedSession {
             let localVdf = prefix.localAppDataSteamDir.appending(path: "local.vdf").path(percentEncoded: false)
             if !FileManager.default.fileExists(atPath: localVdf) {
@@ -90,15 +110,20 @@ final class SteamSessionBridge {
             }
             let exists = FileManager.default.fileExists(atPath: localVdf)
             log.info("[prepare] strategy=steamSelfManaged — Steam owns local.vdf (exists=\(exists))")
-            if !settings.steamCredentialSteamID.isEmpty {
-                let sid  = settings.steamCredentialSteamID
-                let name = settings.steamCredentialAccountName
-                try? prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
+            if exists {
+                if !settings.steamCredentialSteamID.isEmpty {
+                    let sid  = settings.steamCredentialSteamID
+                    let name = settings.steamCredentialAccountName
+                    try? prefix.writeLoginUsers(steamID: sid, accountName: name, personaName: name)
+                }
+                return .credentialAuth
             }
-            return .credentialAuth
+
+            log.warning("[prepare] steamSelfManaged session has no local.vdf after restore — clearing flag and falling back to session discovery")
+            settings.steamSelfManagedSession = false
         }
 
-        // Strategy 2: macOS Steam install detected — copy its session files.
+        // Strategy 3: macOS Steam install detected — copy its session files.
         log.info("[prepare] checking for macOS Steam install")
         guard let steamDataDir = macSteamDataDirectory() else {
             log.info("[prepare] no macOS Steam install found at ~/Library/Application Support/Steam")

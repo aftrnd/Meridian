@@ -68,7 +68,7 @@ final class SteamCredentialAuth {
     func authenticate(
         username: String,
         password: String,
-        onAuthenticated: @escaping @MainActor (String, String, String) async -> Void = { _, _, _ in }
+        onAuthenticated: @escaping @MainActor (String, String, String) async throws -> Void = { _, _, _ in }
     ) {
         guard authTask == nil else { return }
         step = .authenticating
@@ -151,7 +151,7 @@ final class SteamCredentialAuth {
     private func runAuthFlow(
         username: String,
         password: String,
-        onAuthenticated: @escaping @MainActor (String, String, String) async -> Void
+        onAuthenticated: @escaping @MainActor (String, String, String) async throws -> Void
     ) async throws {
 
         // 1. Get RSA public key for this account name
@@ -220,7 +220,7 @@ final class SteamCredentialAuth {
 
         // 6. Hand tokens to the caller — they decide what to do (write to prefix,
         //    store for later, etc.). This is a pure-auth method; no Wine operations.
-        await onAuthenticated(session.steamID, tokens.accountName, tokens.refreshToken)
+        try await onAuthenticated(session.steamID, tokens.accountName, tokens.refreshToken)
         log.info("[auth] authentication complete ✓ steamID=\(session.steamID)")
     }
 

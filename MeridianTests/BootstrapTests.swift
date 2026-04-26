@@ -10,6 +10,16 @@ import XCTest
 /// When editing the source, update the mirror here and re-run `swift test`.
 final class BootstrapTests: XCTestCase {
 
+    private var repoRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func readSource(_ relativePath: String) throws -> String {
+        try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
+    }
+
     // MARK: - Phase enum mirror (BootstrapManager.Phase)
 
     /// Mirror of BootstrapManager.Phase
@@ -120,6 +130,19 @@ final class BootstrapTests: XCTestCase {
         FileManager.default.createFile(atPath: dllPath, contents: Data("dummy".utf8))
 
         XCTAssertFalse(needsBootstrap(steamInstallDir: tempDir))
+    }
+
+    func testBootstrapEngagesSuppressionBeforeSteamSelfBootstrap() throws {
+        let src = try readSource("Meridian/App/BootstrapManager.swift")
+        guard let bootstrapBlock = src.range(of: "if steamManager.needsBootstrap(prefix: prefix)"),
+              let steamBootstrapCall = src.range(of: "try await steamManager.bootstrap", range: bootstrapBlock.upperBound..<src.endIndex),
+              let suppressorCall = src.range(of: "windowSuppressor?.beginSession()", range: bootstrapBlock.upperBound..<steamBootstrapCall.lowerBound)
+        else {
+            XCTFail("BootstrapManager must call windowSuppressor?.beginSession() inside the needsBootstrap block before steamManager.bootstrap() so Steam's updater window is suppressed")
+            return
+        }
+
+        XCTAssertLessThan(suppressorCall.lowerBound, steamBootstrapCall.lowerBound)
     }
 
     // MARK: - Package directory quiescence logic

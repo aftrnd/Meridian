@@ -415,22 +415,38 @@ final class SteamCredentialAuthTests: XCTestCase {
     // Docstring-test: encodes the invariant in code form so it stays visible
     // to future agents grep-ing for the sign-in flow.
 
-    func testSignInFlowInvariants() {
-        let requiredSteps: [String] = [
-            "writeLoginUsers",
-            "writeSteamSessionLocalVdf",
-            "backupSteamSession",
-        ]
-        let forbiddenSteps: [String] = [
+    func testSignInFlowInvariants() throws {
+        let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
+
+        XCTAssertTrue(authView.contains("SteamCredentialAuth()"),
+                      "AuthView must use the durable SteamCredentialAuth flow, not steam.exe -login persistence=0.")
+        XCTAssertTrue(authView.contains("writeLoginUsers"),
+                      "Sign-in must write loginusers.vdf before launching persistent Steam.")
+        XCTAssertTrue(authView.contains("writeSteamSessionLocalVdf"),
+                      "Sign-in must write DPAPI local.vdf from the persistent refresh token before advancing.")
+        XCTAssertTrue(authView.contains("backupSteamSession"),
+                      "Sign-in must back up local.vdf so prefix resets preserve the Steam session.")
+
+        let forbiddenSteps = [
             "authenticateSteamCMD",
             "writeConnectCache",
             "provisionNativeCache",
+            "SteamExeSignIn()",
+            "steamSelfManagedSession    = true",
         ]
-
-        XCTAssertFalse(requiredSteps.isEmpty)
         for step in forbiddenSteps {
-            XCTAssertFalse(requiredSteps.contains(step),
-                           "\(step) MUST NOT be in the sign-in flow — removed in DPAPI local.vdf migration")
+            XCTAssertFalse(authView.contains(step),
+                           "\(step) MUST NOT be in the sign-in flow — it does not create durable local.vdf state.")
         }
+    }
+
+    private var repoRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func readSource(_ relativePath: String) throws -> String {
+        try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
     }
 }

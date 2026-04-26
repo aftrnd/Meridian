@@ -1,8 +1,9 @@
 # Meridian v0.9.11 — Verified Working State (April 25, 2026)
 
 This document captures the **complete arc of fixes** that brought Meridian
-to a user-confirmed working state on app `v0.9.11` paired with engine
-`v3.0.6-engine`. It is the answer to "what changed, what worked, why".
+to a user-confirmed working state on app `v0.9.11` paired with
+**Meridian Engine v3.0.6** (release tag `v3.0.6-engine`). It is the
+answer to "what changed, what worked, why".
 
 **User-verified outcome (April 25, 2026):**
 
@@ -21,11 +22,12 @@ are the remaining open items; core architecture is correct.
 | Component | Tag | Source of truth |
 |---|---|---|
 | Meridian app | **v0.9.11** | `MARKETING_VERSION` in `Meridian.xcodeproj/project.pbxproj`; GitHub Releases |
-| Wine engine | **v3.0.6-engine** | `~/Library/Application Support/com.meridian.app/engine/wine/meridian-engine-version.txt`; GitHub Releases |
+| Meridian Engine | **v3.0.6** (`v3.0.6-engine` tag) | `~/Library/Application Support/com.meridian.app/engine/wine/meridian-engine-version.txt`; GitHub Releases |
 
-The engine is unchanged from `v3.0.6-engine` (published April 24 2026). All
-fixes since then are **app-side**. `Scripts/release-engine.sh` was last
-touched in commit `4d6add0` which is included in `v3.0.6-engine`.
+Meridian Engine v3.0.6 is unchanged from release tag `v3.0.6-engine`
+(published April 24 2026). All fixes since then are **app-side**.
+`Scripts/release-engine.sh` was last touched in commit `4d6add0` which
+is included in `v3.0.6-engine`.
 
 ---
 
@@ -81,15 +83,37 @@ Why this is the right architecture (vs the deleted JWT-injection path):
 - Future Valve protocol changes don't break us; Steam handles its own
   upgrades.
 
-### 2. Network plumbing: `nsiproxy` registered in `system.reg`
+### 2. Network plumbing: core Wine services registered via `wine64 reg add`
 
-`WinePrefix.ensureNsiproxyService()` (`Meridian/Engine/WinePrefix.swift`)
-injects the `nsiproxy` service registration directly into `system.reg`.
-Without it Steam's main process asserts `WebUITransportController` and
-crash-loops before reaching auth — see `engine-research-findings.mdc`
-"Pattern 7" for the original failure signature. With it, Wine's
-`iphlpapi.dll` enumerates loopback adapters, the webhelper handshake
-succeeds, and Steam reaches `[Logged On,`.
+`WinePrefix.ensureCoreServices(engine:)`
+(`Meridian/Engine/WinePrefix.swift`) registers `nsiproxy`, `RpcSs`,
+`EventLog`, and `PlugPlay` via `wine64 reg add
+HKLM\System\CurrentControlSet\Services\<svc>` on every fresh prefix.
+Without `nsiproxy`, Wine's `\\.\Nsi` device is never created,
+`iphlpapi::GetAdaptersAddresses` returns `ERROR_FILE_NOT_FOUND`, Steam's
+`CalcUnIPThisBox` (`net_misc.cpp:252`) asserts, and the
+`WebUITransportController` (`webuitransportcontroller.cpp:165`) websocket
+handshake fails — Steam's main process enters an assert/auto-restart loop
+that produces a macOS "wine64 unexpected error" dialog before reaching
+auth. See `engine-research-findings.mdc` "Pattern 7" for the full failure
+signature.
+
+The runtime self-heal exists because `Scripts/release-engine.sh`'s
+`wineboot --init` step is killed by its 180 s timeout
+(`rundll32 setupapi InstallHinfSection` runaway recursion in `ntdll.so`
+on macOS hosts), leaving the shipped prefix template with only 2
+services (`MountMgr`, `Tcpip\Parameters`) instead of the 12+ a
+Linux-host wineboot would register.
+
+`wine64 reg add` is required (instead of file-surgery on `system.reg`)
+because Wine's `[System\\CurrentControlSet]` is a registry symlink to
+`[System\\ControlSet001]`. Direct file writes under
+`CurrentControlSet\Services\<svc>` are dropped on the next `wineserver`
+save when the symlink is resolved. The legacy `ensureNsiproxyService`
+(file-surgery) approach was unreliable for exactly this reason.
+
+Guard tests in `MeridianTests/EnsureCoreServicesTests.swift` keep this
+invariant in place.
 
 ### 3. Session persistence: wait for `local.vdf` to actually flush
 
@@ -216,7 +240,8 @@ authoritative integration signal.
 
 1. Install **app v0.9.11** from
    <https://github.com/aftrnd/Meridian/releases/tag/v0.9.11>.
-2. Engine **v3.0.6-engine** auto-downloads on first launch (or pull from
+2. **Meridian Engine v3.0.6** auto-downloads on first launch (release tag
+   `v3.0.6-engine`, or pull from
    <https://github.com/aftrnd/Meridian/releases/tag/v3.0.6-engine>).
 3. Sign in via the Meridian sheet (username + password; tap Approve on
    Steam Mobile).
@@ -231,6 +256,6 @@ the sign-in sheet — see `BootstrapManager` `authenticationFailed` branch.
 
 ---
 
-*Working-state document for Meridian v0.9.11 paired with engine
-v3.0.6-engine. Generated April 25 2026 from the file diffs and commit
-history at HEAD `0053212`.*
+*Working-state document for Meridian v0.9.11 paired with Meridian Engine
+v3.0.6 (release tag `v3.0.6-engine`). Generated April 25 2026 from the
+file diffs and commit history at HEAD `0053212`.*

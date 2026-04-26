@@ -183,9 +183,10 @@ private struct SteamLoginStepContent: View {
     @Environment(SteamSessionBridge.self)   private var sessionBridge
     @Environment(SteamAuthService.self)     private var steamAuth
 
-    @State private var auth     = SteamExeSignIn()
+    @State private var auth     = SteamCredentialAuth()
     @State private var username = ""
     @State private var password = ""
+    @State private var guardCode = ""
     private var canSignIn: Bool {
         !username.trimmingCharacters(in: .whitespaces).isEmpty
             && !password.isEmpty
@@ -208,13 +209,17 @@ private struct SteamLoginStepContent: View {
             case .idle:
                 credentialFields
 
-            case .startingSteam:
-                centeredStatus(icon: "gear", message: "Preparing Steam…")
+            case .authenticating:
+                centeredStatus(icon: "lock.rotation", message: "Contacting Steam…")
 
-            case .sendingCredentials:
-                centeredStatus(icon: "lock.rotation", message: "Signing in to Steam…")
+            case .awaitingGuardCode(let guardType):
+                if guardType == .deviceConfirmation || guardType == .emailConfirmation {
+                    awaitingResultView
+                } else {
+                    guardCodeView(guardType)
+                }
 
-            case .awaitingResult:
+            case .polling:
                 awaitingResultView
 
             case .done:
@@ -309,6 +314,32 @@ private struct SteamLoginStepContent: View {
         }
     }
 
+    private func guardCodeView(_ guardType: SteamCredentialAuth.GuardType) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(
+                guardType == .emailCode ? "Enter the code Steam emailed you." : "Enter your Steam Guard code.",
+                systemImage: "lock.shield"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+
+            TextField("Steam Guard code", text: $guardCode)
+                .textFieldStyle(.roundedBorder)
+                .textContentType(.oneTimeCode)
+                .onSubmit {
+                    let code = guardCode.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !code.isEmpty { auth.submitGuardCode(code) }
+                }
+
+            Button("Continue") {
+                let code = guardCode.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !code.isEmpty { auth.submitGuardCode(code) }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(guardCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
     // MARK: - Centered status (authenticating / polling)
 
     private func centeredStatus(icon: String, message: String) -> some View {
@@ -326,6 +357,7 @@ private struct SteamLoginStepContent: View {
 
     private func beginSignIn() {
         auth.reset()
+        guardCode = ""
         let prefix   = WinePrefix.defaultPrefix
         let eng      = engine
         let mgr      = steamManager
@@ -336,27 +368,31 @@ private struct SteamLoginStepContent: View {
         auth_.saveSteamPassword(password)
         auth.authenticate(
             username: username,
-            password: password,
-            engine: eng,
-            prefix: prefix,
-            steamManager: mgr
-        ) { steamID, accountName in
-            // Steam now owns its own `local.vdf` — do NOT inject a JWT. Mark
-            // the bottle as Steam-self-managed so SessionBridge keeps hands off.
-            AppSettings.shared.steamCredentialSteamID     = steamID
-            AppSettings.shared.steamCredentialAccountName = accountName
-            AppSettings.shared.steamCredentialRefreshToken = ""   // legacy field — keep empty
-            AppSettings.shared.steamSelfManagedSession    = true
-
-            // Refresh `loginusers.vdf` so Steam's "auto-login user" decision is
-            // pinned to this account on subsequent `-silent` launches.
-            try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
-
-            // Steam already wrote its own `local.vdf` mid-flow; back it up so a
-            // future prefix reset can restore the same byte-format-compatible
-            // file (DPAPI keying is bottle-agnostic — see Pattern 6 in
-            // engine-research-findings.mdc).
+            password: password
+        ) { steamID, accountName, refreshToken in
+            // The REST credential flow explicitly requests a persistent refresh
+            // token. Write it to Steam's DPAPI-backed local.vdf before advancing;
+            // a live `steam.exe -login` success with `persistence: 0` is not a
+            // durable session and caused repeat 2FA prompts on cold launch.
+            try prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
+            try await prefix.writeSteamSessionLocalVdf(
+                engine: eng,
+                steamID: steamID,
+                accountName: accountName,
+                refreshToken: refreshToken
+            )
             prefix.backupSteamSession()
+
+            AppSettings.shared.steamCredentialSteamID = steamID
+            AppSettings.shared.steamCredentialAccountName = accountName
+            AppSettings.shared.steamCredentialRefreshToken = refreshToken
+            AppSettings.shared.steamSelfManagedSession = false
+
+            if mgr.isSteamProcessAlive {
+                await mgr.stopPersistent(engine: eng, prefix: prefix)
+            }
+            try await mgr.startPersistent(engine: eng, prefix: prefix)
+            try await mgr.waitUntilReady(prefix: prefix, timeout: .seconds(180))
 
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true

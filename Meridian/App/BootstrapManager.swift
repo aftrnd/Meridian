@@ -333,14 +333,23 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
-        // 2c. Ensure Wine's nsiproxy service is registered. Without it,
-        //     `\\.\Nsi` is never created, `iphlpapi::GetAdaptersAddresses`
-        //     returns ERROR_FILE_NOT_FOUND, and Steam's `CalcUnIPThisBox`
-        //     can't recognise 127.0.0.1 as local — every webhelper WebSocket
-        //     gets rejected and auto-login never starts. Our prefix template
-        //     ships without the service registration (release-engine.sh
-        //     limitation); this self-heals at runtime. Idempotent + cheap.
-        prefix.ensureNsiproxyService()
+        // 2c. Ensure Wine's core services are registered: nsiproxy, RpcSs,
+        //     EventLog, PlugPlay. Without nsiproxy, `\\.\Nsi` is never
+        //     created → `iphlpapi::GetAdaptersAddresses` returns
+        //     ERROR_FILE_NOT_FOUND → Steam's `CalcUnIPThisBox` asserts and
+        //     the main↔webhelper websocket fails → steam.exe enters an
+        //     assert/auto-restart loop showing the macOS "wine64 unexpected
+        //     error" dialog. Without RpcSs, OLE class registration fails
+        //     and some Steam IPC paths break. Our prefix template ships
+        //     without these services because `release-engine.sh`'s
+        //     `wineboot --init` step is killed by its 180 s timeout
+        //     (rundll32 setupapi InstallHinfSection runaway recursion on
+        //     macOS hosts, CLI-confirmed April 25 2026). This self-heals
+        //     at runtime via `wine64 reg add`, which correctly resolves
+        //     the `CurrentControlSet` registry symlink (file-surgery on
+        //     `system.reg` would be discarded on the next wineserver
+        //     save). Idempotent — fast-paths when all 4 already present.
+        await prefix.ensureCoreServices(engine: engine)
 
         // 3. Install Steam if needed
         if !prefix.isSteamInstalled {
@@ -440,6 +449,11 @@ final class BootstrapManager {
         // 4. Bootstrap Steam (first-run client download) if needed
         if steamManager.needsBootstrap(prefix: prefix) {
             transition(to: .bootstrappingSteam, message: "Downloading Steam client…")
+            // Steam's self-bootstrap may render an update/webhelper window while
+            // downloading the full client. At this point SteamSetup and prefix
+            // operations are complete, so suppression can safely engage before
+            // `steam.exe -silent` launches.
+            windowSuppressor?.beginSession()
             let t = ContinuousClock.now
             do {
                 try await steamManager.bootstrap(engine: engine, prefix: prefix) { [weak self] downloaded, total in
@@ -504,9 +518,9 @@ final class BootstrapManager {
         guard !Task.isCancelled else { return }
 
         // 6. Engage window suppression now that all prefix operations are complete.
-        // Prefix operations (wineboot --init, wineboot --update, SteamSetup.exe)
-        // spawn transient Wine GUI windows that must be allowed to render and
-        // exit naturally. From here on, all Steam-adjacent UI is hidden.
+        // This is still needed when Steam was already bootstrapped and the block
+        // above did not run. Calling it twice is harmless; the suppressor refreshes
+        // its polling/observer layers.
         windowSuppressor?.beginSession()
 
         // 7. Start the persistent `steam.exe -silent` host if the user is signed in.
