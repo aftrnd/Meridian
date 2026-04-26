@@ -4,7 +4,9 @@ import XCTest
 ///
 /// MIRROR CONTRACT:
 ///   - `extractSteamID(from:)` mirrors `SteamExeSignIn.extractSteamID(from:)`.
-///     Update both whenever Steam's `connection_log.txt` line format changes.
+///   - `hasPlausibleLocalVdf(steamLocalDir:)` mirrors
+///     `SteamExeSignIn.hasPlausibleLocalVdf(steamLocalDir:)`.
+///     Update both whenever the on-disk `local.vdf` heuristics change.
 ///
 /// We mirror rather than `@testable import` because Meridian is an
 /// executableTarget — see testing-standards.mdc → "Why Inlined Logic".
@@ -46,6 +48,39 @@ final class SteamExeSignInTests: XCTestCase {
         XCTAssertNil(extractSteamID(from: line))
     }
 
+    // MARK: - hasPlausibleLocalVdf
+
+    func testHasPlausibleLocalVdf_falseWhenMissing() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        XCTAssertFalse(hasPlausibleLocalVdf(steamLocalDir: dir))
+    }
+
+    func testHasPlausibleLocalVdf_falseWhenTooSmall() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = dir.appending(path: "local.vdf")
+        try Data(repeating: 0, count: 32).write(to: url)
+        XCTAssertFalse(hasPlausibleLocalVdf(steamLocalDir: dir))
+    }
+
+    func testHasPlausibleLocalVdf_trueAtMinimumSize() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "meridian-localvdf-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = dir.appending(path: "local.vdf")
+        try Data(repeating: 0, count: 64).write(to: url)
+        XCTAssertTrue(hasPlausibleLocalVdf(steamLocalDir: dir))
+    }
+
     // MARK: - Mirror of SteamExeSignIn.extractSteamID
 
     /// Mirror of `SteamExeSignIn.extractSteamID(from:)`. Update both together.
@@ -65,5 +100,19 @@ final class SteamExeSignInTests: XCTestCase {
         guard accountID > 0 else { return nil }
         let steamID64 = accountID + 76561197960265728
         return String(steamID64)
+    }
+
+    // MARK: - Mirror of SteamExeSignIn.hasPlausibleLocalVdf
+
+    private let minimumLocalVdfByteCount = 64
+
+    /// Mirror of `SteamExeSignIn.hasPlausibleLocalVdf(steamLocalDir:)`.
+    private func hasPlausibleLocalVdf(steamLocalDir: URL) -> Bool {
+        localVdfByteCount(steamLocalDir: steamLocalDir) >= minimumLocalVdfByteCount
+    }
+
+    private func localVdfByteCount(steamLocalDir: URL) -> Int {
+        let path = steamLocalDir.appending(path: "local.vdf").path(percentEncoded: false)
+        return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
     }
 }

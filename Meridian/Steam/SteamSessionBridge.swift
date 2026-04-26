@@ -84,6 +84,10 @@ final class SteamSessionBridge {
         // Strategy 1: Steam self-managed session (post-April-25-2026).
         if settings.steamSelfManagedSession {
             let localVdf = prefix.localAppDataSteamDir.appending(path: "local.vdf").path(percentEncoded: false)
+            if !FileManager.default.fileExists(atPath: localVdf) {
+                log.warning("[prepare] steamSelfManaged but local.vdf missing — attempting backup restore")
+                prefix.restoreSteamSession()
+            }
             let exists = FileManager.default.fileExists(atPath: localVdf)
             log.info("[prepare] strategy=steamSelfManaged — Steam owns local.vdf (exists=\(exists))")
             if !settings.steamCredentialSteamID.isEmpty {

@@ -257,6 +257,11 @@ final class SteamExeSignIn {
         switch outcome {
         case .loggedOn(let steamID):
             log.info("[runFlow] ✅ logged on — steamID=\(steamID)")
+            try await Self.ensureLocalVdfOnDisk(
+                prefix: prefix,
+                engine: engine,
+                steamManager: steamManager
+            )
             return AuthResult(steamID: steamID, accountName: username)
         case .invalidPassword:
             throw AuthError.failed(.invalidCredentials)
@@ -268,6 +273,77 @@ final class SteamExeSignIn {
             throw AuthError.failed(.steamCrashed(code))
         case .timeout:
             throw AuthError.failed(.timeout)
+        }
+    }
+
+    // MARK: - Session file persistence (local.vdf)
+
+    /// Steam's DPAPI-wrapped `local.vdf` is often **not** on disk the instant
+    /// `connection_log.txt` prints `[Logged On, ` — the client can defer the
+    /// flush until a later tick or until shutdown. `AuthView` immediately calls
+    /// `backupSteamSession()`; without waiting, that races and `installGame`'s
+    /// `stopPersistent` + silent restart finds no token → `waitUntilReady`
+    /// times out (Connected but never Logged On).
+    ///
+    /// Minimum size is a loose guard against an empty or half-written file.
+    static let minimumLocalVdfByteCount = 64
+
+    static func hasPlausibleLocalVdf(steamLocalDir: URL) -> Bool {
+        localVdfByteCount(steamLocalDir: steamLocalDir) >= minimumLocalVdfByteCount
+    }
+
+    private static func localVdfByteCount(steamLocalDir: URL) -> Int {
+        let path = steamLocalDir.appending(path: "local.vdf").path(percentEncoded: false)
+        return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+    }
+
+    /// After a successful CM logon, blocks until `local.vdf` is readable and
+    /// sized like a real DPAPI blob. If it never appears while Steam is still
+    /// running, performs a graceful shutdown (flush) and polls again, then
+    /// cold-starts `steam.exe -silent` and reuses `waitUntilReady` so the
+    /// same session path `installGame` relies on is proven before sign-in
+    /// completes.
+    private static func ensureLocalVdfOnDisk(
+        prefix: WinePrefix,
+        engine: WineEngine,
+        steamManager: WineSteamManager
+    ) async throws {
+        let steamLocal = prefix.localAppDataSteamDir
+        let waitWhileRunning = ContinuousClock.now + .seconds(60)
+        while ContinuousClock.now < waitWhileRunning {
+            if hasPlausibleLocalVdf(steamLocalDir: steamLocal) {
+                log.info("[ensureLocalVdf] present while running (\(localVdfByteCount(steamLocalDir: steamLocal)) bytes)")
+                return
+            }
+            try Task.checkCancellation()
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+
+        log.warning("[ensureLocalVdf] missing after 60s while running — stopping Steam to flush")
+        await steamManager.stopPersistent(engine: engine, prefix: prefix)
+
+        let afterStop = ContinuousClock.now + .seconds(25)
+        while ContinuousClock.now < afterStop {
+            if hasPlausibleLocalVdf(steamLocalDir: steamLocal) {
+                log.info("[ensureLocalVdf] present after shutdown (\(localVdfByteCount(steamLocalDir: steamLocal)) bytes)")
+                break
+            }
+            try Task.checkCancellation()
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+
+        guard hasPlausibleLocalVdf(steamLocalDir: steamLocal) else {
+            throw AuthError.failed(.other("Steam did not save its session file (local.vdf). Try again, or reset the Wine environment in Settings."))
+        }
+
+        log.info("[ensureLocalVdf] restarting silent steam to verify auto-login")
+        try await steamManager.startPersistent(engine: engine, prefix: prefix, extraArgs: [])
+        do {
+            try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(180))
+        } catch WineSteamManager.SteamError.authenticationFailed {
+            throw AuthError.failed(.other("Signed in, but Steam could not reload its saved session. Try again or reset the Wine environment in Settings."))
+        } catch {
+            throw AuthError.failed(.other(error.localizedDescription))
         }
     }
 

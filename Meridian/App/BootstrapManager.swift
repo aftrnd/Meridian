@@ -533,6 +533,7 @@ final class BootstrapManager {
             } catch WineSteamManager.SteamError.authenticationFailed {
                 log.warning("[bootstrap] persistent steam.exe reached network but auto-login failed — saved session is stale")
                 authFailed = true
+                settings.steamSelfManagedSession = false
             } catch {
                 log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
             }
