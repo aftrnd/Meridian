@@ -48,7 +48,7 @@ struct ContentView: View {
                     .onAppear {
                         guard !hasCheckedSetup else { return }
                         hasCheckedSetup = true
-                        if !steamManager.isSteamLoggedIn || steamAuth.needsAPIKey {
+                        if !steamAuth.isAuthenticated || !steamManager.isSteamLoggedIn || steamAuth.needsAPIKey {
                             showSetupSheet = true
                         }
                     }
@@ -497,5 +497,4 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(BootstrapManager())
         .environment(CategoryStore())
         .environment(AppUpdateChecker())
-        .environment(SteamCMDService())
 }

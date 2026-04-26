@@ -73,6 +73,27 @@ final class EngineDownloader {
             log.info("[download] found asset: \(asset.name) (\(asset.size) bytes)")
             log.info("[download] url: \(asset.downloadURL)")
 
+            // Short-circuit if the installed engine already matches the latest
+            // release. Without this guard, callers like the post-app-update
+            // auto-refresh in `MeridianApp.swift` would re-extract the same
+            // engine on every app version bump — which RACES with the in-flight
+            // bootstrap pipeline that's running `wine64 SteamSetup.exe` from
+            // that same engine directory. Extraction calls `removeItem` on
+            // the engine root (see `extractArchive` below), which deletes
+            // wine64 mid-execution and crashes the bootstrap with
+            // `ShellExecuteEx failed`. CLI-confirmed April 25, 2026.
+            //
+            // The `installedTag` read goes through `WineEngine` which sources
+            // it from `wine/meridian-engine-version.txt` — written by
+            // `release-engine.sh` and untouched after extraction.
+            if let installedTag = WineEngine.installedEngineTagOnDisk(),
+               installedTag == asset.releaseTag {
+                log.info("[download] installed engine \(installedTag) matches latest \(asset.releaseTag) — skipping (no-op)")
+                state = .complete
+                onComplete()
+                return
+            }
+
             guard !Task.isCancelled else { return }
 
             let archivePath = try await downloadAsset(asset)
@@ -121,6 +142,10 @@ final class EngineDownloader {
         let name: String
         let downloadURL: String
         let size: Int64
+        /// The GitHub release tag this asset belongs to (e.g. `v3.0.6-engine`).
+        /// Used to short-circuit no-op downloads when the installed engine
+        /// already matches the latest published tag.
+        let releaseTag: String
     }
 
     private func fetchLatestAsset(repoSlug: String) async throws -> ReleaseAsset {
@@ -171,7 +196,7 @@ final class EngineDownloader {
 
                 if name.hasSuffix(".tar.gz") || name.hasSuffix(".tar.xz") {
                     log.info("[fetchLatestAsset] matched: \(name) from \(tagName)")
-                    return ReleaseAsset(name: name, downloadURL: downloadURL, size: size)
+                    return ReleaseAsset(name: name, downloadURL: downloadURL, size: size, releaseTag: tagName)
                 }
             }
 

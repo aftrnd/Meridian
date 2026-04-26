@@ -89,7 +89,7 @@ final class WineEngine {
 
     // MARK: - Known Paths
 
-    nonisolated(unsafe) static let engineDir: URL = {
+    nonisolated static let engineDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appending(path: "com.meridian.app/engine", directoryHint: .isDirectory)
     }()
@@ -220,10 +220,28 @@ final class WineEngine {
         log.info("[detect]   gptk=\(self.gptkPath ?? "none") cxABI=\(hasCXWineABI)")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
         log.info("[detect] backend=\(backendName) ✓")
+
+        // Seed the wine-accessory dylib into the engine + re-sign wine64
+        // ad-hoc with the `allow-dyld-environment-variables` entitlement.
+        // This is the one-time-per-engine setup that makes
+        // `DYLD_INSERT_LIBRARIES` work under hardened runtime. Idempotent —
+        // on second launch it fast-paths out when the entitlement is
+        // already present. See `Scripts/wine-accessory/` for the dylib
+        // rationale and `WineEngine.ensureDyldInjection` for the re-sign
+        // mechanics.
+        Self.ensureDyldInjection()
     }
 
     /// Reads the engine release tag from the version file written by `release-engine.sh`.
     private func readEngineVersion() -> String? {
+        Self.installedEngineTagOnDisk()
+    }
+
+    /// Reads the installed engine tag (e.g. `v3.0.6-engine`) directly from disk
+    /// without needing a `WineEngine` instance. Used by `EngineDownloader` to
+    /// short-circuit no-op downloads before extraction wipes the engine
+    /// directory and races with any in-flight Wine process.
+    static func installedEngineTagOnDisk() -> String? {
         let versionFile = Self.engineDir.appending(path: "wine/meridian-engine-version.txt")
         return try? String(contentsOf: versionFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -267,15 +285,28 @@ final class WineEngine {
 
     // MARK: - Environment
 
-    /// Builds the minimal environment for SteamCMD (no Metal HUD, no Rosetta flags).
-    /// SteamCMD is a console tool; it does not use DirectX or Metal.
+    /// Builds the minimal environment for Steam administrative Wine calls
+    /// (bootstrap, persistent steam.exe, IPC forwarders, registry writes).
+    /// No Metal HUD, no D3D overrides, no Rosetta game tweaks — those
+    /// belong to `environment(for:)` which is game-launch-only.
+    ///
+    /// Includes `DYLD_INSERT_LIBRARIES` pointing at Meridian's
+    /// `meridian-wine-accessory.dylib` when it's on disk. The dylib's
+    /// constructor calls `[NSApp setActivationPolicy:.accessory]` inside
+    /// every Wine subprocess, killing its Dock tile and preventing
+    /// self-activation for notification toasts. See
+    /// `Scripts/wine-accessory/meridian_wine_accessory.m` for the full
+    /// rationale.
+    ///
+    /// Only injected for Steam — NOT game launches — because a real game
+    /// window SHOULD appear in the Dock + menu bar.
     func steamCMDEnvironment(for prefix: WinePrefix) -> [String: String] {
         guard let lib = libraryPath else { return [:] }
         let wine64  = Self.engineDir.appending(path: "wine/bin/wine64").path(percentEncoded: false)
         let server  = Self.engineDir.appending(path: "wine/bin/wineserver").path(percentEncoded: false)
         var dyld = "\(lib):\(lib)/wine/x86_64-unix"
         if let l64 = lib64Path { dyld += ":\(l64)" }
-        return [
+        var env: [String: String] = [
             "WINEPREFIX":                prefix.path.path(percentEncoded: false),
             "WINESERVER":                server,
             "WINELOADER":                wine64,
@@ -283,6 +314,168 @@ final class WineEngine {
             "DYLD_FALLBACK_LIBRARY_PATH": dyld,
             "WINE_LARGE_ADDRESS_AWARE":  "1",
         ]
+        if let accessoryPath = Self.accessoryDylibPath() {
+            env["DYLD_INSERT_LIBRARIES"] = accessoryPath
+        }
+        return env
+    }
+
+    /// Path to `meridian-wine-accessory.dylib` on disk, or `nil` if it's
+    /// missing both from the engine and the app bundle. Prefers the
+    /// engine-internal copy (so versioned engines ship their own), falls
+    /// back to the app bundle (so a bundled-only install works), and
+    /// returns `nil` as a last resort (callers degrade to the previous
+    /// Dock-visible behavior, not a crash).
+    static func accessoryDylibPath() -> String? {
+        let fm = FileManager.default
+        let engineCopy = Self.engineDir
+            .appending(path: "wine/share/meridian/meridian-wine-accessory.dylib")
+        if fm.fileExists(atPath: engineCopy.path(percentEncoded: false)) {
+            return engineCopy.path(percentEncoded: false)
+        }
+        if let bundled = Bundle.main.url(forResource: "meridian-wine-accessory", withExtension: "dylib"),
+           fm.fileExists(atPath: bundled.path(percentEncoded: false)) {
+            return bundled.path(percentEncoded: false)
+        }
+        return nil
+    }
+
+    /// Ensures `wine64` is signed with the
+    /// `com.apple.security.cs.allow-dyld-environment-variables` entitlement,
+    /// required for `DYLD_INSERT_LIBRARIES` to take effect under hardened
+    /// runtime. CrossOver's stock wine64 doesn't include it; this method
+    /// re-signs ad-hoc with the full entitlement set (preserving CX's
+    /// existing entitlements + adding the dyld-env permission).
+    ///
+    /// Idempotent — checks current entitlements first and returns early if
+    /// already present. Safe to call on every app launch.
+    ///
+    /// Note on ad-hoc signing: we lose CrossOver's Developer ID signature,
+    /// but `wine64` is launched as a subprocess of the Developer-ID-signed
+    /// Meridian app, not directly by the user, so Gatekeeper is not
+    /// consulted. The re-sign preserves all functionality. Meridian owns
+    /// the engine; CX's signature was never a trust anchor in our flow.
+    ///
+    /// Also seeds `meridian-wine-accessory.dylib` into the engine if the
+    /// engine tarball didn't ship one (same pattern as `meridian-dpapi.exe`).
+    static func ensureDyldInjection() {
+        let fm = FileManager.default
+        let wine64 = Self.engineDir.appending(path: "wine/bin/wine64")
+        let wine64Path = wine64.path(percentEncoded: false)
+        guard fm.isExecutableFile(atPath: wine64Path) else {
+            log.debug("[ensureDyld] wine64 missing — engine not ready yet")
+            return
+        }
+
+        // Copy dylib from bundle → engine if absent (parallels the
+        // dpapi-helper self-heal in `WinePrefix.installDpapiHelperFromBundle`).
+        let dylibDest = Self.engineDir.appending(path: "wine/share/meridian/meridian-wine-accessory.dylib")
+        if !fm.fileExists(atPath: dylibDest.path(percentEncoded: false)),
+           let bundled = Bundle.main.url(forResource: "meridian-wine-accessory", withExtension: "dylib") {
+            do {
+                try fm.createDirectory(at: dylibDest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.copyItem(at: bundled, to: dylibDest)
+                log.info("[ensureDyld] copied bundled meridian-wine-accessory.dylib → engine")
+            } catch {
+                log.warning("[ensureDyld] could not copy accessory dylib: \(error.localizedDescription)")
+            }
+        }
+
+        // Fast path: entitlement already present → no re-sign needed.
+        if currentEntitlements(for: wine64Path).contains("com.apple.security.cs.allow-dyld-environment-variables") {
+            log.debug("[ensureDyld] wine64 already has allow-dyld-environment-variables ✓")
+            return
+        }
+
+        log.info("[ensureDyld] wine64 missing allow-dyld-environment-variables — re-signing ad-hoc with augmented entitlements")
+
+        // Write the combined entitlements plist. Keys match what CrossOver's
+        // wine64 ships with, plus our dyld-env addition. Keeping CX's set
+        // verbatim is important — stripping any of them (e.g. disable-
+        // library-validation) would break legitimate Wine functionality.
+        let entitlements = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-executable-page-protection</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+            <true/>
+            <key>com.apple.security.device.audio-input</key>
+            <true/>
+            <key>com.apple.security.device.camera</key>
+            <true/>
+        </dict>
+        </plist>
+        """
+        let plistURL = URL.temporaryDirectory
+            .appending(path: "meridian-wine64-ents-\(UUID().uuidString.prefix(8)).plist")
+        do {
+            try entitlements.write(to: plistURL, atomically: true, encoding: .utf8)
+        } catch {
+            log.error("[ensureDyld] could not write entitlements plist: \(error.localizedDescription)")
+            return
+        }
+        defer { try? fm.removeItem(at: plistURL) }
+
+        let codesign = Process()
+        codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        // CRITICAL: do NOT preserve `team-identifier` from CrossOver's original
+        // signature. Ad-hoc signing (`--sign -`) produces a signature with no
+        // team identifier by design; keeping CW's "9C6B7X7Z8E" leaves the
+        // binary with a contradictory `Signature=adhoc` + `TeamIdentifier=…`
+        // state. The kernel SIGKILLs such binaries at exec time with
+        // exit 137 (= 128 + 9). CLI-verified April 23 2026.
+        //
+        // `flags` must be preserved so the hardened-runtime flag survives
+        // the re-sign (without it, our dyld-env entitlement would be
+        // applied to a non-hardened-runtime binary, which macOS accepts
+        // but means `DYLD_INSERT_LIBRARIES` would work even without the
+        // entitlement — harmless, just wastes the re-sign work).
+        codesign.arguments = [
+            "--force",
+            "--sign", "-",
+            "--entitlements", plistURL.path(percentEncoded: false),
+            "--preserve-metadata=flags,runtime",
+            wine64Path,
+        ]
+        let stderrPipe = Pipe()
+        codesign.standardError = stderrPipe
+        codesign.standardOutput = FileHandle.nullDevice
+        do {
+            try codesign.run()
+            codesign.waitUntilExit()
+            if codesign.terminationStatus != 0 {
+                let err = (try? stderrPipe.fileHandleForReading.readToEnd())
+                    .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                log.error("[ensureDyld] codesign exit=\(codesign.terminationStatus) stderr=\(err.prefix(500))")
+            } else {
+                log.info("[ensureDyld] wine64 re-signed ad-hoc with allow-dyld entitlement ✓")
+            }
+        } catch {
+            log.error("[ensureDyld] codesign failed to launch: \(error.localizedDescription)")
+        }
+    }
+
+    /// Returns the current codesign entitlements for a path as a single string
+    /// (used for substring-based feature-detection — "does the binary have
+    /// entitlement X?"). Returns empty on error.
+    private static func currentEntitlements(for path: String) -> String {
+        let cs = Process()
+        cs.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        cs.arguments = ["-d", "--entitlements", ":-", path]
+        let outPipe = Pipe()
+        cs.standardOutput = outPipe
+        cs.standardError = FileHandle.nullDevice
+        guard (try? cs.run()) != nil else { return "" }
+        cs.waitUntilExit()
+        let data = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     /// Builds the environment dictionary for launching a Wine process.
@@ -441,8 +634,11 @@ private func readNonBlocking(_ pipe: Pipe) -> Data {
     let fd = fh.fileDescriptor
     let flags = fcntl(fd, F_GETFL)
     guard flags >= 0 else { return Data() }
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-    defer { fcntl(fd, F_SETFL, flags) }
+    // fcntl return value is discarded — we only care that O_NONBLOCK was set/restored
+    // (errors here would surface as unexpected blocking behaviour in the read loop
+    // below, which we'd see immediately during development).
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    defer { _ = fcntl(fd, F_SETFL, flags) }
 
     var result = Data()
     var buf = [UInt8](repeating: 0, count: 65536)

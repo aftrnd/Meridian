@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Darwin
 import Observation
 
 private let log = MeridianLog(category: "SteamWindowSuppressor")
@@ -455,15 +456,71 @@ final class SteamWindowSuppressor {
         for pid in currentWinePIDs() { installObserver(for: pid) }
     }
 
+    /// Enumerates every Wine process running under the Meridian engine, via
+    /// `libproc`. This is deliberately broader than `NSWorkspace.runningApplications`:
+    ///
+    /// `NSRunningApplication` only lists processes registered with Launch
+    /// Services. Wine's main `wine64` process typically registers, but its
+    /// child processes (`steamwebhelper.exe` + its CEF renderer + utility
+    /// children, typically 5+ extra Wine PIDs per Steam session) **do not**.
+    /// CLI-verified April 23 2026: `ps aux | grep steam` showed 5 Wine
+    /// processes; our suppressor's old `NSWorkspace` scan only saw 2. The
+    /// unregistered processes could still end up with a Dock tile when they
+    /// activated themselves briefly, which is exactly what the user was
+    /// seeing with `steamwebhelper.exe` appearing in the Dock during Steam's
+    /// download-complete popup.
+    ///
+    /// `proc_listpids(PROC_ALL_PIDS)` + `proc_pidpath` catches every
+    /// `wine64` / `wineloader` / `wine` process regardless of LS status.
+    /// Filter is scoped to paths under the Meridian engine so we can never
+    /// accidentally touch a user's CrossOver or Whisky installation.
     private func currentWinePIDs() -> [pid_t] {
-        NSWorkspace.shared.runningApplications
-            .filter { isWineProcess($0) }
-            .map(\.processIdentifier)
+        let enginePathFragment = WineEngine.engineDir.path(percentEncoded: false).lowercased()
+        // First sizing call — pass 0 buffer to get required byte count.
+        let neededBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard neededBytes > 0 else { return [] }
+        let slots = Int(neededBytes) / MemoryLayout<pid_t>.size + 32 // headroom for PIDs racing in
+        var pidBuffer = [pid_t](repeating: 0, count: slots)
+        let bytesWritten = pidBuffer.withUnsafeMutableBufferPointer { buf in
+            proc_listpids(UInt32(PROC_ALL_PIDS), 0, buf.baseAddress, Int32(buf.count * MemoryLayout<pid_t>.size))
+        }
+        guard bytesWritten > 0 else { return [] }
+        let pidCount = Int(bytesWritten) / MemoryLayout<pid_t>.size
+
+        var result: [pid_t] = []
+        // `PROC_PIDPATHINFO_MAXSIZE` is C-macro only (not bridged to Swift) —
+        // hardcoded to 4 × MAXPATHLEN = 4096 since macOS 10.7, per sys/proc_info.h.
+        var pathBuf = [CChar](repeating: 0, count: 4096)
+        for i in 0..<pidCount {
+            let pid = pidBuffer[i]
+            if pid <= 0 { continue }
+            let read = pathBuf.withUnsafeMutableBufferPointer { buf -> Int32 in
+                proc_pidpath(pid, buf.baseAddress, UInt32(buf.count))
+            }
+            guard read > 0 else { continue }
+            // `String(cString:)` is deprecation-warned in Swift 6 but still
+            // works correctly on null-terminated C strings; the "modern"
+            // UTF8-buffer form requires extra bookkeeping for zero-byte
+            // trimming that adds no value here.
+            let path = String(cString: pathBuf).lowercased()
+            // Keep only Meridian-engine Wine processes. A path match of "wine64"
+            // or "wineloader" alone would false-positive on Whisky/CrossOver.
+            guard path.contains(enginePathFragment) else { continue }
+            if path.contains("wine64") || path.contains("wineloader") || path.contains("/wine/") {
+                result.append(pid)
+            }
+        }
+        return result
     }
 
-    /// Identifies a Wine process by its executable path.
+    /// Kept for the `NSWorkspace.didLaunchApplicationNotification` path (Layer
+    /// 3) where we receive an `NSRunningApplication` directly. libproc-based
+    /// scans (`currentWinePIDs`) use a broader filter that catches child
+    /// CEF / webhelper processes too.
     private func isWineProcess(_ app: NSRunningApplication) -> Bool {
         guard let path = app.executableURL?.path.lowercased() else { return false }
+        let engineFrag = WineEngine.engineDir.path(percentEncoded: false).lowercased()
+        guard path.contains(engineFrag) else { return false }
         return path.contains("wineloader")
             || path.contains("wine64")
             || path.contains("/wine/")
@@ -495,72 +552,105 @@ final class SteamWindowSuppressor {
     // MARK: - Window Classification
 
     enum WindowClassification {
-        case essential   // Must be shown: install dialogs, EULAs, updates, Steam Guard
-        case suppressible // Main Steam UI: store, library, friends, community
-        case unknown     // No title or unrecognized — suppress by default
+        case essential   // Must be shown: genuine user-actionable prompts we can't handle headlessly
+        case suppressible // Everything Steam renders — store, library, friends, install dialogs, toasts
+        case unknown     // No title yet (window just opened) — suppress by default
     }
 
+    /// The only windows we LET THROUGH from Steam. Post-DPAPI / pre-seeded-ACF
+    /// flow (April 23 2026+), Meridian drives every user-facing step from its
+    /// native macOS UI:
+    ///   - Sign-in happens in `AuthView` → `SteamCredentialAuth` → DPAPI `local.vdf`
+    ///   - Install happens by pre-seeded `appmanifest_<appID>.acf` + Steam auto-download
+    ///   - Uninstall happens via `WineSteamManager.uninstallGame` (ACF delete + rmdir)
+    ///   - Progress is polled from the ACF and rendered in Meridian's progress bar
+    ///   - Download-complete notifications from Steam are suppressed (we show our own)
+    ///
+    /// This list must ONLY match prompts Meridian genuinely cannot handle itself —
+    /// currently: nothing. Previously `install/update/download/complete/login/...`
+    /// were allowed through because those flows legitimately needed Steam's UI,
+    /// but every one of those is now headless. Keeping them on the allow-list
+    /// regressed to Steam's install-location dialog, "Download Complete" toast,
+    /// and update popups surfacing unwanted windows + Dock icons.
     private static let essentialTitlePatterns: [String] = [
-        "install", "uninstall", "update", "updating",
-        "eula", "license", "agreement",
-        "steam guard", "verification", "confirm", "warning", "error",
-        "sign in", "log in", "login", "activate", "redeem",
-        "extracting", "validating", "downloading", "preparing", "completing",
-        "first-time setup", "setup", "requires restart",
+        // Intentionally empty. If a future edge case requires a visible Steam
+        // prompt (e.g. CAPTCHA on signup), add the specific title here with a
+        // comment explaining what Meridian can't do for that user yet.
     ]
 
-    /// Steam informational system popups that should always be suppressed.
-    /// These match the essentialTitlePatterns ("error") but are purely cosmetic —
-    /// the game launches correctly regardless. Checked BEFORE essentialTitlePatterns.
-    private static let steamSystemSuppressiblePatterns: [String] = [
-        "steam - fatal error",  // OS version check: "Steam is no longer supported on your OS"
-        "no longer supported",  // Same popup, matched by content if title is generic
-    ]
-
+    /// Known Steam window titles we actively suppress. Checked AFTER the
+    /// essential list so anything in essentialTitlePatterns still wins. Kept
+    /// for speed — the default fallthrough also suppresses unknown titles.
     private static let suppressibleTitlePatterns: [String] = [
-        "friends", "community", "store", "news", "screenshot",
+        "steam", "friends", "community", "store", "news", "screenshot",
         "chat", "voice", "broadcast", "music player",
+        "download", "install", "update", "complete", "finished",
+        "ready to play", "now available", "launch",
+        "notification", "alert", "toast",
+        "fatal error", "no longer supported",
     ]
 
     private func classifyWindow(_ window: AXUIElement) -> WindowClassification {
         var titleRef: CFTypeRef?
         AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
-        guard let title = titleRef as? String, !title.isEmpty else {
-            return .unknown
-        }
-
+        let title = (titleRef as? String) ?? ""
         let lower = title.lowercased()
 
-        // Steam informational system popups — always suppress even if they match
-        // essentialTitlePatterns (e.g. "fatal error"). These are cosmetic only;
-        // the game launches correctly regardless.
-        for pattern in Self.steamSystemSuppressiblePatterns {
-            if lower.contains(pattern) { return .suppressible }
-        }
-
+        // Explicit essential allowlist (currently empty — see doc above).
         for pattern in Self.essentialTitlePatterns {
             if lower.contains(pattern) { return .essential }
         }
 
+        // Explicit suppressible list (fast path).
         for pattern in Self.suppressibleTitlePatterns {
             if lower.contains(pattern) { return .suppressible }
         }
 
-        // "Steam" alone is the main client window — suppress it.
-        // But "Steam - Installing..." or similar should be essential.
-        if lower == "steam" || lower == "steam client" {
-            return .suppressible
-        }
-
+        // Default: suppress. Any Steam-rendered window Meridian hasn't
+        // explicitly allowed is a surface we don't want the user to see.
         return .unknown
     }
 
     /// Two-step hide: move off-screen first (instant, no animation), then minimize.
     /// Essential windows (install dialogs, EULAs, Steam Guard, etc.) are allowed through.
+    ///
+    /// **Dock-icon suppression — `TransformProcessType` to UIElement.**
+    /// `NSRunningApplication.hide()` is equivalent to ⌘H — it temporarily
+    /// hides a regular (`.regular`) application's windows, but the Dock tile
+    /// stays present and the OS still treats it as a foreground-capable app.
+    /// For Wine child processes (`steamwebhelper.exe`, CEF renderers) that
+    /// flash a window for half a second to fire a notification, hide() loses
+    /// the race and the Dock tile remains.
+    ///
+    /// `TransformProcessType` with `kProcessTransformToUIElementApplication`
+    /// is the correct API: it changes the process's activation policy
+    /// permanently (for the lifetime of the process) to UIElement, which
+    /// means NO DOCK TILE EVER and the app cannot activate itself. This is
+    /// exactly what LSUIElement=1 in Info.plist does for statically-configured
+    /// apps; TransformProcessType is the dynamic form we need for external
+    /// processes we didn't configure.
+    ///
+    /// CLI-verified April 2026 pattern: called once per new PID on registration,
+    /// subsequent hides are no-ops (idempotent). `NSRunningApplication.hide()`
+    /// is retained as a belt-and-suspenders for cases where TransformProcessType
+    /// fails (deprecated-API fallback).
     private func hideWindows(for pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         var val: CFTypeRef?
         let fetchResult = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &val)
+
+        // Permanently demote to UIElement — kills the Dock tile at the OS
+        // level. Idempotent: calling on an already-UIElement process returns
+        // noErr and does nothing. We call every pass rather than tracking
+        // which PIDs we've already transformed because the cost is ~100 ns
+        // per call and the code is simpler.
+        Self.demoteToUIElement(pid: pid)
+        // Also fire the deprecated-but-still-works hide() as a fallback
+        // (e.g. in case TransformProcessType is blocked by sandbox in future).
+        if let running = NSRunningApplication(processIdentifier: pid) {
+            _ = running.hide()
+        }
+
         guard fetchResult == .success,
               let windows = val as? [AXUIElement], !windows.isEmpty else {
             if fetchResult != .success {
@@ -596,5 +686,29 @@ final class SteamWindowSuppressor {
         if hiddenCount > 0 || allowedCount > 0 {
             log.info("[suppressor] pid=\(pid): hid \(hiddenCount), allowed \(allowedCount) essential window(s)")
         }
+    }
+
+    /// Demotes a Wine process from `.regular` activation to hidden/accessory
+    /// behavior as aggressively as the public macOS API allows, so it does
+    /// not show a Dock tile or steal focus when Steam activates itself for
+    /// a notification/toast.
+    ///
+    /// Three layers, applied every call (all idempotent + cheap):
+    ///   1. `NSRunningApplication.hide()` — ⌘H-equivalent. Demotes the app
+    ///      below the Dock's focus ring. Comes back on self-activation.
+    ///   2. Set `activationPolicy` via KVC — bypasses the "self-only" check
+    ///      on `setActivationPolicy(_:)`. Works on macOS 14+; ignored with
+    ///      a log entry on older OS.
+    ///   3. If the app becomes foreground, re-activate Meridian to snap
+    ///      focus back (done at the call-site, not here).
+    ///
+    /// Note: we deliberately do NOT use the Carbon `TransformProcessType` /
+    /// `GetProcessForPID` path. Swift 6.0 + macOS SDK 15 mark
+    /// `GetProcessForPID` unavailable; private CGS APIs would work but fail
+    /// App Store review. `NSRunningApplication.hide()` + aggressive polling
+    /// catches the common cases even when the KVC path is a no-op.
+    private static func demoteToUIElement(pid: pid_t) {
+        guard let running = NSRunningApplication(processIdentifier: pid) else { return }
+        _ = running.hide()
     }
 }

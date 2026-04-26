@@ -22,11 +22,10 @@ struct GameDetailView: View {
     @Environment(WineEngine.self)         private var engine
     @Environment(WineSteamManager.self)   private var steamManager
     @Environment(SteamAuthService.self)   private var steamAuth
-    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(GameLauncher.self)       private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
-    @Environment(SteamCMDService.self)    private var steamCMDService
+    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
@@ -45,6 +44,10 @@ struct GameDetailView: View {
     @State private var achievements: [GameAchievement] = []
     @State private var achievementsLoading = false
     @State private var achievementsUnavailable = false
+    /// When non-nil, the achievement-detail sheet is presented for this row.
+    /// Using `sheet(item:)` so each selection replaces the previous without
+    /// a dismiss bounce.
+    @State private var selectedAchievement: GameAchievement? = nil
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
@@ -215,6 +218,9 @@ struct GameDetailView: View {
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
         }
+        .sheet(item: $selectedAchievement) { ach in
+            AchievementDetailSheet(achievement: ach)
+        }
         .alert("Reset Wine Environment?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Reset", role: .destructive) {
@@ -228,8 +234,7 @@ struct GameDetailView: View {
                         engine: engine,
                         steamManager: steamManager,
                         sessionBridge: sessionBridge,
-                        engineDownloader: engineDownloader,
-                        steamCMDService: steamCMDService
+                        engineDownloader: engineDownloader
                     )
                 }
             }
@@ -564,7 +569,12 @@ struct GameDetailView: View {
                     VStack(spacing: 0) {
                         ForEach(Array(recentUnlocked.enumerated()), id: \.element.id) { idx, ach in
                             if idx > 0 { Divider().padding(.leading, 54) }
-                            AchievementRow(achievement: ach)
+                            Button {
+                                selectedAchievement = ach
+                            } label: {
+                                AchievementRow(achievement: ach)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
@@ -669,8 +679,15 @@ struct GameDetailView: View {
             }
 
         case .bootstrappingSteam:
+            // Use the live activity message from `GameLauncher.transition(to:activity:)`
+            // — it accurately reflects the current phase ("Starting Steam…",
+            // "Steam is updating…" only when an actual self-update is detected
+            // via `WineSteamManager.waitUntilReady`'s `statusUpdate` callback).
+            // The previous hardcoded "Updating Steam…" was misleading whenever
+            // we were just waking the persistent process — which is the common
+            // case post-auth-success.
             HStack(spacing: 8) {
-                ProgressButton("Updating Steam…")
+                ProgressButton(launcher.currentActivity ?? "Starting Steam…")
                 cancelButton
             }
 
@@ -851,7 +868,6 @@ struct GameDetailView: View {
             game: currentGame,
             engine: engine,
             steamManager: steamManager,
-            sessionBridge: sessionBridge,
             steamAuth: steamAuth,
             library: library
         )
@@ -866,11 +882,11 @@ struct GameDetailView: View {
             game: currentGame,
             engine: engine,
             steamManager: steamManager,
-            sessionBridge: sessionBridge,
             steamAuth: steamAuth,
             library: library
         )
     }
+
 }
 
 // MARK: - Detail Row helpers
@@ -1023,7 +1039,12 @@ private struct StatusCard: View {
         case .preparingPrefix:
             return launcher.currentActivity ?? "Preparing Wine environment…"
         case .bootstrappingSteam:
-            return "Updating Steam — first launch takes a few minutes"
+            // Live activity reflects what's actually happening: typically
+            // "Starting Steam…" (waking the persistent process) and only
+            // "Steam is updating…" if `waitUntilReady` detects a real
+            // bootstrap_log "Downloading update" line. Falls back to a
+            // generic message if `currentActivity` is unset.
+            return launcher.currentActivity ?? "Starting Steam…"
         case .awaitingInstallConfirmation:
             return "Downloading…"
         case .launching:
@@ -1115,11 +1136,136 @@ private struct AchievementRow: View {
             }
 
             Spacer()
+
+            // Affordance so the row reads as tappable even on a trackpad
+            // without hover; matches the chevron used in the "View all
+            // on Steam" row below.
+            Image(systemName: "chevron.right")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .contentShape(Rectangle())  // make the full row hit-test
     }
 }
+
+// MARK: - Achievement Detail Sheet
+
+/// Modal that shows the essentials for a single Steam achievement: glyph,
+/// name, unlock status + date, description. Follows Apple HIG — a focused
+/// sheet with a clear hierarchy and no developer metadata.
+///
+/// Hidden-achievement handling mirrors Steam's own behaviour: if the
+/// achievement is flagged hidden AND the user hasn't unlocked it, we show
+/// a generic "Hidden Achievement" title + locked glyph and no description.
+/// Once unlocked, all fields render normally.
+private struct AchievementDetailSheet: View {
+    let achievement: GameAchievement
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var isLockedHidden: Bool {
+        achievement.isHidden && !achievement.achieved
+    }
+
+    private var title: String {
+        isLockedHidden ? "Hidden Achievement" : achievement.displayName
+    }
+
+    private var description: String? {
+        guard !isLockedHidden else { return nil }
+        let text = achievement.description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text?.isEmpty == false) ? text : nil
+    }
+
+    private var statusText: String {
+        if let date = achievement.unlockDate {
+            return "Unlocked \(date.formatted(date: .long, time: .shortened))"
+        }
+        return "Locked"
+    }
+
+    var body: some View {
+        VStack(spacing: 20) {
+            AchievementDetailIcon(
+                url: achievement.iconURL,
+                grayURL: achievement.iconGrayURL,
+                achieved: achievement.achieved
+            )
+
+            VStack(spacing: 6) {
+                Text(title)
+                    .font(.title2).fontWeight(.bold)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 5) {
+                    Image(systemName: achievement.achieved ? "checkmark.seal.fill" : "lock.fill")
+                        .font(.caption2)
+                        .foregroundStyle(achievement.achieved ? .green : .secondary)
+                    Text(statusText)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let desc = description {
+                Text(desc)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 380)
+            }
+
+            Button("Done") { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(28)
+        .frame(width: 420)
+    }
+}
+
+/// Larger icon used by `AchievementDetailSheet` — mirrors `AchievementIcon`
+/// but at 96 × 96 and without the subtle 45 % fade on locked icons (the
+/// Steam-shipped grey asset is already visually distinct).
+private struct AchievementDetailIcon: View {
+    let url: URL?
+    let grayURL: URL?
+    let achieved: Bool
+
+    var body: some View {
+        CachedAsyncImage(url: achieved ? url : (grayURL ?? url)) { phase in
+            switch phase {
+            case .success(let image):
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 96, height: 96)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .strokeBorder(.separator, lineWidth: 0.5)
+                    )
+                    .opacity(achieved ? 1.0 : 0.6)
+            default:
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.secondary.opacity(0.15))
+                    .frame(width: 96, height: 96)
+                    .overlay(
+                        Image(systemName: "trophy.fill")
+                            .font(.system(size: 36, weight: .medium))
+                            .foregroundStyle(achieved ? .yellow.opacity(0.85) : .secondary.opacity(0.5))
+                    )
+            }
+        }
+    }
+}
+
 
 private struct AchievementIcon: View {
     let url: URL?

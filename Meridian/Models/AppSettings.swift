@@ -185,6 +185,17 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "steamInstallPathRegistrationVersion") }
     }
 
+    /// Tracks whether the prefix's reported Windows version has been set to `win10`.
+    ///
+    /// Valve deprecated Windows 7/8 support for the Steam client in late 2024 — any
+    /// prefix reporting pre-Windows-10 triggers "Steam is no longer supported on
+    /// your operating system" at startup. Increment
+    /// `WinePrefix.windowsVersionRegistrationVersion` to force a re-write.
+    var windowsVersionAppliedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "windowsVersionAppliedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "windowsVersionAppliedVersion") }
+    }
+
     /// Tracks whether quarantine attributes have been stripped from the engine directory.
     ///
     /// macOS sets `com.apple.quarantine` on files downloaded via URLSession. On macOS 26,
@@ -199,6 +210,23 @@ final class AppSettings: @unchecked Sendable {
     var quarantineCleanedVersion: Int {
         get { UserDefaults.standard.integer(forKey: "quarantineCleanedVersion") }
         set { UserDefaults.standard.set(newValue, forKey: "quarantineCleanedVersion") }
+    }
+
+    /// One-time cleanup pass for stale `Steam Client Service` Windows service
+    /// registration. Old Meridian versions (running the Jan 29 steam.exe stub)
+    /// left behind a `HKLM\System\CurrentControlSet\Services\Steam Client Service`
+    /// entry pointing to `C:\Program Files (x86)\Common Files\Steam\steamservice.exe`.
+    /// The Mar 12 Steam install has its service binary at
+    /// `C:\Program Files\Steam\bin\SteamService.exe`, so Steam's `StartService`
+    /// call fails (`GLE 126 = ERROR_MOD_NOT_FOUND`). Not directly the cause of
+    /// 0x3008 but a documented broken-state that logs noise and should never
+    /// have been written. Compare to `WinePrefix.staleSteamServiceCleanupVersion`.
+    ///
+    /// Version history:
+    ///   1 — delete HKLM\System\CurrentControlSet\Services\Steam Client Service once
+    var staleSteamServiceCleanupVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "staleSteamServiceCleanupVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "staleSteamServiceCleanupVersion") }
     }
 
     // MARK: - Favorites
@@ -233,20 +261,21 @@ final class AppSettings: @unchecked Sendable {
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
         steamCredentialRefreshToken = ""
+        steamSelfManagedSession = false
     }
 
     // MARK: - Steam Credential Cache
     //
-    // The Steam ConnectCache refresh token is written to the Wine prefix's config.vdf
-    // during the SteamCredentialAuth flow. Steam's ConnectCache authentication requires
-    // a MINIMAL config.vdf structure to work correctly — Steam's own flushed config
-    // (which adds ipv6 state, shader cache, etc.) does not re-trigger authentication on
-    // subsequent startups. Persisting the token here lets SteamSessionBridge re-write
-    // a clean minimal config.vdf before each persistent Steam session, ensuring the
-    // ConnectCache is always in the expected format when Steam starts.
+    // The JWT refresh token received from Meridian's IAuthenticationService sign-in
+    // is persisted here so `SteamSessionBridge` can write a fresh ConnectCache into
+    // the Wine prefix before each `steam.exe` startup. Steam's own auto-login reads
+    // ConnectCache and logs the user in silently — no password, no Steam Guard push,
+    // no UI. Persisting the token across launches means sign-in happens exactly once
+    // and subsequent app starts are fully passwordless.
     //
-    // The token is already stored in plaintext in the Wine prefix's config.vdf on disk.
-    // Storing it in UserDefaults does not reduce security beyond that baseline.
+    // The token is already stored in plaintext in the Wine prefix's config.vdf on
+    // disk. Storing it in UserDefaults adds convenient re-write on every launch
+    // without reducing security below that baseline.
 
     var steamCredentialSteamID: String {
         get { UserDefaults.standard.string(forKey: "steamCredentialSteamID") ?? "" }
@@ -265,6 +294,19 @@ final class AppSettings: @unchecked Sendable {
 
     var hasSteamCredentials: Bool {
         !steamCredentialRefreshToken.isEmpty && !steamCredentialSteamID.isEmpty
+    }
+
+    /// Set to true once `SteamExeSignIn` (April 25 2026+) drives a successful
+    /// `steam.exe -login` round-trip. From that point on, Meridian must NEVER
+    /// rewrite `local.vdf` — Steam owns the file and our DPAPI-encrypted
+    /// JWT lacks the `machine_id` HMAC binding Valve's CM requires (Pattern 7
+    /// rejection cascade).
+    ///
+    /// Cleared on sign-out so the next sign-in starts clean. Persisted to
+    /// UserDefaults so Steam keeps owning its session across launches.
+    var steamSelfManagedSession: Bool {
+        get { UserDefaults.standard.bool(forKey: "steamSelfManagedSession") }
+        set { UserDefaults.standard.set(newValue, forKey: "steamSelfManagedSession") }
     }
 
     private init() {}
