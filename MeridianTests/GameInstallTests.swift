@@ -24,6 +24,7 @@ import Foundation
 ///   • gameInstallDir(...)          ← WinePrefix.gameInstallDir()
 ///   • parseSteamCMDProgress(...)   ← GameLauncher.parseSteamCMDProgress(line:)
 ///   • formatBytes(...)             ← GameLauncher.formatBytes(_:)
+///   • installActivityMessage(...)  ← GameLauncher.installActivityMessage(...)
 ///   • mergeOverrides(...)          ← WineSteamManager.launchGameDirectly merge logic
 ///   • TestGameProfile              ← GameProfile (struct fields)
 ///   • TestGameEngine               ← GameEngine enum
@@ -351,6 +352,53 @@ final class GameInstallTests: XCTestCase {
                        "Sanity: deprecated command is not the same as the new command")
     }
 
+    func testLaunchPipelineResumesPartialAcfInsteadOfReportingInstalled() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/GameLauncher.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains("if !prefix.isGameFullyInstalled(appID: game.id)"),
+                      "Launch/install gate must use fully-installed state, not mere ACF presence.")
+        XCTAssertTrue(src.contains("if !prefix.isGameInstalled(appID: game.id)"),
+                      "Fresh installs still need the pre-seeded ACF path.")
+        XCTAssertTrue(src.contains("has partial ACF — resuming existing Steam download"),
+                      "Partial ACFs must resume progress polling instead of sending install-complete.")
+    }
+
+    func testLibraryReconciliationUsesFullyInstalledState() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamLibraryStore.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains("prefix.isGameFullyInstalled(appID: game.id)"),
+                      "Library badges must not mark queued/partial ACFs as installed.")
+    }
+
+    func testFailedInstallResetIsGameScoped() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Views/Library/GameDetailView.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains(".alert(\"Reset Game Install?\""),
+                      "Failed-install reset must be presented as game-scoped.")
+        XCTAssertTrue(src.contains("launcher.uninstall(game: currentGame"),
+                      "Failed-install reset should remove only the selected game's files.")
+        XCTAssertFalse(src.contains("WinePrefix.defaultPrefix.reset()"),
+                       "Game detail reset must not wipe the whole Wine prefix or other games.")
+    }
+
     // MARK: - SteamCMD stdout parsing tests
 
     /// Mirror of GameLauncher.parseSteamCMDProgress(line:)
@@ -377,6 +425,51 @@ final class GameInstallTests: XCTestCase {
         let mb = Double(bytes) / 1_048_576
         if mb >= 1 { return String(format: "%.0f MB", mb) }
         return String(format: "%.0f KB", Double(bytes) / 1024)
+    }
+
+    private enum TestInstallPhase {
+        case preparing
+        case downloading
+        case installing
+        case installed
+
+        var userDescription: String {
+            switch self {
+            case .preparing:   return "Preparing"
+            case .downloading: return "Downloading"
+            case .installing:  return "Installing"
+            case .installed:   return "Installed"
+            }
+        }
+    }
+
+    /// Mirror of GameLauncher.installActivityMessage(...)
+    private func installActivityMessage(
+        gameName: String,
+        phase: TestInstallPhase,
+        downloadedBytes: Int64,
+        downloadTotalBytes: Int64,
+        installedBytes: Int64,
+        installTotalBytes: Int64,
+        percent: Int
+    ) -> String {
+        let verb = phase.userDescription
+        switch phase {
+        case .downloading:
+            return "\(verb) \(gameName) — \(formatBytes(downloadedBytes)) / \(formatBytes(downloadTotalBytes)) (\(percent)%)"
+        case .installing:
+            guard installedBytes > 0 else {
+                if downloadedBytes > 0 && downloadTotalBytes > 0 {
+                    return "\(verb) \(gameName) — download complete, preparing files (\(percent)%)"
+                }
+                return "\(verb) \(gameName) — preparing files (\(percent)%)"
+            }
+            return "\(verb) \(gameName) — \(formatBytes(installedBytes)) / \(formatBytes(installTotalBytes)) (\(percent)%)"
+        case .installed:
+            return "\(verb) \(gameName)"
+        case .preparing:
+            return "\(verb) \(gameName)…"
+        }
     }
 
     func testParseSteamCMDProgressDownloading() {
@@ -445,6 +538,50 @@ final class GameInstallTests: XCTestCase {
     func testFormatBytesKB() {
         XCTAssertEqual(formatBytes(512_000), "500 KB")
         XCTAssertEqual(formatBytes(1024), "1 KB")
+    }
+
+    func testInstallActivityDoesNotShowZeroCommittedBytesAtPhaseBoundary() {
+        let message = installActivityMessage(
+            gameName: "Half-Life 2",
+            phase: .installing,
+            downloadedBytes: 3_187_105_792,
+            downloadTotalBytes: 3_172_218_096,
+            installedBytes: 0,
+            installTotalBytes: 6_197_695_726,
+            percent: 90
+        )
+
+        XCTAssertEqual(message, "Installing Half-Life 2 — download complete, preparing files (90%)")
+        XCTAssertFalse(message.contains("0 KB / 5.8 GB"))
+    }
+
+    func testInstallActivityShowsCommittedBytesOnceFilesAppear() {
+        let message = installActivityMessage(
+            gameName: "Half-Life 2",
+            phase: .installing,
+            downloadedBytes: 3_187_105_792,
+            downloadTotalBytes: 3_172_218_096,
+            installedBytes: 1_610_612_736,
+            installTotalBytes: 6_197_695_726,
+            percent: 92
+        )
+
+        XCTAssertEqual(message, "Installing Half-Life 2 — 1.5 GB / 5.8 GB (92%)")
+    }
+
+    func testInstallProgressUsesManifestInstallDirForCommittedBytes() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/GameLauncher.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains("let installDir = prefix.gameInstallDir(appID: game.id) ?? game.name"),
+                      "Install progress must use the manifest installdir, not only the display name.")
+        XCTAssertTrue(src.contains("bytesOnDiskForInstall(appID: game.id, installDir: installDir)"),
+                      "Committed-byte progress should scan the resolved Steam install directory.")
     }
 
     // MARK: - GameCompatibilityDB profile tests

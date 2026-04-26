@@ -26,9 +26,9 @@ private final class _AXCallbackBox: @unchecked Sendable {
 /// Receives `kAXWindowCreatedNotification` / `kAXApplicationShownNotification` the
 /// moment Steam creates or reveals a window and hides it before it paints.
 ///
-/// **Layer 2 — 0.5-second polling timer** (catch-all)
-/// Scans `NSWorkspace.shared.runningApplications` every 0.5 s, discovers new Wine
-/// PIDs, installs observers, and hides any window that slipped through.
+/// **Layer 2 — 0.2-second polling timer** (catch-all)
+/// Scans live Wine processes every 0.2 s, discovers new Wine PIDs, installs
+/// observers, and hides any window that slipped through.
 ///
 /// **Layer 3 — NSWorkspace app-launch observer** (instant for new processes)
 /// Reacts to `NSWorkspace.didLaunchApplicationNotification` so a fresh Wine process
@@ -50,10 +50,10 @@ private final class _AXCallbackBox: @unchecked Sendable {
 /// 2. Minimize — keeps it hidden if it tries to reposition itself
 ///
 /// ## Dock icon
-/// Wine's Mac Driver sets `NSApplicationActivationPolicyRegular` on every hosted
-/// Windows process, which causes a Dock icon. There is no macOS API to change
-/// another process's activation policy — the Dock icon is unavoidable. The windows
-/// themselves are suppressed.
+/// Steam admin launches also inject `meridian-wine-accessory.dylib` through
+/// `WineEngine.steamCMDEnvironment(for:)`, which forces Wine-hosted Steam
+/// processes to `.accessory` before winemac can create a Dock tile. This class is
+/// the fallback/outer layer for processes or windows that still activate briefly.
 @Observable
 @MainActor
 final class SteamWindowSuppressor {
@@ -85,6 +85,11 @@ final class SteamWindowSuppressor {
     private var pollingTickCount: Int = 0
     private var lastLoggedObservedCount: Int = -1
     private var lastLoggedMatchCount: Int = -1
+    private var burstSuppressUntil: Date = .distantPast
+
+    private static let pollingInterval: TimeInterval = 0.2
+    private static let burstSuppressDuration: TimeInterval = 20.0
+    private static let globalHideThrottle: TimeInterval = 0.12
 
     /// Coalesces AX-driven hide sweeps so we don't hammer Steam every few ms — that
     /// fight causes Steam to restore windows repeatedly ("reopens and reopens").
@@ -126,7 +131,7 @@ final class SteamWindowSuppressor {
     // MARK: - Session control
 
     /// Start all three suppression layers. Call once after permission is confirmed,
-    /// before Steam is launched. The polling timer will find Steam within 0.5 s.
+    /// before Steam is launched. The polling timer will find Steam within 0.2 s.
     func beginSession() {
         log.info("[suppressor] beginSession — permission=\(self.isPermissionGranted) suppressionActive=\(self.suppressionActive) observedPIDs=\(self.observerEntries.count)")
         guard isPermissionGranted else {
@@ -149,6 +154,7 @@ final class SteamWindowSuppressor {
         log.info("[suppressor] registerPID(\(pid)) — installing observer and hiding immediately")
         installObserver(for: pid)
         hideWindows(for: pid)
+        startSuppressionBurst(reason: "registered pid=\(pid)")
     }
 
     /// Resume suppression after `stopSuppressingNewWindows()` (game exited or stopped).
@@ -164,7 +170,8 @@ final class SteamWindowSuppressor {
             if observerEntries[pid] == nil { installObserver(for: pid) }
             hideWindows(for: pid)
         }
-        hideAllObservedWindows()
+        hideAllKnownWineWindows()
+        startSuppressionBurst(reason: "resume pid=\(pid)")
         log.info("[suppressor] resumed suppression pid=\(pid)")
     }
 
@@ -304,7 +311,8 @@ final class SteamWindowSuppressor {
         startPollingTimer()         // Layer 2
         installWorkspaceObserver()  // Layer 3
         scanAndInstallObservers()   // Layer 1 — existing Wine PIDs
-        hideAllObservedWindows()    // Immediately hide anything visible
+        hideAllKnownWineWindows()   // Immediately hide anything visible
+        startSuppressionBurst(reason: "begin session")
 
         log.info("[suppressor] all 3 layers active — observed=\(self.observerEntries.count) initial Wine PID(s)")
     }
@@ -361,13 +369,13 @@ final class SteamWindowSuppressor {
         log.debug("[suppressor] removed dead observer pid=\(pid)")
     }
 
-    // MARK: - Layer 2: 0.5s polling timer
+    // MARK: - Layer 2: 0.2s polling timer
 
     private func startPollingTimer() {
         pollingTimer?.invalidate()
         pollingTickCount = 0
         // Use .common mode so the timer fires during window tracking and event loops.
-        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: Self.pollingInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pollingTick() }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -393,9 +401,12 @@ final class SteamWindowSuppressor {
             }
         }
 
-        // 3. Periodic safety sweep only — hiding every 0.5 s fights Steam, which keeps
-        //    restoring its client and feels like an infinite reopen loop.
-        if suppressionActive, pollingTickCount % 10 == 0 {
+        // 3. Hide aggressively for a short burst after launches/restarts. Outside
+        //    that window, keep periodic sweeps to avoid a permanent hide/restore
+        //    fight with Steam's UI loop.
+        if suppressionActive, isBurstSuppressionActive {
+            hideAllKnownWineWindows()
+        } else if suppressionActive, pollingTickCount % 5 == 0 {
             throttledHideAllObservedWindows()
         }
 
@@ -444,7 +455,10 @@ final class SteamWindowSuppressor {
                 guard let self else { return }
                 log.info("[suppressor] workspace observer: new Wine app launched pid=\(pid) name='\(name)' exe='\(exePath)'")
                 self.installObserver(for: pid)
-                if self.suppressionActive { self.hideWindows(for: pid) }
+                if self.suppressionActive {
+                    self.hideWindows(for: pid)
+                    self.startSuppressionBurst(reason: "workspace launch pid=\(pid)")
+                }
             }
         }
         log.info("[suppressor] workspace observer installed")
@@ -534,19 +548,45 @@ final class SteamWindowSuppressor {
         for pid in observerEntries.keys { hideWindows(for: pid) }
     }
 
+    /// Hide every currently-known Wine process, including freshly-spawned
+    /// child processes that libproc can see before LaunchServices reports them.
+    private func hideAllKnownWineWindows() {
+        let livePIDs = currentWinePIDs()
+        for pid in livePIDs where observerEntries[pid] == nil {
+            installObserver(for: pid)
+        }
+        let allPIDs = Set(observerEntries.keys).union(livePIDs)
+        for pid in allPIDs { hideWindows(for: pid) }
+    }
+
     /// AX notifications can fire in bursts; spacing global sweeps avoids a hide/restore tug-of-war with Steam.
     private func throttledHideAllObservedWindows() {
         let now = Date()
-        guard now.timeIntervalSince(lastGlobalHideAt) >= 0.45 else { return }
+        guard now.timeIntervalSince(lastGlobalHideAt) >= Self.globalHideThrottle else { return }
         lastGlobalHideAt = now
         hideAllObservedWindows()
     }
 
+    private var isBurstSuppressionActive: Bool {
+        Date() < burstSuppressUntil
+    }
+
+    private func startSuppressionBurst(reason: String, duration: TimeInterval = SteamWindowSuppressor.burstSuppressDuration) {
+        guard suppressionActive else { return }
+        let nextDeadline = Date().addingTimeInterval(duration)
+        if nextDeadline > burstSuppressUntil {
+            burstSuppressUntil = nextDeadline
+        }
+        log.debug("[suppressor] burst suppression armed (\(reason)) until \(self.burstSuppressUntil)")
+        hideAllKnownWineWindows()
+    }
+
     /// Public surface so call sites in GameLauncher can trigger an immediate
     /// suppress sweep without needing a specific PID (e.g. at uninstall start).
-    func suppressNow() {
+    func suppressNow(duration: TimeInterval = SteamWindowSuppressor.burstSuppressDuration, reason: String = "manual suppressNow") {
         guard isPermissionGranted, suppressionActive else { return }
-        hideAllObservedWindows()
+        hideAllKnownWineWindows()
+        startSuppressionBurst(reason: reason, duration: duration)
     }
 
     // MARK: - Window Classification
@@ -681,6 +721,7 @@ final class SteamWindowSuppressor {
             if minResult != .success {
                 log.debug("[suppressor] kAXMinimizedAttribute set failed pid=\(pid) code=\(minResult.rawValue)")
             }
+            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, false as CFTypeRef)
             hiddenCount += 1
         }
         if hiddenCount > 0 || allowedCount > 0 {

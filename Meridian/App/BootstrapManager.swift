@@ -542,6 +542,7 @@ final class BootstrapManager {
                 if let pid = steamManager.persistentProcessIdentifier {
                     windowSuppressor?.resumeSuppressing(pid: pid)
                 }
+                steamManager.startHeadlessWebhelperKillBurst(reason: "bootstrap ready", duration: .seconds(12))
                 log.info("[bootstrap] persistent steam.exe signed in ✓")
                 steamStartSucceeded = true
             } catch WineSteamManager.SteamError.authenticationFailed {

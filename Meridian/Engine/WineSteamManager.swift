@@ -668,6 +668,8 @@ final class WineSteamManager {
         engine: WineEngine,
         prefix: WinePrefix
     ) async throws {
+        startHeadlessWebhelperKillBurst(reason: "installGame start appID=\(appID)", duration: .seconds(20))
+        windowSuppressor?.suppressNow(reason: "installGame preseed appID=\(appID)")
         log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
         try prefix.writePreseededAppManifest(
             appID: appID,
@@ -677,12 +679,16 @@ final class WineSteamManager {
         )
 
         log.info("[installGame] restarting persistent Steam so it picks up the new manifest")
+        windowSuppressor?.suppressNow(reason: "installGame restart appID=\(appID)")
         await stopPersistent(engine: engine, prefix: prefix)
+        windowSuppressor?.suppressNow(reason: "installGame post-stop appID=\(appID)")
         try await startPersistent(engine: engine, prefix: prefix)
+        windowSuppressor?.suppressNow(reason: "installGame post-start appID=\(appID)")
         try await waitUntilReady(prefix: prefix, timeout: .seconds(180))
         if let pid = persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
         }
+        startHeadlessWebhelperKillBurst(reason: "installGame ready appID=\(appID)", duration: .seconds(12))
         log.info("[installGame] persistent steam.exe ready — download starts momentarily (ACF detected at startup)")
     }
 
@@ -1003,7 +1009,7 @@ final class WineSteamManager {
                 // appear. Window suppression catches the AX window but Steam's
                 // UI loop keeps re-focusing it, leaking past suppression. The
                 // webhelper respawns automatically next time Steam needs UI.
-                Self.killWebhelper()
+                Self.killWebhelper(reason: "waitUntilReady login window")
                 throw SteamError.authenticationFailed
             }
 
@@ -1031,7 +1037,7 @@ final class WineSteamManager {
                     let attemptFailures = text.components(separatedBy: "SteamUI: WARNING: connect attempt failed").count - 1
                     if attemptFailures >= 2 {
                         log.error("[waitUntilReady] signal: webhelper connect failed ×\(attemptFailures) — auth rejected, failing fast")
-                        Self.killWebhelper()
+                        Self.killWebhelper(reason: "waitUntilReady webhelper connect failed")
                         throw SteamError.authenticationFailed
                     }
                 }
@@ -1041,7 +1047,7 @@ final class WineSteamManager {
             if let connectedAt = connectedObservedAt,
                ContinuousClock.now - connectedAt > authTimeout {
                 log.error("[waitUntilReady] signal: Connected \(authTimeout) ago but Logged On never observed — auth failed")
-                Self.killWebhelper()
+                Self.killWebhelper(reason: "waitUntilReady auth timeout")
                 throw SteamError.authenticationFailed
             }
 
@@ -1146,6 +1152,7 @@ final class WineSteamManager {
         }
 
         log.info("[stopPersistent] sending -shutdown")
+        windowSuppressor?.suppressNow(reason: "stopPersistent before shutdown")
         await stop(engine: engine, prefix: prefix)
 
         // Block until the tracked process actually exits — NOT just 3 seconds
@@ -1193,6 +1200,8 @@ final class WineSteamManager {
                 shutdownProcess.terminationHandler = { _ in cont.resume() }
                 do {
                     try shutdownProcess.run()
+                    self.windowSuppressor?.registerPID(shutdownProcess.processIdentifier)
+                    self.windowSuppressor?.suppressNow(reason: "steam shutdown forwarder")
                 } catch {
                     shutdownProcess.terminationHandler = nil
                     cont.resume(throwing: error)
@@ -1239,6 +1248,20 @@ final class WineSteamManager {
         isRunning = false
     }
 
+    /// Repeatedly kills Steam's CEF host for a short window while leaving the
+    /// main `steam.exe` backend alive. This is intentionally used only for
+    /// headless backend states (post-auth library, install restarts), never for
+    /// explicit "Show Steam" UI.
+    func startHeadlessWebhelperKillBurst(reason: String, duration: Duration = .seconds(8)) {
+        Task { @MainActor in
+            let deadline = ContinuousClock.now + duration
+            repeat {
+                Self.killWebhelper(reason: reason)
+                try? await Task.sleep(for: .milliseconds(500))
+            } while ContinuousClock.now < deadline
+        }
+    }
+
     /// Kills any running `steamwebhelper.exe` (the CEF process that renders
     /// Steam's UI) without touching the main `steam.exe` host.
     ///
@@ -1250,7 +1273,7 @@ final class WineSteamManager {
     /// auth-fail moment removes the source entirely. Idempotent — `pkill`
     /// returns non-zero when no matching process is running, which we ignore.
     /// Steam respawns webhelper automatically when it next needs UI.
-    static func killWebhelper() {
+    static func killWebhelper(reason: String = "manual") {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
         task.arguments = ["-9", "-f", "steamwebhelper"]
@@ -1259,7 +1282,7 @@ final class WineSteamManager {
         do {
             try task.run()
             task.waitUntilExit()
-            log.debug("[killWebhelper] pkill steamwebhelper exit=\(task.terminationStatus)")
+            log.debug("[killWebhelper] reason=\(reason) pkill steamwebhelper exit=\(task.terminationStatus)")
         } catch {
             log.warning("[killWebhelper] \(error.localizedDescription)")
         }

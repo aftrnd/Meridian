@@ -214,7 +214,7 @@ final class SteamLibraryStore {
         var reconciledIDs = Set<Int>()
         let result: [Game] = source.map { game in
             var copy = game
-            copy.isInstalled = prefix.isGameInstalled(appID: game.id)
+            copy.isInstalled = prefix.isGameFullyInstalled(appID: game.id)
             if copy.isInstalled { reconciledIDs.insert(game.id) }
             return copy
         }

@@ -330,13 +330,14 @@ final class GameLauncher {
             log.info("[launch] game profile appID=\(game.id): \(compat.fixSummary(for: game.id))")
         }
 
-        // If the game isn't installed yet, ask the running `steam.exe` to install it
-        // via IPC and poll the ACF manifest for progress. Steam runs its own native
-        // downloader — same path, same CDN, same verification as Steam Desktop.
-        // `SteamWindowSuppressor` hides any confirmation dialogs Steam renders.
-        if !prefix.isGameInstalled(appID: game.id) {
+        // If the game isn't fully installed yet, either seed a fresh install or resume
+        // an existing partial ACF. ACF presence alone is not playable: Steam writes it
+        // as soon as a download is queued.
+        if !prefix.isGameFullyInstalled(appID: game.id) {
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
+            windowSuppressor?.suppressNow(reason: "download click appID=\(game.id)")
+            steamManager.startHeadlessWebhelperKillBurst(reason: "download click appID=\(game.id)", duration: .seconds(20))
 
             // Make sure Steam is actually running. Normally `BootstrapManager` started
             // it, but if the sign-in sheet ran later (first launch after install), or
@@ -359,7 +360,6 @@ final class GameLauncher {
             transition(to: .awaitingInstallConfirmation,
                        activity: "Preparing download for \(game.name)…")
             appendLog("Preparing download for \(game.name)")
-            log.info("[launch] pre-seeding appmanifest for appID=\(game.id) and restarting Steam")
 
             let steamID64 = steamAuth?.steamID ?? ""
             guard !steamID64.isEmpty else {
@@ -367,18 +367,25 @@ final class GameLauncher {
                 return
             }
 
-            do {
-                try await steamManager.installGame(
-                    appID: game.id,
-                    name: game.name,
-                    installDir: game.name,
-                    steamID64: steamID64,
-                    engine: engine,
-                    prefix: prefix
-                )
-            } catch {
-                fail("Could not start install: \(error.localizedDescription)", error: error)
-                return
+            if !prefix.isGameInstalled(appID: game.id) {
+                log.info("[launch] pre-seeding appmanifest for appID=\(game.id) and restarting Steam")
+                do {
+                    try await steamManager.installGame(
+                        appID: game.id,
+                        name: game.name,
+                        installDir: game.name,
+                        steamID64: steamID64,
+                        engine: engine,
+                        prefix: prefix
+                    )
+                } catch {
+                    fail("Could not start install: \(error.localizedDescription)", error: error)
+                    return
+                }
+            } else {
+                appendLog("Resuming download for \(game.name)")
+                currentActivity = "Resuming download for \(game.name)…"
+                log.info("[launch] appID=\(game.id) has partial ACF — resuming existing Steam download")
             }
 
             // The pre-seeded ACF is already on disk before steam.exe restarted.
@@ -397,6 +404,7 @@ final class GameLauncher {
             //   0 – 90 %  download (diskBytes / bytesToDownload from ACF)
             //   90 – 99 % install (bytesOnDiskForInstall / bytesToStage)
             //   100 %     StateFlags == 4
+            let installDir = prefix.gameInstallDir(appID: game.id) ?? game.name
             var lastLoggedPercent = -1
             var lastPhase: WinePrefix.InstallPhase?
             var maxSeenDownloadBytes: Int64 = 0
@@ -417,7 +425,7 @@ final class GameLauncher {
                 let bytesToStage    = d?.bytesToStage ?? 0
 
                 let diskDl = prefix.bytesOnDiskForDownload(appID: game.id)
-                let diskInstall = prefix.bytesOnDiskForInstall(appID: game.id, installDir: game.name)
+                let diskInstall = prefix.bytesOnDiskForInstall(appID: game.id, installDir: installDir)
 
                 // Clamp to monotonic non-decreasing. Steam briefly moves files
                 // from downloading/ into common/ during commit — without
@@ -454,18 +462,15 @@ final class GameLauncher {
                 let pct = Int(fraction * 100)
                 let verb = phase.userDescription
 
-                let activity: String
-                switch phase {
-                case .downloading:
-                    activity = "\(verb) \(game.name) — \(Self.formatBytes(maxSeenDownloadBytes)) / \(Self.formatBytes(bytesToDownload)) (\(pct)%)"
-                case .installing:
-                    activity = "\(verb) \(game.name) — \(Self.formatBytes(maxSeenInstallBytes)) / \(Self.formatBytes(bytesToStage)) (\(pct)%)"
-                case .installed:
-                    activity = "\(verb) \(game.name)"
-                case .preparing:
-                    activity = "\(verb) \(game.name)…"
-                }
-                currentActivity = activity
+                currentActivity = Self.installActivityMessage(
+                    gameName: game.name,
+                    phase: phase,
+                    downloadedBytes: maxSeenDownloadBytes,
+                    downloadTotalBytes: bytesToDownload,
+                    installedBytes: maxSeenInstallBytes,
+                    installTotalBytes: bytesToStage,
+                    percent: pct
+                )
 
                 if lastPhase != phase {
                     appendLog("\(verb) \(game.name)")
@@ -493,7 +498,7 @@ final class GameLauncher {
             // can fire; the main `steam.exe` (needed for DRM game launches)
             // is untouched and automatically respawns webhelper a few
             // seconds later for the next operation.
-            Self.silenceSteamChime()
+            WineSteamManager.killWebhelper(reason: "download complete chime")
             appendLog("Download complete")
             library?.setInstalled(true, for: game.id)
             downloadProgress = 1.0
@@ -721,29 +726,31 @@ final class GameLauncher {
         return String(format: "%.0f KB", Double(bytes) / 1024)
     }
 
-    /// Kills every `steamwebhelper.exe` Wine process. Used at the instant an
-    /// install completes to prevent Steam's download-complete chime + toast
-    /// from firing — both of those paths run through the webhelper (CEF +
-    /// HTML5 audio). The main `steam.exe` process is untouched, so DRM game
-    /// launches continue to work; Steam automatically respawns webhelper a
-    /// few seconds later for the next UI operation.
-    ///
-    /// This is a pragmatic workaround for Valve not exposing a
-    /// "silence notifications for this session" API. The DYLD_INSERT
-    /// accessory dylib suppresses the toast WINDOW; this kill covers the
-    /// parallel audio-queue path.
-    fileprivate static func silenceSteamChime() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-9", "-f", "steamwebhelper"]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError  = FileHandle.nullDevice
-        do {
-            try task.run()
-            task.waitUntilExit()
-            log.info("[launch] silenceSteamChime: pkill steamwebhelper exit=\(task.terminationStatus)")
-        } catch {
-            log.warning("[launch] silenceSteamChime: \(error.localizedDescription)")
+    static func installActivityMessage(
+        gameName: String,
+        phase: WinePrefix.InstallPhase,
+        downloadedBytes: Int64,
+        downloadTotalBytes: Int64,
+        installedBytes: Int64,
+        installTotalBytes: Int64,
+        percent: Int
+    ) -> String {
+        let verb = phase.userDescription
+        switch phase {
+        case .downloading:
+            return "\(verb) \(gameName) — \(Self.formatBytes(downloadedBytes)) / \(Self.formatBytes(downloadTotalBytes)) (\(percent)%)"
+        case .installing:
+            guard installedBytes > 0 else {
+                if downloadedBytes > 0 && downloadTotalBytes > 0 {
+                    return "\(verb) \(gameName) — download complete, preparing files (\(percent)%)"
+                }
+                return "\(verb) \(gameName) — preparing files (\(percent)%)"
+            }
+            return "\(verb) \(gameName) — \(Self.formatBytes(installedBytes)) / \(Self.formatBytes(installTotalBytes)) (\(percent)%)"
+        case .installed:
+            return "\(verb) \(gameName)"
+        case .preparing:
+            return "\(verb) \(gameName)…"
         }
     }
 

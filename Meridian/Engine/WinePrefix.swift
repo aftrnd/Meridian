@@ -1338,8 +1338,12 @@ struct WinePrefix: Sendable {
         return nil
     }
 
-    /// Checks whether a specific Steam game is installed by looking for its
-    /// appmanifest ACF file across all configured Steam library folders.
+    /// Checks whether a specific Steam game has an appmanifest across all configured
+    /// Steam library folders.
+    ///
+    /// A present ACF does NOT mean the game is playable: Steam writes it before and
+    /// during downloads. Use `isGameFullyInstalled(appID:)` for user-facing installed
+    /// state and launch gating.
     func isGameInstalled(appID: Int) -> Bool {
         let result = acfURL(for: appID) != nil
         log.debug("[isGameInstalled] appID=\(appID) → \(result)")

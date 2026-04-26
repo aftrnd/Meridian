@@ -221,25 +221,13 @@ struct GameDetailView: View {
         .sheet(item: $selectedAchievement) { ach in
             AchievementDetailSheet(achievement: ach)
         }
-        .alert("Reset Wine Environment?", isPresented: $showResetConfirm) {
+        .alert("Reset Game Install?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Reset", role: .destructive) {
-                Task {
-                    await launcher.cleanupProcesses(engine: engine, steamManager: steamManager)
-                    WinePrefix.defaultPrefix.reset()
-                    // Re-run the full bootstrap pipeline so the app recovers immediately
-                    // without requiring a restart. ContentView watches bootstrap.isReady
-                    // and shows SplashView while the pipeline runs.
-                    bootstrap.retry(
-                        engine: engine,
-                        steamManager: steamManager,
-                        sessionBridge: sessionBridge,
-                        engineDownloader: engineDownloader
-                    )
-                }
+                launcher.uninstall(game: currentGame, engine: engine, steamManager: steamManager, library: library)
             }
         } message: {
-            Text("This will delete the Wine prefix, Steam installation, and all downloaded game files. On next launch, everything will be set up fresh.")
+            Text("This removes this game's local manifest and downloaded files only. It does not reset the Wine engine, Steam, or other installed games.")
         }
     }
 
@@ -692,29 +680,9 @@ struct GameDetailView: View {
             }
 
         case .awaitingInstallConfirmation:
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    ProgressButton("Downloading…")
-                    cancelButton
-                }
-                if let progress = launcher.downloadProgress {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ProgressView(value: progress)
-                            .progressViewStyle(.linear)
-                            .tint(.accentColor)
-                        if let activity = launcher.currentActivity {
-                            Text(activity)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        } else {
-                            Text("\(Int(progress * 100))%")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                    }
-                }
+            HStack(spacing: 8) {
+                ProgressButton("Downloading…")
+                cancelButton
             }
 
         case .launching:
@@ -744,7 +712,7 @@ struct GameDetailView: View {
             ProgressButton("Stopping…")
 
         case .uninstalling:
-            ProgressButton(launcher.currentActivity ?? "Uninstalling…")
+            ProgressButton("Uninstalling…")
 
         case .failed(let msg):
             VStack(alignment: .leading, spacing: 6) {
@@ -777,7 +745,7 @@ struct GameDetailView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
-                    .help("Delete Wine prefix and start fresh")
+                    .help("Remove this game's local files and retry the install")
                 }
 
                 Text(msg)
@@ -977,6 +945,7 @@ private struct StatusCard: View {
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
+            let progress = downloadProgressValue
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 10) {
                     statusIcon
@@ -1007,11 +976,26 @@ private struct StatusCard: View {
                     .foregroundStyle(.secondary)
                     .help("Open launch log window")
                 }
-                .padding(12)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, progress == nil ? 12 : 0)
+
+                if let progress {
+                    CapsuleProgressBar(value: progress)
+                        .frame(height: 8)
+                        .padding(.top, 12)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 12)
+                }
             }
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
         }
+    }
+
+    private var downloadProgressValue: Double? {
+        guard case .awaitingInstallConfirmation = launcher.launchState else { return nil }
+        return launcher.downloadProgress
     }
 
     @ViewBuilder
@@ -1046,7 +1030,7 @@ private struct StatusCard: View {
             // generic message if `currentActivity` is unset.
             return launcher.currentActivity ?? "Starting Steam…"
         case .awaitingInstallConfirmation:
-            return "Downloading…"
+            return launcher.currentActivity ?? "Preparing download…"
         case .launching:
             if let last = launcher.logs.last, !last.isEmpty {
                 return last
@@ -1075,6 +1059,27 @@ private struct StatusCard: View {
         let mins = secs / 60
         let rem  = secs % 60
         return mins > 0 ? "\(mins)m \(rem)s" : "\(rem)s"
+    }
+}
+
+private struct CapsuleProgressBar: View {
+    let value: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let clamped = min(max(value, 0), 1)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.secondary.opacity(0.22))
+
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: max(proxy.size.width * clamped, proxy.size.height))
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Download progress")
+        .accessibilityValue("\(Int(min(max(value, 0), 1) * 100)) percent")
     }
 }
 
