@@ -400,7 +400,14 @@ final class GameLauncher {
                         steamID64: steamID64,
                         engine: engine,
                         prefix: prefix,
-                        statusUpdate: { [weak self] msg in self?.appendLog(msg) }
+                        statusUpdate: { [weak self] msg in
+                            // currentActivity drives the StatusCard text;
+                            // appendLog adds to the detail-page log panel.
+                            // The button ignores currentActivity during install
+                            // (it shows hardcoded Downloading…/Installing…).
+                            self?.currentActivity = msg
+                            self?.appendLog(msg)
+                        }
                     )
                 } catch is CancellationError {
                     log.info("[launch] install cancelled by user — not an error")
