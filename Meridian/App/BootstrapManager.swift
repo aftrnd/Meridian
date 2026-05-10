@@ -612,6 +612,23 @@ final class BootstrapManager {
                         }
                         log.info("[bootstrap] -login retry succeeded ✓")
                         steamStartSucceeded = true
+                        // Wait up to 12s for Steam to write its ssfn device-trust
+                        // token after login. ssfn enables silent -silent restarts
+                        // without 2FA for all future operations this session.
+                        if !prefix.hasSsfnToken {
+                            log.info("[bootstrap] waiting for ssfn token to be written…")
+                            let ssfnDeadline = ContinuousClock.now + .seconds(12)
+                            while ContinuousClock.now < ssfnDeadline {
+                                try? await Task.sleep(for: .seconds(1))
+                                if prefix.hasSsfnToken {
+                                    log.info("[bootstrap] ssfn token written ✓")
+                                    break
+                                }
+                            }
+                            if !prefix.hasSsfnToken {
+                                log.warning("[bootstrap] ssfn token not written within 12s — next install restart may require 2FA")
+                            }
+                        }
                     } catch {
                         log.warning("[bootstrap] -login retry also failed: \(error.localizedDescription)")
                         // Token is genuinely stale — clear it so sign-in sheet

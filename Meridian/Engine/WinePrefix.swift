@@ -56,6 +56,17 @@ struct WinePrefix: Sendable {
         steamInstallDir.appending(path: "steam.exe")
     }
 
+    /// Whether Steam has written at least one ssfn device-trust token.
+    /// ssfn files are written a few seconds after a successful -login CM auth
+    /// and allow future -silent restarts to authenticate without 2FA.
+    var hasSsfnToken: Bool {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            atPath: steamInstallDir.path(percentEncoded: false)
+        ) else { return false }
+        return entries.contains { $0.hasPrefix("ssfn") }
+    }
+
     /// The Windows path to steam.exe as seen inside Wine (C:\ drive).
     ///
     /// Derived from the actual install location detected by `steamInstallDir`. Must use

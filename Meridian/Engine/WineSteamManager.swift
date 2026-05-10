@@ -680,27 +680,46 @@ final class WineSteamManager {
             steamID64: steamID64
         )
 
-        guard isRunning else {
-            // Steam is not running — the caller (executeLaunchPipeline) handles
-            // starting it. Nothing else to do here; the startup ACF scan will
-            // pick up the manifest when Steam logs in.
-            log.info("[installGame] Steam not running — ACF written, bootstrap will start Steam appID=\(appID)")
-            return
+        // Restart Steam so its startup ACF scan picks up the StateFlags=1026
+        // manifest. This is the only reliable way to trigger an immediate
+        // download — IPC (steam://install, +app_update) both show a suppressed
+        // dialog and never start the download.
+        //
+        // Auth strategy (checked in order):
+        //   1. ssfn token on disk → plain -silent restart, Steam uses device
+        //      trust token, logs in silently in ~10s, no 2FA.
+        //   2. No ssfn → -login user pass, may trigger 2FA on first call.
+        let hasSsfn = prefix.hasSsfnToken
+        let extraArgs: [String]
+        if hasSsfn {
+            log.info("[installGame] ssfn present — plain -silent restart for ACF scan appID=\(appID)")
+            extraArgs = []
+        } else {
+            let accountName = AppSettings.shared.steamCredentialAccountName
+            let authSvc     = SteamAuthService()
+            guard !accountName.isEmpty, let pw = authSvc.loadSteamPassword() else {
+                log.warning("[installGame] no ssfn and no saved credentials — cannot restart")
+                throw WineSteamManager.SteamError.authenticationFailed
+            }
+            log.info("[installGame] no ssfn — -login restart for user=\(accountName) appID=\(appID)")
+            extraArgs = ["-login", accountName, pw]
         }
 
-        // Send steam://install/<appID> to the running instance via IPC.
-        // Steam processes this as a native install request against the already-
-        // configured library (libraryfolders.vdf was written at bootstrap).
-        // The ACF specifies installDir so no location-picker dialog appears.
-        // No restart, no re-auth — Steam is already signed in.
-        startHeadlessWebhelperKillBurst(reason: "installGame IPC appID=\(appID)", duration: .seconds(15))
-        windowSuppressor?.suppressNow(reason: "installGame IPC appID=\(appID)")
-        log.info("[installGame] sending steam://install/\(appID) IPC to running Steam")
-        try sendSteamCommand(["steam://install/\(appID)"], engine: engine, prefix: prefix)
-        log.info("[installGame] IPC command sent — download should start momentarily appID=\(appID)")
-        if let pid = persistentProcessIdentifier {
-            windowSuppressor?.resumeSuppressing(pid: pid)
-        }
+        statusUpdate?("Restarting Steam to begin download…")
+        startHeadlessWebhelperKillBurst(reason: "installGame restart appID=\(appID)", duration: .seconds(25))
+        windowSuppressor?.suppressNow(reason: "installGame restart appID=\(appID)")
+        await stopPersistent(engine: engine, prefix: prefix)
+        killAll(engine: engine, prefix: prefix)
+        clearPersistentProcess()
+        try? await Task.sleep(for: .milliseconds(500))
+        statusUpdate?("Connecting to Steam…")
+        try await startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs, skipRegistryConfig: true)
+        statusUpdate?(hasSsfn ? "Signing in to Steam…" : "Signing in to Steam — approve in Steam Mobile if prompted…")
+        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: hasSsfn ? .seconds(30) : .seconds(90))
+        if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
+        startHeadlessWebhelperKillBurst(reason: "installGame restart ready appID=\(appID)", duration: .seconds(12))
+        statusUpdate?("Starting download for \(name)…")
+        log.info("[installGame] restart complete — startup ACF scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam
