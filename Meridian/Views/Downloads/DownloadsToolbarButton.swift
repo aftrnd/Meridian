@@ -35,7 +35,7 @@ struct DownloadsToolbarButton: View {
                             .animation(.linear(duration: 0.3), value: p)
                     }
                     Image(systemName: "arrow.down")
-                        .font(.body.weight(isDownloading ? .semibold : .regular))
+                        .font(.system(size: 10, weight: isDownloading ? .semibold : .regular))
                 }
             }
             // Do NOT override buttonStyle — let macOS supply the toolbar circle / liquid glass.

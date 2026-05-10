@@ -402,6 +402,9 @@ final class GameLauncher {
                         prefix: prefix,
                         statusUpdate: { [weak self] msg in self?.appendLog(msg) }
                     )
+                } catch is CancellationError {
+                    log.info("[launch] install cancelled by user — not an error")
+                    return
                 } catch {
                     fail("Could not start install: \(error.localizedDescription)", error: error)
                     return
