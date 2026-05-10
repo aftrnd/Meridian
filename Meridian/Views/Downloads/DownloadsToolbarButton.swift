@@ -1,12 +1,10 @@
 import SwiftUI
 
-// MARK: - Toolbar button
-
 /// Safari-style circular download indicator for the window toolbar.
 ///
-/// The button itself is a fixed square so macOS 26 renders it as the standard
-/// liquid-glass circle — not an oval. Placement is handled by the caller
-/// inserting a Spacer() before this item so it sits on the trailing side.
+/// Renders as a standard macOS toolbar circle button (liquid glass on macOS 26)
+/// with an arc-progress overlay while a download is active. Tapping shows a
+/// popover listing the active download and recently completed installs.
 struct DownloadsToolbarButton: View {
     let launcher: GameLauncher
     let library: SteamLibraryStore
@@ -18,31 +16,29 @@ struct DownloadsToolbarButton: View {
         return false
     }
 
-    var body: some View {
-        if isDownloading || !DownloadHistory.shared.recent.isEmpty {
-            Button { isPresented.toggle() } label: {
-                ZStack {
-                    // Track ring
-                    Circle()
-                        .stroke(.tertiary, lineWidth: 2)
+    private var hasContent: Bool {
+        isDownloading || !DownloadHistory.shared.recent.isEmpty
+    }
 
-                    // Filled arc proportional to download progress
+    var body: some View {
+        if hasContent {
+            Button { isPresented.toggle() } label: {
+                // Standard SF icon — macOS adds the circular glass background automatically.
+                // The progress arc is a thin trim overlay that animates on top of the icon.
+                ZStack {
                     if isDownloading, let p = launcher.downloadProgress, p > 0 {
                         Circle()
                             .trim(from: 0, to: p)
-                            .stroke(.primary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .stroke(.primary.opacity(0.7),
+                                    style: StrokeStyle(lineWidth: 2, lineCap: .round))
                             .rotationEffect(.degrees(-90))
                             .animation(.linear(duration: 0.3), value: p)
                     }
-
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(isDownloading ? .primary : .secondary)
+                    Image(systemName: "arrow.down.circle")
+                        .font(.body.weight(isDownloading ? .semibold : .regular))
                 }
-                // Fixed square — keeps macOS from stretching the button into an oval
-                .frame(width: 18, height: 18)
             }
-            // No explicit buttonStyle: macOS 26 applies liquid-glass automatically to toolbar items
+            // Do NOT override buttonStyle — let macOS supply the toolbar circle / liquid glass.
             .popover(isPresented: $isPresented, arrowEdge: .bottom) {
                 DownloadsPopoverContent(
                     launcher: launcher,
@@ -85,9 +81,7 @@ private struct DownloadsPopoverContent: View {
 
             let recent = DownloadHistory.shared.recent
             if !recent.isEmpty {
-                if activeGame != nil {
-                    Divider().padding(.horizontal, 8)
-                }
+                if activeGame != nil { Divider().padding(.horizontal, 8) }
 
                 Text("Recently Installed")
                     .font(.caption.weight(.semibold))
@@ -96,7 +90,7 @@ private struct DownloadsPopoverContent: View {
                     .kerning(0.4)
                     .padding(.horizontal, 16)
                     .padding(.top, 10)
-                    .padding(.bottom, 4)
+                    .padding(.bottom, 6)
 
                 ForEach(recent) { entry in
                     recentRow(entry)
@@ -112,7 +106,7 @@ private struct DownloadsPopoverContent: View {
             }
         }
         .frame(width: 320)
-        .padding(.bottom, 8)
+        .padding(.bottom, 10)
     }
 
     // MARK: - Active row
@@ -120,13 +114,13 @@ private struct DownloadsPopoverContent: View {
     private func activeDownloadRow(_ game: Game) -> some View {
         Button { onSelectGame(game) } label: {
             HStack(spacing: 10) {
-                // Capsule thumbnail
-                capsuleThumbnail(for: game)
+                capsuleArt(for: game)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(game.name)
                         .font(.subheadline.weight(.medium))
                         .lineLimit(1)
+
                     if let activity = launcher.currentActivity {
                         Text(activity)
                             .font(.caption)
@@ -137,22 +131,29 @@ private struct DownloadsPopoverContent: View {
 
                 Spacer()
 
-                // Circular progress on the right
-                ZStack {
-                    Circle().stroke(.quaternary, lineWidth: 2.5)
+                // Progress ring + percentage on the right
+                VStack(spacing: 2) {
+                    ZStack {
+                        Circle().stroke(.quaternary, lineWidth: 2.5)
+                        if let p = launcher.downloadProgress, p > 0 {
+                            Circle()
+                                .trim(from: 0, to: p)
+                                .stroke(.tint, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                                .rotationEffect(.degrees(-90))
+                                .animation(.linear(duration: 0.3), value: p)
+                        } else {
+                            ProgressView().scaleEffect(0.45)
+                        }
+                    }
+                    .frame(width: 22, height: 22)
+
                     if let p = launcher.downloadProgress, p > 0 {
-                        Circle()
-                            .trim(from: 0, to: p)
-                            .stroke(.tint, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                            .rotationEffect(.degrees(-90))
-                        Text("\(Int(p * 100))")
-                            .font(.system(size: 7, weight: .bold))
+                        Text("\(Int(p * 100))%")
+                            .font(.system(size: 9))
                             .monospacedDigit()
-                    } else {
-                        ProgressView().scaleEffect(0.45)
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .frame(width: 28, height: 28)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
@@ -164,16 +165,19 @@ private struct DownloadsPopoverContent: View {
     // MARK: - Recent row
 
     private func recentRow(_ entry: DownloadHistory.Entry) -> some View {
-        let game = library.games.first { $0.id == entry.appID }
-        return Button {
-            if let game { onSelectGame(game) }
+        Button {
+            if let game = library.games.first(where: { $0.id == entry.appID }) {
+                onSelectGame(game)
+            }
         } label: {
             HStack(spacing: 10) {
-                // Capsule thumbnail (uses game if found, else placeholder)
-                if let game {
-                    capsuleThumbnail(for: game)
+                if let game = library.games.first(where: { $0.id == entry.appID }) {
+                    capsuleArt(for: game)
                 } else {
-                    placeholderThumbnail
+                    // Fallback placeholder when game isn't in library
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(.quaternary)
+                        .frame(width: 32, height: 48)
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -198,43 +202,42 @@ private struct DownloadsPopoverContent: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Thumbnail helpers
+    // MARK: - Capsule art
 
-    private func capsuleThumbnail(for game: Game) -> some View {
-        let urls = game.newCDNCapsuleURLs + [game.verticalCapsuleURL] + game.verticalCapsuleURLFallbacks
-        let fallbacks = urls.count > 1 ? Array(urls[1...]) : []
-        return CachedAsyncImage(url: urls.first, fallbacks: fallbacks) { phase in
+    @ViewBuilder
+    private func capsuleArt(for game: Game) -> some View {
+        let urls = game.newCDNCapsuleURLs
+            + [game.verticalCapsuleURL]
+            + game.verticalCapsuleURLFallbacks
+        CachedAsyncImage(url: urls.first, fallbacks: Array(urls.dropFirst)) { phase in
             switch phase {
             case .success(let image):
-                image.resizable()
+                image
+                    .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fill)
+                    .frame(width: 32, height: 48)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
             default:
-                placeholderThumbnail
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(.quaternary)
+                    .frame(width: 32, height: 48)
+                    .overlay {
+                        Image(systemName: "gamecontroller")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
             }
         }
-        .frame(width: 36, height: 48)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.separator, lineWidth: 0.5))
-    }
-
-    private var placeholderThumbnail: some View {
-        RoundedRectangle(cornerRadius: 4)
-            .fill(.quaternary)
-            .frame(width: 36, height: 48)
-            .overlay {
-                Image(systemName: "gamecontroller")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+        .frame(width: 32, height: 48)
     }
 }
 
 // MARK: - Download History
 
-/// Session-scoped (in-memory) download history.
-/// Deduplicates by appID — re-downloading a game replaces the old entry.
-/// Keeps the last 10 unique games, most recent first.
+/// Lightweight session-scoped download history for the popover.
+/// In-memory only — clears on quit. Keeps the 10 most recent unique installs.
 @Observable
 final class DownloadHistory: @unchecked Sendable {
     static let shared = DownloadHistory()
@@ -248,8 +251,9 @@ final class DownloadHistory: @unchecked Sendable {
 
     private(set) var recent: [Entry] = []
 
+    /// Records a completed download. Replaces any existing entry for the same
+    /// game so re-downloads don't create duplicates — only the latest is kept.
     func recordCompletion(appID: Int, name: String) {
-        // Remove any prior entry for this game so re-downloads don't duplicate
         recent.removeAll { $0.appID == appID }
         recent.insert(Entry(appID: appID, name: name, completedAt: .now), at: 0)
         if recent.count > 10 { recent.removeLast() }

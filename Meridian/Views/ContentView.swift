@@ -96,7 +96,8 @@ struct ContentView: View {
                             .id(game.id)
                     }
                     .toolbar {
-                        // Spacer pushes the download button to the trailing end of the toolbar.
+                        // Flexible space pushes everything after it to the
+                        // trailing end — same pattern as GameDetailView.
                         ToolbarItem(placement: .automatic) { Spacer() }
                         ToolbarItem(placement: .automatic) {
                             DownloadsToolbarButton(
