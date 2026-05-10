@@ -447,6 +447,7 @@ actor SteamAPIService {
                     }
                 }
             }
+        } // end if let firstItem
 
         var out: [Int: GameCDNHashes] = [:]
         for item in items {
