@@ -72,10 +72,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.setContentSize(Self.splashSize)
         setTrafficLights(hidden: true, in: window)
 
-        // NSWindow.center() uses the same algorithm as Cmd+Ctrl+C:
-        // horizontally centered on the main display, vertically centered in the
-        // usable area (screen minus menu bar and Dock).
-        window.center()
+        // Center the window in the screen's visible frame — the area that excludes
+        // both the menu bar (top) and the Dock (bottom/side). This matches the
+        // geometric result of Window → Center (Ctrl+Fn+C), which positions the
+        // window at the true midpoint of the available display area.
+        //
+        // NSWindow.center() uses a different formula (Apple's "cascade" convention
+        // that places windows at roughly the upper third), which is why calling it
+        // produces a window that sits too high. Using visibleFrame.mid directly
+        // gives the exact centre the user expects.
+        if let screen = window.screen ?? NSScreen.main {
+            let vf = screen.visibleFrame
+            window.setFrameOrigin(CGPoint(
+                x: vf.midX - window.frame.width  / 2,
+                y: vf.midY - window.frame.height / 2
+            ))
+        }
 
         log.debug("Main window locked to splash size \(Self.splashSize.width)x\(Self.splashSize.height) and centered")
     }
