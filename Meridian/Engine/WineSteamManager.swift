@@ -669,6 +669,8 @@ final class WineSteamManager {
         prefix: WinePrefix,
         statusUpdate: (@MainActor (String) -> Void)? = nil
     ) async throws {
+        // Write the pre-seeded manifest (StateFlags=1026) so Steam knows the
+        // install location when it receives the IPC command.
         windowSuppressor?.suppressNow(reason: "installGame preseed appID=\(appID)")
         log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
         try prefix.writePreseededAppManifest(
@@ -678,86 +680,27 @@ final class WineSteamManager {
             steamID64: steamID64
         )
 
-        // Fast path: the ACF is on disk and the installDir is already specified.
-        // Steam watches its steamapps/ directory for ACF changes via filesystem
-        // notification and may pick this up without a restart. Give it 12 seconds
-        // to start a download before falling back to the full restart cycle.
-        //
-        // Use `isRunning` rather than `isSteamProcessAlive`. After a code-42
-        // self-update, `persistentProcess` is nil (we clear it on 42 so we can
-        // keep polling for the restarted process) but Steam IS alive and
-        // authenticated — `isRunning` stays true because we set it true when
-        // [Logged On] is observed in waitUntilReady. Checking `isSteamProcessAlive`
-        // would skip the probe and go straight to restart, launching a new steam.exe
-        // that detects the still-running untracked instance and exits with code=0.
-        if isRunning {
-            log.info("[installGame] Steam is running — probing for immediate download (5s window)")
-            statusUpdate?("Queuing \(name) for download…")
-            startHeadlessWebhelperKillBurst(reason: "installGame probe appID=\(appID)", duration: .seconds(8))
-            let probeDeadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < probeDeadline {
-                try? await Task.sleep(for: .seconds(1))
-                if let details = prefix.gameDownloadDetails(appID: appID),
-                   details.bytesToDownload > 0 {
-                    log.info("[installGame] ✓ no-restart path worked — Steam picked up ACF, download started appID=\(appID)")
-                    if let pid = persistentProcessIdentifier {
-                        windowSuppressor?.resumeSuppressing(pid: pid)
-                    }
-                    startHeadlessWebhelperKillBurst(reason: "installGame no-restart ready appID=\(appID)", duration: .seconds(12))
-                    return
-                }
-            }
-            // Probe didn't detect a download in 12s. Steam scans ACFs once at
-            // startup — if the ACF was written after Steam's startup scan completed,
-            // Steam will never see it without a restart. local.vdf injection does
-            // not survive a restart; only -login user pass reliably authenticates.
-            // Fall through to the -login restart path below.
-            log.info("[installGame] no-restart probe expired — restarting Steam with -login to force ACF scan appID=\(appID)")
+        guard isRunning else {
+            // Steam is not running — the caller (executeLaunchPipeline) handles
+            // starting it. Nothing else to do here; the startup ACF scan will
+            // pick up the manifest when Steam logs in.
+            log.info("[installGame] Steam not running — ACF written, bootstrap will start Steam appID=\(appID)")
+            return
         }
 
-        // -login restart: the only 100% reliable auth mechanism for plain Steam restarts.
-        //
-        // local.vdf injection is non-deterministic — the same token sometimes works and
-        // sometimes Steam ignores it entirely (connection_log shows U:1:0, never attempts
-        // LogOn()). This caused repeated install failures in every session today.
-        //
-        // -login user pass is reliable because Steam drives its own CM auth handshake.
-        // The first call after a fresh Meridian sign-in triggers a Mobile Authenticator
-        // push (one-time per device); after approval Steam writes an ssfn device-trust
-        // token. All subsequent -login calls use ssfn silently (~10s, no 2FA).
-        // ssfn files are preserved across sessions by resetToEngineTemplate.
-        let accountName = AppSettings.shared.steamCredentialAccountName
-        let authSvc     = SteamAuthService()
-        let password    = authSvc.loadSteamPassword()
-
-        guard !accountName.isEmpty, let pw = password else {
-            log.warning("[installGame] no saved credentials for -login restart")
-            throw WineSteamManager.SteamError.authenticationFailed
+        // Send steam://install/<appID> to the running instance via IPC.
+        // Steam processes this as a native install request against the already-
+        // configured library (libraryfolders.vdf was written at bootstrap).
+        // The ACF specifies installDir so no location-picker dialog appears.
+        // No restart, no re-auth — Steam is already signed in.
+        startHeadlessWebhelperKillBurst(reason: "installGame IPC appID=\(appID)", duration: .seconds(15))
+        windowSuppressor?.suppressNow(reason: "installGame IPC appID=\(appID)")
+        log.info("[installGame] sending steam://install/\(appID) IPC to running Steam")
+        try sendSteamCommand(["steam://install/\(appID)"], engine: engine, prefix: prefix)
+        log.info("[installGame] IPC command sent — download should start momentarily appID=\(appID)")
+        if let pid = persistentProcessIdentifier {
+            windowSuppressor?.resumeSuppressing(pid: pid)
         }
-
-        log.info("[installGame] -login restart for user=\(accountName)")
-        statusUpdate?("Restarting Steam to begin download…")
-        startHeadlessWebhelperKillBurst(reason: "installGame login-restart appID=\(appID)", duration: .seconds(25))
-        windowSuppressor?.suppressNow(reason: "installGame login-restart appID=\(appID)")
-        await stopPersistent(engine: engine, prefix: prefix)
-        killAll(engine: engine, prefix: prefix)
-        clearPersistentProcess()
-        try? await Task.sleep(for: .milliseconds(500))
-        statusUpdate?("Connecting to Steam…")
-        try await startPersistent(
-            engine: engine,
-            prefix: prefix,
-            extraArgs: ["-login", accountName, pw],
-            skipRegistryConfig: true
-        )
-        // authTimeout 90s: ssfn-established calls complete in ~10s. 90s gives
-        // enough time for a Mobile Authenticator push to be approved on first call.
-        statusUpdate?("Signing in to Steam — approve in Steam Mobile if prompted…")
-        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(90))
-        if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
-        startHeadlessWebhelperKillBurst(reason: "installGame login-restart ready appID=\(appID)", duration: .seconds(12))
-        statusUpdate?("Starting download for \(name)…")
-        log.info("[installGame] -login restart complete — Steam startup scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam

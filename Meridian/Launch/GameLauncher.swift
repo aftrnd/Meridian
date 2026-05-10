@@ -391,7 +391,7 @@ final class GameLauncher {
             }
 
             if !prefix.isGameInstalled(appID: game.id) {
-                log.info("[launch] pre-seeding appmanifest for appID=\(game.id) and restarting Steam")
+                log.info("[launch] pre-seeding appmanifest and sending install IPC for appID=\(game.id)")
                 do {
                     try await steamManager.installGame(
                         appID: game.id,
@@ -401,10 +401,6 @@ final class GameLauncher {
                         engine: engine,
                         prefix: prefix,
                         statusUpdate: { [weak self] msg in
-                            // currentActivity drives the StatusCard text;
-                            // appendLog adds to the detail-page log panel.
-                            // The button ignores currentActivity during install
-                            // (it shows hardcoded Downloading…/Installing…).
                             self?.currentActivity = msg
                             self?.appendLog(msg)
                         }
@@ -414,6 +410,27 @@ final class GameLauncher {
                     return
                 } catch {
                     fail("Could not start install: \(error.localizedDescription)", error: error)
+                    return
+                }
+
+                // Wait up to 15s for Steam to acknowledge the IPC and write
+                // BytesToDownload into the ACF. If nothing starts, the IPC
+                // command may have triggered a suppressed dialog — tell the
+                // user rather than spinning indefinitely.
+                let ipcDeadline = ContinuousClock.now + .seconds(15)
+                while ContinuousClock.now < ipcDeadline {
+                    guard !Task.isCancelled else { return }
+                    let d = prefix.gameDownloadDetails(appID: game.id)
+                    if (d?.bytesToDownload ?? 0) > 0 || prefix.isGameFullyInstalled(appID: game.id) {
+                        log.info("[launch] IPC triggered download for appID=\(game.id)")
+                        break
+                    }
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                if (prefix.gameDownloadDetails(appID: game.id)?.bytesToDownload ?? 0) == 0
+                    && !prefix.isGameFullyInstalled(appID: game.id) {
+                    log.warning("[launch] IPC did not start download within 15s for appID=\(game.id)")
+                    fail("Steam didn't start the download. Try clicking Install again.")
                     return
                 }
             } else {
