@@ -125,26 +125,78 @@ final class SteamLibraryStore {
         let resolvedCount = games.filter { $0.libraryCapsuleHash != nil }.count
         log.info("[prefetchLibraryCapsuleHashes] batch pass resolved \(resolvedCount)/\(appIDs.count) hashes — games without hashes use legacy CDN fallback")
 
-        // Pass 2: for recently-played games that still lack a logo hash, run the
-        // targeted appdetails probe. Covers all recently played games so the hero
-        // carousel always has logo art regardless of library position.
-        let logoMissing = recentlyPlayedGames
-            .filter { $0.logoHash == nil }
-            .map(\.id)
-        if !logoMissing.isEmpty {
-            log.info("[prefetchLibraryCapsuleHashes] probing logo hashes for \(logoMissing.count) recently played games")
-            for appID in logoMissing {
-                if let hash = await SteamAPIService.shared.probeLogoHash(appID: appID) {
-                    if let idx = games.firstIndex(where: { $0.id == appID }) {
-                        games[idx].logoHash = hash
+        // Pass 2: Scan Steam's local librarycache for logo hashes.
+        //
+        // Steam downloads and caches library art from PICSData into
+        // appcache/librarycache/{appID}/{hash}/. The hash directory NAME is the
+        // asset hash used to construct CDN URLs. Any directory containing
+        // logo.png is the logo hash for that game — no API call, no network.
+        //
+        // This is the authoritative source for logo hashes because:
+        // - IStoreBrowseService/GetItems/v1 does not return logo hashes
+        // - appdetails only includes screenshot/header hashes, not the logo hash
+        // - SteamDB reads the same data from PICSData via CM protocol (not HTTP)
+        // Reading from disk is instant and works for every game Steam has cached.
+        let libraryCacheBase = WinePrefix.defaultPrefix.steamInstallDir
+            .appending(path: "appcache/librarycache")
+        let fm = FileManager.default
+        var localLogoCount = 0
+        for idx in games.indices where games[idx].logoHash == nil {
+            let appID = games[idx].id
+            let gameDir = libraryCacheBase.appending(path: "\(appID)")
+            guard let entries = try? fm.contentsOfDirectory(
+                at: gameDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: .skipsHiddenFiles
+            ) else { continue }
+            for entry in entries {
+                let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDir else { continue }
+                let hash = entry.lastPathComponent
+                guard hash.count == 40, hash.allSatisfy(\.isHexDigit) else { continue }
+                let hasLogo = fm.fileExists(atPath: entry.appending(path: "logo.png").path(percentEncoded: false))
+                    || fm.fileExists(atPath: entry.appending(path: "logo_2x.png").path(percentEncoded: false))
+                if hasLogo {
+                    games[idx].logoHash = hash
+                    if let rIdx = recentGames.firstIndex(where: { $0.id == appID }) {
+                        recentGames[rIdx].logoHash = hash
                     }
-                    if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
-                        recentGames[idx].logoHash = hash
-                    }
+                    localLogoCount += 1
+                    log.debug("[prefetchLibraryCapsuleHashes] localCache logo appID=\(appID) hash=\(hash.prefix(8))…")
+                    break
                 }
-                try? await Task.sleep(for: .milliseconds(500))
             }
         }
+        // While we have the librarycache open, also pick up capsule hashes
+        // for games the batch API missed. library_capsule.jpg in the same dir
+        // gives the capsule hash for free.
+        var localCapsuleCount = 0
+        for idx in games.indices where games[idx].libraryCapsuleHash == nil {
+            let appID = games[idx].id
+            let gameDir = libraryCacheBase.appending(path: "\(appID)")
+            guard let entries = try? fm.contentsOfDirectory(
+                at: gameDir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: .skipsHiddenFiles
+            ) else { continue }
+            for entry in entries {
+                let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDir else { continue }
+                let hash = entry.lastPathComponent
+                guard hash.count == 40, hash.allSatisfy(\.isHexDigit) else { continue }
+                let hasCapsule = fm.fileExists(atPath: entry.appending(path: "library_capsule.jpg").path(percentEncoded: false))
+                    || fm.fileExists(atPath: entry.appending(path: "library_600x900.jpg").path(percentEncoded: false))
+                if hasCapsule {
+                    games[idx].libraryCapsuleHash = hash
+                    if let rIdx = recentGames.firstIndex(where: { $0.id == appID }) {
+                        recentGames[rIdx].libraryCapsuleHash = hash
+                    }
+                    localCapsuleCount += 1
+                    break
+                }
+            }
+        }
+        log.info("[prefetchLibraryCapsuleHashes] localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule hashes from Steam's librarycache")
 
         // Pass 3: ALL library games still missing a 600x900 capsule hash after
         // passes 1 & 2. The batch call misses some games (new CDN, API gaps, etc.)
