@@ -681,7 +681,7 @@ struct GameDetailView: View {
 
         case .awaitingInstallConfirmation:
             HStack(spacing: 8) {
-                ProgressButton("Downloading…")
+                ProgressButton(launcher.currentActivity ?? "Preparing download…")
                 cancelButton
             }
 

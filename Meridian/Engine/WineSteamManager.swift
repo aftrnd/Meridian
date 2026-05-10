@@ -666,7 +666,8 @@ final class WineSteamManager {
         installDir: String,
         steamID64: String,
         engine: WineEngine,
-        prefix: WinePrefix
+        prefix: WinePrefix,
+        statusUpdate: (@MainActor (String) -> Void)? = nil
     ) async throws {
         windowSuppressor?.suppressNow(reason: "installGame preseed appID=\(appID)")
         log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
@@ -690,9 +691,10 @@ final class WineSteamManager {
         // would skip the probe and go straight to restart, launching a new steam.exe
         // that detects the still-running untracked instance and exits with code=0.
         if isRunning {
-            log.info("[installGame] Steam is running (isRunning=\(isRunning)) — probing for no-restart download (12s window)")
-            startHeadlessWebhelperKillBurst(reason: "installGame probe appID=\(appID)", duration: .seconds(15))
-            let probeDeadline = ContinuousClock.now + .seconds(12)
+            log.info("[installGame] Steam is running — probing for immediate download (5s window)")
+            statusUpdate?("Queuing \(name) for download…")
+            startHeadlessWebhelperKillBurst(reason: "installGame probe appID=\(appID)", duration: .seconds(8))
+            let probeDeadline = ContinuousClock.now + .seconds(5)
             while ContinuousClock.now < probeDeadline {
                 try? await Task.sleep(for: .seconds(1))
                 if let details = prefix.gameDownloadDetails(appID: appID),
@@ -726,6 +728,7 @@ final class WineSteamManager {
         let accountName  = settings.steamCredentialAccountName
         let refreshToken = settings.steamCredentialRefreshToken
 
+        statusUpdate?("Restarting Steam to begin download…")
         log.info("[installGame] refreshing local.vdf and restarting Steam for ACF scan appID=\(appID)")
         startHeadlessWebhelperKillBurst(reason: "installGame credential-restart appID=\(appID)", duration: .seconds(25))
         windowSuppressor?.suppressNow(reason: "installGame credential-restart appID=\(appID)")
@@ -744,10 +747,15 @@ final class WineSteamManager {
         killAll(engine: engine, prefix: prefix)
         clearPersistentProcess()
         try? await Task.sleep(for: .milliseconds(500))
+        statusUpdate?("Connecting to Steam…")
         try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
-        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60))
+        statusUpdate?("Signing in to Steam…")
+        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60)) { [name] msg in
+            statusUpdate?("Preparing \(name) — \(msg)")
+        }
         if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
         startHeadlessWebhelperKillBurst(reason: "installGame credential-restart ready appID=\(appID)", duration: .seconds(12))
+        statusUpdate?("Starting download for \(name)…")
         log.info("[installGame] credential restart complete — Steam startup scan queuing download appID=\(appID)")
     }
 
