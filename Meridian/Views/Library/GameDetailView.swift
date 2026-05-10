@@ -660,28 +660,19 @@ struct GameDetailView: View {
         case .idle, .exited:
             idleButton
 
-        case .preparingEngine, .preparingPrefix:
+        case .preparingEngine, .preparingPrefix, .bootstrappingSteam:
             HStack(spacing: 8) {
-                ProgressButton(launcher.currentActivity ?? "Preparing…")
-                cancelButton
-            }
-
-        case .bootstrappingSteam:
-            // Use the live activity message from `GameLauncher.transition(to:activity:)`
-            // — it accurately reflects the current phase ("Starting Steam…",
-            // "Steam is updating…" only when an actual self-update is detected
-            // via `WineSteamManager.waitUntilReady`'s `statusUpdate` callback).
-            // The previous hardcoded "Updating Steam…" was misleading whenever
-            // we were just waking the persistent process — which is the common
-            // case post-auth-success.
-            HStack(spacing: 8) {
-                ProgressButton(launcher.currentActivity ?? "Starting Steam…")
+                ProgressButton("Downloading…")
                 cancelButton
             }
 
         case .awaitingInstallConfirmation:
+            // Distinguish downloading vs installing phases from progress value.
+            // > ~90% disk filled means chunks are being decompressed to the
+            // install dir — show Installing… to the user.
+            let isInstalling = (launcher.downloadProgress ?? 0) > 0.88
             HStack(spacing: 8) {
-                ProgressButton(launcher.currentActivity ?? "Preparing download…")
+                ProgressButton(isInstalling ? "Installing…" : "Downloading…")
                 cancelButton
             }
 

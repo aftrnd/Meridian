@@ -34,7 +34,7 @@ struct DownloadsToolbarButton: View {
                             .rotationEffect(.degrees(-90))
                             .animation(.linear(duration: 0.3), value: p)
                     }
-                    Image(systemName: "arrow.down.circle")
+                    Image(systemName: "arrow.down")
                         .font(.body.weight(isDownloading ? .semibold : .regular))
                 }
             }
