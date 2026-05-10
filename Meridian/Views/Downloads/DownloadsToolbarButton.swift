@@ -202,7 +202,8 @@ private struct DownloadsPopoverContent: View {
 
     private func capsuleThumbnail(for game: Game) -> some View {
         let urls = game.newCDNCapsuleURLs + [game.verticalCapsuleURL] + game.verticalCapsuleURLFallbacks
-        return CachedAsyncImage(url: urls.first, fallbacks: Array(urls.dropFirst)) { phase in
+        let fallbacks = urls.count > 1 ? Array(urls[1...]) : []
+        return CachedAsyncImage(url: urls.first, fallbacks: fallbacks) { phase in
             switch phase {
             case .success(let image):
                 image.resizable()
