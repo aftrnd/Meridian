@@ -113,8 +113,13 @@ final class SteamLibraryStore {
         guard !appIDs.isEmpty else { return }
         log.info("[prefetchLibraryCapsuleHashes] starting for \(appIDs.count) games")
 
-        // Pass 1: batch requests of 50 — fast, covers most games.
-        for batch in appIDs.chunked(into: 50) {
+        // Pass 1: batch requests of 50.
+        // Recently played games are moved to the front so the visible carousel
+        // always resolves in the first batch, regardless of alphabetical position.
+        let recentIDSet = Set(recentlyPlayedGames.map(\.id))
+        let prioritized = recentlyPlayedGames.map(\.id)
+            + appIDs.filter { !recentIDSet.contains($0) }
+        for batch in prioritized.chunked(into: 50) {
             let hashes = await SteamAPIService.shared.fetchLibraryCapsuleHashes(
                 appIDs: batch, apiKey: apiKey
             )

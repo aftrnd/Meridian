@@ -178,26 +178,29 @@ final class ImageCache: @unchecked Sendable {
 
     private func evictIfNeeded() {
         let fm = FileManager.default
+        // Use contentAccessDate (last read time) for true LRU eviction —
+        // keeps recently viewed art and discards long-unviewed images first.
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentAccessDateKey]
         guard let files = try? fm.contentsOfDirectory(
             at: diskCacheDirectory,
-            includingPropertiesForKeys: [.fileSizeKey, .creationDateKey],
+            includingPropertiesForKeys: Array(keys),
             options: .skipsHiddenFiles
         ) else { return }
 
-        var entries: [(url: URL, size: Int, creationDate: Date)] = []
+        var entries: [(url: URL, size: Int, accessDate: Date)] = []
         var totalBytes = 0
         for file in files {
-            guard let res = try? file.resourceValues(forKeys: [.fileSizeKey, .creationDateKey]),
+            guard let res = try? file.resourceValues(forKeys: keys),
                   let size = res.fileSize,
-                  let date = res.creationDate else { continue }
+                  let date = res.contentAccessDate else { continue }
             entries.append((file, size, date))
             totalBytes += size
         }
 
         guard totalBytes > Self.maxDiskBytes else { return }
 
-        // Remove oldest-created files first until total drops to the target size.
-        entries.sort { $0.creationDate < $1.creationDate }
+        // Evict least-recently-accessed files until under target size.
+        entries.sort { $0.accessDate < $1.accessDate }
         for entry in entries {
             guard totalBytes > Self.targetDiskBytes else { break }
             try? fm.removeItem(at: entry.url)
