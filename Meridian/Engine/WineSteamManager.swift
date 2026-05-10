@@ -668,7 +668,6 @@ final class WineSteamManager {
         engine: WineEngine,
         prefix: WinePrefix
     ) async throws {
-        startHeadlessWebhelperKillBurst(reason: "installGame start appID=\(appID)", duration: .seconds(20))
         windowSuppressor?.suppressNow(reason: "installGame preseed appID=\(appID)")
         log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
         try prefix.writePreseededAppManifest(
@@ -678,20 +677,45 @@ final class WineSteamManager {
             steamID64: steamID64
         )
 
-        log.info("[installGame] restarting persistent Steam so it picks up the new manifest")
+        // Fast path: the ACF is on disk and the installDir is already specified.
+        // Steam watches its steamapps/ directory for ACF changes via filesystem
+        // notification and may pick this up without a restart. Give it 12 seconds
+        // to start a download before falling back to the full restart cycle.
+        //
+        // Background: the old +app_update IPC showed a "choose location" dialog
+        // because there was no ACF on disk. With a pre-seeded ACF that already
+        // contains installDir, Steam knows where to put the game and may skip
+        // the dialog entirely, queuing the download silently.
+        if isSteamProcessAlive {
+            log.info("[installGame] Steam already running — probing for no-restart download (12s window)")
+            startHeadlessWebhelperKillBurst(reason: "installGame probe appID=\(appID)", duration: .seconds(15))
+            let probeDeadline = ContinuousClock.now + .seconds(12)
+            while ContinuousClock.now < probeDeadline {
+                try? await Task.sleep(for: .seconds(1))
+                if let details = prefix.gameDownloadDetails(appID: appID),
+                   details.bytesToDownload > 0 {
+                    log.info("[installGame] ✓ no-restart path worked — Steam picked up ACF, download started appID=\(appID)")
+                    if let pid = persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
+                    }
+                    startHeadlessWebhelperKillBurst(reason: "installGame no-restart ready appID=\(appID)", duration: .seconds(12))
+                    return
+                }
+            }
+            log.info("[installGame] no-restart probe expired — falling back to Steam restart for appID=\(appID)")
+        }
+
+        // Restart path: stop Steam, write the ACF, restart so Steam's startup
+        // ACF scan picks it up. Registry keys are already written on disk from
+        // the initial bootstrap; pass skipRegistryConfig to save ~5s.
+        startHeadlessWebhelperKillBurst(reason: "installGame restart appID=\(appID)", duration: .seconds(20))
         windowSuppressor?.suppressNow(reason: "installGame restart appID=\(appID)")
         await stopPersistent(engine: engine, prefix: prefix)
-        // Kill wineserver and all child processes (steamwebhelper, steamservice, etc.)
-        // so the restarted steam.exe starts into a completely clean Wine session.
-        // Without this, lingering children hold named-pipe handles that cause the new
-        // steam.exe to get stuck during CM re-authentication — identical root cause to
-        // the sign-in code-0 and code-42 failures. CLI-observed: "Connected 60s ago
-        // but Logged On never observed" with connLogBytes frozen at 663.
         killAll(engine: engine, prefix: prefix)
         clearPersistentProcess()
         try? await Task.sleep(for: .milliseconds(500))
         windowSuppressor?.suppressNow(reason: "installGame post-stop appID=\(appID)")
-        try await startPersistent(engine: engine, prefix: prefix)
+        try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
         windowSuppressor?.suppressNow(reason: "installGame post-start appID=\(appID)")
         try await waitUntilReady(prefix: prefix, timeout: .seconds(180))
         if let pid = persistentProcessIdentifier {
@@ -721,19 +745,32 @@ final class WineSteamManager {
     /// matches the JWT Valve issues. Externally-minted JWTs (from our
     /// `IAuthenticationService` OAuth) never matched, so CM rejected them
     /// with `Invalid Password`. See `engine-research-findings.mdc` Pattern 7.
-    func startPersistent(engine: WineEngine, prefix: WinePrefix, extraArgs: [String] = []) async throws {
+    /// - Parameters:
+    ///   - skipRegistryConfig: When `true`, skips `configureSteamRegistryForSilentMode`
+    ///     and its 2-second drain sleep. Pass `true` for install restarts where the
+    ///     registry keys were already written during the initial bootstrap startup and
+    ///     are persisted to `user.reg` on disk. This saves ~5 seconds per install.
+    func startPersistent(
+        engine: WineEngine,
+        prefix: WinePrefix,
+        extraArgs: [String] = [],
+        skipRegistryConfig: Bool = false
+    ) async throws {
         guard persistentProcess == nil || !(persistentProcess?.isRunning ?? false) else {
             log.info("[startPersistent] Steam already running — skipping")
             return
         }
 
-        // Write registry key before launching Steam. Runs on a background thread
-        // to avoid blocking the main actor with waitUntilExit().
-        await configureSteamRegistryForSilentMode(engine: engine, prefix: prefix)
-
-        // Let the wineserver from reg-add drain so the next wine64 launch
-        // doesn't collide with a shutting-down server.
-        try? await Task.sleep(for: .seconds(2))
+        if skipRegistryConfig {
+            log.info("[startPersistent] skipRegistryConfig=true — registry already configured, skipping wine64 reg adds")
+        } else {
+            // Write registry key before launching Steam. Runs on a background thread
+            // to avoid blocking the main actor with waitUntilExit().
+            await configureSteamRegistryForSilentMode(engine: engine, prefix: prefix)
+            // Let the wineserver from reg-add drain so the next wine64 launch
+            // doesn't collide with a shutting-down server.
+            try? await Task.sleep(for: .seconds(2))
+        }
 
         // Pre-flight so every launch is deterministic (per fail-fast.mdc):
         //   - steam.cfg must contain SteamNoSandbox=1 only; any stale
