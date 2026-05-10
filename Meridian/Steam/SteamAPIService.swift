@@ -365,8 +365,11 @@ actor SteamAPIService {
                 for item in decoded.response?.storeItems ?? [] {
                     guard let appID = item.appid ?? item.id else { continue }
                     let ch = item.assets?.libraryCapsuleHash
+                    // Logo hash is often only in assets_without_overrides (locale-specific).
                     let lh = item.assets?.libraryCapsuleLogoHash
+                              ?? item.assetsWithoutOverrides?.libraryCapsuleLogoHash
                     let hh = item.assets?.libraryHeroHash
+                              ?? item.assetsWithoutOverrides?.libraryHeroHash
                     if ch != nil || lh != nil || hh != nil {
                         result[appID] = GameCDNHashes(capsuleHash: ch, logoHash: lh, heroHash: hh)
                         log.debug("[fetchLibraryCapsuleHashes] S1 appID=\(appID) capsule=\(ch?.prefix(8) ?? "-") logo=\(lh?.prefix(8) ?? "-") hero=\(hh?.prefix(8) ?? "-")")
@@ -440,7 +443,15 @@ actor SteamAPIService {
                 ?? (item["id"] as? String).flatMap(Int.init)
             guard let appID else { continue }
 
-            let target: Any = (item["assets"] as? [String: Any]) ?? item
+            // Merge assets + assets_without_overrides into one search target.
+            // Logo hashes (image/english, image2x/english in SteamDB notation)
+            // appear in assets_without_overrides, not in assets. We request
+            // include_assets_without_overrides:true but previously only searched
+            // assets, silently missing every logo hash on the new CDN.
+            var mergedTarget: [String: Any] = [:]
+            if let a  = item["assets"]                   as? [String: Any] { mergedTarget.merge(a,  uniquingKeysWith: { l, _ in l }) }
+            if let ao = item["assets_without_overrides"]  as? [String: Any] { mergedTarget.merge(ao, uniquingKeysWith: { l, _ in l }) }
+            let target: Any = mergedTarget.isEmpty ? item : mergedTarget
             // Eagerly compute all naming variants before combining with ??
             // so `target` (non-Sendable Any) is not captured lazily across the operator.
             let ch600 = searchForHash(matching: "library_600x900", in: target)
@@ -582,6 +593,12 @@ private struct StoreBrowseItem: Decodable {
     let id: Int?
     let appid: Int?
     let assets: StoreBrowseAssets?
+    /// Per-locale unoverridden assets — logo hashes live here for many games.
+    let assetsWithoutOverrides: StoreBrowseAssets?
+    enum CodingKeys: String, CodingKey {
+        case id, appid, assets
+        case assetsWithoutOverrides = "assets_without_overrides"
+    }
 }
 
 /// Art hashes returned by `fetchLibraryCapsuleHashes` for a single game.
