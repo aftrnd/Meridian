@@ -560,17 +560,17 @@ final class BootstrapManager {
                 }
                 log.info("[bootstrap] persistent steam.exe signed in ✓")
                 steamStartSucceeded = true
-            } catch WineSteamManager.SteamError.authenticationFailed {
-                log.warning("[bootstrap] persistent steam.exe reached network but auto-login failed — saved session is stale")
-                authFailed = true
+            } catch WineSteamManager.SteamError.authenticationFailed,
+                    WineSteamManager.SteamError.steamNotReady {
+                // Both paths mean local.vdf auth failed — either Valve explicitly
+                // rejected the JWT (authenticationFailed, common after code-42
+                // Steam updates that invalidate stored tokens) or the auth window
+                // timed out (steamNotReady). Before clearing credentials and
+                // showing the sign-in sheet, try -login from Keychain. If the
+                // ssfn device-trust file exists from a previous -login session,
+                // this completes silently in ~10s with no 2FA prompt.
+                log.warning("[bootstrap] local.vdf auth failed (JWT rejected or timed out) — attempting -login retry before showing sign-in sheet")
                 settings.steamSelfManagedSession = false
-            } catch WineSteamManager.SteamError.steamNotReady {
-                // steamNotReady means Steam connected to the CM but never logged
-                // on within the authTimeout. This is the code-42 self-update
-                // pattern: the updated client ignores the old local.vdf token.
-                // Attempt a transparent -login retry using the Keychain password
-                // before falling through to the sign-in sheet.
-                log.warning("[bootstrap] Steam connected but did not log on (likely code-42 update) — attempting -login retry")
                 steamManager.killAll(engine: engine, prefix: prefix)
                 steamManager.clearPersistentProcess()
                 try? await Task.sleep(for: .milliseconds(500))
@@ -598,9 +598,13 @@ final class BootstrapManager {
                         steamStartSucceeded = true
                     } catch {
                         log.warning("[bootstrap] -login retry also failed: \(error.localizedDescription)")
+                        // Token is genuinely stale — clear it so sign-in sheet
+                        // drives fresh credential auth on the next user interaction.
+                        settings.steamCredentialRefreshToken = ""
                     }
                 } else {
-                    log.info("[bootstrap] no saved password for -login retry — sign-in sheet will handle it")
+                    log.info("[bootstrap] no saved password for -login retry — clearing token, sign-in sheet will handle it")
+                    settings.steamCredentialRefreshToken = ""
                 }
             } catch {
                 log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
