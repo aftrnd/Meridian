@@ -26,6 +26,7 @@
 		B0010024 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010025 /* ContentView.swift */; };
 		B0010026 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010027 /* LibraryView.swift */; };
 		B0010028 /* GameGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010029 /* GameGridView.swift */; };
+		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
@@ -75,6 +76,7 @@
 		B0010025 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B0010027 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		B0010029 /* GameGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameGridView.swift; sourceTree = "<group>"; };
+		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
@@ -191,12 +193,21 @@
 				B0010025 /* ContentView.swift */,
 				B00E0071 /* HomeView.swift */,
 				B0010049 /* Library */,
+				B00D0003 /* Downloads */,
 				B00E0011 /* Engine */,
 				B004004B /* Settings */,
 				B004004C /* Auth */,
 				4F62085FF69F4F208309DA56 /* SplashView.swift */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		B00D0003 /* Downloads */ = {
+			isa = PBXGroup;
+			children = (
+				B00D0002 /* DownloadsToolbarButton.swift */,
+			);
+			path = Downloads;
 			sourceTree = "<group>";
 		};
 		B0010048 /* Resources */ = {
@@ -443,6 +454,7 @@
 				B00E00B0 /* AppUpdateChecker.swift in Sources */,
 				B00E0040 /* TerminationCleanup.swift in Sources */,
 				B00E0050 /* SearchView.swift in Sources */,
+				B00D0001 /* DownloadsToolbarButton.swift in Sources */,
 				B00E0060 /* SteamWebView.swift in Sources */,
 				31BBDC1F93444D77B811A589 /* BootstrapManager.swift in Sources */,
 				9005918A74DB42729238EB11 /* SplashView.swift in Sources */,
