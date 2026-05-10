@@ -705,33 +705,54 @@ final class WineSteamManager {
                     return
                 }
             }
-            // Probe didn't detect a download in 12s. +app_update IPC was tried
-            // previously and silently ignored — it's a SteamCMD batch command
-            // that the GUI client's IPC forwarder doesn't implement. Just return:
-            // Steam's content manager scans all ACFs at startup and on login. The
-            // ACF is on disk with StateFlags=1026; Steam will queue the download
-            // the next time it performs that scan (usually within ~30s of login).
-            log.info("[installGame] no-restart probe expired — returning; Steam will scan ACF and start download appID=\(appID)")
-            if let pid = persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
-            }
-            startHeadlessWebhelperKillBurst(reason: "installGame return appID=\(appID)", duration: .seconds(12))
+            // Probe didn't detect a download in 12s. Steam scans ACFs once at
+            // startup — if the ACF was written after Steam's startup scan completed,
+            // Steam will never see it without a restart. local.vdf injection does
+            // not survive a restart; only -login user pass reliably authenticates.
+            // Fall through to the -login restart path below.
+            log.info("[installGame] no-restart probe expired — restarting Steam with -login to force ACF scan appID=\(appID)")
+        }
+
+        // -login restart: kill current Steam, restart with credentials so Steam
+        // does a full startup ACF scan (which picks up the StateFlags=1026 manifest)
+        // and authenticates in the same step. Requires a Keychain password.
+        let accountName = AppSettings.shared.steamCredentialAccountName
+        let authSvc = SteamAuthService()
+        let password = authSvc.loadSteamPassword()
+
+        guard !accountName.isEmpty, let pw = password else {
+            // No credentials — fall back to silent restart and hope local.vdf works.
+            log.warning("[installGame] no saved credentials for -login restart — trying silent restart")
+            startHeadlessWebhelperKillBurst(reason: "installGame silent-restart appID=\(appID)", duration: .seconds(20))
+            windowSuppressor?.suppressNow(reason: "installGame silent-restart appID=\(appID)")
+            await stopPersistent(engine: engine, prefix: prefix)
+            killAll(engine: engine, prefix: prefix)
+            clearPersistentProcess()
+            try? await Task.sleep(for: .milliseconds(500))
+            try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
+            try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60))
+            if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
+            startHeadlessWebhelperKillBurst(reason: "installGame silent-restart ready appID=\(appID)", duration: .seconds(12))
             return
         }
 
-        // Steam is not running at all — cold start it. This path only fires when
-        // bootstrap failed to start Steam (e.g. very first launch after sign-in).
-        log.info("[installGame] Steam not running — cold-starting for install appID=\(appID)")
-        startHeadlessWebhelperKillBurst(reason: "installGame cold-start appID=\(appID)", duration: .seconds(20))
-        windowSuppressor?.suppressNow(reason: "installGame cold-start appID=\(appID)")
-        try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
-        windowSuppressor?.suppressNow(reason: "installGame post-start appID=\(appID)")
-        try await waitUntilReady(prefix: prefix, timeout: .seconds(180))
-        if let pid = persistentProcessIdentifier {
-            windowSuppressor?.resumeSuppressing(pid: pid)
-        }
-        startHeadlessWebhelperKillBurst(reason: "installGame ready appID=\(appID)", duration: .seconds(12))
-        log.info("[installGame] persistent steam.exe ready — download starts momentarily (ACF detected at startup)")
+        log.info("[installGame] -login restart with user=\(accountName) — Steam startup scan will pick up ACF appID=\(appID)")
+        startHeadlessWebhelperKillBurst(reason: "installGame login-restart appID=\(appID)", duration: .seconds(25))
+        windowSuppressor?.suppressNow(reason: "installGame login-restart appID=\(appID)")
+        await stopPersistent(engine: engine, prefix: prefix)
+        killAll(engine: engine, prefix: prefix)
+        clearPersistentProcess()
+        try? await Task.sleep(for: .milliseconds(500))
+        try await startPersistent(
+            engine: engine,
+            prefix: prefix,
+            extraArgs: ["-login", accountName, pw],
+            skipRegistryConfig: true
+        )
+        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60))
+        if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
+        startHeadlessWebhelperKillBurst(reason: "installGame login-restart ready appID=\(appID)", duration: .seconds(12))
+        log.info("[installGame] -login restart complete — Steam startup scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam
