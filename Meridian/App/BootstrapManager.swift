@@ -591,6 +591,13 @@ final class BootstrapManager {
                 if steamManager.isSteamProcessAlive {
                     await steamManager.stopPersistent(engine: engine, prefix: prefix)
                 }
+                // Kill ALL Wine processes (wineserver + child processes such as
+                // steamwebhelper) even when the tracked steam.exe already exited.
+                // Without this, child processes that outlive the tracked process
+                // hold Wine mutexes/named-pipes that cause the next steam.exe to
+                // detect a "running instance" and exit cleanly with code 0,
+                // repeating the failure on every subsequent sign-in attempt.
+                steamManager.killAll(engine: engine, prefix: prefix)
                 settings.steamCredentialRefreshToken = ""
                 steamManager.isSteamLoggedIn = false
                 steamManager.clearPersistentProcess()

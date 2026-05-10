@@ -391,6 +391,16 @@ private struct SteamLoginStepContent: View {
             if mgr.isSteamProcessAlive {
                 await mgr.stopPersistent(engine: eng, prefix: prefix)
             }
+            // Kill ALL Wine processes (wineserver + child processes such as
+            // steamwebhelper) before launching the new authenticated session.
+            // Lingering children from a previous failed or stopped Steam start
+            // hold Wine mutexes/named-pipes that cause the new steam.exe to
+            // detect a "running instance" and exit cleanly with code 0 — the
+            // same root cause as the bootstrap-path failure in BootstrapManager.
+            // Mirrors the cleanup sequence in SteamExeSignIn.runFlow.
+            mgr.killAll(engine: eng, prefix: prefix)
+            mgr.clearPersistentProcess()
+            try? await Task.sleep(for: .milliseconds(500))
             try await mgr.startPersistent(engine: eng, prefix: prefix)
             try await mgr.waitUntilReady(prefix: prefix, timeout: .seconds(180))
 
