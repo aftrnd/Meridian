@@ -14,6 +14,12 @@ final class SteamLibraryStore {
     private(set) var loadError: String?
     private(set) var lastRefreshed: Date?
 
+    /// Background task that polls ACF files every 5 seconds and flips
+    /// `isInstalled` on any game whose state changed on disk. Keeps the
+    /// Install/Play button accurate when Steam downloads a game silently
+    /// (e.g. via the no-restart IPC path) without Meridian's download loop.
+    @ObservationIgnored private var installPollTask: Task<Void, Never>?
+
     var searchQuery: String = ""
     var sortOrder: SortOrder = .nameAscending
     var filter: LibraryFilter = .all
@@ -82,6 +88,7 @@ final class SteamLibraryStore {
             recentGames = applyInstallCache(to: recentlyPlayed)
             lastRefreshed = .now
             log.info("[refresh] complete: \(ownedGames.count) owned, \(recentlyPlayed.count) recent")
+            startInstallStatePolling()
         } catch {
             loadError = error.localizedDescription
             log.error("[refresh] failed: \(error.localizedDescription)")
@@ -175,6 +182,50 @@ final class SteamLibraryStore {
                 if let h = cdnHashes.logoHash    { recentGames[idx].logoHash = h }
                 if let h = cdnHashes.heroHash    { recentGames[idx].heroHash = h }
             }
+        }
+    }
+
+    // MARK: - Install state polling
+
+    /// Starts a 5-second background poll that re-reads ACF files and updates
+    /// `isInstalled` flags without a full API refresh. Called once after the
+    /// library loads; idempotent — cancels any prior task before starting.
+    func startInstallStatePolling() {
+        installPollTask?.cancel()
+        installPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { break }
+                await self?.syncInstallStateFromDisk()
+            }
+        }
+    }
+
+    /// Reads ACF state for every game in the library and updates `isInstalled`
+    /// in-memory when it differs from disk. Lightweight: stat() per game, no network.
+    @MainActor
+    private func syncInstallStateFromDisk() {
+        guard !games.isEmpty else { return }
+        let prefix = WinePrefix.defaultPrefix
+        guard prefix.exists else { return }
+
+        var changedIDs = Set<Int>()
+        for idx in games.indices {
+            let appID = games[idx].id
+            let onDisk = prefix.isGameFullyInstalled(appID: appID)
+            guard games[idx].isInstalled != onDisk else { continue }
+            games[idx].isInstalled = onDisk
+            changedIDs.insert(appID)
+            if onDisk {
+                log.info("[installPoll] appID=\(appID) '\(games[idx].name)' became installed — updating UI")
+                settings.markInstalled(appID: appID)
+            } else {
+                settings.markNotInstalled(appID: appID)
+            }
+        }
+        guard !changedIDs.isEmpty else { return }
+        for idx in recentGames.indices where changedIDs.contains(recentGames[idx].id) {
+            recentGames[idx].isInstalled = prefix.isGameFullyInstalled(appID: recentGames[idx].id)
         }
     }
 
