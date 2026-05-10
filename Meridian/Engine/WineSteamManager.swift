@@ -705,19 +705,31 @@ final class WineSteamManager {
                     return
                 }
             }
-            log.info("[installGame] no-restart probe expired — falling back to Steam restart for appID=\(appID)")
+            // Probe didn't detect a download. Instead of killing Steam and
+            // restarting (which destroys the authenticated session after code-42
+            // self-updates), send +app_update via IPC. The ACF is already on disk
+            // with installDir set, so Steam knows the install location — the
+            // "choose location" dialog that motivated the original restart approach
+            // only appears when no ACF exists.
+            log.info("[installGame] no-restart probe expired — sending +app_update IPC for appID=\(appID)")
+            startHeadlessWebhelperKillBurst(reason: "installGame IPC appID=\(appID)", duration: .seconds(15))
+            try sendSteamCommand(["+app_update", "\(appID)"], engine: engine, prefix: prefix)
+            // Give Steam a few seconds to react to the IPC command before the
+            // caller starts polling for download progress.
+            try? await Task.sleep(for: .seconds(3))
+            if let pid = persistentProcessIdentifier {
+                windowSuppressor?.resumeSuppressing(pid: pid)
+            }
+            startHeadlessWebhelperKillBurst(reason: "installGame IPC ready appID=\(appID)", duration: .seconds(12))
+            log.info("[installGame] +app_update IPC sent — download should start momentarily appID=\(appID)")
+            return
         }
 
-        // Restart path: stop Steam, write the ACF, restart so Steam's startup
-        // ACF scan picks it up. Registry keys are already written on disk from
-        // the initial bootstrap; pass skipRegistryConfig to save ~5s.
-        startHeadlessWebhelperKillBurst(reason: "installGame restart appID=\(appID)", duration: .seconds(20))
-        windowSuppressor?.suppressNow(reason: "installGame restart appID=\(appID)")
-        await stopPersistent(engine: engine, prefix: prefix)
-        killAll(engine: engine, prefix: prefix)
-        clearPersistentProcess()
-        try? await Task.sleep(for: .milliseconds(500))
-        windowSuppressor?.suppressNow(reason: "installGame post-stop appID=\(appID)")
+        // Steam is not running at all — cold start it. This path only fires when
+        // bootstrap failed to start Steam (e.g. very first launch after sign-in).
+        log.info("[installGame] Steam not running — cold-starting for install appID=\(appID)")
+        startHeadlessWebhelperKillBurst(reason: "installGame cold-start appID=\(appID)", duration: .seconds(20))
+        windowSuppressor?.suppressNow(reason: "installGame cold-start appID=\(appID)")
         try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
         windowSuppressor?.suppressNow(reason: "installGame post-start appID=\(appID)")
         try await waitUntilReady(prefix: prefix, timeout: .seconds(180))
@@ -1130,12 +1142,17 @@ final class WineSteamManager {
                 }
             }
 
-            // Auth-window exceeded after Connected — definitive auth failure.
+            // Auth-window exceeded after Connected — Steam reached the network
+            // but never completed login. This is distinct from Valve explicitly
+            // rejecting credentials (LogonFailureReceived / Invalid Password) —
+            // it may be a transient issue from a code-42 self-update losing
+            // in-memory session state. Throw steamNotReady (not authenticationFailed)
+            // so BootstrapManager preserves credentials for retry.
             if let connectedAt = connectedObservedAt,
                ContinuousClock.now - connectedAt > authTimeout {
-                log.error("[waitUntilReady] signal: Connected \(authTimeout) ago but Logged On never observed — auth failed")
+                log.error("[waitUntilReady] signal: Connected \(authTimeout) ago but Logged On never observed — auth timeout (not CM rejection)")
                 Self.killWebhelper(reason: "waitUntilReady auth timeout")
-                throw SteamError.authenticationFailed
+                throw SteamError.steamNotReady
             }
 
             // Secondary progress signal: Steam is downloading an update.
