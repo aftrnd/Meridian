@@ -35,9 +35,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setTrafficLights(hidden: true, in: w)
         }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.enforceMainWindowLaunchFrame()
-        }
+        // Call synchronously — no async hop. The window exists by the time
+        // applicationDidFinishLaunching fires. An async dispatch gives macOS
+        // window restoration one runloop cycle to restore the previous full-size
+        // frame (1030×625) before we can override it, causing the wrong size to
+        // flash on screen. Synchronous call wins the race.
+        enforceMainWindowLaunchFrame()
 
         readyObserver = NotificationCenter.default.addObserver(
             forName: .meridianBootstrapReady,
@@ -55,20 +58,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
 
-        // Prevent macOS from restoring a saved window position/size
+        // Prevent macOS window restoration from applying the previous session's
+        // frame (full-size 1030×625). Must be set before setContentSize so the
+        // restore system never overrides what we're about to write.
         window.isRestorable = false
         window.setFrameAutosaveName("")
 
+        // Lock to splash size first, then center. Centering must come after
+        // setContentSize so NSWindow.center() uses the correct geometry when
+        // computing the Dock-aware centered position.
         window.contentMinSize = Self.splashSize
         window.contentMaxSize = Self.splashSize
         window.setContentSize(Self.splashSize)
         setTrafficLights(hidden: true, in: window)
 
-        // SplashView centers the window via its .task body (after SwiftUI layout settles).
-        // Calling center() here as well gives an early best-effort position.
+        // NSWindow.center() uses the same algorithm as Cmd+Ctrl+C:
+        // horizontally centered on the main display, vertically centered in the
+        // usable area (screen minus menu bar and Dock).
         window.center()
 
-        log.debug("Main window locked to splash size \(Self.splashSize.width)x\(Self.splashSize.height)")
+        log.debug("Main window locked to splash size \(Self.splashSize.width)x\(Self.splashSize.height) and centered")
     }
 
     private func animateToFullSize() {
