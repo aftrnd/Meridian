@@ -682,12 +682,15 @@ final class WineSteamManager {
         // notification and may pick this up without a restart. Give it 12 seconds
         // to start a download before falling back to the full restart cycle.
         //
-        // Background: the old +app_update IPC showed a "choose location" dialog
-        // because there was no ACF on disk. With a pre-seeded ACF that already
-        // contains installDir, Steam knows where to put the game and may skip
-        // the dialog entirely, queuing the download silently.
-        if isSteamProcessAlive {
-            log.info("[installGame] Steam already running — probing for no-restart download (12s window)")
+        // Use `isRunning` rather than `isSteamProcessAlive`. After a code-42
+        // self-update, `persistentProcess` is nil (we clear it on 42 so we can
+        // keep polling for the restarted process) but Steam IS alive and
+        // authenticated — `isRunning` stays true because we set it true when
+        // [Logged On] is observed in waitUntilReady. Checking `isSteamProcessAlive`
+        // would skip the probe and go straight to restart, launching a new steam.exe
+        // that detects the still-running untracked instance and exits with code=0.
+        if isRunning {
+            log.info("[installGame] Steam is running (isRunning=\(isRunning)) — probing for no-restart download (12s window)")
             startHeadlessWebhelperKillBurst(reason: "installGame probe appID=\(appID)", duration: .seconds(15))
             let probeDeadline = ContinuousClock.now + .seconds(12)
             while ContinuousClock.now < probeDeadline {
@@ -1298,7 +1301,30 @@ final class WineSteamManager {
 
     /// Kills the Wine server for the prefix, terminating all Wine processes.
     func killAll(engine: WineEngine, prefix: WinePrefix) {
-        log.info("[killAll] sending wineserver -k")
+        log.info("[killAll] pre-killing steam.exe + wineserver -k")
+
+        // Step 1: pre-kill steam.exe by Windows process name before wineserver -k.
+        // After a code-42 self-update, the new steam.exe has replaced its argv[0]
+        // with its Windows path and is no longer tracked by persistentProcess.
+        // wineserver -k alone may not reach it in time before startPersistent
+        // launches a fresh steam.exe — which then detects the surviving instance
+        // and exits cleanly with code=0. Killing by Windows name first eliminates
+        // the race. Mirrors TerminationCleanup.killAllWineProcesses step 1.
+        func pkill(_ args: [String]) {
+            let t = Process()
+            t.executableURL = URL(filePath: "/usr/bin/pkill")
+            t.arguments = args
+            t.standardOutput = FileHandle.nullDevice
+            t.standardError  = FileHandle.nullDevice
+            try? t.run()
+            t.waitUntilExit()
+            log.info("[killAll] pkill \(args.joined(separator: " ")) exit=\(t.terminationStatus)")
+        }
+        pkill(["-9", "-f", "steamwebhelper"])
+        pkill(["-9", "-f", "steam.exe"])
+        usleep(100_000)  // 100 ms for signals to land
+
+        // Step 2: wineserver -k signals every Wine client in this prefix to exit.
         let process = Process()
         process.executableURL = engine.wineserverURL
         process.arguments = ["-k"]
