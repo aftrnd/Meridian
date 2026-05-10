@@ -681,6 +681,15 @@ final class WineSteamManager {
         log.info("[installGame] restarting persistent Steam so it picks up the new manifest")
         windowSuppressor?.suppressNow(reason: "installGame restart appID=\(appID)")
         await stopPersistent(engine: engine, prefix: prefix)
+        // Kill wineserver and all child processes (steamwebhelper, steamservice, etc.)
+        // so the restarted steam.exe starts into a completely clean Wine session.
+        // Without this, lingering children hold named-pipe handles that cause the new
+        // steam.exe to get stuck during CM re-authentication — identical root cause to
+        // the sign-in code-0 and code-42 failures. CLI-observed: "Connected 60s ago
+        // but Logged On never observed" with connLogBytes frozen at 663.
+        killAll(engine: engine, prefix: prefix)
+        clearPersistentProcess()
+        try? await Task.sleep(for: .milliseconds(500))
         windowSuppressor?.suppressNow(reason: "installGame post-stop appID=\(appID)")
         try await startPersistent(engine: engine, prefix: prefix)
         windowSuppressor?.suppressNow(reason: "installGame post-start appID=\(appID)")
