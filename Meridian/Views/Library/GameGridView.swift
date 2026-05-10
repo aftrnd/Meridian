@@ -6,6 +6,8 @@ import AppKit
 enum GameCardState: Equatable {
     case idle
     case notInstalled
+    /// Game files are downloading. `progress` is 0…1 or nil while preparing.
+    case downloading(progress: Double?)
     case launching
     case running
     case stopping
@@ -276,6 +278,22 @@ struct GameGridView: View {
                 Text("Now Playing")
                     .font(.caption2)
                     .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.6), in: Capsule())
+            .padding(6)
+
+        case .downloading(let progress):
+            HStack(spacing: 4) {
+                ProgressView()
+                    .scaleEffect(0.5)
+                    .frame(width: 10, height: 10)
+                Text(progress.map { "\(Int($0 * 100))%" } ?? "Downloading")
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
                     .foregroundStyle(.white)
             }
             .padding(.horizontal, 7)

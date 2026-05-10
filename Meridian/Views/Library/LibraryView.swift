@@ -192,6 +192,8 @@ struct LibraryView: View {
             return game.isInstalled ? .idle : .notInstalled
         }
         switch launcher.launchState {
+        case .awaitingInstallConfirmation:
+            return .downloading(progress: launcher.downloadProgress)
         case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching:
             return .launching
         case .running:
