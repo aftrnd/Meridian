@@ -209,7 +209,7 @@ private struct DownloadsPopoverContent: View {
         let urls = game.newCDNCapsuleURLs
             + [game.verticalCapsuleURL]
             + game.verticalCapsuleURLFallbacks
-        CachedAsyncImage(url: urls.first, fallbacks: Array(urls.dropFirst)) { phase in
+        CachedAsyncImage(url: urls.first, fallbacks: Array(urls.dropFirst())) { phase in
             switch phase {
             case .success(let image):
                 image

@@ -543,7 +543,15 @@ final class BootstrapManager {
             var authFailed = false
             do {
                 try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(180)) { [weak self] msg in
+                // authTimeout: 30 s after Connected. A valid local.vdf token
+                // logs in within ~5 s of reaching the CM. 30 s is 6× that and
+                // still far tighter than the previous 60 s default which caused
+                // visible spinning after code-42 self-update restarts.
+                try await steamManager.waitUntilReady(
+                    prefix: prefix,
+                    timeout: .seconds(180),
+                    authTimeout: .seconds(30)
+                ) { [weak self] msg in
                     self?.statusMessage = msg
                 }
                 if let pid = steamManager.persistentProcessIdentifier {
