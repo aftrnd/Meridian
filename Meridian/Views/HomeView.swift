@@ -210,7 +210,11 @@ struct HomeView: View {
                             .frame(minWidth: 140, minHeight: 24)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 6)
-                            .background(.thinMaterial, in: Capsule())
+                            .background {
+                                Capsule()
+                                    .fill(.regularMaterial)
+                                    .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                            }
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))

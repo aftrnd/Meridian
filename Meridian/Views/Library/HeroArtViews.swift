@@ -54,6 +54,7 @@ struct HeroLogoImage: View {
             if let image = loadedImage {
                 Image(nsImage: image)
                     .resizable()
+                    .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
                     .frame(maxHeight: 100)
                     .frame(maxWidth: 420, alignment: .leading)
