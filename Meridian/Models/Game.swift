@@ -81,17 +81,36 @@ struct Game: Identifiable, Hashable, Sendable {
     }
 
     /// New hash-based CDN URLs for logo.png — required for games published after ~2024.
-    /// Prefers the manual override hash from GameArtOverrides, then the auto-fetched hash.
+    ///
+    /// Steam's new CDN uses a deployment/release hash, not a per-file content hash.
+    /// All library assets for a game release (capsule, hero, logo) live under the
+    /// same hash directory. `probeLogoHash` never succeeds because the logo hash
+    /// isn't returned by appdetails — but since logo shares a directory with the
+    /// capsule and hero assets, we can try those known hashes too.
+    ///
+    /// Priority:
+    ///   1. Specific logo hash (from batch API or manual override, if ever present)
+    ///   2. Capsule hash (shared directory — most reliable since we have it for most games)
+    ///   3. Hero hash (same shared directory)
     var newCDNLogoURLs: [URL] {
-        guard let hash = effectiveLogoHash, !hash.isEmpty else { return [] }
-        return [
+        // Deduplicate while preserving priority order.
+        var hashes: [String] = []
+        func add(_ h: String?) {
+            guard let h, !h.isEmpty, !hashes.contains(h) else { return }
+            hashes.append(h)
+        }
+        add(effectiveLogoHash)
+        add(effectiveCapsuleHash)
+        add(effectiveHeroHash)
+        guard !hashes.isEmpty else { return [] }
+
+        return hashes.flatMap { hash -> [URL?] in [
             URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo_2x.png"),
             URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo_2x.png"),
             URL(string: "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo_2x.png"),
             URL(string: "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
             URL(string: "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
-            URL(string: "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/\(id)/\(hash)/logo.png"),
-        ].compactMap { $0 }
+        ] }.compactMap { $0 }
     }
 
     /// New hash-based CDN URLs for the library hero banner — required for games
