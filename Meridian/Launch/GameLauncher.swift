@@ -399,8 +399,7 @@ final class GameLauncher {
                         installDir: game.name,
                         steamID64: steamID64,
                         engine: engine,
-                        prefix: prefix,
-                        statusUpdate: { [weak self] msg in self?.currentActivity = msg }
+                        prefix: prefix
                     )
                 } catch {
                     fail("Could not start install: \(error.localizedDescription)", error: error)
