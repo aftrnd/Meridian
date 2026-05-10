@@ -146,9 +146,13 @@ final class SteamLibraryStore {
             }
         }
 
-        // Pass 3: recently-played games still missing a 600x900 capsule hash after
-        // passes 1 & 2 (e.g. very new games the batch call missed). Probe individually.
-        let capsuleMissing = recentlyPlayedGames
+        // Pass 3: ALL library games still missing a 600x900 capsule hash after
+        // passes 1 & 2. The batch call misses some games (new CDN, API gaps, etc.)
+        // that have art only on the hash-based CDN. Probe every missing game so
+        // any title in the library grid shows art, not just recently-played ones.
+        // probeCapsuleHash hits appdetails and verifies the file exists on CDN,
+        // so it safely returns nil for old games with no new-CDN art.
+        let capsuleMissing = games
             .filter { $0.libraryCapsuleHash == nil }
             .map(\.id)
         if !capsuleMissing.isEmpty {
