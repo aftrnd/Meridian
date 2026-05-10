@@ -354,8 +354,6 @@ private struct SteamLoginStepContent: View {
 
             AppSettings.shared.steamCredentialSteamID      = steamID
             AppSettings.shared.steamCredentialAccountName  = accountName
-            // Clear the stale JWT refresh token — auth is now ssfn-based.
-            AppSettings.shared.steamCredentialRefreshToken  = ""
             AppSettings.shared.steamSelfManagedSession      = true
 
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)

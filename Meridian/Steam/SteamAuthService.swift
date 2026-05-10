@@ -6,14 +6,11 @@ private let log = MeridianLog(category: "SteamAuth")
 
 /// Holds the user's Steam identity and Web API key.
 ///
-/// Sign-in is driven by `SteamCredentialAuth` through `AuthView`. On success,
-/// `setAuthenticatedFromCredentialFlow` captures the SteamID + account name and
-/// `SteamSessionBridge` writes the resulting JWT into the Wine prefix's
-/// `config/config.vdf` ConnectCache so `steam.exe -silent` can auto-login.
-///
-/// (April 22 2026: see `engine-research-findings.mdc` Pattern 6 for the
-/// currently-known limitation on externally-written ConnectCache JWTs in
-/// Steam 1773426488+.)
+/// Sign-in is driven by `SteamExeSignIn` through `AuthView`. On success,
+/// `setAuthenticatedFromCredentialFlow` captures the SteamID + account name.
+/// Steam writes its own `ssfn*` device-trust token during sign-in; subsequent
+/// cold starts use `steam.exe -silent` which auto-logs in via the ssfn — no
+/// password, no 2FA push.
 @Observable
 @MainActor
 final class SteamAuthService: NSObject {

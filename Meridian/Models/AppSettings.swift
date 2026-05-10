@@ -260,22 +260,10 @@ final class AppSettings: @unchecked Sendable {
         UserDefaults.standard.removeObject(forKey: "isSteamLoggedIn")
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
-        steamCredentialRefreshToken = ""
         steamSelfManagedSession = false
     }
 
     // MARK: - Steam Credential Cache
-    //
-    // The JWT refresh token received from Meridian's IAuthenticationService sign-in
-    // is persisted here so `SteamSessionBridge` can write a fresh ConnectCache into
-    // the Wine prefix before each `steam.exe` startup. Steam's own auto-login reads
-    // ConnectCache and logs the user in silently — no password, no Steam Guard push,
-    // no UI. Persisting the token across launches means sign-in happens exactly once
-    // and subsequent app starts are fully passwordless.
-    //
-    // The token is already stored in plaintext in the Wine prefix's config.vdf on
-    // disk. Storing it in UserDefaults adds convenient re-write on every launch
-    // without reducing security below that baseline.
 
     var steamCredentialSteamID: String {
         get { UserDefaults.standard.string(forKey: "steamCredentialSteamID") ?? "" }
@@ -287,23 +275,11 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "steamCredentialAccountName") }
     }
 
-    var steamCredentialRefreshToken: String {
-        get { UserDefaults.standard.string(forKey: "steamCredentialRefreshToken") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "steamCredentialRefreshToken") }
-    }
-
-    var hasSteamCredentials: Bool {
-        !steamCredentialRefreshToken.isEmpty && !steamCredentialSteamID.isEmpty
-    }
-
-    /// Set to true once `SteamExeSignIn` (April 25 2026+) drives a successful
-    /// `steam.exe -login` round-trip. From that point on, Meridian must NEVER
-    /// rewrite `local.vdf` — Steam owns the file and our DPAPI-encrypted
-    /// JWT lacks the `machine_id` HMAC binding Valve's CM requires (Pattern 7
-    /// rejection cascade).
+    /// True once `SteamExeSignIn` has driven a successful `steam.exe -login` round-trip
+    /// and Steam has written its own `ssfn*` device-trust token. From that point on,
+    /// `steam.exe -silent` auto-logs in using the ssfn — no password, no 2FA push.
     ///
-    /// Cleared on sign-out so the next sign-in starts clean. Persisted to
-    /// UserDefaults so Steam keeps owning its session across launches.
+    /// Cleared on sign-out so the next sign-in starts fresh.
     var steamSelfManagedSession: Bool {
         get { UserDefaults.standard.bool(forKey: "steamSelfManagedSession") }
         set { UserDefaults.standard.set(newValue, forKey: "steamSelfManagedSession") }

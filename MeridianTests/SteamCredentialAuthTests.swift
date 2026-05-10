@@ -53,7 +53,7 @@ final class SteamCredentialAuthTests: XCTestCase {
         case emailConfirmation = 5
     }
 
-    // MARK: - Inlined: VDF templates (mirrors WinePrefix.writeLoginUsers)
+    // MARK: - Inlined: loginusers.vdf template (mirrors WinePrefix.writeLoginUsers)
 
     private func makeLoginUsersVDF(steamID: String, account: String, persona: String) -> String {
         let ts = Int(Date().timeIntervalSince1970)
@@ -67,34 +67,6 @@ final class SteamCredentialAuthTests: XCTestCase {
         \t\t"RememberPassword"\t\t"1"
         \t\t"MostRecent"\t\t"1"
         \t\t"Timestamp"\t\t"\(ts)"
-        \t}
-        }
-        """
-    }
-
-    private func makeConnectCacheVDF(steamID: String, token: String, account: String) -> String {
-        """
-        "InstallConfigStore"
-        {
-        \t"Software"
-        \t{
-        \t\t"Valve"
-        \t\t{
-        \t\t\t"Steam"
-        \t\t\t{
-        \t\t\t\t"ConnectCache"
-        \t\t\t\t{
-        \t\t\t\t\t"\(steamID)"\t\t"\(token)"
-        \t\t\t\t}
-        \t\t\t\t"Accounts"
-        \t\t\t\t{
-        \t\t\t\t\t"\(account)"
-        \t\t\t\t\t{
-        \t\t\t\t\t\t"SteamID"\t\t"\(steamID)"
-        \t\t\t\t\t}
-        \t\t\t\t}
-        \t\t\t}
-        \t\t}
         \t}
         }
         """
@@ -214,48 +186,6 @@ final class SteamCredentialAuthTests: XCTestCase {
             "RememberPassword must be set to 1 for persistent auto-login")
     }
 
-    // MARK: - config.vdf / ConnectCache template
-
-    func testConnectCacheVDFContainsRequiredStructure() {
-        let token = "eyJhbGciOiJSUzI1NiJ9.fake_token_for_testing"
-        let vdf = makeConnectCacheVDF(steamID: "76561198047018335", token: token, account: "testuser")
-        XCTAssertTrue(vdf.contains("\"InstallConfigStore\""))
-        XCTAssertTrue(vdf.contains("\"ConnectCache\""))
-        XCTAssertTrue(vdf.contains("\"76561198047018335\""))
-        XCTAssertTrue(vdf.contains(token))
-        XCTAssertTrue(vdf.contains("\"Accounts\""))
-        XCTAssertTrue(vdf.contains("\"testuser\""))
-    }
-
-    func testConnectCacheVDFHierarchyOrder() {
-        let vdf = makeConnectCacheVDF(steamID: "123", token: "tok", account: "u")
-        // Nesting order: InstallConfigStore > Software > Valve > Steam > ConnectCache
-        let positions: [String] = [
-            "InstallConfigStore", "Software", "Valve", "\"Steam\"", "ConnectCache"
-        ]
-        var lastIdx = vdf.startIndex
-        for key in positions {
-            guard let range = vdf.range(of: key, range: lastIdx..<vdf.endIndex) else {
-                XCTFail("Key \"\(key)\" not found in config.vdf template after \(String(vdf[lastIdx...].prefix(30)))")
-                return
-            }
-            lastIdx = range.upperBound
-        }
-    }
-
-    func testConnectCacheVDFTokenIsPresentUnderSteamID() {
-        let steamID = "76561198047018335"
-        let token = "test.refresh.token"
-        let vdf = makeConnectCacheVDF(steamID: steamID, token: token, account: "u")
-        // Both steamID and token must appear inside the ConnectCache block
-        guard let cacheStart = vdf.range(of: "\"ConnectCache\"") else {
-            return XCTFail("ConnectCache block missing")
-        }
-        let cacheBlock = String(vdf[cacheStart.lowerBound...])
-        XCTAssertTrue(cacheBlock.contains(steamID))
-        XCTAssertTrue(cacheBlock.contains(token))
-    }
-
     // MARK: - VDF round-trip via temp files
 
     func testLoginUsersVDFWriteAndReadBack() throws {
@@ -270,20 +200,6 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertEqual(vdf, readBack)
         XCTAssertTrue(readBack.contains("\"nick\""))
         XCTAssertTrue(readBack.contains("\"MostRecent\""))
-    }
-
-    func testConnectCacheVDFWriteAndReadBack() throws {
-        let tmp = FileManager.default.temporaryDirectory
-            .appending(path: "MeridianTest_config_\(UUID().uuidString).vdf")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let token = "eyJhbGci.very_long_jwt_refresh_token_value"
-        let vdf = makeConnectCacheVDF(steamID: "76561198047018335", token: token, account: "nick")
-        try vdf.write(to: tmp, atomically: true, encoding: .utf8)
-
-        let readBack = try String(contentsOf: tmp, encoding: .utf8)
-        XCTAssertEqual(vdf, readBack)
-        XCTAssertTrue(readBack.contains(token))
     }
 
     // MARK: - Guard type priority logic

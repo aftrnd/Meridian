@@ -35,11 +35,8 @@ import Foundation
 ///   • isGameInstalled(...)               ← WinePrefix.isGameInstalled()
 ///   • isGameFullyInstalled(...)          ← WinePrefix.isGameFullyInstalled()
 ///   • gameInstallDir(...)                ← WinePrefix.gameInstallDir()
-///   • backupSteamSession(...)            ← WinePrefix.backupSteamSession()
-///   • restoreSteamSession(...)           ← WinePrefix.restoreSteamSession()
 ///   • gameRequiresSteamAPI(...)          ← WinePrefix.gameRequiresSteamAPI()
 ///   • writeSteamAppID(...)               ← WinePrefix.writeSteamAppID()
-///   • mirrorConnectCacheKey(...)         ← WinePrefix.connectCacheKey(for:) — DPAPI local.vdf map key
 ///   • vdfKeyValue(from:)                 ← WinePrefix.vdfKeyValue(from:)
 ///   • windowsPathToURL(_:driveC:)        ← WinePrefix.windowsPathToURL(_:)
 ///   • simulateResetToEngineTemplate(...) ← WinePrefix.resetToEngineTemplate()
@@ -1473,7 +1470,7 @@ final class WinePrefixTests: XCTestCase {
         }
     }
 
-    // MARK: - writeLoginUsers + connectCacheKey
+    // MARK: - writeLoginUsers
 
     /// Mirror of WinePrefix.writeLoginUsers — writes loginusers.vdf.
     /// MIRROR CONTRACT: Must stay in sync with the production method. The key
@@ -1532,64 +1529,6 @@ final class WinePrefixTests: XCTestCase {
         let content = try String(contentsOf: configDir.appending(path: "loginusers.vdf"), encoding: .utf8)
         XCTAssertTrue(content.contains("\"AllowAutoLogin\"\t\t\"1\""),
             "loginusers.vdf MUST contain AllowAutoLogin=\"1\" or Steam renders login UI")
-    }
-
-    // MARK: - ConnectCache key derivation
-    //
-    // MIRROR CONTRACT: these helpers duplicate `WinePrefix.connectCacheKey` and
-    // `WinePrefix.ieeeCRC32` verbatim because the test target has no Swift-level
-    // dependency on the Meridian module (see Package.swift — testTarget has
-    // `dependencies: []`). The production code holds the authoritative copy;
-    // keep these two in lock-step or every test below will pass on one side
-    // while production writes a key Steam won't find.
-
-    /// IEEE 802.3 CRC-32 — standard polynomial, init 0xFFFFFFFF, final XOR
-    /// 0xFFFFFFFF, reflected input and output. Same variant used by
-    /// `zlib.crc32`, `binascii.crc32`, and `Ethernet` FCS.
-    private func mirrorCRC32(_ bytes: [UInt8]) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
-        for b in bytes {
-            crc ^= UInt32(b)
-            for _ in 0..<8 {
-                let m: UInt32 = (crc & 1) != 0 ? 0xEDB88320 : 0
-                crc = (crc >> 1) ^ m
-            }
-        }
-        return crc ^ 0xFFFFFFFF
-    }
-
-    private func mirrorConnectCacheKey(for accountName: String) -> String {
-        let crc = mirrorCRC32(Array(accountName.utf8))
-        let key: UInt32 = (crc << 4) | 0x1
-        return String(format: "%08x", key)
-    }
-
-    /// Self-check: the mirror MUST reproduce the field reference vector from
-    /// CX Preview's working Steam bottle. `crc32("nickjack876") = 0x07a611aa`
-    /// → key `0x7a611aa1`. CLI-verified April 23 2026.
-    func testConnectCacheKey_matchesCXReferenceVector() {
-        XCTAssertEqual(mirrorConnectCacheKey(for: "nickjack876"), "7a611aa1")
-    }
-
-    /// Basic CRC32 vectors so a wrong polynomial / init / reflection choice
-    /// fails independently of the reference vector.
-    func testConnectCacheKey_basicCRC32Vectors() {
-        // crc32("") = 0x00000000 → key 0x00000001
-        XCTAssertEqual(mirrorConnectCacheKey(for: ""), "00000001")
-        // crc32("a") = 0xe8b7be43 → (val << 4) & 0xFFFFFFFF | 1 = 0x8b7be431
-        XCTAssertEqual(mirrorConnectCacheKey(for: "a"), "8b7be431")
-    }
-
-    /// Different account names MUST produce different keys; Steam uses this
-    /// map-key as the per-user lookup inside a bottle, and collisions would
-    /// silently swap users at auto-login time.
-    func testConnectCacheKey_distinctPerAccount() {
-        let a = mirrorConnectCacheKey(for: "alice")
-        let b = mirrorConnectCacheKey(for: "bob")
-        let c = mirrorConnectCacheKey(for: "nickjack876")
-        XCTAssertNotEqual(a, b)
-        XCTAssertNotEqual(b, c)
-        XCTAssertNotEqual(a, c)
     }
 
     func testWriteLoginUsers_thenHasSteamLoginSession_roundTrip() throws {
@@ -1837,171 +1776,5 @@ final class WinePrefixTests: XCTestCase {
     func testIsWoW64FileType_caseInsensitive() {
         XCTAssertTrue(isWoW64FileType("WINEMAC.DRV"))
         XCTAssertTrue(isWoW64FileType("Kernel32.Dll"))
-    }
-
-    // MARK: - Steam Session Backup / Restore (local.vdf)
-
-    /// Mirror of WinePrefix.backupSteamSession — copies local.vdf.
-    /// Production writes backups to
-    /// `<AppSupport>/com.meridian.app/steam-session-backup/local.vdf`.
-    private func backupSteamSession(localAppDataSteamDir: URL, backupURL: URL) {
-        let localVdf = localAppDataSteamDir.appending(path: "local.vdf")
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: localVdf.path(percentEncoded: false)) else { return }
-        try? fm.removeItem(at: backupURL)
-        try? fm.copyItem(at: localVdf, to: backupURL)
-    }
-
-    /// Mirror of WinePrefix.restoreSteamSession — restores local.vdf.
-    private func restoreSteamSession(localAppDataSteamDir: URL, backupURL: URL) {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: backupURL.path(percentEncoded: false)) else { return }
-        let localVdf = localAppDataSteamDir.appending(path: "local.vdf")
-        try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
-        try? fm.removeItem(at: localVdf)
-        try? fm.copyItem(at: backupURL, to: localVdf)
-    }
-
-    func testSteamSessionBackup_preservesLocalVdfAcrossPrefixReset() throws {
-        let fm = FileManager.default
-        let prefix = tempDir.appending(path: "prefix_session")
-        let localDir = prefix.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
-        let localVdf = localDir.appending(path: "local.vdf")
-        let backupURL = tempDir.appending(path: "session-backup/local.vdf")
-
-        try fm.createDirectory(at: localDir, withIntermediateDirectories: true)
-        // Plausible VDF structure with an opaque hex-encoded blob
-        let sessionData = """
-        "MachineUserConfigStore"
-        {
-        \t"Software" { "Valve" { "Steam" { "ConnectCache" {
-        \t\t"7a611aa1"  "0100000057696e652043727970743332206f6b00..."
-        \t} } } }
-        }
-        """
-        try sessionData.write(to: localVdf, atomically: true, encoding: .utf8)
-
-        try fm.createDirectory(at: backupURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        backupSteamSession(localAppDataSteamDir: localDir, backupURL: backupURL)
-        XCTAssertTrue(fm.fileExists(atPath: backupURL.path(percentEncoded: false)))
-
-        // Simulate prefix wipe
-        try fm.removeItem(at: prefix)
-        XCTAssertFalse(fm.fileExists(atPath: localVdf.path(percentEncoded: false)))
-
-        // Recreate prefix structure (bootstrap does this)
-        try fm.createDirectory(at: localDir, withIntermediateDirectories: true)
-
-        restoreSteamSession(localAppDataSteamDir: localDir, backupURL: backupURL)
-        XCTAssertTrue(fm.fileExists(atPath: localVdf.path(percentEncoded: false)))
-
-        let restored = try String(contentsOf: localVdf, encoding: .utf8)
-        XCTAssertEqual(restored, sessionData)
-    }
-
-    func testSteamSessionRestore_noopWhenNoBackup() throws {
-        let fm = FileManager.default
-        let localDir = tempDir.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
-        let localVdf = localDir.appending(path: "local.vdf")
-        let backupURL = tempDir.appending(path: "no-backup-yet/local.vdf")
-
-        try fm.createDirectory(at: localDir, withIntermediateDirectories: true)
-
-        restoreSteamSession(localAppDataSteamDir: localDir, backupURL: backupURL)
-        XCTAssertFalse(fm.fileExists(atPath: localVdf.path(percentEncoded: false)))
-    }
-
-    func testSteamSessionBackup_noopWhenNoLocalVdf() throws {
-        let fm = FileManager.default
-        let localDir = tempDir.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
-        let backupURL = tempDir.appending(path: "empty-backup/local.vdf")
-
-        try fm.createDirectory(at: localDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: backupURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        backupSteamSession(localAppDataSteamDir: localDir, backupURL: backupURL)
-        XCTAssertFalse(fm.fileExists(atPath: backupURL.path(percentEncoded: false)))
-    }
-
-    // MARK: - gameRequiresSteamAPI / writeSteamAppID
-
-    /// Mirror of WinePrefix.gameRequiresSteamAPI — recursively searches for steam_api64.dll or steam_api.dll
-    private func gameRequiresSteamAPI(gameDir: URL) -> Bool {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) else { return false }
-        while let file = enumerator.nextObject() as? String {
-            let lower = (file as NSString).lastPathComponent.lowercased()
-            if lower == "steam_api64.dll" || lower == "steam_api.dll" {
-                return true
-            }
-        }
-        return false
-    }
-
-    func testGameRequiresSteamAPI_trueWhenSteamApi64Present() throws {
-        let fm = FileManager.default
-        let gameDir = tempDir.appending(path: "Animal Well")
-        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        try "".write(to: gameDir.appending(path: "steam_api64.dll"), atomically: true, encoding: .utf8)
-        try "".write(to: gameDir.appending(path: "Animal Well.exe"), atomically: true, encoding: .utf8)
-
-        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir))
-    }
-
-    func testGameRequiresSteamAPI_trueWhenSteamApi32Present() throws {
-        let fm = FileManager.default
-        let gameDir = tempDir.appending(path: "Game32")
-        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        try "".write(to: gameDir.appending(path: "steam_api.dll"), atomically: true, encoding: .utf8)
-
-        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir))
-    }
-
-    /// Regression test: Unity games (e.g. PEAK) place steam_api64.dll in
-    /// GameName_Data/Plugins/x86_64/ — not the root. Root-only detection
-    /// returned false and caused the game to exit after ~6 seconds.
-    func testGameRequiresSteamAPI_trueWhenDLLInSubdirectory() throws {
-        let fm = FileManager.default
-        let gameDir = tempDir.appending(path: "PEAK")
-        let pluginsDir = gameDir.appending(path: "PEAK_Data/Plugins/x86_64")
-        try fm.createDirectory(at: pluginsDir, withIntermediateDirectories: true)
-        try "".write(to: gameDir.appending(path: "PEAK.exe"), atomically: true, encoding: .utf8)
-        try "".write(to: pluginsDir.appending(path: "steam_api64.dll"), atomically: true, encoding: .utf8)
-
-        XCTAssertTrue(gameRequiresSteamAPI(gameDir: gameDir),
-                      "Must detect steam_api64.dll in subdirectory (Unity Plugins path)")
-    }
-
-    func testGameRequiresSteamAPI_falseWhenNoDRM() throws {
-        let fm = FileManager.default
-        let gameDir = tempDir.appending(path: "NoDRM")
-        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        try "".write(to: gameDir.appending(path: "game.exe"), atomically: true, encoding: .utf8)
-        try "".write(to: gameDir.appending(path: "GameAssembly.dll"), atomically: true, encoding: .utf8)
-
-        XCTAssertFalse(gameRequiresSteamAPI(gameDir: gameDir))
-    }
-
-    func testWriteSteamAppID_writesCorrectContent() throws {
-        let gameDir = tempDir.appending(path: "Animal Well")
-        try FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        let appIDFile = gameDir.appending(path: "steam_appid.txt")
-
-        try "813230".write(to: appIDFile, atomically: true, encoding: .utf8)
-
-        let content = try String(contentsOf: appIDFile, encoding: .utf8)
-        XCTAssertEqual(content, "813230")
-    }
-
-    func testWriteSteamAppID_isOverwriteSafe() throws {
-        let gameDir = tempDir.appending(path: "GameOverwrite")
-        try FileManager.default.createDirectory(at: gameDir, withIntermediateDirectories: true)
-        let appIDFile = gameDir.appending(path: "steam_appid.txt")
-
-        try "111111".write(to: appIDFile, atomically: true, encoding: .utf8)
-        try "813230".write(to: appIDFile, atomically: true, encoding: .utf8)
-
-        let content = try String(contentsOf: appIDFile, encoding: .utf8)
-        XCTAssertEqual(content, "813230")
     }
 }

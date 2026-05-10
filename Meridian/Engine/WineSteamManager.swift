@@ -1067,6 +1067,12 @@ final class WineSteamManager {
             if newConnContent.contains("[Logged On, ") {
                 let elapsed = ContinuousClock.now - started
                 log.info("[waitUntilReady] signal: [Logged On observed after \(poll) polls (\(elapsed)) — Steam fully ready ✓")
+                // Kill the CEF webhelper the moment auth completes. Meridian has
+                // its own native UI — there is nothing for the webhelper to render.
+                // Proactively killing it prevents any brief window flash before the
+                // SteamWindowSuppressor catches it. Steam respawns it on-demand if
+                // genuinely needed (e.g. -applaunch DRM games that need Steam UI).
+                Self.killWebhelper(reason: "waitUntilReady logged-on cleanup")
                 isRunning = true
                 return
             }
