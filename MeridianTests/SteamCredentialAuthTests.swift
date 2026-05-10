@@ -398,45 +398,42 @@ final class SteamCredentialAuthTests: XCTestCase {
                           "platform_type \"2\" (WebBrowser) produces aud:[\"web\"] tokens — Steam's ConnectCache requires aud:[\"client\"] to authenticate.")
     }
 
-    // MARK: - Sign-in flow architectural invariants
+    // MARK: - Sign-in flow architectural invariants (May 2026 — ssfn-based auth)
     //
-    // SteamCMD has been removed from Meridian entirely (April 22 2026). All game
-    // installs run via `steam.exe` IPC against the persistent background client.
-    // The sign-in path must:
-    //   1. Complete OAuth (SteamCredentialAuth.authenticate).
-    //   2. Write loginusers.vdf (WinePrefix.writeLoginUsers).
-    //   3. Encrypt and write local.vdf (WinePrefix.writeSteamSessionLocalVdf) —
-    //      this is what Steam client `1773426488+` reads for auto-login.
-    //   4. Back up the local.vdf for prefix-reset survival.
-    //   5. NOT call any SteamCMD-related API (SteamCMDService was deleted).
-    //   6. NOT write config.vdf's ConnectCache block — Steam stopped reading
-    //      tokens from there (see engine-research-findings.mdc Pattern 6).
-    //
-    // Docstring-test: encodes the invariant in code form so it stays visible
-    // to future agents grep-ing for the sign-in flow.
+    // The sign-in path uses `steam.exe -login USER PASS` (SteamExeSignIn) so Steam
+    // performs its own CM auth handshake and writes an ssfn device-trust token.
+    // Subsequent cold starts use `steam.exe -silent` with the ssfn — no 2FA,
+    // no DPAPI, no JWT injection. The path must:
+    //   1. Use SteamExeSignIn (drives steam.exe -login natively).
+    //   2. Write loginusers.vdf with AllowAutoLogin=1 + RememberPassword=1 so that
+    //      the next -silent launch finds the auto-login flag.
+    //   3. Persist steamSelfManagedSession = true (ssfn is now the auth source).
+    //   4. NOT call writeSteamSessionLocalVdf (DPAPI local.vdf injection — replaced
+    //      by Steam's own on-disk token management via ssfn).
+    //   5. NOT call backupSteamSession (backup was for DPAPI local.vdf, now obsolete).
+    //   6. NOT call writeConnectCache or provisionNativeCache.
 
     func testSignInFlowInvariants() throws {
         let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
 
-        XCTAssertTrue(authView.contains("SteamCredentialAuth()"),
-                      "AuthView must use the durable SteamCredentialAuth flow, not steam.exe -login persistence=0.")
+        XCTAssertTrue(authView.contains("SteamExeSignIn()"),
+                      "AuthView must drive sign-in via SteamExeSignIn (steam.exe -login) for native ssfn device-trust.")
         XCTAssertTrue(authView.contains("writeLoginUsers"),
-                      "Sign-in must write loginusers.vdf before launching persistent Steam.")
-        XCTAssertTrue(authView.contains("writeSteamSessionLocalVdf"),
-                      "Sign-in must write DPAPI local.vdf from the persistent refresh token before advancing.")
-        XCTAssertTrue(authView.contains("backupSteamSession"),
-                      "Sign-in must back up local.vdf so prefix resets preserve the Steam session.")
+                      "Sign-in must write loginusers.vdf with AllowAutoLogin=1 so -silent launches auto-login.")
+        XCTAssertTrue(authView.contains("steamSelfManagedSession") && authView.contains("= true"),
+                      "Sign-in must mark steamSelfManagedSession=true so BootstrapManager trusts the ssfn session.")
 
         let forbiddenSteps = [
+            "SteamCredentialAuth()",
+            "writeSteamSessionLocalVdf",
+            "backupSteamSession",
             "authenticateSteamCMD",
             "writeConnectCache",
             "provisionNativeCache",
-            "SteamExeSignIn()",
-            "steamSelfManagedSession    = true",
         ]
         for step in forbiddenSteps {
             XCTAssertFalse(authView.contains(step),
-                           "\(step) MUST NOT be in the sign-in flow — it does not create durable local.vdf state.")
+                           "\(step) MUST NOT be in the sign-in flow — ssfn-based auth does not use DPAPI/JWT injection.")
         }
     }
 

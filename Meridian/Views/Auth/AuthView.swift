@@ -21,7 +21,6 @@ struct SetupSheet: View {
     @Environment(WineSteamManager.self)      private var steamManager
     @Environment(WineEngine.self)            private var engine
     @Environment(SteamWindowSuppressor.self) private var suppressor
-    @Environment(SteamSessionBridge.self)   private var sessionBridge
     @Environment(\.dismiss)                 private var dismiss
 
     private enum Step { case welcome, steamLogin, apiKey, complete }
@@ -177,20 +176,18 @@ private struct SteamLoginStepContent: View {
     let onSkip: () -> Void
     let onSignedIn: () -> Void
 
-    @Environment(WineSteamManager.self)      private var steamManager
-    @Environment(WineEngine.self)            private var engine
-    @Environment(SteamWindowSuppressor.self) private var suppressor
-    @Environment(SteamSessionBridge.self)   private var sessionBridge
-    @Environment(SteamAuthService.self)     private var steamAuth
+    @Environment(WineSteamManager.self)  private var steamManager
+    @Environment(WineEngine.self)        private var engine
+    @Environment(SteamAuthService.self)  private var steamAuth
 
-    @State private var auth     = SteamCredentialAuth()
-    @State private var username = ""
-    @State private var password = ""
-    @State private var guardCode = ""
+    @State private var signIn    = SteamExeSignIn()
+    @State private var username  = ""
+    @State private var password  = ""
+
     private var canSignIn: Bool {
         !username.trimmingCharacters(in: .whitespaces).isEmpty
             && !password.isEmpty
-            && auth.step == .idle
+            && signIn.step == .idle
     }
 
     var body: some View {
@@ -199,27 +196,23 @@ private struct SteamLoginStepContent: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Sign in to Steam")
                     .font(.title2).fontWeight(.bold)
-                Text("Meridian asks Steam itself to sign you in — your credentials go directly into Steam's own client running silently in the background.")
+                Text("Meridian passes your credentials directly to Steam's own client running silently in the background. Your password is saved to Keychain for seamless re-authentication.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             // Adaptive content based on auth step
-            switch auth.step {
+            switch signIn.step {
             case .idle:
                 credentialFields
 
-            case .authenticating:
-                centeredStatus(icon: "lock.rotation", message: "Contacting Steam…")
+            case .startingSteam:
+                centeredStatus(icon: "gear", message: "Preparing Steam…")
 
-            case .awaitingGuardCode(let guardType):
-                if guardType == .deviceConfirmation || guardType == .emailConfirmation {
-                    awaitingResultView
-                } else {
-                    guardCodeView(guardType)
-                }
+            case .sendingCredentials:
+                centeredStatus(icon: "lock.rotation", message: "Signing in to Steam…")
 
-            case .polling:
+            case .awaitingResult:
                 awaitingResultView
 
             case .done:
@@ -227,7 +220,7 @@ private struct SteamLoginStepContent: View {
             }
 
             // Error
-            if let error = auth.errorMessage {
+            if let error = signIn.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -237,14 +230,14 @@ private struct SteamLoginStepContent: View {
             // Action row
             HStack {
                 Button("Skip for now") {
-                    auth.cancel()
+                    signIn.cancel()
                     onSkip()
                 }
                 .keyboardShortcut(.cancelAction)
 
                 Spacer()
 
-                switch auth.step {
+                switch signIn.step {
                 case .idle:
                     Button("Sign In") { beginSignIn() }
                         .buttonStyle(.borderedProminent)
@@ -253,13 +246,19 @@ private struct SteamLoginStepContent: View {
                         .disabled(!canSignIn)
 
                 default:
-                    Button("Cancel") { auth.cancel() }
+                    Button("Cancel") { signIn.cancel() }
                 }
             }
         }
         .padding(28)
         .frame(width: 460)
-        .onDisappear { auth.cancel() }
+        .onAppear {
+            // Pre-fill credentials from previous session (Pattern 8 — seamless re-auth)
+            let savedUsername = AppSettings.shared.steamCredentialAccountName
+            if !savedUsername.isEmpty { username = savedUsername }
+            if let saved = steamAuth.loadSteamPassword(), !saved.isEmpty { password = saved }
+        }
+        .onDisappear { signIn.cancel() }
     }
 
     // MARK: - Credential fields
@@ -285,18 +284,19 @@ private struct SteamLoginStepContent: View {
         }
     }
 
-    // MARK: - Awaiting result (Steam doing CM login)
+    // MARK: - Awaiting result view
 
-    /// Shown while Steam.exe is talking to Valve's CM. For Mobile Confirmation
-    /// accounts the user gets a push on their phone here; for password-only
-    /// accounts this shows briefly before the sheet advances.
+    /// Shown while steam.exe is performing the CM auth handshake.
+    /// For Mobile Confirmation accounts: Valve pushes an approval to the
+    /// Steam Mobile app; user taps Approve; `[Logged On, ` arrives. No
+    /// typed codes needed — Steam handles it silently.
     private var awaitingResultView: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
-                Image(systemName: "lock.shield")
+                Image(systemName: "iphone.gen3")
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Authenticating with Steam")
+                    Text("Check Steam Mobile")
                         .font(.callout).fontWeight(.semibold)
                     Text("If your account uses Steam Guard Mobile, open the Steam app on your phone and tap Approve.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -306,7 +306,7 @@ private struct SteamLoginStepContent: View {
 
             HStack(spacing: 8) {
                 ProgressView().scaleEffect(0.8)
-                Text("Waiting for Steam…")
+                Text("Authenticating with Steam…")
                     .font(.callout).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -314,33 +314,7 @@ private struct SteamLoginStepContent: View {
         }
     }
 
-    private func guardCodeView(_ guardType: SteamCredentialAuth.GuardType) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label(
-                guardType == .emailCode ? "Enter the code Steam emailed you." : "Enter your Steam Guard code.",
-                systemImage: "lock.shield"
-            )
-            .font(.callout)
-            .foregroundStyle(.secondary)
-
-            TextField("Steam Guard code", text: $guardCode)
-                .textFieldStyle(.roundedBorder)
-                .textContentType(.oneTimeCode)
-                .onSubmit {
-                    let code = guardCode.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !code.isEmpty { auth.submitGuardCode(code) }
-                }
-
-            Button("Continue") {
-                let code = guardCode.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !code.isEmpty { auth.submitGuardCode(code) }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(guardCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        }
-    }
-
-    // MARK: - Centered status (authenticating / polling)
+    // MARK: - Centered status
 
     private func centeredStatus(icon: String, message: String) -> some View {
         HStack(spacing: 10) {
@@ -353,61 +327,41 @@ private struct SteamLoginStepContent: View {
         .padding(.vertical, 6)
     }
 
-    // MARK: - Actions
+    // MARK: - Sign-in action
 
     private func beginSignIn() {
-        auth.reset()
-        guardCode = ""
-        let prefix   = WinePrefix.defaultPrefix
-        let eng      = engine
-        let mgr      = steamManager
-        let auth_    = steamAuth
-        let advance  = onSignedIn
-        // Save the password to Keychain in case we need to re-drive
-        // `steam.exe -login` later (prefix reset, session corruption).
+        signIn.reset()
+        let prefix  = WinePrefix.defaultPrefix
+        let eng     = engine
+        let mgr     = steamManager
+        let auth_   = steamAuth
+        let advance = onSignedIn
+
+        // Persist credentials for seamless re-auth on prefix reset / ssfn expiry.
         auth_.saveSteamPassword(password)
-        auth.authenticate(
+
+        signIn.authenticate(
             username: username,
-            password: password
-        ) { steamID, accountName, refreshToken in
-            // The REST credential flow explicitly requests a persistent refresh
-            // token. Write it to Steam's DPAPI-backed local.vdf before advancing;
-            // a live `steam.exe -login` success with `persistence: 0` is not a
-            // durable session and caused repeat 2FA prompts on cold launch.
-            try prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
-            try await prefix.writeSteamSessionLocalVdf(
-                engine: eng,
-                steamID: steamID,
-                accountName: accountName,
-                refreshToken: refreshToken
-            )
-            prefix.backupSteamSession()
+            password: password,
+            engine: eng,
+            prefix: prefix,
+            steamManager: mgr
+        ) { steamID, accountName in
+            // steam.exe -login has completed and is still running. Write loginusers.vdf
+            // with AllowAutoLogin=1 + RememberPassword=1 NOW so the next -silent launch
+            // finds these flags and auto-logins via the ssfn token Steam just wrote.
+            try? prefix.writeLoginUsers(steamID: steamID, accountName: accountName, personaName: accountName)
 
-            AppSettings.shared.steamCredentialSteamID = steamID
-            AppSettings.shared.steamCredentialAccountName = accountName
-            AppSettings.shared.steamCredentialRefreshToken = refreshToken
-            AppSettings.shared.steamSelfManagedSession = false
-
-            if mgr.isSteamProcessAlive {
-                await mgr.stopPersistent(engine: eng, prefix: prefix)
-            }
-            // Kill ALL Wine processes (wineserver + child processes such as
-            // steamwebhelper) before launching the new authenticated session.
-            // Lingering children from a previous failed or stopped Steam start
-            // hold Wine mutexes/named-pipes that cause the new steam.exe to
-            // detect a "running instance" and exit cleanly with code 0 — the
-            // same root cause as the bootstrap-path failure in BootstrapManager.
-            // Mirrors the cleanup sequence in SteamExeSignIn.runFlow.
-            mgr.killAll(engine: eng, prefix: prefix)
-            mgr.clearPersistentProcess()
-            try? await Task.sleep(for: .milliseconds(500))
-            try await mgr.startPersistent(engine: eng, prefix: prefix)
-            try await mgr.waitUntilReady(prefix: prefix, timeout: .seconds(180))
+            AppSettings.shared.steamCredentialSteamID      = steamID
+            AppSettings.shared.steamCredentialAccountName  = accountName
+            // Clear the stale JWT refresh token — auth is now ssfn-based.
+            AppSettings.shared.steamCredentialRefreshToken  = ""
+            AppSettings.shared.steamSelfManagedSession      = true
 
             auth_.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
             mgr.isSteamLoggedIn = true
             let needs = auth_.needsAPIKey
-            setupLog.info("[beginSignIn] advance: isAuthenticated=\(auth_.isAuthenticated) needsAPIKey=\(needs) → \(needs ? "apiKey" : "complete")")
+            setupLog.info("[beginSignIn] ✅ signed in via steam.exe -login | steamID=\(steamID) needsAPIKey=\(needs)")
             advance()
         }
     }

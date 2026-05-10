@@ -9,7 +9,6 @@ struct SplashView: View {
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(WineEngine.self) private var engine
     @Environment(WineSteamManager.self) private var steamManager
-    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(SteamWindowSuppressor.self) private var suppressor
     @Environment(EngineDownloader.self) private var engineDownloader
 
@@ -59,7 +58,6 @@ struct SplashView: View {
             bootstrap.start(
                 engine: engine,
                 steamManager: steamManager,
-                sessionBridge: sessionBridge,
                 engineDownloader: engineDownloader
             )
         }
@@ -202,7 +200,6 @@ struct SplashView: View {
                 bootstrap.retry(
                     engine: engine,
                     steamManager: steamManager,
-                    sessionBridge: sessionBridge,
                     engineDownloader: engineDownloader
                 )
             }
@@ -232,7 +229,6 @@ struct SplashView: View {
         .environment(BootstrapManager())
         .environment(WineEngine())
         .environment(WineSteamManager())
-        .environment(SteamSessionBridge())
         .environment(SteamWindowSuppressor())
         .environment(EngineDownloader())
         .frame(width: 480, height: 300)

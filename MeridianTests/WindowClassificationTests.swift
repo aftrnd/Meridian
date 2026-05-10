@@ -176,13 +176,15 @@ final class WindowClassificationTests: XCTestCase {
             .deletingLastPathComponent()
         let url = root.appendingPathComponent("Meridian/Engine/WineSteamManager.swift")
         let src = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame preseed appID=\\(appID)\")"))
-        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame probe appID=\\(appID)\""))
-        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame credential-restart appID=\\(appID)\")"))
-        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame credential-restart appID=\\(appID)\""))
-        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame no-restart ready appID=\\(appID)\""))
-        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame credential-restart ready appID=\\(appID)\""))
-        XCTAssertTrue(src.contains("self.windowSuppressor?.registerPID(shutdownProcess.processIdentifier)"))
+        // Suppressor must arm before any Steam restart during install
+        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame preseed appID=\\(appID)\")"),
+                      "Suppressor must arm before pre-seeding the ACF manifest")
+        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame restart appID=\\(appID)\""),
+                      "Webhelper kill burst must fire before Steam restart during install")
+        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame restart appID=\\(appID)\")"),
+                      "Suppressor must arm immediately before Steam restart during install")
+        XCTAssertTrue(src.contains("self.windowSuppressor?.registerPID(shutdownProcess.processIdentifier)"),
+                      "Shutdown process PID must be registered with suppressor")
     }
 
     func testGameLauncherSuppressesAtDownloadClick() throws {

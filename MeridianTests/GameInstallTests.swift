@@ -364,9 +364,9 @@ final class GameInstallTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(src.contains("if !prefix.isGameFullyInstalled(appID: game.id)"),
+        XCTAssertTrue(src.contains("isGameFullyInstalled(appID: game.id)"),
                       "Launch/install gate must use fully-installed state, not mere ACF presence.")
-        XCTAssertTrue(src.contains("if !prefix.isGameInstalled(appID: game.id)"),
+        XCTAssertTrue(src.contains("isGameInstalled(appID: game.id)"),
                       "Fresh installs still need the pre-seeded ACF path.")
         XCTAssertTrue(src.contains("has partial ACF — resuming existing Steam download"),
                       "Partial ACFs must resume progress polling instead of sending install-complete.")

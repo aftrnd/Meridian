@@ -17,7 +17,6 @@ struct ContentView: View {
     @Environment(SteamLibraryStore.self) private var library
     @Environment(WineEngine.self) private var engine
     @Environment(WineSteamManager.self) private var steamManager
-    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(GameLauncher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
@@ -506,7 +505,6 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(SteamLibraryStore())
         .environment(WineEngine())
         .environment(WineSteamManager())
-        .environment(SteamSessionBridge())
         .environment(GameLauncher())
         .environment(BootstrapManager())
         .environment(CategoryStore())

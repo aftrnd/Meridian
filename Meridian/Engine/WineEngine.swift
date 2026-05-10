@@ -313,6 +313,10 @@ final class WineEngine {
             "WINEDLLPATH":               "\(lib)/wine",
             "DYLD_FALLBACK_LIBRARY_PATH": dyld,
             "WINE_LARGE_ADDRESS_AWARE":  "1",
+            // Disable the Windows audio API for all non-game Wine processes
+            // (steam.exe, wineboot, reg, etc.) so Steam sounds never leak
+            // through. Games use environment(for:) which does not set this.
+            "WINEDLLOVERRIDES":          "mmdevapi=d",
         ]
         if let accessoryPath = Self.accessoryDylibPath() {
             env["DYLD_INSERT_LIBRARIES"] = accessoryPath

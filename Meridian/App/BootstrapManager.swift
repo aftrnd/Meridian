@@ -64,7 +64,6 @@ final class BootstrapManager {
     func start(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         engineDownloader: EngineDownloader
     ) {
         guard phase == .idle || isFailed else { return }
@@ -74,7 +73,6 @@ final class BootstrapManager {
             await self?.runPipeline(
                 engine: engine,
                 steamManager: steamManager,
-                sessionBridge: sessionBridge,
                 engineDownloader: engineDownloader
             )
         }
@@ -107,7 +105,6 @@ final class BootstrapManager {
     func retry(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         engineDownloader: EngineDownloader
     ) {
         let cleanupPhases: [Phase] = [.creatingPrefix, .installingSteam, .bootstrappingSteam, .startingSteam]
@@ -120,7 +117,7 @@ final class BootstrapManager {
         phase = .idle
         statusMessage = ""
         engineDownloadState = .idle
-        start(engine: engine, steamManager: steamManager, sessionBridge: sessionBridge, engineDownloader: engineDownloader)
+        start(engine: engine, steamManager: steamManager, engineDownloader: engineDownloader)
     }
 
     // MARK: - Pipeline
@@ -131,7 +128,6 @@ final class BootstrapManager {
     private func runPipeline(
         engine: WineEngine,
         steamManager: WineSteamManager,
-        sessionBridge: SteamSessionBridge,
         engineDownloader: EngineDownloader
     ) async {
         let pipelineStart = ContinuousClock.now
@@ -487,40 +483,24 @@ final class BootstrapManager {
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
 
-        // 5. Sync Steam session.
+        // 5. Check whether a valid Steam session exists on disk.
         //
-        // SessionBridge has three strategies, tried in order:
-        //   1. Pending credential-auth tokens (user just finished the sign-in sheet
-        //      and we have a fresh JWT refresh_token in memory).
-        //   2. Persisted refresh_token from a previous session (AppSettings).
-        //      SessionBridge re-writes loginusers.vdf + local.vdf on every launch so
-        //      steam.exe's auto-login has a clean known state.
-        //   3. macOS Steam install detected — copy its loginusers.vdf + ssfn*.
+        // After a successful `steam.exe -login` sign-in (via AuthView → SteamExeSignIn),
+        // Steam writes its own ssfn* device-trust token + local.vdf. On every subsequent
+        // cold start, `steam.exe -silent` reads the ssfn token and auto-authenticates
+        // without 2FA — same mechanism as the Windows Steam desktop client.
         //
-        // Path 1 and 2 encrypt the JWT into `AppData/Local/Steam/local.vdf` via
-        // `meridian-dpapi.exe` so Steam's `steamclient64.dll` can decrypt it at
-        // startup (matches Valve's current on-disk format, CLI-verified April 23
-        // 2026 — see `WinePrefix.writeSteamSessionLocalVdf` for the full mechanism).
-        // If none of the strategies succeed, the sign-in sheet will take over.
-        transition(to: .syncingSession, message: "Syncing Steam session…")
-        let strategy = await sessionBridge.prepare(prefix: prefix, engine: engine)
-        sessionBridge.syncAccountNameIfNeeded(prefix: prefix)
-        switch strategy {
-        case .credentialAuth:
-            log.info("[bootstrap] session written from credential-auth tokens ✓")
-        case .sessionFileCopy:
-            log.info("[bootstrap] session files copied from macOS Steam ✓")
-        case .none:
-            log.info("[bootstrap] no session available — Wine Steam login required via sign-in sheet")
-        }
-
-        // Record login state. `isSteamLoggedIn` is true ONLY when SessionBridge
-        // successfully prepared a session this launch — either from pending
-        // tokens (just-finished sign-in), persisted tokens (previous sign-in),
-        // or macOS Steam session-file copy.
-        let hasLogin = strategy != .none
+        // We consider a session present when EITHER:
+        //   • ssfn device-trust token exists (strongest signal — Steam issued it after -login)
+        //   • loginusers.vdf has a MostRecent=1 user (written by SteamExeSignIn's onAuthenticated)
+        //
+        // If neither is present the sign-in sheet will take over at the end of the pipeline.
+        transition(to: .syncingSession, message: "Checking Steam session…")
+        let hasSsfn     = prefix.hasSsfnToken
+        let hasLoginVdf = prefix.hasSteamLoginSession()
+        let hasLogin    = hasSsfn || hasLoginVdf
         steamManager.isSteamLoggedIn = hasLogin
-        log.info("[bootstrap] Steam login session present=\(hasLogin) strategy=\(String(describing: strategy))")
+        log.info("[bootstrap] Steam session check: hasSsfn=\(hasSsfn) hasLoginVdf=\(hasLoginVdf) → hasLogin=\(hasLogin)")
 
         guard !Task.isCancelled else { return }
 
@@ -532,146 +512,55 @@ final class BootstrapManager {
 
         // 7. Start the persistent `steam.exe -silent` host if the user is signed in.
         //
-        // `waitUntilReady` gates on [Logged On, — the authenticated-ready signal.
-        // Auth failure surfaces as `SteamError.authenticationFailed` and we clear
-        // the stale refresh_token so the sign-in sheet takes over. Without this
-        // gate, the library opened but the user saw Steam's own "Unexpected error
-        // 0x3008" dialog (CLI-verified April 22 2026).
+        // Auth is ssfn-based: steam.exe reads the device-trust token written during
+        // the `steam.exe -login` sign-in and authenticates silently — same mechanism
+        // as the Windows Steam desktop client (no JWT injection, no DPAPI, no typed codes).
+        //
+        // authTimeout: 15 s after Connected. A valid ssfn token logs in within ~5 s
+        // of reaching the CM. 15 s is 3× that. If auth fails (ssfn expired / rotated),
+        // isSteamLoggedIn is cleared so the sign-in sheet appears with pre-filled creds.
         if hasLogin {
-            transition(to: .startingSteam, message: "Starting Steam…")
-            var steamStartSucceeded = false
-            var authFailed = false
-            do {
-                try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                // authTimeout: 15 s after Connected. A valid local.vdf token
-                // logs in within ~5 s of reaching the CM. 15 s is 3× that and
-                // still enough buffer for a slow CM response. If local.vdf is
-                // invalid (e.g. after a code-42 self-update), we detect failure
-                // quickly and fall through to the -login retry path below.
-                try await steamManager.waitUntilReady(
-                    prefix: prefix,
-                    timeout: .seconds(180),
-                    authTimeout: .seconds(15)
-                ) { [weak self] msg in
-                    self?.statusMessage = msg
+            // If steam.exe is already running from a just-completed sign-in (AuthView →
+            // SteamExeSignIn) do NOT restart it — it is already authenticated.
+            if !steamManager.isSteamProcessAlive {
+                transition(to: .startingSteam, message: "Starting Steam…")
+                do {
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
+                    try await steamManager.waitUntilReady(
+                        prefix: prefix,
+                        timeout: .seconds(180),
+                        authTimeout: .seconds(15)
+                    ) { [weak self] msg in
+                        self?.statusMessage = msg
+                    }
+                    if let pid = steamManager.persistentProcessIdentifier {
+                        windowSuppressor?.resumeSuppressing(pid: pid)
+                    }
+                    log.info("[bootstrap] persistent steam.exe signed in via ssfn ✓")
+                } catch WineSteamManager.SteamError.authenticationFailed,
+                        WineSteamManager.SteamError.steamNotReady {
+                    // ssfn expired or Steam timed out — surface the sign-in sheet.
+                    // Credentials are preserved in Keychain for one-tap re-auth.
+                    log.warning("[bootstrap] ssfn auth failed — clearing session, sign-in sheet will handle re-auth")
+                    if steamManager.isSteamProcessAlive {
+                        await steamManager.stopPersistent(engine: engine, prefix: prefix)
+                    }
+                    steamManager.killAll(engine: engine, prefix: prefix)
+                    steamManager.clearPersistentProcess()
+                    steamManager.isSteamLoggedIn = false
+                } catch {
+                    log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
+                    // Transient failure — preserve isSteamLoggedIn so a manual retry works.
                 }
+            } else {
+                // Steam is already running (just-completed sign-in). Attach the suppressor.
                 if let pid = steamManager.persistentProcessIdentifier {
                     windowSuppressor?.resumeSuppressing(pid: pid)
                 }
-                log.info("[bootstrap] persistent steam.exe signed in ✓")
-                steamStartSucceeded = true
-            } catch WineSteamManager.SteamError.authenticationFailed,
-                    WineSteamManager.SteamError.steamNotReady {
-                // Both paths mean local.vdf auth failed — either Valve explicitly
-                // rejected the JWT (authenticationFailed, common after code-42
-                // Steam updates that invalidate stored tokens) or the auth window
-                // timed out (steamNotReady). Before clearing credentials and
-                // showing the sign-in sheet, try -login from Keychain. If the
-                // ssfn device-trust file exists from a previous -login session,
-                // this completes silently in ~10s with no 2FA prompt.
-                log.warning("[bootstrap] local.vdf auth failed (JWT rejected or timed out) — attempting -login retry before showing sign-in sheet")
-                settings.steamSelfManagedSession = false
-                steamManager.killAll(engine: engine, prefix: prefix)
-                steamManager.clearPersistentProcess()
-                try? await Task.sleep(for: .milliseconds(500))
-
-                let accountName = settings.steamCredentialAccountName
-                let authSvc = SteamAuthService()
-                if !accountName.isEmpty, let password = authSvc.loadSteamPassword() {
-                    log.info("[bootstrap] -login retry with saved credentials for user=\(accountName)")
-                    transition(to: .startingSteam, message: "Reconnecting to Steam…")
-                    do {
-                        try await steamManager.startPersistent(
-                            engine: engine,
-                            prefix: prefix,
-                            extraArgs: ["-login", accountName, password]
-                        )
-                        // After Steam starts, update the message. If this is a first
-                        // -login on this device (no ssfn yet), Steam will send a Mobile
-                        // Authenticator push within ~8s of connecting. Show a helpful
-                        // message so the user knows to check their phone.
-                        statusMessage = "Signing in to Steam…"
-                        let approvalTask = Task { [weak self] in
-                            try? await Task.sleep(for: .seconds(8))
-                            guard !Task.isCancelled else { return }
-                            await MainActor.run {
-                                // Only update if still in the signing-in phase
-                                if case .startingSteam = self?.phase {
-                                    self?.statusMessage = "Approve sign-in on Steam Mobile…"
-                                }
-                            }
-                        }
-                        defer { approvalTask.cancel() }
-                        try await steamManager.waitUntilReady(
-                            prefix: prefix,
-                            timeout: .seconds(180),
-                            authTimeout: .seconds(60)
-                        ) { [weak self] msg in self?.statusMessage = msg }
-                        if let pid = steamManager.persistentProcessIdentifier {
-                            windowSuppressor?.resumeSuppressing(pid: pid)
-                        }
-                        log.info("[bootstrap] -login retry succeeded ✓")
-                        steamStartSucceeded = true
-                        // Wait up to 12s for Steam to write its ssfn device-trust
-                        // token after login. ssfn enables silent -silent restarts
-                        // without 2FA for all future operations this session.
-                        if !prefix.hasSsfnToken {
-                            log.info("[bootstrap] waiting for ssfn token to be written…")
-                            let ssfnDeadline = ContinuousClock.now + .seconds(12)
-                            while ContinuousClock.now < ssfnDeadline {
-                                try? await Task.sleep(for: .seconds(1))
-                                if prefix.hasSsfnToken {
-                                    log.info("[bootstrap] ssfn token written ✓")
-                                    break
-                                }
-                            }
-                            if !prefix.hasSsfnToken {
-                                log.warning("[bootstrap] ssfn token not written within 12s — next install restart may require 2FA")
-                            }
-                        }
-                    } catch {
-                        log.warning("[bootstrap] -login retry also failed: \(error.localizedDescription)")
-                        // Token is genuinely stale — clear it so sign-in sheet
-                        // drives fresh credential auth on the next user interaction.
-                        settings.steamCredentialRefreshToken = ""
-                    }
-                } else {
-                    log.info("[bootstrap] no saved password for -login retry — clearing token, sign-in sheet will handle it")
-                    settings.steamCredentialRefreshToken = ""
-                }
-            } catch {
-                log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
-            }
-
-            if !steamStartSucceeded {
-                if steamManager.isSteamProcessAlive {
-                    await steamManager.stopPersistent(engine: engine, prefix: prefix)
-                }
-                // Kill ALL Wine processes (wineserver + child processes such as
-                // steamwebhelper) even when the tracked steam.exe already exited.
-                // Without this, child processes that outlive the tracked process
-                // hold Wine mutexes/named-pipes that cause the next steam.exe to
-                // detect a "running instance" and exit cleanly with code 0,
-                // repeating the failure on every subsequent sign-in attempt.
-                steamManager.killAll(engine: engine, prefix: prefix)
-                steamManager.isSteamLoggedIn = false
-                steamManager.clearPersistentProcess()
-
-                if authFailed {
-                    // Valve's CM explicitly rejected the stored token — it is
-                    // genuinely stale. Clear it so the sign-in sheet drives a
-                    // fresh credential auth on the next user interaction.
-                    log.info("[bootstrap] auth rejected by Valve — clearing stale refresh token")
-                    settings.steamCredentialRefreshToken = ""
-                } else {
-                    // Steam had a transient startup failure — credentials are
-                    // still valid. Do NOT clear the token; isSteamLoggedIn=false
-                    // will surface the sign-in sheet with pre-filled credentials.
-                    log.info("[bootstrap] transient Steam startup failure — preserving credentials for retry")
-                }
+                log.info("[bootstrap] steam.exe already running and authenticated — skipping start")
             }
         } else {
-            log.info("[bootstrap] skipping persistent steam.exe (no session) — sign-in sheet will handle it")
+            log.info("[bootstrap] no session on disk — sign-in sheet will handle it")
         }
 
         lastFailedPhase = nil

@@ -25,7 +25,6 @@ struct GameDetailView: View {
     @Environment(GameLauncher.self)       private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
-    @Environment(SteamSessionBridge.self) private var sessionBridge
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
