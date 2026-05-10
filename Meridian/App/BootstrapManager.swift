@@ -586,6 +586,22 @@ final class BootstrapManager {
                             prefix: prefix,
                             extraArgs: ["-login", accountName, password]
                         )
+                        // After Steam starts, update the message. If this is a first
+                        // -login on this device (no ssfn yet), Steam will send a Mobile
+                        // Authenticator push within ~8s of connecting. Show a helpful
+                        // message so the user knows to check their phone.
+                        statusMessage = "Signing in to Steam…"
+                        let approvalTask = Task { [weak self] in
+                            try? await Task.sleep(for: .seconds(8))
+                            guard !Task.isCancelled else { return }
+                            await MainActor.run {
+                                // Only update if still in the signing-in phase
+                                if case .startingSteam = self?.phase {
+                                    self?.statusMessage = "Approve sign-in on Steam Mobile…"
+                                }
+                            }
+                        }
+                        defer { approvalTask.cancel() }
                         try await steamManager.waitUntilReady(
                             prefix: prefix,
                             timeout: .seconds(180),
