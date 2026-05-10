@@ -427,12 +427,26 @@ actor SteamAPIService {
             if let assets = firstItem["assets"] as? [String: Any] {
                 let assetKeys = assets.keys.sorted().joined(separator: ", ")
                 log.debug("[extractHashesFromRaw] first item assets keys: [\(assetKeys)]")
-                // Log every string value inside assets so we can see the path format.
                 for (k, v) in assets {
                     if let str = v as? String { log.debug("[extractHashesFromRaw]   assets.\(k)=\(str)") }
                 }
             }
-        }
+            // Also log assets_without_overrides so we can verify logo hashes appear here.
+            if let awos = firstItem["assets_without_overrides"] as? [String: Any] {
+                let awoKeys = awos.keys.sorted().joined(separator: ", ")
+                log.debug("[extractHashesFromRaw] first item assets_without_overrides keys: [\(awoKeys)]")
+                for (k, v) in awos {
+                    if let str = v as? String {
+                        log.debug("[extractHashesFromRaw]   assets_without_overrides.\(k)=\(str)")
+                    } else if let nested = v as? [String: Any] {
+                        for (nk, nv) in nested {
+                            if let str = nv as? String {
+                                log.debug("[extractHashesFromRaw]   assets_without_overrides.\(k).\(nk)=\(str)")
+                            }
+                        }
+                    }
+                }
+            }
 
         var out: [Int: GameCDNHashes] = [:]
         for item in items {
