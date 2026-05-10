@@ -950,6 +950,9 @@ final class WineSteamManager {
 
         var connectedObservedAt: ContinuousClock.Instant?
         var connectedReported = false
+        // Set when the tracked process exits with code 42 (Steam self-update restart).
+        // If no connection_log activity appears within 30s of that exit we give up.
+        var restartGraceDeadline: ContinuousClock.Instant? = nil
 
         while ContinuousClock.now - started < timeout {
             // Throw CancellationError on task cancellation rather than returning
@@ -962,14 +965,40 @@ final class WineSteamManager {
             try Task.checkCancellation()
             poll += 1
 
-            // Fast exit: tracked process died before we got our signals.
+            // Tracked process exited — determine whether this is a recoverable
+            // restart or a genuine failure.
             if let p = persistentProcess, !p.isRunning {
                 let exit = p.terminationStatus
-                log.error("[waitUntilReady] signal: persistent steam.exe exited (code=\(exit)) — failing fast")
-                throw SteamError.steamExitedEarly(exitCode: exit)
+                if exit == 42 {
+                    // Code 42 = Steam self-update: the bootstrapper applied a
+                    // pending update and signalled that it needs to restart.
+                    // A new steam.exe should be starting up automatically.
+                    // Clear the reference, arm a 30s grace window, and continue
+                    // polling — if connection_log grows we know the restart
+                    // succeeded; if nothing appears within 30s we fail as stuck.
+                    log.info("[waitUntilReady] tracked process exited (code=42) — Steam self-update restart in progress, allowing 30s for new process")
+                    persistentProcess = nil
+                    restartGraceDeadline = ContinuousClock.now + .seconds(30)
+                } else {
+                    log.error("[waitUntilReady] signal: persistent steam.exe exited (code=\(exit)) — failing fast")
+                    throw SteamError.steamExitedEarly(exitCode: exit)
+                }
             }
 
             let currentSize = Self.fileSize(at: connLogPath)
+
+            // If we are in a post-code-42 grace window, check whether the
+            // restarted Steam has started producing output.
+            if let deadline = restartGraceDeadline {
+                if currentSize > startOffset {
+                    // Connection log is growing — the restarted process is up.
+                    log.info("[waitUntilReady] Steam self-update restart produced output — resuming normal polling")
+                    restartGraceDeadline = nil
+                } else if ContinuousClock.now > deadline {
+                    log.error("[waitUntilReady] Steam restart (code=42) produced no output in 30s — treating as stuck")
+                    throw SteamError.steamStuck
+                }
+            }
 
             // Read the new tail of connection_log once per poll; reuse for both
             // Connected and Logged On detection.

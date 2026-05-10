@@ -560,14 +560,6 @@ final class BootstrapManager {
             }
 
             if !steamStartSucceeded {
-                // Session is dead (either crash before ready, or Logged On never
-                // observed). Clear the stale refresh_token so the sign-in sheet
-                // will drive a fresh auth on the next user interaction.
-                //
-                // Also kill the running persistent Steam so it can't keep
-                // retrying auth in the background and popping the "Unexpected
-                // error (0x3008)" dialog at the user.
-                log.info("[bootstrap] clearing stale refresh token; sign-in sheet will re-authenticate (authFailed=\(authFailed))")
                 if steamManager.isSteamProcessAlive {
                     await steamManager.stopPersistent(engine: engine, prefix: prefix)
                 }
@@ -578,9 +570,24 @@ final class BootstrapManager {
                 // detect a "running instance" and exit cleanly with code 0,
                 // repeating the failure on every subsequent sign-in attempt.
                 steamManager.killAll(engine: engine, prefix: prefix)
-                settings.steamCredentialRefreshToken = ""
                 steamManager.isSteamLoggedIn = false
                 steamManager.clearPersistentProcess()
+
+                if authFailed {
+                    // Valve's CM explicitly rejected the stored token — it is
+                    // genuinely stale. Clear it so the sign-in sheet drives a
+                    // fresh credential auth on the next user interaction.
+                    log.info("[bootstrap] auth rejected by Valve — clearing stale refresh token")
+                    settings.steamCredentialRefreshToken = ""
+                } else {
+                    // Steam had a transient startup failure (self-update restart,
+                    // process stuck, etc.) — credentials are still valid. Do NOT
+                    // clear the token; the next launch will retry automatically.
+                    // isSteamLoggedIn=false above will surface the sign-in sheet
+                    // if needed, and the sheet's credential fields will be
+                    // pre-populated from the saved account name.
+                    log.info("[bootstrap] transient Steam startup failure — preserving credentials for retry")
+                }
             }
         } else {
             log.info("[bootstrap] skipping persistent steam.exe (no session) — sign-in sheet will handle it")
