@@ -413,26 +413,13 @@ final class GameLauncher {
                     return
                 }
 
-                // Wait up to 15s for Steam to acknowledge the IPC and write
-                // BytesToDownload into the ACF. If nothing starts, the IPC
-                // command may have triggered a suppressed dialog — tell the
-                // user rather than spinning indefinitely.
-                let ipcDeadline = ContinuousClock.now + .seconds(15)
-                while ContinuousClock.now < ipcDeadline {
-                    guard !Task.isCancelled else { return }
-                    let d = prefix.gameDownloadDetails(appID: game.id)
-                    if (d?.bytesToDownload ?? 0) > 0 || prefix.isGameFullyInstalled(appID: game.id) {
-                        log.info("[launch] IPC triggered download for appID=\(game.id)")
-                        break
-                    }
-                    try? await Task.sleep(for: .seconds(1))
-                }
-                if (prefix.gameDownloadDetails(appID: game.id)?.bytesToDownload ?? 0) == 0
-                    && !prefix.isGameFullyInstalled(appID: game.id) {
-                    log.warning("[launch] IPC did not start download within 15s for appID=\(game.id)")
-                    fail("Steam didn't start the download. Try clicking Install again.")
-                    return
-                }
+                // Wait for Steam to acknowledge the IPC and start downloading.
+                // Steam's content scheduler may take up to 60s to process a new
+                // ACF (especially right after an uninstall when its internal state
+                // is settling). The download loop below handles the progress bar
+                // once bytesToDownload becomes non-zero.
+                // No fast-fail here — the download loop's own cancel/stop path
+                // handles user-initiated cancellation cleanly.
             } else {
                 appendLog("Resuming download for \(game.name)")
                 currentActivity = "Resuming download for \(game.name)…"
