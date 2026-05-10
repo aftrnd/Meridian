@@ -850,7 +850,7 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(result, "d3d11,dxgi=b")
     }
 
-    // MARK: - markInstalledGamesForUpdate tests
+    // MARK: - markInstalledGamesForUpdate helpers (retained for WinePrefix unit tests; not used in bootstrap)
 
     /// Mirror of WinePrefix.flipFullyInstalledToUpdateRequired(in:)
     private static func flipFullyInstalledToUpdateRequired(in acfContents: String) -> String? {
@@ -995,33 +995,11 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
-    /// Guard test: the bootstrap pipeline MUST call
-    /// `markInstalledGamesForUpdate()` before `startPersistent` so Steam's
-    /// single startup ACF scan picks up the marks. Without this, every
-    /// installed game stays pinned to whatever build was current when the
-    /// user first installed it (CLI-confirmed April 26 2026 with Half-Life 2:
-    /// `appmanifest_220.acf` had `StateFlags=4` + `buildid=19307283` and never
-    /// updated despite Steam being online).
-    func testBootstrapManagerMarksInstalledGamesForUpdate() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let src = try String(
-            contentsOf: root.appendingPathComponent("Meridian/App/BootstrapManager.swift"),
-            encoding: .utf8
-        )
-
-        XCTAssertTrue(src.contains("prefix.markInstalledGamesForUpdate()"),
-                      "BootstrapManager must call markInstalledGamesForUpdate() so Steam's startup scan validates installed games against current PICS manifests.")
-        // Must run BEFORE startPersistent (Steam scans manifests exactly once
-        // per startup). Asserting source order via substring positions.
-        if let markRange = src.range(of: "prefix.markInstalledGamesForUpdate()"),
-           let startRange = src.range(of: "steamManager.startPersistent")
-        {
-            XCTAssertLessThan(markRange.lowerBound, startRange.lowerBound,
-                              "markInstalledGamesForUpdate() must be called before startPersistent so Steam picks up the marks.")
-        } else {
-            XCTFail("Could not locate both markInstalledGamesForUpdate and startPersistent in BootstrapManager source.")
-        }
-    }
+    /// Removed: `markInstalledGamesForUpdate` is no longer called from the bootstrap
+    /// pipeline. Flipping all installed game ACFs to StateFlags=1026 at every launch
+    /// caused Steam to fire download-complete notifications, briefly show the Dock icon,
+    /// flash bottom-right Steam notifications, and made the Meridian UI show the Install
+    /// button for all games until Steam re-validated them (~60–90 s). The update-check
+    /// edge case it was designed to solve (stale buildid) is handled by Steam's normal
+    /// PICS version check when the game is launched. See no-piling-on.mdc.
 }

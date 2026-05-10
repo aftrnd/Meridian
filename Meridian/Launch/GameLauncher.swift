@@ -333,7 +333,8 @@ final class GameLauncher {
         // If the game isn't fully installed yet, either seed a fresh install or resume
         // an existing partial ACF. ACF presence alone is not playable: Steam writes it
         // as soon as a download is queued.
-        if !prefix.isGameFullyInstalled(appID: game.id) {
+        let wasAlreadyInstalled = prefix.isGameFullyInstalled(appID: game.id)
+        if !wasAlreadyInstalled {
             try? prefix.ensureSteamCFG()
             try? prefix.ensureDefaultLibrary()
             windowSuppressor?.suppressNow(reason: "download click appID=\(game.id)")
@@ -506,8 +507,16 @@ final class GameLauncher {
 
         // Install-only mode: stop here without proceeding to launch.
         if !launchAfterInstall {
-            appendLog("Installation complete")
-            MeridianNotifications.sendInstallComplete(gameName: game.name)
+            // Only notify if we actually downloaded something. If the game was
+            // already fully installed when we entered (e.g. the UI showed the
+            // Install button due to a transient StateFlags mismatch), skip the
+            // notification — there's nothing to announce. Either way, ensure
+            // the library reflects the installed state so the button flips to Play.
+            library?.setInstalled(true, for: game.id)
+            if !wasAlreadyInstalled {
+                appendLog("Installation complete")
+                MeridianNotifications.sendInstallComplete(gameName: game.name)
+            }
             launchState = .idle
             activeAppID = nil
             pipelineStartDate = nil

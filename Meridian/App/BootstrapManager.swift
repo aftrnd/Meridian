@@ -530,26 +530,6 @@ final class BootstrapManager {
         // its polling/observer layers.
         windowSuppressor?.beginSession()
 
-        // 6b. Mark every fully-installed game's appmanifest as `StateFlags=1026`
-        // (UpdateRequired | Validating) so Steam's content manager performs its
-        // single startup ACF scan against the current PICS manifests and silently
-        // pulls any deltas. Steam writes `StateFlags=4` back as soon as each
-        // game is up to date — when nothing has changed server-side, this is a
-        // 1-2 second PICS round-trip with no download. When a game IS out of
-        // date (e.g. a manifest was preseeded before depot 220 was added in
-        // HL2's 20th Anniversary Update), the existing install/progress loop in
-        // `GameLauncher` catches the `1026` state on launch and surfaces the
-        // delta download.
-        //
-        // Must run AFTER session sync (loginusers.vdf written → Steam knows the
-        // user) and BEFORE `startPersistent` (Steam scans manifests exactly
-        // once per startup). Skipped when no session is available — Steam won't
-        // start, so the marks would just be stale flags on disk.
-        if hasLogin {
-            let marked = prefix.markInstalledGamesForUpdate()
-            log.info("[bootstrap] marked \(marked) installed game(s) for Steam update check")
-        }
-
         // 7. Start the persistent `steam.exe -silent` host if the user is signed in.
         //
         // `waitUntilReady` gates on [Logged On, — the authenticated-ready signal.
