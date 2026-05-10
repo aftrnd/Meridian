@@ -905,9 +905,18 @@ final class WineSteamManager {
         _ = try? await prefix.writeUserNotificationPreferences(steamID64: AppSettings.shared.steamCredentialSteamID)
     }
 
-    /// Whether the persistent Steam process is still alive.
+    /// Whether a persistent Steam process is running.
+    ///
+    /// Checks the tracked `persistentProcess` handle first. Falls back to
+    /// `isRunning` when `persistentProcess` is nil — which happens after a
+    /// code-42 self-update restart where we cleared the stale handle but
+    /// Steam is still alive and authenticated (we set `isRunning = true` when
+    /// `[Logged On` is observed, regardless of whether we held a reference).
+    /// Without this fallback, every `isSteamProcessAlive` check after a code-42
+    /// boot returns false, causing callers to try starting a second Steam that
+    /// immediately detects the running instance and exits with code=0.
     var isSteamProcessAlive: Bool {
-        persistentProcess?.isRunning ?? false
+        persistentProcess?.isRunning ?? isRunning
     }
 
     /// The macOS process identifier of the persistent Steam wine64 process.
