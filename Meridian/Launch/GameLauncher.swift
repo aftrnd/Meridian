@@ -151,17 +151,39 @@ final class GameLauncher {
         }
     }
 
-    /// Cancels an in-progress launch. Cleans up any spawned processes.
+    /// Cancels an in-progress launch or download.
+    ///
+    /// Behaviour depends on the current state:
+    ///
+    /// **Download in progress** (`.awaitingInstallConfirmation`, `.bootstrappingSteam`
+    /// while in the install path, `.preparingEngine`, `.preparingPrefix`): stop our
+    /// polling loop but leave Steam running. Steam may continue downloading in the
+    /// background; when the user clicks Install again the no-restart probe will detect
+    /// it immediately and the bar reappears without a 40-second restart+re-auth cycle.
+    ///
+    /// **Game running/launching** (`.running`, `.launching`): kill all Wine processes
+    /// so the game and its DLLs are fully torn down before the next operation.
     func cancelLaunch(engine: WineEngine, steamManager: WineSteamManager) async {
-        log.info("[cancelLaunch] cancelling current launch")
+        let gameWasRunning: Bool
+        switch launchState {
+        case .running, .launching:
+            gameWasRunning = true
+        default:
+            gameWasRunning = false
+        }
+
+        log.info("[cancelLaunch] cancelling — gameWasRunning=\(gameWasRunning) state=\(String(describing: launchState))")
         launchTask?.cancel()
         launchTask = nil
-
-        // Install was dispatched to `steam.exe` via IPC; `steam.exe` itself
-        // notices when the user cancels from its own UI. We don't try to
-        // pre-empt it here — just drop our polling loop and move on.
         steamManager.gameIsRunning = false
-        await cleanupProcesses(engine: engine, steamManager: steamManager)
+
+        if gameWasRunning {
+            // Game processes are alive — kill everything so the next operation
+            // starts from a clean Wine session.
+            await cleanupProcesses(engine: engine, steamManager: steamManager)
+        }
+        // Download cancel: leave Steam running. The user will get instant progress
+        // resumption on the next Install click instead of a 30+ second restart.
 
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)
@@ -174,7 +196,7 @@ final class GameLauncher {
         currentActivity = nil
         downloadProgress = nil
         processesConfirmed = false
-        appendLog("Launch cancelled by user")
+        appendLog(gameWasRunning ? "Game stopped" : "Download cancelled")
     }
 
     /// Stops the currently running game.
