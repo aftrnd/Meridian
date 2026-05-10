@@ -543,14 +543,15 @@ final class BootstrapManager {
             var authFailed = false
             do {
                 try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                // authTimeout: 30 s after Connected. A valid local.vdf token
-                // logs in within ~5 s of reaching the CM. 30 s is 6× that and
-                // still far tighter than the previous 60 s default which caused
-                // visible spinning after code-42 self-update restarts.
+                // authTimeout: 15 s after Connected. A valid local.vdf token
+                // logs in within ~5 s of reaching the CM. 15 s is 3× that and
+                // still enough buffer for a slow CM response. If local.vdf is
+                // invalid (e.g. after a code-42 self-update), we detect failure
+                // quickly and fall through to the -login retry path below.
                 try await steamManager.waitUntilReady(
                     prefix: prefix,
                     timeout: .seconds(180),
-                    authTimeout: .seconds(30)
+                    authTimeout: .seconds(15)
                 ) { [weak self] msg in
                     self?.statusMessage = msg
                 }
@@ -563,6 +564,44 @@ final class BootstrapManager {
                 log.warning("[bootstrap] persistent steam.exe reached network but auto-login failed — saved session is stale")
                 authFailed = true
                 settings.steamSelfManagedSession = false
+            } catch WineSteamManager.SteamError.steamNotReady {
+                // steamNotReady means Steam connected to the CM but never logged
+                // on within the authTimeout. This is the code-42 self-update
+                // pattern: the updated client ignores the old local.vdf token.
+                // Attempt a transparent -login retry using the Keychain password
+                // before falling through to the sign-in sheet.
+                log.warning("[bootstrap] Steam connected but did not log on (likely code-42 update) — attempting -login retry")
+                steamManager.killAll(engine: engine, prefix: prefix)
+                steamManager.clearPersistentProcess()
+                try? await Task.sleep(for: .milliseconds(500))
+
+                let accountName = settings.steamCredentialAccountName
+                let authSvc = SteamAuthService()
+                if !accountName.isEmpty, let password = authSvc.loadSteamPassword() {
+                    log.info("[bootstrap] -login retry with saved credentials for user=\(accountName)")
+                    transition(to: .startingSteam, message: "Reconnecting to Steam…")
+                    do {
+                        try await steamManager.startPersistent(
+                            engine: engine,
+                            prefix: prefix,
+                            extraArgs: ["-login", accountName, password]
+                        )
+                        try await steamManager.waitUntilReady(
+                            prefix: prefix,
+                            timeout: .seconds(180),
+                            authTimeout: .seconds(60)
+                        ) { [weak self] msg in self?.statusMessage = msg }
+                        if let pid = steamManager.persistentProcessIdentifier {
+                            windowSuppressor?.resumeSuppressing(pid: pid)
+                        }
+                        log.info("[bootstrap] -login retry succeeded ✓")
+                        steamStartSucceeded = true
+                    } catch {
+                        log.warning("[bootstrap] -login retry also failed: \(error.localizedDescription)")
+                    }
+                } else {
+                    log.info("[bootstrap] no saved password for -login retry — sign-in sheet will handle it")
+                }
             } catch {
                 log.warning("[bootstrap] persistent steam.exe did not reach ready state: \(error.localizedDescription)")
             }
@@ -588,12 +627,9 @@ final class BootstrapManager {
                     log.info("[bootstrap] auth rejected by Valve — clearing stale refresh token")
                     settings.steamCredentialRefreshToken = ""
                 } else {
-                    // Steam had a transient startup failure (self-update restart,
-                    // process stuck, etc.) — credentials are still valid. Do NOT
-                    // clear the token; the next launch will retry automatically.
-                    // isSteamLoggedIn=false above will surface the sign-in sheet
-                    // if needed, and the sheet's credential fields will be
-                    // pre-populated from the saved account name.
+                    // Steam had a transient startup failure — credentials are
+                    // still valid. Do NOT clear the token; isSteamLoggedIn=false
+                    // will surface the sign-in sheet with pre-filled credentials.
                     log.info("[bootstrap] transient Steam startup failure — preserving credentials for retry")
                 }
             }

@@ -705,23 +705,17 @@ final class WineSteamManager {
                     return
                 }
             }
-            // Probe didn't detect a download. Instead of killing Steam and
-            // restarting (which destroys the authenticated session after code-42
-            // self-updates), send +app_update via IPC. The ACF is already on disk
-            // with installDir set, so Steam knows the install location — the
-            // "choose location" dialog that motivated the original restart approach
-            // only appears when no ACF exists.
-            log.info("[installGame] no-restart probe expired — sending +app_update IPC for appID=\(appID)")
-            startHeadlessWebhelperKillBurst(reason: "installGame IPC appID=\(appID)", duration: .seconds(15))
-            try sendSteamCommand(["+app_update", "\(appID)"], engine: engine, prefix: prefix)
-            // Give Steam a few seconds to react to the IPC command before the
-            // caller starts polling for download progress.
-            try? await Task.sleep(for: .seconds(3))
+            // Probe didn't detect a download in 12s. +app_update IPC was tried
+            // previously and silently ignored — it's a SteamCMD batch command
+            // that the GUI client's IPC forwarder doesn't implement. Just return:
+            // Steam's content manager scans all ACFs at startup and on login. The
+            // ACF is on disk with StateFlags=1026; Steam will queue the download
+            // the next time it performs that scan (usually within ~30s of login).
+            log.info("[installGame] no-restart probe expired — returning; Steam will scan ACF and start download appID=\(appID)")
             if let pid = persistentProcessIdentifier {
                 windowSuppressor?.resumeSuppressing(pid: pid)
             }
-            startHeadlessWebhelperKillBurst(reason: "installGame IPC ready appID=\(appID)", duration: .seconds(12))
-            log.info("[installGame] +app_update IPC sent — download should start momentarily appID=\(appID)")
+            startHeadlessWebhelperKillBurst(reason: "installGame return appID=\(appID)", duration: .seconds(12))
             return
         }
 

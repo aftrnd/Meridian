@@ -201,33 +201,11 @@ final class SteamLibraryStore {
                 }
             }
         }
-        log.info("[prefetchLibraryCapsuleHashes] localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule hashes from Steam's librarycache")
-
-        // Pass 3: ALL library games still missing a 600x900 capsule hash after
-        // passes 1 & 2. The batch call misses some games (new CDN, API gaps, etc.)
-        // that have art only on the hash-based CDN. Probe every missing game so
-        // any title in the library grid shows art, not just recently-played ones.
-        // probeCapsuleHash hits appdetails and verifies the file exists on CDN,
-        // so it safely returns nil for old games with no new-CDN art.
-        let capsuleMissing = games
-            .filter { $0.libraryCapsuleHash == nil }
-            .map(\.id)
-        if !capsuleMissing.isEmpty {
-            log.info("[prefetchLibraryCapsuleHashes] probing capsule hashes for \(capsuleMissing.count) recently played games")
-            for appID in capsuleMissing {
-                if let hash = await SteamAPIService.shared.probeCapsuleHash(appID: appID) {
-                    if let idx = games.firstIndex(where: { $0.id == appID }) {
-                        games[idx].libraryCapsuleHash = hash
-                    }
-                    if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
-                        recentGames[idx].libraryCapsuleHash = hash
-                    }
-                }
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-        }
-
-        log.info("[prefetchLibraryCapsuleHashes] complete")
+        // Pass 3 (probeCapsuleHash network probing) was removed. It made hundreds
+        // of HTTP requests per session that never succeeded — the appdetails API
+        // doesn't contain the capsule hash for games on the new CDN, so all probes
+        // returned nil. The local librarycache scan above already covers these games.
+        log.info("[prefetchLibraryCapsuleHashes] complete — localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule hashes")
     }
 
     /// Applies a hash dictionary to both the main games array and recentGames.
