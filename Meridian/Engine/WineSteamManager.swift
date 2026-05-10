@@ -715,48 +715,49 @@ final class WineSteamManager {
             log.info("[installGame] no-restart probe expired — restarting Steam with -login to force ACF scan appID=\(appID)")
         }
 
-        // Credential restart: re-write local.vdf from the stored refresh token (same
-        // as SteamSessionBridge.prepare does at bootstrap), then kill+restart Steam.
-        // Steam reads the fresh local.vdf at startup, logs in without any 2FA push
-        // (the refresh token is the same long-lived JWT that worked at bootstrap),
-        // and performs its startup ACF scan which sees StateFlags=1026 → download.
+        // -login restart: the only 100% reliable auth mechanism for plain Steam restarts.
         //
-        // Do NOT use -login user pass — that triggers a Mobile Authenticator push
-        // every time, which is unexpected and blocks the install for 30-90s.
-        let settings = AppSettings.shared
-        let sid          = settings.steamCredentialSteamID
-        let accountName  = settings.steamCredentialAccountName
-        let refreshToken = settings.steamCredentialRefreshToken
+        // local.vdf injection is non-deterministic — the same token sometimes works and
+        // sometimes Steam ignores it entirely (connection_log shows U:1:0, never attempts
+        // LogOn()). This caused repeated install failures in every session today.
+        //
+        // -login user pass is reliable because Steam drives its own CM auth handshake.
+        // The first call after a fresh Meridian sign-in triggers a Mobile Authenticator
+        // push (one-time per device); after approval Steam writes an ssfn device-trust
+        // token. All subsequent -login calls use ssfn silently (~10s, no 2FA).
+        // ssfn files are preserved across sessions by resetToEngineTemplate.
+        let accountName = AppSettings.shared.steamCredentialAccountName
+        let authSvc     = SteamAuthService()
+        let password    = authSvc.loadSteamPassword()
 
-        statusUpdate?("Restarting Steam to begin download…")
-        log.info("[installGame] refreshing local.vdf and restarting Steam for ACF scan appID=\(appID)")
-        startHeadlessWebhelperKillBurst(reason: "installGame credential-restart appID=\(appID)", duration: .seconds(25))
-        windowSuppressor?.suppressNow(reason: "installGame credential-restart appID=\(appID)")
-
-        // Re-write local.vdf BEFORE killing Steam so it's on disk for the restart.
-        if !sid.isEmpty, !accountName.isEmpty, !refreshToken.isEmpty {
-            try? await prefix.writeSteamSessionLocalVdf(
-                engine: engine, steamID: sid, accountName: accountName, refreshToken: refreshToken
-            )
-            log.info("[installGame] local.vdf refreshed for user=\(accountName)")
-        } else {
-            log.warning("[installGame] no stored credentials — restarting without refreshing local.vdf")
+        guard !accountName.isEmpty, let pw = password else {
+            log.warning("[installGame] no saved credentials for -login restart")
+            throw WineSteamManager.SteamError.authenticationFailed
         }
 
+        log.info("[installGame] -login restart for user=\(accountName)")
+        statusUpdate?("Restarting Steam to begin download…")
+        startHeadlessWebhelperKillBurst(reason: "installGame login-restart appID=\(appID)", duration: .seconds(25))
+        windowSuppressor?.suppressNow(reason: "installGame login-restart appID=\(appID)")
         await stopPersistent(engine: engine, prefix: prefix)
         killAll(engine: engine, prefix: prefix)
         clearPersistentProcess()
         try? await Task.sleep(for: .milliseconds(500))
         statusUpdate?("Connecting to Steam…")
-        try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
-        statusUpdate?("Signing in to Steam…")
-        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60)) { [name] msg in
-            statusUpdate?("Preparing \(name) — \(msg)")
-        }
+        try await startPersistent(
+            engine: engine,
+            prefix: prefix,
+            extraArgs: ["-login", accountName, pw],
+            skipRegistryConfig: true
+        )
+        // authTimeout 90s: ssfn-established calls complete in ~10s. 90s gives
+        // enough time for a Mobile Authenticator push to be approved on first call.
+        statusUpdate?("Signing in to Steam — approve in Steam Mobile if prompted…")
+        try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(90))
         if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
-        startHeadlessWebhelperKillBurst(reason: "installGame credential-restart ready appID=\(appID)", duration: .seconds(12))
+        startHeadlessWebhelperKillBurst(reason: "installGame login-restart ready appID=\(appID)", duration: .seconds(12))
         statusUpdate?("Starting download for \(name)…")
-        log.info("[installGame] credential restart complete — Steam startup scan queuing download appID=\(appID)")
+        log.info("[installGame] -login restart complete — Steam startup scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam
