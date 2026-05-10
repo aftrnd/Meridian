@@ -32,6 +32,7 @@ struct ContentView: View {
     @State private var showSetupSheet = false
     /// Guards the onAppear setup check so it runs exactly once per app session.
     @State private var hasCheckedSetup = false
+    @State private var showingDownloadsPopover = false
 
     var body: some View {
         Group {
@@ -93,6 +94,16 @@ struct ContentView: View {
                     .navigationDestination(item: $selectedGame) { game in
                         GameDetailView(game: game) { selectedGame = nil }
                             .id(game.id)
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .automatic) {
+                            DownloadsToolbarButton(
+                                launcher: launcher,
+                                library: library,
+                                isPresented: $showingDownloadsPopover,
+                                onSelectGame: { selectedGame = $0 }
+                            )
+                        }
                     }
             }
         }

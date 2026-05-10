@@ -37,7 +37,6 @@ struct HomeView: View {
             }
         }
         .navigationTitle("")
-        .toolbar { activeDownloadToolbarItem }
         .onAppear { startCarouselTimer() }
         .onDisappear { carouselTimer?.invalidate() }
         .onChange(of: library.games.count) { _, _ in
@@ -336,52 +335,6 @@ struct HomeView: View {
         Text(title)
             .font(.title2.weight(.semibold))
             .foregroundStyle(.primary)
-    }
-
-    // MARK: - Active download toolbar indicator
-
-    /// Safari-style download progress pill shown in the toolbar while a game is
-    /// downloading. Tapping it navigates to the game's detail page.
-    @ToolbarContentBuilder
-    private var activeDownloadToolbarItem: some ToolbarContent {
-        if case .awaitingInstallConfirmation = launcher.launchState,
-           let activeID = launcher.activeAppID,
-           let game = library.games.first(where: { $0.id == activeID }) {
-            ToolbarItem(placement: .automatic) {
-                Button { selectedGame = game } label: {
-                    HStack(spacing: 6) {
-                        // Circular progress ring — filled arc + track, mirrors Safari's style.
-                        ZStack {
-                            Circle()
-                                .stroke(.tertiary, lineWidth: 2)
-                            if let p = launcher.downloadProgress, p > 0 {
-                                Circle()
-                                    .trim(from: 0, to: p)
-                                    .stroke(.primary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                                    .rotationEffect(.degrees(-90))
-                            } else {
-                                ProgressView()
-                                    .scaleEffect(0.45)
-                            }
-                        }
-                        .frame(width: 16, height: 16)
-
-                        Text(game.name)
-                            .lineLimit(1)
-                            .frame(maxWidth: 160, alignment: .leading)
-
-                        if let p = launcher.downloadProgress, p > 0 {
-                            Text("\(Int(p * 100))%")
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .font(.subheadline)
-                }
-                .buttonStyle(.plain)
-                .help("Downloading \(game.name) — tap to view details")
-            }
-        }
     }
 
     private func gameState(for game: Game) -> GameCardState {

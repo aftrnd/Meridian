@@ -524,6 +524,7 @@ final class GameLauncher {
             WineSteamManager.killWebhelper(reason: "download complete chime")
             appendLog("Download complete")
             library?.setInstalled(true, for: game.id)
+            DownloadHistory.shared.recordCompletion(appID: game.id, name: game.name)
             downloadProgress = 1.0
         }
 
