@@ -713,46 +713,42 @@ final class WineSteamManager {
             log.info("[installGame] no-restart probe expired — restarting Steam with -login to force ACF scan appID=\(appID)")
         }
 
-        // -login restart: kill current Steam, restart with credentials so Steam
-        // does a full startup ACF scan (which picks up the StateFlags=1026 manifest)
-        // and authenticates in the same step. Requires a Keychain password.
-        let accountName = AppSettings.shared.steamCredentialAccountName
-        let authSvc = SteamAuthService()
-        let password = authSvc.loadSteamPassword()
+        // Credential restart: re-write local.vdf from the stored refresh token (same
+        // as SteamSessionBridge.prepare does at bootstrap), then kill+restart Steam.
+        // Steam reads the fresh local.vdf at startup, logs in without any 2FA push
+        // (the refresh token is the same long-lived JWT that worked at bootstrap),
+        // and performs its startup ACF scan which sees StateFlags=1026 → download.
+        //
+        // Do NOT use -login user pass — that triggers a Mobile Authenticator push
+        // every time, which is unexpected and blocks the install for 30-90s.
+        let settings = AppSettings.shared
+        let sid          = settings.steamCredentialSteamID
+        let accountName  = settings.steamCredentialAccountName
+        let refreshToken = settings.steamCredentialRefreshToken
 
-        guard !accountName.isEmpty, let pw = password else {
-            // No credentials — fall back to silent restart and hope local.vdf works.
-            log.warning("[installGame] no saved credentials for -login restart — trying silent restart")
-            startHeadlessWebhelperKillBurst(reason: "installGame silent-restart appID=\(appID)", duration: .seconds(20))
-            windowSuppressor?.suppressNow(reason: "installGame silent-restart appID=\(appID)")
-            await stopPersistent(engine: engine, prefix: prefix)
-            killAll(engine: engine, prefix: prefix)
-            clearPersistentProcess()
-            try? await Task.sleep(for: .milliseconds(500))
-            try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
-            try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60))
-            if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
-            startHeadlessWebhelperKillBurst(reason: "installGame silent-restart ready appID=\(appID)", duration: .seconds(12))
-            return
+        log.info("[installGame] refreshing local.vdf and restarting Steam for ACF scan appID=\(appID)")
+        startHeadlessWebhelperKillBurst(reason: "installGame credential-restart appID=\(appID)", duration: .seconds(25))
+        windowSuppressor?.suppressNow(reason: "installGame credential-restart appID=\(appID)")
+
+        // Re-write local.vdf BEFORE killing Steam so it's on disk for the restart.
+        if !sid.isEmpty, !accountName.isEmpty, !refreshToken.isEmpty {
+            try? await prefix.writeSteamSessionLocalVdf(
+                engine: engine, steamID: sid, accountName: accountName, refreshToken: refreshToken
+            )
+            log.info("[installGame] local.vdf refreshed for user=\(accountName)")
+        } else {
+            log.warning("[installGame] no stored credentials — restarting without refreshing local.vdf")
         }
 
-        log.info("[installGame] -login restart with user=\(accountName) — Steam startup scan will pick up ACF appID=\(appID)")
-        startHeadlessWebhelperKillBurst(reason: "installGame login-restart appID=\(appID)", duration: .seconds(25))
-        windowSuppressor?.suppressNow(reason: "installGame login-restart appID=\(appID)")
         await stopPersistent(engine: engine, prefix: prefix)
         killAll(engine: engine, prefix: prefix)
         clearPersistentProcess()
         try? await Task.sleep(for: .milliseconds(500))
-        try await startPersistent(
-            engine: engine,
-            prefix: prefix,
-            extraArgs: ["-login", accountName, pw],
-            skipRegistryConfig: true
-        )
+        try await startPersistent(engine: engine, prefix: prefix, skipRegistryConfig: true)
         try await waitUntilReady(prefix: prefix, timeout: .seconds(180), authTimeout: .seconds(60))
         if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
-        startHeadlessWebhelperKillBurst(reason: "installGame login-restart ready appID=\(appID)", duration: .seconds(12))
-        log.info("[installGame] -login restart complete — Steam startup scan queuing download appID=\(appID)")
+        startHeadlessWebhelperKillBurst(reason: "installGame credential-restart ready appID=\(appID)", duration: .seconds(12))
+        log.info("[installGame] credential restart complete — Steam startup scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam
