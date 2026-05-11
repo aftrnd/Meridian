@@ -905,6 +905,19 @@ final class WineSteamManager {
                 log.warning("[installGameViaIPCRestart] no ssfn and no saved credentials — cannot restart")
                 throw WineSteamManager.SteamError.authenticationFailed
             }
+            // Pre-write loginusers.vdf with RememberPassword=1 before the -login
+            // restart so Steam sends should_remember_password=true in CMsgClientLogon.
+            // Valve then writes an ssfn device-trust token, enabling future -silent
+            // launches without credentials.
+            let storedSteamID = AppSettings.shared.steamCredentialSteamID
+            if !storedSteamID.isEmpty {
+                try? prefix.writeLoginUsers(
+                    steamID: storedSteamID,
+                    accountName: accountName,
+                    personaName: accountName
+                )
+                log.info("[installGameViaIPCRestart] wrote loginusers.vdf RememberPassword=1 for ssfn creation")
+            }
             log.info("[installGameViaIPCRestart] no ssfn — -login restart for user=\(accountName) appID=\(appID)")
             extraArgs = ["-login", accountName, pw]
         }

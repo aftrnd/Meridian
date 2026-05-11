@@ -364,23 +364,11 @@ final class GameLauncher {
             windowSuppressor?.suppressNow(reason: "download click appID=\(game.id)")
             steamManager.startHeadlessWebhelperKillBurst(reason: "download click appID=\(game.id)", duration: .seconds(20))
 
-            // Make sure Steam is actually running. Normally `BootstrapManager` started
-            // it, but if the sign-in sheet ran later (first launch after install), or
-            // Steam crashed, we restart it here.
-            if !steamManager.isSteamProcessAlive {
-                log.info("[launch] persistent Steam not alive — starting")
-                transition(to: .bootstrappingSteam, activity: "Starting Steam…")
-                do {
-                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                    try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(120))
-                    if let pid = steamManager.persistentProcessIdentifier {
-                        windowSuppressor?.resumeSuppressing(pid: pid)
-                    }
-                } catch {
-                    fail("Steam is not ready: \(error.localizedDescription)", error: error)
-                    return
-                }
-            }
+            // Steam start is handled by installGame itself (SteamCMD path needs no
+            // running steam.exe; IPC fallback in installGameViaIPCRestart starts it
+            // with proper ssfn-aware auth). No pre-start here — doing so without
+            // ssfn/credential logic would call startPersistent(no -login) and block
+            // waitUntilReady for 2+ minutes with no auth, surfacing "Steam not ready".
 
             transition(to: .awaitingInstallConfirmation,
                        activity: "Preparing download for \(game.name)…")
@@ -585,15 +573,40 @@ final class GameLauncher {
             log.info("[launch] Steam DRM detected — writing steam_appid.txt and verifying Steam is ready")
             prefix.writeSteamAppID(game.id)
 
-            // If Steam somehow isn't running (edge case — user quit it manually or
-            // it crashed since bootstrap), restart it now. Otherwise the game will
-            // fail SteamAPI_Init and exit within seconds.
+            // If Steam somehow isn't running, restart it now with ssfn-aware auth.
+            // Using -login USER PASS (from Keychain) when no ssfn exists ensures
+            // the first auth writes an ssfn for future -silent launches.
             if !steamManager.isSteamProcessAlive {
                 log.warning("[launch] Steam DRM required but persistent Steam not alive — restarting")
                 appendLog("Starting Steam…")
                 do {
-                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
-                    try await steamManager.waitUntilReady(prefix: prefix, timeout: .seconds(60))
+                    let hasSsfn = prefix.hasSsfnToken
+                    var extraArgs: [String] = []
+                    if !hasSsfn {
+                        let accountName = AppSettings.shared.steamCredentialAccountName
+                        let storedSteamID = AppSettings.shared.steamCredentialSteamID
+                        let authSvc = SteamAuthService()
+                        if !accountName.isEmpty, let pw = authSvc.loadSteamPassword() {
+                            // Pre-write loginusers.vdf with RememberPassword=1 so this
+                            // -login auth sends should_remember_password=true and Valve
+                            // writes the ssfn device-trust token for future -silent use.
+                            if !storedSteamID.isEmpty {
+                                try? prefix.writeLoginUsers(
+                                    steamID: storedSteamID,
+                                    accountName: accountName,
+                                    personaName: accountName
+                                )
+                            }
+                            extraArgs = ["-login", accountName, pw]
+                            log.info("[launch] no ssfn — DRM steam start using -login for user=\(accountName)")
+                        }
+                    }
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)
+                    try await steamManager.waitUntilReady(
+                        prefix: prefix,
+                        timeout: .seconds(120),
+                        authTimeout: hasSsfn ? .seconds(30) : .seconds(90)
+                    )
                     if let pid = steamManager.persistentProcessIdentifier {
                         windowSuppressor?.resumeSuppressing(pid: pid)
                     }
