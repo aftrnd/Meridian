@@ -16,8 +16,8 @@ struct ContentView: View {
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(SteamLibraryStore.self) private var library
     @Environment(WineEngine.self) private var engine
-    @Environment(WineSteamManager.self) private var steamManager
-    @Environment(GameLauncher.self) private var launcher
+    @Environment(SteamSession.self) private var session
+    @Environment(Launcher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
     @Environment(\.openSettings) private var openSettings
@@ -48,7 +48,7 @@ struct ContentView: View {
                     .onAppear {
                         guard !hasCheckedSetup else { return }
                         hasCheckedSetup = true
-                        if !steamAuth.isAuthenticated || !steamManager.isSteamLoggedIn || steamAuth.needsAPIKey {
+                        if !steamAuth.isAuthenticated || !session.isReady || steamAuth.needsAPIKey {
                             showSetupSheet = true
                         }
                     }
@@ -75,9 +75,11 @@ struct ContentView: View {
         // signing out in Settings leaves the app with no way to sign back in
         // until a full restart.
         .onChange(of: steamAuth.isAuthenticated) { _, authenticated in
-            if !authenticated {
-                showSetupSheet = true
-            }
+            if !authenticated { showSetupSheet = true }
+        }
+        .onChange(of: session.isReady) { _, ready in
+            // When Steam session fails silently (e.g. expired ssfn), show the sign-in sheet.
+            if !ready && steamAuth.isAuthenticated && !showSetupSheet { showSetupSheet = true }
         }
     }
 
@@ -504,8 +506,8 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(SteamAuthService())
         .environment(SteamLibraryStore())
         .environment(WineEngine())
-        .environment(WineSteamManager())
-        .environment(GameLauncher())
+        .environment(SteamSession())
+        .environment(Launcher())
         .environment(BootstrapManager())
         .environment(CategoryStore())
         .environment(AppUpdateChecker())

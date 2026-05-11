@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SearchView: View {
     @Environment(SteamLibraryStore.self) private var library
-    @Environment(GameLauncher.self)      private var launcher
+    @Environment(Launcher.self)      private var launcher
     @Binding var selectedGame: Game?
 
     @State private var searchText = ""
@@ -99,9 +99,9 @@ struct SearchView: View {
             return game.isInstalled ? .idle : .notInstalled
         }
         switch launcher.launchState {
-        case .awaitingInstallConfirmation:
+        case .downloading, .installing:
             return .downloading(progress: launcher.downloadProgress)
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching:
+        case .launching:
             return .launching
         case .running:
             return .running

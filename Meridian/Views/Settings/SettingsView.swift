@@ -5,7 +5,7 @@ import UserNotifications
 struct SettingsView: View {
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(WineEngine.self) private var engine
-    @Environment(SteamWindowSuppressor.self) private var suppressor
+    @Environment(SteamWindow.self) private var steamWindow
     @Environment(AppUpdateChecker.self) private var updateChecker
 
     /// Persisted so the menu command "Check for Updates…" can navigate here directly.
@@ -38,7 +38,7 @@ struct SettingsView: View {
 
 private struct SteamSettingsTab: View {
     @Environment(SteamAuthService.self) private var steamAuth
-    @Environment(WineSteamManager.self) private var steamManager
+    @Environment(SteamSession.self) private var session
     @Environment(SteamLibraryStore.self) private var library
     @State private var apiKeyInput: String = ""
     @State private var isValidating = false
@@ -70,7 +70,6 @@ private struct SteamSettingsTab: View {
 
                         Button("Sign Out", role: .destructive) {
                             steamAuth.signOut()
-                            steamManager.isSteamLoggedIn = false
                         }
                         .buttonStyle(.bordered)
                     }
@@ -157,7 +156,7 @@ private struct SteamSettingsTab: View {
 
 private struct EngineSettingsTab: View {
     @Environment(WineEngine.self) private var engine
-    @Environment(WineSteamManager.self) private var steamManager
+    @Environment(SteamSession.self) private var session
     private let settings = AppSettings.shared
     @State private var showAdvanced = false
     @State private var showResetConfirm = false
@@ -242,7 +241,7 @@ private struct EngineSettingsTab: View {
         ) {
             Button("Reset Everything", role: .destructive) {
                 let prefix = WinePrefix.defaultPrefix
-                steamManager.killAll(engine: engine, prefix: prefix)
+                session.killAllWineProcesses(engine: engine)
                 prefix.reset()
                 engine.resetEngine()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -259,7 +258,7 @@ private struct EngineSettingsTab: View {
 // MARK: - Permissions tab
 
 private struct PermissionsSettingsTab: View {
-    @Environment(SteamWindowSuppressor.self) private var suppressor
+    @Environment(SteamWindow.self) private var steamWindow
 
     @State private var notificationsStatus: UNAuthorizationStatus = .notDetermined
 
@@ -268,14 +267,14 @@ private struct PermissionsSettingsTab: View {
             Section {
                 // Accessibility
                 PermissionRow(
-                    icon: suppressor.isPermissionGranted ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
-                    iconColor: suppressor.isPermissionGranted ? .green : .orange,
+                    icon: steamWindow.isPermissionGranted ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
+                    iconColor: steamWindow.isPermissionGranted ? .green : .orange,
                     title: "Accessibility",
-                    detail: suppressor.isPermissionGranted
+                    detail: steamWindow.isPermissionGranted
                         ? "Granted — Steam windows will be suppressed automatically."
                         : "Not granted — Steam UI may appear during installs and launches.",
-                    status: suppressor.isPermissionGranted ? .granted : .notGranted,
-                    onGrant: { suppressor.requestPermission() },
+                    status: steamWindow.isPermissionGranted ? .granted : .notGranted,
+                    onGrant: { steamWindow.requestPermission() },
                     onOpenSettings: {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                     }

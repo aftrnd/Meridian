@@ -100,10 +100,10 @@ final class BootstrapTests: XCTestCase {
         XCTAssertEqual(expectedOrder.last, .ready)
     }
 
-    // MARK: - needsBootstrap mirror (WineSteamManager)
+    // MARK: - needsBootstrap mirror (WinePrefix.isSteamBootstrapped)
 
-    /// Mirror of WineSteamManager.needsBootstrap logic.
-    /// Returns true when steamui.dll is missing at the given path.
+    /// Mirror of WinePrefix.isSteamBootstrapped (checks steamui.dll presence).
+    /// BootstrapManager uses !prefix.isSteamBootstrapped as the bootstrap trigger.
     private func needsBootstrap(steamInstallDir: String) -> Bool {
         let dllPath = steamInstallDir + "/steamui.dll"
         return !FileManager.default.fileExists(atPath: dllPath)
@@ -132,78 +132,47 @@ final class BootstrapTests: XCTestCase {
         XCTAssertFalse(needsBootstrap(steamInstallDir: tempDir))
     }
 
-    // MARK: - Front-load steam.exe at bootstrap
+    // MARK: - Rewrite invariant guards
 
-    /// Guard: BootstrapManager step 7 must start steam.exe -silent during the
-    /// pipeline (not on-demand) so DRM games launch immediately. NEVER -login.
-    func testBootstrap_startssteamExeSilentOnly() throws {
+    /// Bootstrap MUST NEVER send -login (triggers unsolicited 2FA).
+    /// Only SteamSession.signIn() (called from the sign-in sheet) sends -login.
+    func testBootstrap_neverSendsLoginFlag() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
-        XCTAssertTrue(
-            src.contains("startPersistent(engine: engine, prefix: prefix)"),
-            "BootstrapManager step 7 must call startPersistent (no extraArgs = -silent)"
-        )
-        XCTAssertTrue(
-            src.contains("startingSteam"),
-            "BootstrapManager must transition to .startingSteam when starting steam.exe"
-        )
-        XCTAssertFalse(
-            src.contains("steam.exe will start on-demand"),
-            "BootstrapManager must NOT defer steam.exe to on-demand — it should start at bootstrap"
-        )
-        // CRITICAL: bootstrap must NEVER send -login — that triggers 2FA pushes
-        // the user didn't ask for. Only SteamExeSignIn (sign-in sheet) uses -login.
         XCTAssertFalse(
             src.contains("\"-login\""),
-            "BootstrapManager MUST NOT send -login to steam.exe — triggers unsolicited 2FA. Only the sign-in sheet does -login."
+            "BootstrapManager MUST NOT contain -login — only SteamSession.signIn() from the sign-in sheet sends it"
         )
-    }
-
-    /// Guard: SteamExeSignIn must pre-write loginusers.vdf with RememberPassword=1
-    /// BEFORE launching steam.exe -login so that Valve returns persistence=1 and
-    /// steam.exe writes the ssfn device-trust token.
-    func testSignIn_prewritesLoginUsersVdfForSsfnCreation() throws {
-        let src = try readSource("Meridian/Steam/SteamExeSignIn.swift")
-        // The pre-write must appear BEFORE startPersistent in the source file.
-        guard let prewriteRange = src.range(of: "pre-wrote loginusers.vdf RememberPassword=1"),
-              let startPersistentRange = src.range(of: "steamManager.startPersistent") else {
-            XCTFail("SteamExeSignIn must pre-write loginusers.vdf with RememberPassword=1 before startPersistent")
-            return
-        }
-        XCTAssertLessThan(
-            prewriteRange.lowerBound,
-            startPersistentRange.lowerBound,
-            "writeLoginUsers pre-write must appear before startPersistent in SteamExeSignIn.runFlow"
-        )
-    }
-
-    /// Guard: GameLauncher DRM path must be crash-recovery only (no full auth rebuild).
-    /// With front-loaded bootstrap, steam.exe is already running and authenticated.
-    func testGameLauncher_drmPathIsCrashRecoveryOnly() throws {
-        let src = try readSource("Meridian/Launch/GameLauncher.swift")
         XCTAssertTrue(
-            src.contains("crash-recovery"),
-            "GameLauncher DRM path must be labeled as crash-recovery (steam.exe started at bootstrap)"
+            src.contains("session.start(engine: engine)"),
+            "BootstrapManager step 7 must delegate to SteamSession.start()"
         )
-        // Must NOT contain the old complex ssfn-aware -login logic in the DRM path.
-        // The DRM restart path should use simple -silent; the full -login flow only
-        // lives in BootstrapManager and SteamExeSignIn.
-        XCTAssertFalse(
-            src.contains("no ssfn — DRM steam start using -login"),
-            "DRM path must not contain -login auth logic — that belongs in BootstrapManager"
+    }
+
+    /// SteamSession.start() must not send -login.
+    func testSteamSession_startIsSilentOnly() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        // The start() function must launch with empty extraArgs (no -login).
+        XCTAssertTrue(
+            src.contains("extraArgs: [])"),
+            "SteamSession.start() must launch steam.exe with no extra args (silent-only)"
+        )
+        // signIn() is the only place -login appears.
+        XCTAssertTrue(
+            src.contains("\"-login\", username, password"),
+            "SteamSession.signIn() must send -login credentials"
         )
     }
 
     func testBootstrapEngagesSuppressionBeforeSteamSelfBootstrap() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
-        guard let bootstrapBlock = src.range(of: "if steamManager.needsBootstrap(prefix: prefix)"),
-              let steamBootstrapCall = src.range(of: "try await steamManager.bootstrap", range: bootstrapBlock.upperBound..<src.endIndex),
-              let suppressorCall = src.range(of: "windowSuppressor?.beginSession()", range: bootstrapBlock.upperBound..<steamBootstrapCall.lowerBound)
+        // Suppression must start before the Steam self-bootstrap (steamui.dll download).
+        guard let suppressorCall = src.range(of: "steamWindow?.startSuppressing()"),
+              let bootstrapCall = src.range(of: "bootstrapSteamClient(engine: engine")
         else {
-            XCTFail("BootstrapManager must call windowSuppressor?.beginSession() inside the needsBootstrap block before steamManager.bootstrap() so Steam's updater window is suppressed")
+            XCTFail("BootstrapManager must call steamWindow?.startSuppressing() before bootstrapSteamClient")
             return
         }
-
-        XCTAssertLessThan(suppressorCall.lowerBound, steamBootstrapCall.lowerBound)
+        XCTAssertLessThan(suppressorCall.lowerBound, bootstrapCall.lowerBound)
     }
 
     // MARK: - Package directory quiescence logic

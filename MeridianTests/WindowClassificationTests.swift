@@ -137,66 +137,56 @@ final class WindowClassificationTests: XCTestCase {
     // MARK: - Suppression aggressiveness guards
 
     func testSuppressorUsesFastPollingInterval() throws {
-        let src = try productionSource()
-        XCTAssertTrue(src.contains("private static let pollingInterval: TimeInterval = 0.2"))
-        XCTAssertTrue(src.contains("private static let burstSuppressDuration: TimeInterval = 20.0"))
-        XCTAssertTrue(src.contains("Timer(timeInterval: Self.pollingInterval"))
+        let src = try steamWindowSource()
+        // SteamWindow uses 0.25s polling (single timer, no burst).
+        XCTAssertTrue(src.contains("withTimeInterval: 0.25"))
+        XCTAssertTrue(src.contains("Timer.scheduledTimer(withTimeInterval:"))
     }
 
-    func testSuppressNowSweepsLiveWinePIDsAndArmsBurst() throws {
-        let src = try productionSource()
-        guard let fn = src.range(of: "func suppressNow(") else {
-            return XCTFail("SteamWindowSuppressor must expose suppressNow()")
+    func testSteamWindowExposesCoreAPI() throws {
+        let src = try steamWindowSource()
+        XCTAssertTrue(src.contains("func startSuppressing()"),
+                      "SteamWindow must expose startSuppressing()")
+        XCTAssertTrue(src.contains("func stopSuppressing()"),
+                      "SteamWindow must expose stopSuppressing()")
+        XCTAssertTrue(src.contains("func registerPID(_ pid: pid_t)"),
+                      "SteamWindow must expose registerPID for immediate suppression of new Wine PIDs")
+        XCTAssertTrue(src.contains("func pauseForGame()"),
+                      "SteamWindow must expose pauseForGame() to allow game windows to appear")
+        XCTAssertTrue(src.contains("func resumeAfterGame(steamPID:"),
+                      "SteamWindow must expose resumeAfterGame() to re-enable suppression")
+    }
+
+    func testSteamWindowUsesAXObserverForInstantHide() throws {
+        let src = try steamWindowSource()
+        XCTAssertTrue(src.contains("AXObserverCreate"),
+                      "SteamWindow must use AXObserver for instant window-created notification")
+        XCTAssertTrue(src.contains("kAXWindowCreatedNotification"),
+                      "SteamWindow must subscribe to kAXWindowCreatedNotification")
+        XCTAssertTrue(src.contains("func hideWindows(for pid:"),
+                      "SteamWindow must have a hideWindows function")
+    }
+
+    func testSteamWindowRegisterPIDHidesImmediately() throws {
+        let src = try steamWindowSource()
+        guard let fn = src.range(of: "func registerPID(") else {
+            return XCTFail("SteamWindow must expose registerPID")
         }
         let body = src[fn.lowerBound...]
-        XCTAssertTrue(body.contains("hideAllKnownWineWindows()"))
-        XCTAssertTrue(body.contains("reason: String = \"manual suppressNow\""))
-        XCTAssertTrue(body.contains("startSuppressionBurst(reason: reason, duration: duration)"))
+        XCTAssertTrue(body.contains("installObserver(for: pid)") && body.contains("hideWindows(for: pid)"),
+                      "registerPID must install observer and hide windows immediately")
     }
 
-    func testRegisterPIDArmsBurstSuppression() throws {
-        let src = try productionSource()
-        guard let fn = src.range(of: "func registerPID(_ pid: pid_t)") else {
-            return XCTFail("SteamWindowSuppressor must expose registerPID(_:)")
-        }
-        let body = src[fn.lowerBound...]
-        XCTAssertTrue(body.contains("startSuppressionBurst(reason: \"registered pid=\\(pid)\")"))
-    }
-
-    func testBurstSuppressionUsesLiveWineSweep() throws {
-        let src = try productionSource()
-        XCTAssertTrue(src.contains("private func hideAllKnownWineWindows()"))
-        XCTAssertTrue(src.contains("let livePIDs = currentWinePIDs()"))
-        XCTAssertTrue(src.contains("if suppressionActive, isBurstSuppressionActive"))
-    }
-
-    func testInstallPathArmsSuppressionBeforeSteamRestart() throws {
+    func testLauncherPausesWindowsForGame() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let url = root.appendingPathComponent("Meridian/Engine/WineSteamManager.swift")
+        let url = root.appendingPathComponent("Meridian/Launch/Launcher.swift")
         let src = try String(contentsOf: url, encoding: .utf8)
-        // Suppressor must arm before any Steam restart during install
-        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame preseed appID=\\(appID)\")"),
-                      "Suppressor must arm before pre-seeding the ACF manifest")
-        XCTAssertTrue(src.contains("startHeadlessWebhelperKillBurst(reason: \"installGame restart appID=\\(appID)\""),
-                      "Webhelper kill burst must fire before Steam restart during install")
-        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"installGame restart appID=\\(appID)\")"),
-                      "Suppressor must arm immediately before Steam restart during install")
-        XCTAssertTrue(src.contains("self.windowSuppressor?.registerPID(shutdownProcess.processIdentifier)"),
-                      "Shutdown process PID must be registered with suppressor")
-    }
-
-    func testGameLauncherSuppressesAtDownloadClick() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let url = root.appendingPathComponent("Meridian/Launch/GameLauncher.swift")
-        let src = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(src.contains("windowSuppressor?.suppressNow(reason: \"download click appID=\\(game.id)\")"))
-        XCTAssertTrue(src.contains("steamManager.startHeadlessWebhelperKillBurst(reason: \"download click appID=\\(game.id)\", duration: .seconds(20))"))
-        XCTAssertTrue(src.contains("WineSteamManager.killWebhelper(reason: \"download complete chime\")"))
-        XCTAssertFalse(src.contains("silenceSteamChime"))
+        XCTAssertTrue(src.contains("steamWindow?.pauseForGame()"),
+                      "Launcher must pause window suppression before game launch so game window appears")
+        XCTAssertTrue(src.contains("steamWindow?.resumeAfterGame("),
+                      "Launcher must resume window suppression after game exits")
     }
 
     func testBootstrapDoesNotKillWebhelperAfterReady() throws {
@@ -211,22 +201,30 @@ final class WindowClassificationTests: XCTestCase {
         )
     }
 
-    func testWineSteamManagerExposesHeadlessWebhelperKillBurst() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let url = root.appendingPathComponent("Meridian/Engine/WineSteamManager.swift")
-        let src = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(src.contains("func startHeadlessWebhelperKillBurst(reason: String, duration: Duration = .seconds(8))"))
-        XCTAssertTrue(src.contains("Self.killWebhelper(reason: reason)"))
-        XCTAssertTrue(src.contains("static func killWebhelper(reason: String = \"manual\")"))
+    func testSteamSessionKillsWebhelperAfterAuth() throws {
+        let src = try steamSessionSource()
+        XCTAssertTrue(src.contains("killWebhelper()"),
+                      "SteamSession must kill steamwebhelper after Logged On to prevent UI flash")
     }
 
     private func productionSource() throws -> String {
+        // Legacy alias — now reads SteamWindow since SteamWindowSuppressor was replaced.
+        return try steamWindowSource()
+    }
+
+    private func steamWindowSource() throws -> String {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let url = root.appendingPathComponent("Meridian/Engine/SteamWindowSuppressor.swift")
+        let url = root.appendingPathComponent("Meridian/Steam/SteamWindow.swift")
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    private func steamSessionSource() throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let url = root.appendingPathComponent("Meridian/Steam/SteamSession.swift")
         return try String(contentsOf: url, encoding: .utf8)
     }
 }

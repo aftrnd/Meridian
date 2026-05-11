@@ -331,25 +331,35 @@ final class SteamCredentialAuthTests: XCTestCase {
 
     func testSignInFlowInvariants() throws {
         let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
+        let session  = try readSource("Meridian/Steam/SteamSession.swift")
 
-        XCTAssertTrue(authView.contains("SteamExeSignIn()"),
-                      "AuthView must drive sign-in via SteamExeSignIn (steam.exe -login) for native ssfn device-trust.")
+        // AuthView must use SteamSession.signIn() — the single owner of -login.
+        XCTAssertTrue(authView.contains("session.signIn("),
+                      "AuthView must drive sign-in via SteamSession.signIn() for native ssfn device-trust.")
+
+        // loginusers.vdf must be written after successful auth so the next -silent
+        // cold-start auto-logins.
         XCTAssertTrue(authView.contains("writeLoginUsers"),
-                      "Sign-in must write loginusers.vdf with AllowAutoLogin=1 so -silent launches auto-login.")
-        XCTAssertTrue(authView.contains("steamSelfManagedSession") && authView.contains("= true"),
-                      "Sign-in must mark steamSelfManagedSession=true so BootstrapManager trusts the ssfn session.")
+                      "Sign-in must write loginusers.vdf after auth so -silent auto-login works.")
 
-        let forbiddenSteps = [
+        // SteamSession.signIn pre-writes loginusers.vdf BEFORE launching -login
+        // so RememberPassword=1 is set and Valve returns persistence=1 → ssfn created.
+        XCTAssertTrue(session.contains("pre-wrote loginusers.vdf RememberPassword=1"),
+                      "SteamSession.signIn must pre-write loginusers.vdf before -login for ssfn creation.")
+
+        // The sign-in flow must NOT use any legacy DPAPI/JWT/SteamCMD mechanisms.
+        let forbidden = [
             "SteamCredentialAuth()",
             "writeSteamSessionLocalVdf",
             "backupSteamSession",
             "authenticateSteamCMD",
             "writeConnectCache",
             "provisionNativeCache",
+            "SteamExeSignIn()",
         ]
-        for step in forbiddenSteps {
+        for step in forbidden {
             XCTAssertFalse(authView.contains(step),
-                           "\(step) MUST NOT be in the sign-in flow — ssfn-based auth does not use DPAPI/JWT injection.")
+                           "\(step) MUST NOT be in the sign-in flow — legacy auth paths are deleted.")
         }
     }
 

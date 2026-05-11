@@ -20,9 +20,9 @@ struct GameDetailView: View {
 
     @Environment(SteamLibraryStore.self)  private var library
     @Environment(WineEngine.self)         private var engine
-    @Environment(WineSteamManager.self)   private var steamManager
+    @Environment(SteamSession.self)        private var session
     @Environment(SteamAuthService.self)   private var steamAuth
-    @Environment(GameLauncher.self)       private var launcher
+    @Environment(Launcher.self)           private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
     @Environment(\.openWindow)            private var openWindow
@@ -164,23 +164,10 @@ struct GameDetailView: View {
                         Label("View Launch Logs", systemImage: "terminal")
                     }
 
-                    Button {
-                        Task {
-                            await steamManager.showSteamUI(engine: engine, prefix: WinePrefix.defaultPrefix)
-                        }
-                    } label: {
-                        Label("Show Steam", systemImage: "gamecontroller")
-                    }
-
                     if currentGame.isInstalled {
                         Divider()
                         Button(role: .destructive) {
-                            launcher.uninstall(
-                                game: currentGame,
-                                engine: engine,
-                                steamManager: steamManager,
-                                library: library
-                            )
+                            launcher.uninstall(game: currentGame, engine: engine)
                         } label: {
                             Label("Uninstall", systemImage: "trash")
                         }
@@ -223,7 +210,7 @@ struct GameDetailView: View {
         .alert("Reset Game Install?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Reset", role: .destructive) {
-                launcher.uninstall(game: currentGame, engine: engine, steamManager: steamManager, library: library)
+                launcher.uninstall(game: currentGame, engine: engine)
             }
         } message: {
             Text("This removes this game's local manifest and downloaded files only. It does not reset the Wine engine, Steam, or other installed games.")
@@ -633,13 +620,7 @@ struct GameDetailView: View {
 
     private var isThisGameActive: Bool {
         guard isThisGame else { return false }
-        switch launcher.launchState {
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam,
-             .awaitingInstallConfirmation, .launching, .running, .stopping, .uninstalling:
-            return true
-        default:
-            return false
-        }
+        return launcher.isBusy
     }
 
     // MARK: - Play button
@@ -656,19 +637,16 @@ struct GameDetailView: View {
     @ViewBuilder
     private var activePlayButton: some View {
         switch launcher.launchState {
-        case .idle, .exited:
+        case .idle, .failed:
             idleButton
 
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam:
+        case .installing:
             HStack(spacing: 8) {
-                ProgressButton("Downloading…")
+                ProgressButton("Preparing…")
                 cancelButton
             }
 
-        case .awaitingInstallConfirmation:
-            // Distinguish downloading vs installing phases from progress value.
-            // > ~90% disk filled means chunks are being decompressed to the
-            // install dir — show Installing… to the user.
+        case .downloading:
             let isInstalling = (launcher.downloadProgress ?? 0) > 0.88
             HStack(spacing: 8) {
                 ProgressButton(isInstalling ? "Installing…" : "Downloading…")
@@ -779,15 +757,12 @@ struct GameDetailView: View {
 
     private var isLauncherBusyWithOtherGame: Bool {
         guard let activeID = launcher.activeAppID, activeID != game.id else { return false }
-        switch launcher.launchState {
-        case .idle, .exited, .failed: return false
-        default: return true
-        }
+        return launcher.isBusy
     }
 
     private var cancelButton: some View {
         Button {
-            Task { await launcher.cancelLaunch(engine: engine, steamManager: steamManager) }
+            launcher.cancelLaunch()
         } label: {
             Label("Cancel", systemImage: "xmark")
                 .frame(minHeight: GameDetailMetrics.launchButtonHeight)
@@ -798,7 +773,7 @@ struct GameDetailView: View {
 
     private var stopButton: some View {
         Button {
-            Task { await launcher.stopGame(engine: engine, steamManager: steamManager) }
+            launcher.stopGame(engine: engine)
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "stop.fill")
@@ -818,30 +793,18 @@ struct GameDetailView: View {
     }
 
     private func handleInstallTapped() {
-        guard engine.isReady else {
-            showEngineSetup = true
-            return
-        }
+        guard engine.isReady else { showEngineSetup = true; return }
         launcher.installOnly(
-            game: currentGame,
-            engine: engine,
-            steamManager: steamManager,
-            steamAuth: steamAuth,
-            library: library
+            game: currentGame, engine: engine,
+            session: session, steamAuth: steamAuth, library: library
         )
     }
 
     private func handlePlayTapped() {
-        guard engine.isReady else {
-            showEngineSetup = true
-            return
-        }
+        guard engine.isReady else { showEngineSetup = true; return }
         launcher.launch(
-            game: currentGame,
-            engine: engine,
-            steamManager: steamManager,
-            steamAuth: steamAuth,
-            library: library
+            game: currentGame, engine: engine,
+            session: session, steamAuth: steamAuth, library: library
         )
     }
 
@@ -930,7 +893,7 @@ private extension View {
 
 private struct StatusCard: View {
     let game: Game
-    let launcher: GameLauncher
+    let launcher: Launcher
     let openWindow: OpenWindowAction
 
     var body: some View {
@@ -984,8 +947,7 @@ private struct StatusCard: View {
     }
 
     private var downloadProgressValue: Double? {
-        guard case .awaitingInstallConfirmation = launcher.launchState else { return nil }
-        return launcher.downloadProgress
+        launcher.isInstalling ? launcher.downloadProgress : nil
     }
 
     @ViewBuilder
@@ -1008,24 +970,11 @@ private struct StatusCard: View {
 
     private func statusMessage(at date: Date) -> String {
         switch launcher.launchState {
-        case .preparingEngine:
-            return launcher.currentActivity ?? "Checking Wine runtime…"
-        case .preparingPrefix:
-            return launcher.currentActivity ?? "Preparing Wine environment…"
-        case .bootstrappingSteam:
-            // Live activity reflects what's actually happening: typically
-            // "Starting Steam…" (waking the persistent process) and only
-            // "Steam is updating…" if `waitUntilReady` detects a real
-            // bootstrap_log "Downloading update" line. Falls back to a
-            // generic message if `currentActivity` is unset.
-            return launcher.currentActivity ?? "Starting Steam…"
-        case .awaitingInstallConfirmation:
+        case .installing, .downloading:
             return launcher.currentActivity ?? "Preparing download…"
         case .launching:
-            if let last = launcher.logs.last, !last.isEmpty {
-                return last
-            }
-            return "Waiting for Steam to start \(game.name)…"
+            if let last = launcher.logs.last, !last.isEmpty { return last }
+            return "Launching \(game.name)…"
         case .running:
             return "\(game.name) is running"
         case .stopping:
@@ -1036,13 +985,7 @@ private struct StatusCard: View {
     }
 
     private func elapsedText(at date: Date) -> String? {
-        let start: Date?
-        switch launcher.launchState {
-        case .running:
-            start = launcher.runningSince ?? launcher.pipelineStartDate
-        default:
-            start = launcher.pipelineStartDate
-        }
+        let start: Date? = launcher.runningSince
         guard let start else { return nil }
         let secs = Int(date.timeIntervalSince(start))
         guard secs >= 3 else { return nil }
@@ -1502,7 +1445,7 @@ private struct MetacriticBadge: View {    let score: Int
 // MARK: - Launch Log Window
 
 struct LaunchLogWindow: View {
-    @Environment(GameLauncher.self) private var launcher
+    @Environment(Launcher.self) private var launcher
 
     var body: some View {
         VStack(spacing: 0) {

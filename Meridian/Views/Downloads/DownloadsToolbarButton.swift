@@ -6,15 +6,12 @@ import SwiftUI
 /// with an arc-progress overlay while a download is active. Tapping shows a
 /// popover listing the active download and recently completed installs.
 struct DownloadsToolbarButton: View {
-    let launcher: GameLauncher
+    let launcher: Launcher
     let library: SteamLibraryStore
     @Binding var isPresented: Bool
     var onSelectGame: (Game) -> Void
 
-    private var isDownloading: Bool {
-        if case .awaitingInstallConfirmation = launcher.launchState { return true }
-        return false
-    }
+    private var isDownloading: Bool { launcher.isInstalling }
 
     private var hasContent: Bool {
         isDownloading || !DownloadHistory.shared.recent.isEmpty
@@ -57,13 +54,12 @@ struct DownloadsToolbarButton: View {
 // MARK: - Popover content
 
 private struct DownloadsPopoverContent: View {
-    let launcher: GameLauncher
+    let launcher: Launcher
     let library: SteamLibraryStore
     var onSelectGame: (Game) -> Void
 
     private var activeGame: Game? {
-        guard case .awaitingInstallConfirmation = launcher.launchState,
-              let id = launcher.activeAppID else { return nil }
+        guard launcher.isInstalling, let id = launcher.activeAppID else { return nil }
         return library.games.first { $0.id == id }
     }
 

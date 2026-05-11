@@ -4,7 +4,7 @@ import AppKit
 struct HomeView: View {
     @Environment(SteamLibraryStore.self) private var library
     @Environment(SteamAuthService.self) private var steamAuth
-    @Environment(GameLauncher.self) private var launcher
+    @Environment(Launcher.self) private var launcher
     @Environment(AppUpdateChecker.self) private var updateChecker
     @Binding var selectedGame: Game?
 
@@ -342,9 +342,9 @@ struct HomeView: View {
             return game.isInstalled ? .idle : .notInstalled
         }
         switch launcher.launchState {
-        case .awaitingInstallConfirmation:
+        case .downloading, .installing:
             return .downloading(progress: launcher.downloadProgress)
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching:
+        case .launching:
             return .launching
         case .running:
             return .running
@@ -753,7 +753,7 @@ private struct FriendCard: View {
     HomeView(selectedGame: .constant(nil))
         .environment(SteamAuthService())
         .environment(SteamLibraryStore())
-        .environment(GameLauncher())
+        .environment(Launcher())
         .environment(AppUpdateChecker())
         .frame(width: 900, height: 800)
 }

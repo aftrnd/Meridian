@@ -260,7 +260,6 @@ final class AppSettings: @unchecked Sendable {
         UserDefaults.standard.removeObject(forKey: "isSteamLoggedIn")
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
-        steamSelfManagedSession = false
     }
 
     // MARK: - Steam Credential Cache
@@ -275,15 +274,6 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "steamCredentialAccountName") }
     }
 
-    /// True once `SteamExeSignIn` has driven a successful `steam.exe -login` round-trip
-    /// and Steam has written its own `ssfn*` device-trust token. From that point on,
-    /// `steam.exe -silent` auto-logs in using the ssfn — no password, no 2FA push.
-    ///
-    /// Cleared on sign-out so the next sign-in starts fresh.
-    var steamSelfManagedSession: Bool {
-        get { UserDefaults.standard.bool(forKey: "steamSelfManagedSession") }
-        set { UserDefaults.standard.set(newValue, forKey: "steamSelfManagedSession") }
-    }
 
     private init() {}
 }

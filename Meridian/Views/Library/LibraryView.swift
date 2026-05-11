@@ -2,10 +2,10 @@ import SwiftUI
 
 struct LibraryView: View {
     @Environment(SteamLibraryStore.self)  private var library
-    @Environment(GameLauncher.self)       private var launcher
+    @Environment(Launcher.self)           private var launcher
     @Environment(CategoryStore.self)      private var categoryStore
     @Environment(WineEngine.self)         private var engine
-    @Environment(WineSteamManager.self)   private var steamManager
+    @Environment(SteamSession.self)        private var session
     @Binding var selectedGame: Game?
 
     // MARK: - Category mode
@@ -125,12 +125,7 @@ struct LibraryView: View {
         if game.isInstalled {
             Divider()
             Button(role: .destructive) {
-                launcher.uninstall(
-                    game: game,
-                    engine: engine,
-                    steamManager: steamManager,
-                    library: library
-                )
+                launcher.uninstall(game: game, engine: engine)
             } label: {
                 Label("Uninstall", systemImage: "trash")
             }
@@ -192,9 +187,9 @@ struct LibraryView: View {
             return game.isInstalled ? .idle : .notInstalled
         }
         switch launcher.launchState {
-        case .awaitingInstallConfirmation:
+        case .downloading, .installing:
             return .downloading(progress: launcher.downloadProgress)
-        case .preparingEngine, .preparingPrefix, .bootstrappingSteam, .launching:
+        case .launching:
             return .launching
         case .running:
             return .running

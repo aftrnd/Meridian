@@ -8,8 +8,8 @@ import SwiftUI
 struct SplashView: View {
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(WineEngine.self) private var engine
-    @Environment(WineSteamManager.self) private var steamManager
-    @Environment(SteamWindowSuppressor.self) private var suppressor
+    @Environment(SteamSession.self) private var session
+    @Environment(SteamWindow.self) private var steamWindow
     @Environment(EngineDownloader.self) private var engineDownloader
 
     @State private var isExiting = false
@@ -57,7 +57,7 @@ struct SplashView: View {
             NSApp.mainWindow?.center()
             bootstrap.start(
                 engine: engine,
-                steamManager: steamManager,
+                session: session,
                 engineDownloader: engineDownloader
             )
         }
@@ -85,7 +85,7 @@ struct SplashView: View {
             .padding(.horizontal, 24)
 
             Button {
-                suppressor.requestPermission()
+                steamWindow.requestPermission()
             } label: {
                 Label("Open System Settings", systemImage: "gear")
                     .frame(minWidth: 200)
@@ -199,7 +199,7 @@ struct SplashView: View {
             Button("Retry") {
                 bootstrap.retry(
                     engine: engine,
-                    steamManager: steamManager,
+                    session: session,
                     engineDownloader: engineDownloader
                 )
             }
@@ -228,8 +228,8 @@ struct SplashView: View {
     SplashView()
         .environment(BootstrapManager())
         .environment(WineEngine())
-        .environment(WineSteamManager())
-        .environment(SteamWindowSuppressor())
+        .environment(SteamSession())
+        .environment(SteamWindow())
         .environment(EngineDownloader())
         .frame(width: 480, height: 300)
 }

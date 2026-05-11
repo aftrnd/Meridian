@@ -5,29 +5,27 @@ import AppKit
 struct MeridianApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
-    @State private var steamAuth         = SteamAuthService()
-    @State private var library           = SteamLibraryStore()
-    @State private var engine            = WineEngine()
-    @State private var steamManager      = WineSteamManager()
-    @State private var launcher          = GameLauncher()
-    @State private var bootstrap         = BootstrapManager()
-    @State private var categories        = CategoryStore()
-    @State private var suppressor        = SteamWindowSuppressor()
-    @State private var updateChecker     = AppUpdateChecker()
-    @State private var engineDownloader  = EngineDownloader()
+    @State private var steamAuth        = SteamAuthService()
+    @State private var library          = SteamLibraryStore()
+    @State private var engine           = WineEngine()
+    @State private var session          = SteamSession()
+    @State private var steamWindow      = SteamWindow()
+    @State private var launcher         = Launcher()
+    @State private var bootstrap        = BootstrapManager()
+    @State private var categories       = CategoryStore()
+    @State private var updateChecker    = AppUpdateChecker()
+    @State private var engineDownloader = EngineDownloader()
 
     private let settings = AppSettings.shared
 
     var body: some Scene {
-        // Wire cross-object dependencies. These assignments are idempotent —
-        // they run on every body evaluation but always set the same references.
         let _ = {
-            bootstrap.windowSuppressor    = suppressor
-            launcher.windowSuppressor     = suppressor
-            steamManager.windowSuppressor = suppressor
-            appDelegate.suppressor        = suppressor
-            appDelegate.steamManager      = steamManager
-            appDelegate.bootstrap         = bootstrap
+            // Wire 1:1 relationships between the new objects.
+            session.steamWindow     = steamWindow
+            launcher.steamWindow    = steamWindow
+            bootstrap.steamWindow   = steamWindow
+            appDelegate.session     = session
+            appDelegate.bootstrap   = bootstrap
         }()
 
         WindowGroup {
@@ -35,35 +33,23 @@ struct MeridianApp: App {
                 .environment(steamAuth)
                 .environment(library)
                 .environment(engine)
-                .environment(steamManager)
+                .environment(session)
                 .environment(launcher)
                 .environment(bootstrap)
                 .environment(categories)
-                .environment(suppressor)
+                .environment(steamWindow)
                 .environment(updateChecker)
                 .environment(engineDownloader)
-                // Refresh permission state when Meridian becomes active (user may
-                // have just granted Accessibility access in System Preferences).
                 .onReceive(NotificationCenter.default.publisher(
                     for: NSApplication.didBecomeActiveNotification
                 )) { _ in
-                    suppressor.refreshPermission()
-                    suppressor.onMeridianDidBecomeActive(
-                        resumeForSteamPID: steamManager.persistentProcessIdentifier
-                    )
+                    steamWindow.refreshPermission()
                 }
                 .task {
-                    // Tell the update checker which engine is installed so it can
-                    // compare against the latest engine release on GitHub.
                     updateChecker.installedEngineTag = engine.engineVersion
-
-                    // Rate-limited background update check (once per 24 hours).
                     updateChecker.checkIfStale()
 
-                    // Silently refresh the Wine engine when the app version changes.
-                    // Only runs when the engine is already installed, so it never
-                    // interferes with a fresh bootstrap.
-                    let current = AppUpdateChecker.currentVersion
+                    let current  = AppUpdateChecker.currentVersion
                     let previous = settings.lastLaunchAppVersion
                     settings.lastLaunchAppVersion = current
                     if !previous.isEmpty && previous != current && engine.isReady {
@@ -77,8 +63,6 @@ struct MeridianApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 480, height: 300)
         .commands {
-            // "Check for Updates…" goes in the app-name menu, right after "About Meridian".
-            // CommandGroup(after: .appInfo) is the standard macOS placement.
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     updateChecker.installedEngineTag = engine.engineVersion
@@ -87,7 +71,6 @@ struct MeridianApp: App {
                     NotificationCenter.default.post(name: .meridianOpenSettings, object: nil)
                 }
             }
-
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Meridian") {
                 Button("Sign Out of Steam") {
@@ -100,6 +83,7 @@ struct MeridianApp: App {
         WindowGroup("Launch Log", id: "launch-log") {
             LaunchLogWindow()
                 .environment(launcher)
+                .environment(SteamSession())
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 560, height: 320)
@@ -109,10 +93,10 @@ struct MeridianApp: App {
                 .environment(steamAuth)
                 .environment(engine)
                 .environment(library)
-                .environment(suppressor)
+                .environment(steamWindow)
                 .environment(updateChecker)
                 .environment(engineDownloader)
-                .environment(steamManager)
+                .environment(session)
         }
     }
 }

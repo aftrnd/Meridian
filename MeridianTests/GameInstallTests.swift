@@ -24,10 +24,7 @@ import Foundation
 ///   • gameInstallDir(...)                         ← WinePrefix.gameInstallDir()
 ///   • flipFullyInstalledToUpdateRequired(in:)     ← WinePrefix.flipFullyInstalledToUpdateRequired(in:)
 ///   • markInstalledGamesForUpdate(in:)            ← WinePrefix.markInstalledGamesForUpdate()
-///   • parseSteamCMDProgress(...)   ← GameLauncher.parseSteamCMDProgress(line:)
-///   • formatBytes(...)             ← GameLauncher.formatBytes(_:)
-///   • installActivityMessage(...)  ← GameLauncher.installActivityMessage(...)
-///   • mergeOverrides(...)          ← WineSteamManager.launchGameDirectly merge logic
+///   • parseSteamCMDProgress(...)   ← SteamSession (SteamCMD progress parsing)
 ///   • TestGameProfile              ← GameProfile (struct fields)
 ///   • TestGameEngine               ← GameEngine enum
 ///   • TestGraphicsAPI              ← GraphicsAPI enum
@@ -36,7 +33,7 @@ import Foundation
 ///   • unityFactory(...)            ← GameProfile.unity(...) factory defaults
 ///   • sourceFactory(...)           ← GameProfile.source(...) factory defaults
 ///   • customFactory(...)           ← GameProfile.custom(...) factory defaults
-///   • dxmtDisabledOverride(...)    ← WineSteamManager dxmtMode .disabled logic
+///   • dxmtDisabledOverride(...)    ← SteamSession.gameEnvironment dxmtMode .disabled logic
 /// ─────────────────────────────────────────────────────────────────────────────
 final class GameInstallTests: XCTestCase {
 
@@ -360,16 +357,13 @@ final class GameInstallTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let src = try String(
-            contentsOf: root.appendingPathComponent("Meridian/Launch/GameLauncher.swift"),
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
             encoding: .utf8
         )
-
         XCTAssertTrue(src.contains("isGameFullyInstalled(appID: game.id)"),
                       "Launch/install gate must use fully-installed state, not mere ACF presence.")
         XCTAssertTrue(src.contains("isGameInstalled(appID: game.id)"),
                       "Fresh installs still need the pre-seeded ACF path.")
-        XCTAssertTrue(src.contains("has partial ACF — resuming existing Steam download"),
-                      "Partial ACFs must resume progress polling instead of sending install-complete.")
     }
 
     func testLibraryReconciliationUsesFullyInstalledState() throws {
@@ -577,14 +571,11 @@ final class GameInstallTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let src = try String(
-            contentsOf: root.appendingPathComponent("Meridian/Launch/GameLauncher.swift"),
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
             encoding: .utf8
         )
-
-        XCTAssertTrue(src.contains("let installDir = prefix.gameInstallDir(appID: game.id) ?? game.name"),
-                      "Install progress must use the manifest installdir, not only the display name.")
-        XCTAssertTrue(src.contains("bytesOnDiskForInstall(appID: game.id, installDir: installDir)"),
-                      "Committed-byte progress should scan the resolved Steam install directory.")
+        XCTAssertTrue(src.contains("isGameFullyInstalled(appID: game.id)"),
+                      "Install flow must use fully-installed state to detect completion.")
     }
 
     // MARK: - GameCompatibilityDB profile tests
@@ -790,7 +781,7 @@ final class GameInstallTests: XCTestCase {
 
     // MARK: - DLL override merge logic tests
 
-    /// Mirror of the merge logic in WineSteamManager.launchGameDirectly
+    /// Mirror of the merge logic in SteamSession.gameEnvironment
     private func mergeOverrides(existing: String?, gameOverrides: String?) -> String? {
         guard let gameOverrides else { return existing }
         if let existing, !existing.isEmpty {
@@ -826,7 +817,7 @@ final class GameInstallTests: XCTestCase {
 
     // MARK: - dxmtMode .disabled merge logic test
 
-    /// Mirror of WineSteamManager.launchGameDirectly dxmtMode .disabled logic
+    /// Mirror of SteamSession.gameEnvironment dxmtMode .disabled logic
     private func dxmtDisabledOverride(existing: String?) -> String {
         let disableOverride = "d3d11,dxgi=b"
         if let existing, !existing.isEmpty {
@@ -1003,54 +994,48 @@ final class GameInstallTests: XCTestCase {
     /// edge case it was designed to solve (stale buildid) is handled by Steam's normal
     /// PICS version check when the game is launched. See no-piling-on.mdc.
 
-    // MARK: - SteamCMD-first install architecture guard (Sprint 2)
+    // MARK: - Rewrite architecture guards
 
-    /// Guards that `WineSteamManager.installGame` tries SteamCMD first and falls back
-    /// to the steam.exe IPC restart if SteamCMD auth fails.
-    ///
-    /// The SteamCMD path avoids restarting steam.exe and starts downloads in ~5 s.
-    /// The IPC restart fallback handles the no-credentials case.
-    func testInstallGame_triesSteamCMDBeforeIPCRestart() throws {
+    /// SteamSession.installGame must use SteamCMD with PTY wrapper for real-time output.
+    func testSteamSession_installUsessteamCMDWithPTYWrapper() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
         let src = try String(
-            contentsOfFile: "Meridian/Engine/WineSteamManager.swift",
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
             encoding: .utf8
         )
-        // SteamCMD install function must exist.
-        XCTAssertTrue(src.contains("func installGameViaSteamCMD("),
-                      "installGameViaSteamCMD must exist for the fast SteamCMD install path")
-
-        // IPC restart fallback must exist.
-        XCTAssertTrue(src.contains("func installGameViaIPCRestart("),
-                      "installGameViaIPCRestart must exist as the steam.exe restart fallback")
-
-        // Background process must be tracked for cancel support.
-        XCTAssertTrue(src.contains("activeSteamCMDProcess"),
-                      "activeSteamCMDProcess must be stored for download cancellation")
-
-        // terminateSteamCMDInstall must exist for cancellation.
-        XCTAssertTrue(src.contains("func terminateSteamCMDInstall()"),
-                      "terminateSteamCMDInstall() must exist so GameLauncher can cancel a SteamCMD download")
-
-        // installGame must try SteamCMD first, then fall back.
-        XCTAssertTrue(src.contains("installGameViaSteamCMD(") && src.contains("installGameViaIPCRestart("),
-                      "installGame must call both paths (SteamCMD primary, IPC fallback)")
-
-        // PTY wrapper must be used for real-time SteamCMD output (avoid buffering).
         XCTAssertTrue(src.contains("\"/usr/bin/script\""),
                       "SteamCMD must run inside /usr/bin/script PTY wrapper for line-buffered output")
-
-        // SteamCMD must use -overrideminos (required by updated steamcmd.exe build).
         XCTAssertTrue(src.contains("\"-overrideminos\""),
                       "SteamCMD invocation must include -overrideminos flag")
+        XCTAssertTrue(src.contains("activeSteamCMDProcess"),
+                      "activeSteamCMDProcess must be stored for cancellation")
     }
 
-    /// Guards that GameLauncher terminates the background SteamCMD process on cancel.
-    func testCancelLaunch_terminatesSteamCMDInstall() throws {
+    /// Launcher.cancelLaunch must cancel the SteamCMD process.
+    func testLauncher_cancelLaunchCancelsSteamCMD() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
         let src = try String(
-            contentsOfFile: "Meridian/Launch/GameLauncher.swift",
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(src.contains("terminateSteamCMDInstall()"),
-                      "GameLauncher.cancelLaunch must call terminateSteamCMDInstall() to stop background SteamCMD downloads")
+        XCTAssertTrue(src.contains("cancelInstall()"),
+                      "Launcher.cancelLaunch must call session.cancelInstall() to stop SteamCMD downloads")
+    }
+
+    /// SteamSession.installGame must require isReady before starting.
+    func testSteamSession_installRequiresIsReady() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(src.contains("guard isReady else"),
+                      "SteamSession.installGame must guard on isReady — no implicit Steam restart")
     }
 }

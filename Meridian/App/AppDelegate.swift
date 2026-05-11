@@ -11,11 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private var readyObserver: NSObjectProtocol?
 
-    /// Set by MeridianApp so suppression observers are torn down at termination.
-    var suppressor: SteamWindowSuppressor?
-
     /// Set by MeridianApp for process cleanup on termination.
-    var steamManager: WineSteamManager?
+    var session: SteamSession?
 
     /// Set by MeridianApp so the bootstrap pipeline is cancelled before Wine cleanup.
     var bootstrap: BootstrapManager?
@@ -142,7 +139,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        suppressor?.stopSuppressing()
         // Final safety-net cleanup — `applicationShouldTerminate` is the primary
         // path and normally runs first with background cleanup; this handles the
         // edge case of a force-quit that skips ShouldTerminate (e.g. SIGTERM).
