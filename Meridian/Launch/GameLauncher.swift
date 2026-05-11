@@ -573,45 +573,27 @@ final class GameLauncher {
             log.info("[launch] Steam DRM detected — writing steam_appid.txt and verifying Steam is ready")
             prefix.writeSteamAppID(game.id)
 
-            // If Steam somehow isn't running, restart it now with ssfn-aware auth.
-            // Using -login USER PASS (from Keychain) when no ssfn exists ensures
-            // the first auth writes an ssfn for future -silent launches.
+            // BootstrapManager starts steam.exe during the splash, so it should
+            // already be running and authenticated. This block is crash-recovery only:
+            // if steam.exe died between bootstrap and game launch, restart it.
+            // At this point an ssfn must exist (bootstrap would have created it),
+            // so -silent auth is sufficient and completes in ~5-10 s.
             if !steamManager.isSteamProcessAlive {
-                log.warning("[launch] Steam DRM required but persistent Steam not alive — restarting")
-                appendLog("Starting Steam…")
+                log.warning("[launch] DRM game — steam.exe not alive (crash?), performing crash-recovery restart")
+                appendLog("Restarting Steam…")
                 do {
-                    let hasSsfn = prefix.hasSsfnToken
-                    var extraArgs: [String] = []
-                    if !hasSsfn {
-                        let accountName = AppSettings.shared.steamCredentialAccountName
-                        let storedSteamID = AppSettings.shared.steamCredentialSteamID
-                        let authSvc = SteamAuthService()
-                        if !accountName.isEmpty, let pw = authSvc.loadSteamPassword() {
-                            // Pre-write loginusers.vdf with RememberPassword=1 so this
-                            // -login auth sends should_remember_password=true and Valve
-                            // writes the ssfn device-trust token for future -silent use.
-                            if !storedSteamID.isEmpty {
-                                try? prefix.writeLoginUsers(
-                                    steamID: storedSteamID,
-                                    accountName: accountName,
-                                    personaName: accountName
-                                )
-                            }
-                            extraArgs = ["-login", accountName, pw]
-                            log.info("[launch] no ssfn — DRM steam start using -login for user=\(accountName)")
-                        }
-                    }
-                    try await steamManager.startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
                     try await steamManager.waitUntilReady(
                         prefix: prefix,
-                        timeout: .seconds(120),
-                        authTimeout: hasSsfn ? .seconds(30) : .seconds(90)
+                        timeout: .seconds(60),
+                        authTimeout: .seconds(30)
                     )
                     if let pid = steamManager.persistentProcessIdentifier {
                         windowSuppressor?.resumeSuppressing(pid: pid)
                     }
+                    log.info("[launch] crash-recovery restart complete")
                 } catch {
-                    log.warning("[launch] Steam restart failed: \(error.localizedDescription) — launching game anyway, it may fail DRM init")
+                    log.warning("[launch] crash-recovery restart failed: \(error.localizedDescription) — launching anyway, may fail DRM")
                 }
             }
 

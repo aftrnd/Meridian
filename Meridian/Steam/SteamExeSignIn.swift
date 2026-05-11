@@ -220,6 +220,23 @@ final class SteamExeSignIn {
         // THIS run's outcome from history.
         Self.truncateLogs(prefix: prefix)
 
+        // Pre-write loginusers.vdf with RememberPassword=1 BEFORE launching
+        // steam.exe. Steam reads this flag at startup and sends
+        // should_remember_password=true in CMsgClientLogon → Valve returns
+        // persistence=1 → steam.exe writes an ssfn device-trust token for
+        // future -silent cold-starts that authenticate without 2FA.
+        //
+        // steamID: use stored value for re-auths; "0" as a placeholder for
+        // first-ever sign-in (Steam overwrites the entry with the real steamID
+        // after a successful login, so the placeholder is always transient).
+        let preWriteSteamID = AppSettings.shared.steamCredentialSteamID
+        try? prefix.writeLoginUsers(
+            steamID: preWriteSteamID.isEmpty ? "0" : preWriteSteamID,
+            accountName: username,
+            personaName: username
+        )
+        log.info("[runFlow] pre-wrote loginusers.vdf RememberPassword=1 (steamID=\(preWriteSteamID.isEmpty ? "0(placeholder)" : preWriteSteamID))")
+
         // 2. Capture log offsets BEFORE launch, since fileSize-after-launch
         //    races with Steam buffering.
         let connLogPath = prefix.steamInstallDir.appending(path: "logs/connection_log.txt").path(percentEncoded: false)

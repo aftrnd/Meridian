@@ -6,17 +6,18 @@ private let log = MeridianLog(category: "BootstrapManager")
 /// Orchestrates the full app initialization pipeline at launch.
 ///
 /// Runs each phase in order, skipping steps that are already complete
-/// (prefix exists, Steam installed, etc.). Does NOT start steam.exe — it runs
-/// on-demand only:
+/// (prefix exists, Steam installed, etc.). Step 7 starts steam.exe with
+/// ssfn-aware auth so it is running and authenticated before the library opens:
 ///
-///   • DRM games:    `startSteamForDRM` starts steam.exe before game launch.
-///   • Game installs: SteamCMD downloads directly (fast, ~5 s to first bytes).
-///                    steam.exe IPC restart is the fallback when SteamCMD auth
-///                    fails or no Keychain password is stored.
+///   • Has ssfn (returning user):   `-silent` → CM auth → Logged On in ~5-10 s
+///   • No ssfn, has credentials:    pre-write loginusers.vdf + `-login USER PASS`
+///                                   → ssfn written → ~20 s (one-time)
+///   • No session/credentials:      skipped — sign-in sheet handles auth
 ///
-/// Keeping steam.exe out of the bootstrap eliminates the 15–30 s "Starting
-/// Steam" splash delay and prevents orphaned steamwebhelper.exe windows from
-/// showing up after Meridian closes.
+/// With steam.exe already running:
+///   • DRM games launch instantly — no on-demand Steam startup delay.
+///   • SteamCMD installs proceed in parallel without touching steam.exe.
+///   • IPC install fallback dispatches directly to the running instance.
 ///
 /// State is published for the splash screen to display real milestones.
 @Observable
@@ -512,28 +513,63 @@ final class BootstrapManager {
         // 6. Engage window suppression now that all prefix operations are complete.
         windowSuppressor?.beginSession()
 
-        // 7. Attach suppressor to steam.exe if it is already running from a
-        //    just-completed sign-in (AuthView → SteamExeSignIn). Otherwise, do nothing.
+        // 7. Start steam.exe now with ssfn-aware auth so it is ready before the
+        //    user can click anything. This front-loads the wait onto the splash
+        //    (where the user expects delays) and means DRM games launch instantly,
+        //    IPC install fallback dispatches to an already-running instance, and
+        //    window suppression stays continuously active with no startup gaps.
         //
-        // steam.exe is NOT started here proactively. Starting it at every cold boot
-        // added 15–30 s to the splash (Steam self-update restart + CM connect + ssfn
-        // auth) with no benefit for non-DRM sessions. Instead:
+        //    Auth paths:
+        //      • ssfn present:       -silent → CM auth  → Logged On  ~5-10 s
+        //      • no ssfn, has creds: pre-write loginusers.vdf RememberPassword=1
+        //                             + -login USER PASS → ssfn written  ~20 s
+        //      • no creds:           skipped — sign-in sheet handles auth
         //
-        //   • DRM games:     startSteamForDRM starts steam.exe on demand before launch.
-        //   • Installs:      SteamCMD handles downloads directly (Sprint 2). The IPC
-        //                    restart fallback in installGameViaIPCRestart starts
-        //                    steam.exe only when SteamCMD auth fails.
-        //   • ssfn validity: Checked at next actual Steam interaction. If the ssfn has
-        //                    expired, waitUntilReady throws, and the relevant caller
-        //                    (startSteamForDRM / installGameViaIPCRestart) clears
-        //                    isSteamLoggedIn and surfaces the sign-in sheet.
-        if hasLogin && steamManager.isSteamProcessAlive {
-            if let pid = steamManager.persistentProcessIdentifier {
-                windowSuppressor?.resumeSuppressing(pid: pid)
+        //    Non-fatal: if startup fails, isSteamLoggedIn stays false → ContentView
+        //    shows the sign-in sheet for recovery.
+        if hasLogin {
+            transition(to: .startingSteam, message: hasSsfn ? "Starting Steam…" : "Signing in to Steam…")
+            do {
+                if !steamManager.isSteamProcessAlive {
+                    var extraArgs: [String] = []
+                    if !hasSsfn {
+                        // No ssfn yet — use -login so Valve returns persistence=1
+                        // and steam.exe writes an ssfn for future -silent launches.
+                        let accountName = AppSettings.shared.steamCredentialAccountName
+                        let storedSteamID = AppSettings.shared.steamCredentialSteamID
+                        let authSvc = SteamAuthService()
+                        if !accountName.isEmpty, let pw = authSvc.loadSteamPassword() {
+                            if !storedSteamID.isEmpty {
+                                try? prefix.writeLoginUsers(
+                                    steamID: storedSteamID,
+                                    accountName: accountName,
+                                    personaName: accountName
+                                )
+                                log.info("[bootstrap] pre-wrote loginusers.vdf RememberPassword=1 for ssfn creation")
+                            }
+                            extraArgs = ["-login", accountName, pw]
+                            log.info("[bootstrap] no ssfn — starting steam.exe -login for user=\(accountName)")
+                        } else {
+                            log.info("[bootstrap] no ssfn and no Keychain credentials — trying -silent (may fail auth)")
+                        }
+                    }
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)
+                }
+                let authTimeout: Duration = hasSsfn ? .seconds(30) : .seconds(90)
+                try await steamManager.waitUntilReady(
+                    prefix: prefix,
+                    timeout: .seconds(120),
+                    authTimeout: authTimeout
+                )
+                steamManager.isSteamLoggedIn = true
+                if let pid = steamManager.persistentProcessIdentifier {
+                    windowSuppressor?.resumeSuppressing(pid: pid)
+                }
+                log.info("[bootstrap] steam.exe authenticated and ready ✓")
+            } catch {
+                log.warning("[bootstrap] steam.exe startup/auth failed: \(error.localizedDescription) — sign-in sheet will re-authenticate")
+                steamManager.isSteamLoggedIn = false
             }
-            log.info("[bootstrap] steam.exe already running (post sign-in) — suppressor attached")
-        } else if hasLogin {
-            log.info("[bootstrap] ssfn/session present — steam.exe will start on-demand for DRM or install fallback")
         } else {
             log.info("[bootstrap] no session on disk — sign-in sheet will handle authentication")
         }

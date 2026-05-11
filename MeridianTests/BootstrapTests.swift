@@ -132,6 +132,63 @@ final class BootstrapTests: XCTestCase {
         XCTAssertFalse(needsBootstrap(steamInstallDir: tempDir))
     }
 
+    // MARK: - Front-load steam.exe at bootstrap
+
+    /// Guard: BootstrapManager step 7 must start steam.exe during the pipeline
+    /// (not on-demand) so DRM games launch immediately without a Steam startup delay.
+    func testBootstrap_startssteamExeInStep7() throws {
+        let src = try readSource("Meridian/App/BootstrapManager.swift")
+        // The startPersistent call must be inside the "if hasLogin" branch of step 7.
+        // Verifying by checking the comment + startPersistent appear together in the file.
+        XCTAssertTrue(
+            src.contains("startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)"),
+            "BootstrapManager step 7 must call startPersistent to front-load steam.exe"
+        )
+        XCTAssertTrue(
+            src.contains("startingSteam"),
+            "BootstrapManager must transition to .startingSteam when starting steam.exe"
+        )
+        XCTAssertFalse(
+            src.contains("steam.exe will start on-demand"),
+            "BootstrapManager must NOT defer steam.exe to on-demand — it should start at bootstrap"
+        )
+    }
+
+    /// Guard: SteamExeSignIn must pre-write loginusers.vdf with RememberPassword=1
+    /// BEFORE launching steam.exe -login so that Valve returns persistence=1 and
+    /// steam.exe writes the ssfn device-trust token.
+    func testSignIn_prewritesLoginUsersVdfForSsfnCreation() throws {
+        let src = try readSource("Meridian/Steam/SteamExeSignIn.swift")
+        // The pre-write must appear BEFORE startPersistent in the source file.
+        guard let prewriteRange = src.range(of: "pre-wrote loginusers.vdf RememberPassword=1"),
+              let startPersistentRange = src.range(of: "steamManager.startPersistent") else {
+            XCTFail("SteamExeSignIn must pre-write loginusers.vdf with RememberPassword=1 before startPersistent")
+            return
+        }
+        XCTAssertLessThan(
+            prewriteRange.lowerBound,
+            startPersistentRange.lowerBound,
+            "writeLoginUsers pre-write must appear before startPersistent in SteamExeSignIn.runFlow"
+        )
+    }
+
+    /// Guard: GameLauncher DRM path must be crash-recovery only (no full auth rebuild).
+    /// With front-loaded bootstrap, steam.exe is already running and authenticated.
+    func testGameLauncher_drmPathIsCrashRecoveryOnly() throws {
+        let src = try readSource("Meridian/Launch/GameLauncher.swift")
+        XCTAssertTrue(
+            src.contains("crash-recovery"),
+            "GameLauncher DRM path must be labeled as crash-recovery (steam.exe started at bootstrap)"
+        )
+        // Must NOT contain the old complex ssfn-aware -login logic in the DRM path.
+        // The DRM restart path should use simple -silent; the full -login flow only
+        // lives in BootstrapManager and SteamExeSignIn.
+        XCTAssertFalse(
+            src.contains("no ssfn — DRM steam start using -login"),
+            "DRM path must not contain -login auth logic — that belongs in BootstrapManager"
+        )
+    }
+
     func testBootstrapEngagesSuppressionBeforeSteamSelfBootstrap() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
         guard let bootstrapBlock = src.range(of: "if steamManager.needsBootstrap(prefix: prefix)"),
