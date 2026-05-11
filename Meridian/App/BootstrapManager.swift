@@ -6,18 +6,17 @@ private let log = MeridianLog(category: "BootstrapManager")
 /// Orchestrates the full app initialization pipeline at launch.
 ///
 /// Runs each phase in order, skipping steps that are already complete
-/// (prefix exists, Steam installed, etc.). Step 7 starts steam.exe with
-/// ssfn-aware auth so it is running and authenticated before the library opens:
+/// (prefix exists, Steam installed, etc.). Step 7 starts steam.exe -silent
+/// so it is running before the library opens:
 ///
-///   • Has ssfn (returning user):   `-silent` → CM auth → Logged On in ~5-10 s
-///   • No ssfn, has credentials:    pre-write loginusers.vdf + `-login USER PASS`
-///                                   → ssfn written → ~20 s (one-time)
-///   • No session/credentials:      skipped — sign-in sheet handles auth
+///   • Returning user with valid on-disk session:
+///     `-silent` → Steam authenticates from its own ssfn/local.vdf → ~5-10 s
+///   • Session expired / no session:
+///     `-silent` fails fast (12 s) → sign-in sheet handles recovery
 ///
-/// With steam.exe already running:
-///   • DRM games launch instantly — no on-demand Steam startup delay.
-///   • SteamCMD installs proceed in parallel without touching steam.exe.
-///   • IPC install fallback dispatches directly to the running instance.
+/// NEVER sends `-login USER PASS` from bootstrap. That triggers a 2FA push
+/// the user didn't ask for. Credential-based login only happens in the sign-in
+/// sheet (SteamExeSignIn) where the user is actively engaged.
 ///
 /// State is published for the splash screen to display real milestones.
 @Observable
@@ -513,61 +512,36 @@ final class BootstrapManager {
         // 6. Engage window suppression now that all prefix operations are complete.
         windowSuppressor?.beginSession()
 
-        // 7. Start steam.exe now with ssfn-aware auth so it is ready before the
-        //    user can click anything. This front-loads the wait onto the splash
-        //    (where the user expects delays) and means DRM games launch instantly,
-        //    IPC install fallback dispatches to an already-running instance, and
-        //    window suppression stays continuously active with no startup gaps.
+        // 7. Start steam.exe -silent. NEVER send -login from bootstrap — that
+        //    triggers a 2FA push the user didn't ask for. Only -silent.
         //
-        //    Auth paths:
-        //      • ssfn present:       -silent → CM auth  → Logged On  ~5-10 s
-        //      • no ssfn, has creds: pre-write loginusers.vdf RememberPassword=1
-        //                             + -login USER PASS → ssfn written  ~20 s
-        //      • no creds:           skipped — sign-in sheet handles auth
+        //    Steam authenticates silently using its own on-disk state (ssfn tokens,
+        //    local.vdf, ConnectCache). If that state is valid, [Logged On,] appears
+        //    in ~5-10 s and the user goes straight to the library. If not, the auth
+        //    timeout fires quickly (12 s), isSteamLoggedIn stays false, and the
+        //    sign-in sheet handles recovery — that's where the user expects to
+        //    interact with credentials and 2FA.
         //
-        //    Non-fatal: if startup fails, isSteamLoggedIn stays false → ContentView
-        //    shows the sign-in sheet for recovery.
+        //    -login USER PASS is ONLY used inside SteamExeSignIn (the sign-in sheet)
+        //    where the user is actively engaged and expecting a 2FA prompt.
         if hasLogin {
-            transition(to: .startingSteam, message: hasSsfn ? "Starting Steam…" : "Signing in to Steam…")
+            transition(to: .startingSteam, message: "Starting Steam…")
             do {
                 if !steamManager.isSteamProcessAlive {
-                    var extraArgs: [String] = []
-                    if !hasSsfn {
-                        // No ssfn yet — use -login so Valve returns persistence=1
-                        // and steam.exe writes an ssfn for future -silent launches.
-                        let accountName = AppSettings.shared.steamCredentialAccountName
-                        let storedSteamID = AppSettings.shared.steamCredentialSteamID
-                        let authSvc = SteamAuthService()
-                        if !accountName.isEmpty, let pw = authSvc.loadSteamPassword() {
-                            if !storedSteamID.isEmpty {
-                                try? prefix.writeLoginUsers(
-                                    steamID: storedSteamID,
-                                    accountName: accountName,
-                                    personaName: accountName
-                                )
-                                log.info("[bootstrap] pre-wrote loginusers.vdf RememberPassword=1 for ssfn creation")
-                            }
-                            extraArgs = ["-login", accountName, pw]
-                            log.info("[bootstrap] no ssfn — starting steam.exe -login for user=\(accountName)")
-                        } else {
-                            log.info("[bootstrap] no ssfn and no Keychain credentials — trying -silent (may fail auth)")
-                        }
-                    }
-                    try await steamManager.startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)
+                    try await steamManager.startPersistent(engine: engine, prefix: prefix)
                 }
-                let authTimeout: Duration = hasSsfn ? .seconds(30) : .seconds(90)
                 try await steamManager.waitUntilReady(
                     prefix: prefix,
-                    timeout: .seconds(120),
-                    authTimeout: authTimeout
+                    timeout: .seconds(60),
+                    authTimeout: .seconds(12)
                 )
                 steamManager.isSteamLoggedIn = true
                 if let pid = steamManager.persistentProcessIdentifier {
                     windowSuppressor?.resumeSuppressing(pid: pid)
                 }
-                log.info("[bootstrap] steam.exe authenticated and ready ✓")
+                log.info("[bootstrap] steam.exe authenticated silently ✓")
             } catch {
-                log.warning("[bootstrap] steam.exe startup/auth failed: \(error.localizedDescription) — sign-in sheet will re-authenticate")
+                log.warning("[bootstrap] steam.exe silent auth failed: \(error.localizedDescription) — sign-in sheet will handle")
                 steamManager.isSteamLoggedIn = false
             }
         } else {

@@ -134,15 +134,13 @@ final class BootstrapTests: XCTestCase {
 
     // MARK: - Front-load steam.exe at bootstrap
 
-    /// Guard: BootstrapManager step 7 must start steam.exe during the pipeline
-    /// (not on-demand) so DRM games launch immediately without a Steam startup delay.
-    func testBootstrap_startssteamExeInStep7() throws {
+    /// Guard: BootstrapManager step 7 must start steam.exe -silent during the
+    /// pipeline (not on-demand) so DRM games launch immediately. NEVER -login.
+    func testBootstrap_startssteamExeSilentOnly() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
-        // The startPersistent call must be inside the "if hasLogin" branch of step 7.
-        // Verifying by checking the comment + startPersistent appear together in the file.
         XCTAssertTrue(
-            src.contains("startPersistent(engine: engine, prefix: prefix, extraArgs: extraArgs)"),
-            "BootstrapManager step 7 must call startPersistent to front-load steam.exe"
+            src.contains("startPersistent(engine: engine, prefix: prefix)"),
+            "BootstrapManager step 7 must call startPersistent (no extraArgs = -silent)"
         )
         XCTAssertTrue(
             src.contains("startingSteam"),
@@ -151,6 +149,12 @@ final class BootstrapTests: XCTestCase {
         XCTAssertFalse(
             src.contains("steam.exe will start on-demand"),
             "BootstrapManager must NOT defer steam.exe to on-demand — it should start at bootstrap"
+        )
+        // CRITICAL: bootstrap must NEVER send -login — that triggers 2FA pushes
+        // the user didn't ask for. Only SteamExeSignIn (sign-in sheet) uses -login.
+        XCTAssertFalse(
+            src.contains("\"-login\""),
+            "BootstrapManager MUST NOT send -login to steam.exe — triggers unsolicited 2FA. Only the sign-in sheet does -login."
         )
     }
 
