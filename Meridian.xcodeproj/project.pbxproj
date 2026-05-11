@@ -161,6 +161,7 @@
 		B0010045 /* Launch */ = {
 			isa = PBXGroup;
 			children = (
+				B00F0006 /* Launcher.swift */,
 			);
 			path = Launch;
 			sourceTree = "<group>";
@@ -264,7 +265,6 @@
 				B00E00B1 /* AppUpdateChecker.swift */,
 				B00E0004 /* WinePrefix.swift */,
 				B00E0008 /* GameProcess.swift */,
-				B00F0006 /* Launcher.swift */,
 				AA00000001000002 /* GameCompatibilityDB.swift */,
 				B00E0041 /* TerminationCleanup.swift */,
 				D4965BA889D288764428E3E5 /* GameProfile.swift */,
