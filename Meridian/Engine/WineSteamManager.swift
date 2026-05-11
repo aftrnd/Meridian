@@ -32,6 +32,10 @@ final class WineSteamManager {
     /// The Steam process started on-demand for DRM games or showSteamUI.
     private var persistentProcess: Process?
 
+    /// Background SteamCMD process running a game download.
+    /// Stored so `GameLauncher.cancelLaunch` can terminate it on user-cancel.
+    private(set) var activeSteamCMDProcess: Process?
+
     /// When the persistent process was last launched.
     private var persistentLaunchDate: Date?
 
@@ -669,10 +673,219 @@ final class WineSteamManager {
         prefix: WinePrefix,
         statusUpdate: (@MainActor (String) -> Void)? = nil
     ) async throws {
+        // Try SteamCMD first: direct download, no steam.exe restart, ~5s to first bytes.
+        // Requires saved credentials (account name + Keychain password).
+        let accountName = AppSettings.shared.steamCredentialAccountName
+        let authSvc     = SteamAuthService()
+        if !accountName.isEmpty, let password = authSvc.loadSteamPassword() {
+            do {
+                try await installGameViaSteamCMD(
+                    appID:       appID,
+                    name:        name,
+                    accountName: accountName,
+                    password:    password,
+                    engine:      engine,
+                    prefix:      prefix,
+                    statusUpdate: statusUpdate
+                )
+                return
+            } catch SteamError.authenticationFailed {
+                log.warning("[installGame] SteamCMD auth failed — falling back to steam.exe restart for appID=\(appID)")
+            } catch {
+                log.warning("[installGame] SteamCMD failed (\(error)) — falling back to steam.exe restart for appID=\(appID)")
+            }
+        } else {
+            log.info("[installGame] no saved credentials — using steam.exe restart for appID=\(appID)")
+        }
+
+        // Fallback: steam.exe IPC restart (slower ~15–20 s but works without stored password).
+        try await installGameViaIPCRestart(
+            appID:       appID,
+            name:        name,
+            installDir:  installDir,
+            steamID64:   steamID64,
+            engine:      engine,
+            prefix:      prefix,
+            statusUpdate: statusUpdate
+        )
+    }
+
+    /// Downloads a game using SteamCMD directly — no steam.exe restart required.
+    ///
+    /// Launches `steamcmd.exe -overrideminos +login USER PASS +app_update APPID validate +quit`
+    /// inside a PTY wrapper so progress lines are flushed in real-time. Returns as soon as
+    /// SteamCMD logs in and begins downloading; the process continues in the background
+    /// (`activeSteamCMDProcess`) while `GameLauncher` polls the ACF for disk-based progress.
+    ///
+    /// Throws `SteamError.authenticationFailed` if login fails so the caller can fall back
+    /// to the `installGameViaIPCRestart` path.
+    private func installGameViaSteamCMD(
+        appID: Int,
+        name: String,
+        accountName: String,
+        password: String,
+        engine: WineEngine,
+        prefix: WinePrefix,
+        statusUpdate: (@MainActor (String) -> Void)?
+    ) async throws {
+        let steamcmdPath = prefix.steamInstallDir
+            .appending(path: "steamcmd.exe")
+            .path(percentEncoded: false)
+
+        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
+            log.warning("[steamcmd:install] steamcmd.exe not found at \(steamcmdPath) — cannot use SteamCMD path")
+            throw SteamError.authenticationFailed
+        }
+
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/script")
+        // PTY wrapper: SteamCMD line-buffers only when stdout is a TTY.
+        // script -q /dev/null runs the child in a PTY; typescript discarded to /dev/null.
+        process.arguments = [
+            "-q", "/dev/null",
+            engine.wine64URL.path(percentEncoded: false),
+            steamcmdPath,
+            "-overrideminos",
+            "+login", accountName, password,
+            "+app_update", "\(appID)", "validate",
+            "+quit"
+        ]
+        process.environment = engine.steamCMDEnvironment(for: prefix)
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError  = outputPipe
+
+        try process.run()
+        activeSteamCMDProcess = process
+        let pid = process.processIdentifier
+        log.info("[steamcmd:install] launched pid=\(pid) appID=\(appID) account=\(accountName)")
+        await statusUpdate?("Connecting to Steam…")
+
+        // Stream SteamCMD output with fail-fast pattern detection.
+        // Returns once login succeeds + download has started (SteamCMD continues in background).
+        let started = ContinuousClock.now
+        let loginTimeout = Duration.seconds(60)
+        var lineBuffer = ""
+        var loginConfirmed = false
+        let handle = outputPipe.fileHandleForReading
+
+        readLoop: while process.isRunning || !lineBuffer.isEmpty {
+            // Stuck-detect: no login within 60s means credentials were rejected or
+            // SteamCMD couldn't connect. Fail fast so the IPC fallback can run.
+            if !loginConfirmed, ContinuousClock.now - started > loginTimeout {
+                log.warning("[steamcmd:install] login timeout (\(loginTimeout)) — terminating pid=\(pid)")
+                process.terminate()
+                activeSteamCMDProcess = nil
+                throw SteamError.authenticationFailed
+            }
+
+            // Non-blocking read: avoids blocking when the PTY has no data yet.
+            let fd = handle.fileDescriptor
+            let savedFlags = fcntl(fd, F_GETFL)
+            if savedFlags >= 0 {
+                _ = fcntl(fd, F_SETFL, savedFlags | O_NONBLOCK)
+                let chunk = handle.availableData
+                _ = fcntl(fd, F_SETFL, savedFlags)
+                if !chunk.isEmpty, let str = String(data: chunk, encoding: .utf8) {
+                    lineBuffer += str
+                }
+            }
+
+            // Split on \n and \r (PTY emits bare \r between progress overwrites).
+            while let sep = lineBuffer.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
+                let rawLine = String(lineBuffer[lineBuffer.startIndex..<sep])
+                lineBuffer = String(lineBuffer[lineBuffer.index(after: sep)...])
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                guard !line.isEmpty else { continue }
+
+                // Strip ANSI escape sequences emitted by the PTY.
+                let clean = line.replacingOccurrences(
+                    of: #"\x1B\[[0-9;]*[A-Za-z]"#,
+                    with: "", options: .regularExpression
+                )
+                guard !clean.isEmpty else { continue }
+                log.info("[steamcmd:install] \(clean)")
+
+                // Fail-fast: auth / connection errors.
+                if clean.contains("FAILED") || clean.contains("Two-factor") || clean.contains("code required") {
+                    let isAuthError = clean.contains("Invalid Password")
+                        || clean.contains("Two-factor auth failed")
+                        || clean.contains("Rate Limit Exceeded")
+                        || clean.contains("code required")
+                    let isConnError = clean.contains("No connection") || clean.contains("Failed to load Steam")
+                    if isAuthError || isConnError {
+                        log.warning("[steamcmd:install] fail-fast: \(clean)")
+                        process.terminate()
+                        activeSteamCMDProcess = nil
+                        throw SteamError.authenticationFailed
+                    }
+                }
+
+                // Login confirmed.
+                if !loginConfirmed && clean.contains("Logged in OK") {
+                    loginConfirmed = true
+                    log.info("[steamcmd:install] login OK for appID=\(appID)")
+                    await statusUpdate?("Downloading \(name)…")
+                }
+
+                // Download has started — return to caller; SteamCMD continues in background.
+                if loginConfirmed && (
+                    clean.contains("Update state (0x") && clean.contains("downloading")
+                ) {
+                    log.info("[steamcmd:install] download started — handing off to ACF polling (background pid=\(pid))")
+                    return
+                }
+
+                // Small game: already finished before we saw a progress line.
+                if clean.contains("Success! App") {
+                    log.info("[steamcmd:install] instant download complete for appID=\(appID)")
+                    activeSteamCMDProcess = nil
+                    return
+                }
+            }
+
+            if !process.isRunning { break readLoop }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+
+        // Process exited without a download-started signal.
+        activeSteamCMDProcess = nil
+        let exitCode = process.terminationStatus
+        log.warning("[steamcmd:install] process exited code=\(exitCode) loginConfirmed=\(loginConfirmed)")
+        if !loginConfirmed || exitCode != 0 {
+            throw SteamError.authenticationFailed
+        }
+    }
+
+    /// Terminates a background SteamCMD download if one is active.
+    /// Called by `GameLauncher.cancelLaunch` when the user cancels a download.
+    func terminateSteamCMDInstall() {
+        guard let proc = activeSteamCMDProcess, proc.isRunning else {
+            activeSteamCMDProcess = nil
+            return
+        }
+        log.info("[steamcmd:install] user-cancelled — terminating background pid=\(proc.processIdentifier)")
+        proc.terminate()
+        activeSteamCMDProcess = nil
+    }
+
+    /// Fallback install path: kills and restarts steam.exe so its ACF scan picks up
+    /// a pre-seeded manifest and queues the download. Slower (~15–20 s) but works
+    /// when no Keychain password is available.
+    private func installGameViaIPCRestart(
+        appID: Int,
+        name: String,
+        installDir: String,
+        steamID64: String,
+        engine: WineEngine,
+        prefix: WinePrefix,
+        statusUpdate: (@MainActor (String) -> Void)?
+    ) async throws {
         // Write the pre-seeded manifest (StateFlags=1026) so Steam knows the
         // install location when it receives the IPC command.
         windowSuppressor?.suppressNow(reason: "installGame preseed appID=\(appID)")
-        log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID)")
+        log.info("[installGameViaIPCRestart] writing pre-seeded appmanifest for appID=\(appID)")
         try prefix.writePreseededAppManifest(
             appID: appID,
             name: name,
@@ -680,28 +893,19 @@ final class WineSteamManager {
             steamID64: steamID64
         )
 
-        // Restart Steam so its startup ACF scan picks up the StateFlags=1026
-        // manifest. This is the only reliable way to trigger an immediate
-        // download — IPC (steam://install, +app_update) both show a suppressed
-        // dialog and never start the download.
-        //
-        // Auth strategy (checked in order):
-        //   1. ssfn token on disk → plain -silent restart, Steam uses device
-        //      trust token, logs in silently in ~10s, no 2FA.
-        //   2. No ssfn → -login user pass, may trigger 2FA on first call.
         let hasSsfn = prefix.hasSsfnToken
         let extraArgs: [String]
         if hasSsfn {
-            log.info("[installGame] ssfn present — plain -silent restart for ACF scan appID=\(appID)")
+            log.info("[installGameViaIPCRestart] ssfn present — plain -silent restart for ACF scan appID=\(appID)")
             extraArgs = []
         } else {
             let accountName = AppSettings.shared.steamCredentialAccountName
             let authSvc     = SteamAuthService()
             guard !accountName.isEmpty, let pw = authSvc.loadSteamPassword() else {
-                log.warning("[installGame] no ssfn and no saved credentials — cannot restart")
+                log.warning("[installGameViaIPCRestart] no ssfn and no saved credentials — cannot restart")
                 throw WineSteamManager.SteamError.authenticationFailed
             }
-            log.info("[installGame] no ssfn — -login restart for user=\(accountName) appID=\(appID)")
+            log.info("[installGameViaIPCRestart] no ssfn — -login restart for user=\(accountName) appID=\(appID)")
             extraArgs = ["-login", accountName, pw]
         }
 
@@ -719,7 +923,7 @@ final class WineSteamManager {
         if let pid = persistentProcessIdentifier { windowSuppressor?.resumeSuppressing(pid: pid) }
         startHeadlessWebhelperKillBurst(reason: "installGame restart ready appID=\(appID)", duration: .seconds(12))
         statusUpdate?("Starting download for \(name)…")
-        log.info("[installGame] restart complete — startup ACF scan queuing download appID=\(appID)")
+        log.info("[installGameViaIPCRestart] restart complete — startup ACF scan queuing download appID=\(appID)")
     }
 
     // MARK: - Persistent Steam

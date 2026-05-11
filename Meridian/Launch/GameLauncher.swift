@@ -182,8 +182,10 @@ final class GameLauncher {
             // starts from a clean Wine session.
             await cleanupProcesses(engine: engine, steamManager: steamManager)
         }
-        // Download cancel: leave Steam running. The user will get instant progress
-        // resumption on the next Install click instead of a 30+ second restart.
+        // Download cancel: terminate any background SteamCMD download but leave
+        // Steam running. The user will get instant progress resumption on the next
+        // Install click (SteamCMD resumes partial downloads with +app_update validate).
+        steamManager.terminateSteamCMDInstall()
 
         if let pid = steamManager.persistentProcessIdentifier {
             windowSuppressor?.resumeSuppressing(pid: pid)

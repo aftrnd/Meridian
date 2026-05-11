@@ -6,12 +6,13 @@ private let log = MeridianLog(category: "BootstrapManager")
 /// Orchestrates the full app initialization pipeline at launch.
 ///
 /// Runs each phase in order, skipping steps that are already complete
-/// (prefix exists, Steam installed, etc.). The final phase starts a
-/// persistent SteamCMD interactive session so game installs are instant.
+/// (prefix exists, Steam installed, etc.). On success, starts a persistent
+/// steam.exe -silent session for DRM games and as the install backend.
 ///
-/// steam.exe is NOT started at bootstrap — steam.exe authentication is unreliable — use SteamCMD batch mode for installs
-/// and its crash-restart loop destabilizes the shared wineserver. steam.exe is only
-/// started on-demand for games that require Steam DRM (steam_api64.dll).
+/// Game installs use SteamCMD when Keychain credentials are available (fast,
+/// ~5 s to first bytes). Otherwise they fall back to a steam.exe IPC restart
+/// (slower, ~15–20 s). The fallback also handles the case where the user has
+/// never saved a password (e.g. signed in via Steam Mobile only).
 ///
 /// State is published for the splash screen to display real milestones.
 @Observable

@@ -1002,4 +1002,55 @@ final class GameInstallTests: XCTestCase {
     /// button for all games until Steam re-validated them (~60–90 s). The update-check
     /// edge case it was designed to solve (stale buildid) is handled by Steam's normal
     /// PICS version check when the game is launched. See no-piling-on.mdc.
+
+    // MARK: - SteamCMD-first install architecture guard (Sprint 2)
+
+    /// Guards that `WineSteamManager.installGame` tries SteamCMD first and falls back
+    /// to the steam.exe IPC restart if SteamCMD auth fails.
+    ///
+    /// The SteamCMD path avoids restarting steam.exe and starts downloads in ~5 s.
+    /// The IPC restart fallback handles the no-credentials case.
+    func testInstallGame_triesSteamCMDBeforeIPCRestart() throws {
+        let src = try String(
+            contentsOfFile: "Meridian/Engine/WineSteamManager.swift",
+            encoding: .utf8
+        )
+        // SteamCMD install function must exist.
+        XCTAssertTrue(src.contains("func installGameViaSteamCMD("),
+                      "installGameViaSteamCMD must exist for the fast SteamCMD install path")
+
+        // IPC restart fallback must exist.
+        XCTAssertTrue(src.contains("func installGameViaIPCRestart("),
+                      "installGameViaIPCRestart must exist as the steam.exe restart fallback")
+
+        // Background process must be tracked for cancel support.
+        XCTAssertTrue(src.contains("activeSteamCMDProcess"),
+                      "activeSteamCMDProcess must be stored for download cancellation")
+
+        // terminateSteamCMDInstall must exist for cancellation.
+        XCTAssertTrue(src.contains("func terminateSteamCMDInstall()"),
+                      "terminateSteamCMDInstall() must exist so GameLauncher can cancel a SteamCMD download")
+
+        // installGame must try SteamCMD first, then fall back.
+        XCTAssertTrue(src.contains("installGameViaSteamCMD(") && src.contains("installGameViaIPCRestart("),
+                      "installGame must call both paths (SteamCMD primary, IPC fallback)")
+
+        // PTY wrapper must be used for real-time SteamCMD output (avoid buffering).
+        XCTAssertTrue(src.contains("\"/usr/bin/script\""),
+                      "SteamCMD must run inside /usr/bin/script PTY wrapper for line-buffered output")
+
+        // SteamCMD must use -overrideminos (required by updated steamcmd.exe build).
+        XCTAssertTrue(src.contains("\"-overrideminos\""),
+                      "SteamCMD invocation must include -overrideminos flag")
+    }
+
+    /// Guards that GameLauncher terminates the background SteamCMD process on cancel.
+    func testCancelLaunch_terminatesSteamCMDInstall() throws {
+        let src = try String(
+            contentsOfFile: "Meridian/Launch/GameLauncher.swift",
+            encoding: .utf8
+        )
+        XCTAssertTrue(src.contains("terminateSteamCMDInstall()"),
+                      "GameLauncher.cancelLaunch must call terminateSteamCMDInstall() to stop background SteamCMD downloads")
+    }
 }
