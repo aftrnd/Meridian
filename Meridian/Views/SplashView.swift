@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Shown at app launch while the bootstrap pipeline runs.
 ///
@@ -52,9 +53,24 @@ struct SplashView: View {
             if ready { isExiting = true }
         }
         .task {
-            // Center the window here — .task fires after SwiftUI layout is fully
-            // settled, making it more reliable than AppDelegate's async dispatch.
-            NSApp.mainWindow?.center()
+            // Re-center the window AFTER SwiftUI layout settles.
+            // AppDelegate's `enforceMainWindowLaunchFrame` runs synchronously
+            // in `applicationDidFinishLaunching`, but window restoration can
+            // race with it. Re-applying the same Dock-aware math here is
+            // belt-and-suspenders.
+            //
+            // CRITICAL: do NOT use `NSWindow.center()` — that uses Apple's
+            // "cascade" convention which places the window in the upper third
+            // (Dock-unaware). Use visibleFrame.midX/midY for true centering
+            // that accounts for the menu bar AND the Dock.
+            if let window = NSApp.mainWindow,
+               let screen = window.screen ?? NSScreen.main {
+                let vf = screen.visibleFrame
+                window.setFrameOrigin(CGPoint(
+                    x: vf.midX - window.frame.width  / 2,
+                    y: vf.midY - window.frame.height / 2
+                ))
+            }
             bootstrap.start(
                 engine: engine,
                 session: session,
