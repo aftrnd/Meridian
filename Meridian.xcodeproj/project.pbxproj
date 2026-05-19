@@ -19,6 +19,7 @@
 		B001000C /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001000D /* AppDelegate.swift */; };
 		B001000E /* SteamAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001000F /* SteamAuthService.swift */; };
 		B0010010 /* SteamAPIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010011 /* SteamAPIService.swift */; };
+		B00G0001 /* SteamSessionBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00G0002 /* SteamSessionBackup.swift */; };
 		B00F0001 /* SteamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0002 /* SteamSession.swift */; };
 		B00F0003 /* SteamWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0004 /* SteamWindow.swift */; };
 		B00F0005 /* Launcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0006 /* Launcher.swift */; };
@@ -66,6 +67,7 @@
 		B001000D /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		B001000F /* SteamAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAuthService.swift; sourceTree = "<group>"; };
 		B0010011 /* SteamAPIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAPIService.swift; sourceTree = "<group>"; };
+		B00G0002 /* SteamSessionBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSessionBackup.swift; sourceTree = "<group>"; };
 		B00F0002 /* SteamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSession.swift; sourceTree = "<group>"; };
 		B00F0004 /* SteamWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWindow.swift; sourceTree = "<group>"; };
 		B00F0006 /* Launcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Launcher.swift; sourceTree = "<group>"; };
@@ -153,6 +155,7 @@
 				B0010011 /* SteamAPIService.swift */,
 				B0010013 /* SteamLibraryStore.swift */,
 				B00F0002 /* SteamSession.swift */,
+				B00G0002 /* SteamSessionBackup.swift */,
 				B00F0004 /* SteamWindow.swift */,
 			);
 			path = Steam;
@@ -423,6 +426,7 @@
 				B00E0003 /* WinePrefix.swift in Sources */,
 				B00E0007 /* GameProcess.swift in Sources */,
 				B00F0001 /* SteamSession.swift in Sources */,
+				B00G0001 /* SteamSessionBackup.swift in Sources */,
 				B00F0003 /* SteamWindow.swift in Sources */,
 				B00F0005 /* Launcher.swift in Sources */,
 				AA00000001000001 /* GameCompatibilityDB.swift in Sources */,

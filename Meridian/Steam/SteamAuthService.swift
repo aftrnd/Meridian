@@ -110,12 +110,11 @@ final class SteamAuthService: NSObject {
         deleteSecret(key: KeychainKey.steamPassword)
         apiKeyPromptDismissed = false
         AppSettings.shared.clearAccountData()
-        // Wipe the DPAPI local.vdf backup so the next user doesn't inherit the
-        // prior account's auto-login token. Also delete the live `local.vdf`
-        // inside the prefix so the next sign-in starts from a clean
-        // `WaitingForCredentials` state (otherwise Steam tries to auto-login
-        // with the prior account's now-orphaned token).
-        WinePrefix.clearSteamSessionBackup()
+        // Clear the local.vdf session backup so the next account starts clean.
+        // Also delete the live local.vdf inside the prefix so Steam doesn't try
+        // to auto-login with this account's now-orphaned token.
+        SteamSessionBackup.clear()
+        WinePrefix.clearSteamSessionBackup()   // cleans legacy backup dirs
         let liveLocalVdf = WinePrefix.defaultPrefix.localAppDataSteamDir.appending(path: "local.vdf")
         try? FileManager.default.removeItem(at: liveLocalVdf)
         log.info("[signOut] Keychain cleared, account data + session backup reset")

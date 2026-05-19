@@ -300,7 +300,12 @@ final class BootstrapManager {
         // 6. Engage window suppression now that all prefix operations are complete.
         steamWindow?.startSuppressing()
 
-        // 7. Start steam.exe -silent. NEVER -login from here.
+        // 7. Restore local.vdf from backup (if present) before starting steam.exe.
+        //    Steam reads local.vdf (DPAPI-encrypted refresh token) at startup to auto-login.
+        //    restoreIfNeeded() is a no-op if the file is already in the prefix or no backup exists.
+        SteamSessionBackup.restoreIfNeeded(prefix: prefix)
+
+        // Start steam.exe -silent. NEVER -login from here.
         //    Returns fast: ~5-10 s on success, 12 s on auth failure.
         //    If auth fails → session.state = .failed → ContentView shows sign-in sheet.
         if hasLogin {

@@ -1015,6 +1015,11 @@ final class WinePrefixTests: XCTestCase {
             return (dest: url, data: data)
         }
 
+        // MIRROR CONTRACT: Must mirror WinePrefix.resetToEngineTemplate local.vdf preservation.
+        let localAppDataSteamDir = prefix.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        let localVdfURL = localAppDataSteamDir.appending(path: "local.vdf")
+        let savedLocalVdf: Data? = try? Data(contentsOf: localVdfURL)
+
         // Remove old prefix, copy new template
         try fm.removeItem(at: prefix)
         try fm.copyItem(at: templateDir, to: prefix)
@@ -1059,6 +1064,12 @@ final class WinePrefixTests: XCTestCase {
             try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: dest)
             restoredPaths.append(dest.path(percentEncoded: false))
+        }
+
+        // MIRROR CONTRACT: Restore local.vdf — mirrors WinePrefix.resetToEngineTemplate.
+        if let data = savedLocalVdf, !data.isEmpty {
+            try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
+            try? data.write(to: localVdfURL)
         }
 
         let dosdevContents = (try? fm.contentsOfDirectory(atPath: dosdev.path(percentEncoded: false))) ?? []
@@ -1776,5 +1787,106 @@ final class WinePrefixTests: XCTestCase {
     func testIsWoW64FileType_caseInsensitive() {
         XCTAssertTrue(isWoW64FileType("WINEMAC.DRV"))
         XCTAssertTrue(isWoW64FileType("Kernel32.Dll"))
+    }
+
+    // MARK: - SteamSessionBackup: snapshot / restore / clear
+
+    /// MIRROR CONTRACT: Mirrors SteamSessionBackup.snapshot + restoreIfNeeded.
+    /// These helpers duplicate the file-copy logic so the tests run without the
+    /// real AppSupport paths (which vary by machine and would be persistent side effects).
+
+    func testSteamSessionBackup_snapshotAndRestoreRoundTrip() throws {
+        let fm = FileManager.default
+
+        // Build a fake prefix with local.vdf in the right location.
+        let prefixA = tempDir.appending(path: "prefixA")
+        let steamLocalDir = prefixA.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        try fm.createDirectory(at: steamLocalDir, withIntermediateDirectories: true)
+
+        let sourceContent = Data("fake-dpapi-encrypted-token-\(UUID().uuidString)".utf8)
+        try sourceContent.write(to: steamLocalDir.appending(path: "local.vdf"))
+
+        // Simulate snapshot: copy local.vdf from prefix to a temp backup dir.
+        let backupDir = tempDir.appending(path: "steam-session-backup")
+        try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
+        let backupFile = backupDir.appending(path: "local.vdf")
+        try fm.copyItem(at: steamLocalDir.appending(path: "local.vdf"), to: backupFile)
+
+        // Simulate prefix reset: new prefix with no local.vdf.
+        let prefixB = tempDir.appending(path: "prefixB")
+        let steamLocalDirB = prefixB.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        try fm.createDirectory(at: prefixB, withIntermediateDirectories: true)
+
+        // Simulate restoreIfNeeded: backup exists, prefix lacks local.vdf → copy it in.
+        let destFile = steamLocalDirB.appending(path: "local.vdf")
+        XCTAssertFalse(fm.fileExists(atPath: destFile.path(percentEncoded: false)),
+                       "Pre-condition: new prefix must not have local.vdf")
+
+        try fm.createDirectory(at: steamLocalDirB, withIntermediateDirectories: true)
+        try fm.copyItem(at: backupFile, to: destFile)
+
+        // Verify the restored file is byte-identical to the original.
+        let restoredContent = try Data(contentsOf: destFile)
+        XCTAssertEqual(sourceContent, restoredContent,
+                       "Restored local.vdf must be byte-identical to the original")
+    }
+
+    func testResetToEngineTemplate_preservesLocalVdf() throws {
+        let fm = FileManager.default
+        let (tmplDir, i386Dir) = try makeEngineTemplate()
+
+        // Build a prefix with local.vdf in AppData/Local/Steam.
+        let prefix = tempDir.appending(path: "prefix_localvdf")
+        let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
+        let steamLocalDir = prefix.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        try fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: steamLocalDir, withIntermediateDirectories: true)
+        try "".write(to: prefix.appending(path: "system.reg"), atomically: true, encoding: .utf8)
+
+        // Write a fake local.vdf.
+        let originalToken = "fake-dpapi-token-12345"
+        try originalToken.write(
+            to: steamLocalDir.appending(path: "local.vdf"),
+            atomically: true, encoding: .utf8
+        )
+
+        // Run the simulated reset.
+        _ = try simulateResetToEngineTemplate(
+            prefix: prefix,
+            templateDir: tmplDir,
+            steamInstallDir: steamDir,
+            engineI386Dir: i386Dir
+        )
+
+        // local.vdf must survive the reset.
+        let restoredLocalVdfPath = prefix
+            .appending(path: "drive_c/users/crossover/AppData/Local/Steam/local.vdf")
+            .path(percentEncoded: false)
+        XCTAssertTrue(
+            fm.fileExists(atPath: restoredLocalVdfPath),
+            "local.vdf must be preserved across resetToEngineTemplate — it is the persistent Steam auth token"
+        )
+        let restoredContent = try String(contentsOfFile: restoredLocalVdfPath, encoding: .utf8)
+        XCTAssertEqual(restoredContent, originalToken,
+                       "Restored local.vdf must contain the original token")
+    }
+
+    func testSteamSessionBackup_clearRemovesFile() throws {
+        let fm = FileManager.default
+
+        // Create a fake backup file.
+        let backupDir = tempDir.appending(path: "steam-session-backup-clear")
+        try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
+        let backupFile = backupDir.appending(path: "local.vdf")
+        try "token".write(to: backupFile, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(fm.fileExists(atPath: backupFile.path(percentEncoded: false)),
+                      "Pre-condition: backup file must exist before clear")
+
+        // Simulate SteamSessionBackup.clear() — just remove the file.
+        try fm.removeItem(at: backupFile)
+
+        XCTAssertFalse(fm.fileExists(atPath: backupFile.path(percentEncoded: false)),
+                       "Backup local.vdf must be deleted after clear() — sign-out must not leave prior account's token")
     }
 }

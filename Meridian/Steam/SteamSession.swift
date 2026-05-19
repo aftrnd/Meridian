@@ -170,6 +170,19 @@ final class SteamSession {
         AppSettings.shared.steamCredentialSteamID = outcome.steamID
         AppSettings.shared.steamCredentialAccountName = username
 
+        // Snapshot local.vdf after a short wait so Steam has time to flush the file.
+        // Steam writes local.vdf (DPAPI-encrypted refresh token) shortly after Logged On.
+        // The snapshot is picked up on the next cold start by SteamSessionBackup.restoreIfNeeded()
+        // so steam.exe -silent can auto-login without credentials.
+        //
+        // If local.vdf is NOT written (Valve returned persistence: 0), snapshot() logs a
+        // prominent PHASE 3 MAY BE REQUIRED warning — the gate signal for the DPAPI helper path.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .seconds(5))
+            SteamSessionBackup.snapshot(prefix: self.prefix)
+        }
+
         // Tell the caller (AuthView) so it can advance the setup sheet.
         await onAuthenticated(outcome.steamID, outcome.accountName)
     }

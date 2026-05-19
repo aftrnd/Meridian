@@ -289,7 +289,14 @@ struct WinePrefix: Sendable {
             guard let data = try? Data(contentsOf: url) else { return nil }
             return (dest: url, data: data)
         }
-        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)")
+
+        // Save local.vdf (DPAPI-encrypted refresh token) separately because its
+        // path is outside steamInstallDir (it lives in AppData/Local/Steam).
+        let localVdfURL = localAppDataSteamDir.appending(path: "local.vdf")
+        let savedLocalVdf: Data? = try? Data(contentsOf: localVdfURL)
+
+        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)" +
+            (savedLocalVdf != nil ? " + local.vdf" : ""))
 
         // Remove the existing prefix and copy the new template
         log.info("[resetToTemplate] removing existing prefix")
@@ -342,6 +349,14 @@ struct WinePrefix: Sendable {
             try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: dest)
         }
+
+        // Restore local.vdf so steam.exe -silent can auto-login without credentials.
+        if let data = savedLocalVdf, !data.isEmpty {
+            try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
+            try? data.write(to: localVdfURL)
+            log.info("[resetToTemplate] restored local.vdf (\(data.count) bytes)")
+        }
+
         log.info("[resetToTemplate] restored \(savedConfigs.count) Steam config file(s)")
 
         log.info("[resetToTemplate] prefix reset to new engine template ✓")
