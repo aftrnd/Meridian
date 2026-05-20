@@ -765,6 +765,184 @@ struct WinePrefix: Sendable {
         log.info("[writeLoginUsers] written steamID=\(steamID) → \(dest.path(percentEncoded: false))")
     }
 
+    // MARK: - Steam local.vdf DPAPI injection
+    //
+    // Steam's persistent auto-login token lives at
+    //   <prefix>/drive_c/users/crossover/AppData/Local/Steam/local.vdf
+    // The token is a JWT refresh_token embedded inside Steam's "ConnectCache"
+    // VDF dictionary, DPAPI-encrypted with these inputs (verified against
+    // CX Preview's working bottle April 23 2026):
+    //   • GetUserNameA()  → always "crossover" in Meridian bottles
+    //   • crypt32_protectdata_secret → Wine compile-time constant
+    //   • pOptionalEntropy → ASCII account name
+    //   • L"BObfuscateBuffer" → szDataDescr embedded in the blob (Steam validates this)
+    //   • 16-byte random salt → stored inside the blob itself
+    //
+    // Meridian's flow is:
+    //   1. SteamCredentialAuth.authenticate() → JWT refresh_token (via Valve's
+    //      IAuthenticationService REST API; no Steam UI involved).
+    //   2. writeSteamSessionLocalVdf() invokes meridian-dpapi.exe (mingw-built
+    //      Wine PE shipped at wine/share/meridian/meridian-dpapi.exe) which
+    //      calls Wine's CryptProtectData on the token using the inputs above.
+    //   3. The resulting blob is hex-encoded into the ConnectCache VDF and
+    //      written to local.vdf.
+    //   4. steam.exe -silent on next launch reads local.vdf, calls
+    //      CryptUnprotectData (same Wine binary, same compile-time secret,
+    //      same user name "crossover", same accountName entropy → succeeds),
+    //      sends the refresh_token to Valve, gets a fresh access_token.
+    //      Connection log shows `[Logging On] Using JWT <id>, persistence: 1
+    //      → RecvMsgClientLogOnResponse() : 'OK'` within ~4s. Zero UI.
+
+    /// DPAPI-injects a JWT refresh_token into the prefix's `local.vdf` so that
+    /// the next `steam.exe -silent` cold-start auto-logs in without credentials,
+    /// 2FA, or any visible UI.
+    ///
+    /// - Parameters:
+    ///   - engine: used to invoke `meridian-dpapi.exe` via `wine64`.
+    ///   - steamID: 64-bit Steam ID (logged for diagnostics only — the blob
+    ///     itself doesn't carry it; Steam recovers it from the token).
+    ///   - accountName: the user's Steam login name. Used as BOTH the DPAPI
+    ///     entropy AND as input to the CRC32 that produces the VDF key. MUST be
+    ///     identical on encrypt and decrypt sides.
+    ///   - refreshToken: JWT refresh_token captured via SteamCredentialAuth.
+    func writeSteamSessionLocalVdf(
+        engine: WineEngine,
+        steamID: String,
+        accountName: String,
+        refreshToken: String
+    ) async throws {
+        let fm = FileManager.default
+        let dpapiHelper = WineEngine.engineDir
+            .appending(path: "wine/share/meridian/meridian-dpapi.exe")
+        if !fm.fileExists(atPath: dpapiHelper.path(percentEncoded: false)) {
+            // Engine tarballs published before April 23 2026 don't ship the
+            // helper. The app bundle always carries it (built into
+            // `.app/Contents/Resources/` by the `Build meridian-dpapi.exe`
+            // build phase), so we can recover transparently. This also
+            // handles the case where an engine auto-refresh wiped
+            // `wine/share/meridian/` between app launches.
+            try Self.installDpapiHelperFromBundle(to: dpapiHelper)
+        }
+
+        // Stage plaintext + encrypted blob in drive_c/temp so wine64 can reach
+        // both without path-translation complications. Cleanup is best-effort.
+        let tempDir = driveC.appending(path: "temp")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let sessionID = UUID().uuidString.prefix(8)
+        let plaintextURL = tempDir.appending(path: "dpapi-plain-\(sessionID).bin")
+        let cipherURL    = tempDir.appending(path: "dpapi-cipher-\(sessionID).bin")
+
+        try Data(refreshToken.utf8).write(to: plaintextURL)
+
+        defer {
+            try? fm.removeItem(at: plaintextURL)
+            try? fm.removeItem(at: cipherURL)
+        }
+
+        // Wine-visible Windows paths. The engine dir is outside the prefix —
+        // Wine exposes the host filesystem as Z:\ via dosdevices/z: → /.
+        let winPlain  = "C:\\temp\\dpapi-plain-\(sessionID).bin"
+        let winCipher = "C:\\temp\\dpapi-cipher-\(sessionID).bin"
+        let winHelper = "Z:" + dpapiHelper.path(percentEncoded: false).replacingOccurrences(of: "/", with: "\\")
+
+        let process = try await engine.run(
+            args: [winHelper, "encrypt", winPlain, winCipher, accountName],
+            prefix: self
+        )
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe encrypt failed (exit=\(process.terminationStatus))"
+            ])
+        }
+
+        let cipher = try Data(contentsOf: cipherURL)
+        guard !cipher.isEmpty else {
+            throw NSError(domain: "WinePrefix.writeSteamSessionLocalVdf", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe produced an empty cipher blob"
+            ])
+        }
+
+        let key = Self.connectCacheKey(for: accountName)
+        let hexBlob = cipher.map { String(format: "%02x", $0) }.joined()
+
+        let vdf = """
+        "MachineUserConfigStore"
+        {
+        \t"Software"
+        \t{
+        \t\t"Valve"
+        \t\t{
+        \t\t\t"Steam"
+        \t\t\t{
+        \t\t\t\t"ConnectCache"
+        \t\t\t\t{
+        \t\t\t\t\t"\(key)"\t\t"\(hexBlob)"
+        \t\t\t\t}
+        \t\t\t}
+        \t\t}
+        \t}
+        }
+        """
+
+        try fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
+        let dest = localAppDataSteamDir.appending(path: "local.vdf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writeSteamSession] local.vdf written steamID=\(steamID) key=\(key) blob=\(cipher.count) bytes → \(dest.path(percentEncoded: false))")
+    }
+
+    /// Copies `meridian-dpapi.exe` from the Meridian app bundle's Resources into
+    /// the engine directory. Called by `writeSteamSessionLocalVdf` when the
+    /// engine's own copy is missing — happens on engine tarballs predating the
+    /// helper, or after an engine auto-refresh wiped `wine/share/meridian/`.
+    ///
+    /// The helper is re-built into the app bundle on every Xcode build via the
+    /// `Build meridian-dpapi.exe` script phase, so it's always current with the
+    /// source in `Scripts/dpapi/meridian_dpapi.c`.
+    private static func installDpapiHelperFromBundle(to destination: URL) throws {
+        let fm = FileManager.default
+        guard let bundleHelper = Bundle.main.url(forResource: "meridian-dpapi", withExtension: "exe") else {
+            throw NSError(domain: "WinePrefix.installDpapiHelper", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "meridian-dpapi.exe is missing from both the engine and the Meridian app bundle. Reinstall Meridian."
+            ])
+        }
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fm.fileExists(atPath: destination.path(percentEncoded: false)) {
+            try fm.removeItem(at: destination)
+        }
+        try fm.copyItem(at: bundleHelper, to: destination)
+        log.info("[installDpapiHelper] copied bundled meridian-dpapi.exe → \(destination.path(percentEncoded: false))")
+    }
+
+    /// Steam's ConnectCache map key format: `(crc32(accountName) << 4) | slot_number`.
+    /// Slot is always `1` — Meridian never signs two accounts into the same bottle.
+    ///
+    /// CLI-verified April 23 2026 against CX Preview's working `local.vdf`:
+    /// `crc32("nickjack876") = 0x07a611aa`, CX key = `0x7a611aa1`
+    /// → `(0x07a611aa << 4) | 0x1 = 0x7a611aa1` ✓
+    static func connectCacheKey(for accountName: String) -> String {
+        let bytes = Array(accountName.utf8)
+        let crc = ieeeCRC32(bytes: bytes)
+        let key: UInt32 = (crc << 4) | 0x1
+        return String(format: "%08x", key)
+    }
+
+    /// IEEE 802.3 / CRC-32/ISO-HDLC — same polynomial `zlib.crc32` / Ethernet
+    /// frame CRC use. Init 0xFFFFFFFF, final XOR 0xFFFFFFFF, reflected input,
+    /// reflected output. Implemented locally to keep the key derivation
+    /// self-contained — any other CRC32 variant produces a different key and
+    /// Steam's lookup silently fails with no error message.
+    static func ieeeCRC32(bytes: [UInt8]) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in bytes {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                let mask: UInt32 = (crc & 1) != 0 ? 0xEDB88320 : 0
+                crc = (crc >> 1) ^ mask
+            }
+        }
+        return crc ^ 0xFFFFFFFF
+    }
+
     /// Disables Steam's download-complete desktop notification and chime for
     /// the signed-in user by writing to `userdata/<accountID>/config/localconfig.vdf`.
     ///

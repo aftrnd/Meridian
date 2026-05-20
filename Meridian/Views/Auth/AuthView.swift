@@ -6,8 +6,18 @@ import SwiftUI
 ///
 /// Steps: Welcome → Steam Login → API Key → Complete
 ///
-/// The Steam Login step drives SteamSession.signIn() — the ONLY place -login
-/// is ever sent to steam.exe. The user expects to see 2FA here. Nowhere else.
+/// The Steam Login step drives `SteamCredentialAuth.authenticate()` — Meridian's
+/// own IAuthenticationService client. Credentials go directly to Valve's REST API
+/// over HTTPS; Valve returns a `refresh_token` with `persistence: 1`. Meridian then
+/// DPAPI-injects that token into the prefix's `local.vdf` via the bundled
+/// `meridian-dpapi.exe` Wine helper, and starts `steam.exe -silent` — Steam reads
+/// the freshly-written `local.vdf`, decrypts it with the same Wine `crypt32.dll`
+/// that wrote it, and silently auto-logs in.
+///
+/// `steam.exe -login USER PASS` is NOT used. CLI-verified May 19 2026: that path
+/// produced `persistence: 0` access-only JWTs, which Steam refused to persist to
+/// `local.vdf` → every cold start re-prompted for credentials. The OAuth +
+/// `IAuthenticationService` path is the only one that yields `persistence: 1`.
 private let setupLog = MeridianLog(category: "SetupSheet")
 
 struct SetupSheet: View {
@@ -156,9 +166,10 @@ private struct SteamLoginStepContent: View {
     @Environment(WineEngine.self) private var engine
     @Environment(SteamAuthService.self) private var steamAuth
 
+    @State private var credentialAuth = SteamCredentialAuth()
     @State private var username = ""
     @State private var password = ""
-    @State private var signInTask: Task<Void, Never>?
+    @State private var guardCode = ""
     @State private var isSigningIn = false
     @State private var errorMessage: String?
 
@@ -168,12 +179,26 @@ private struct SteamLoginStepContent: View {
             && !isSigningIn
     }
 
+    /// True while Valve is waiting for the user to type a Steam Guard code
+    /// (email Steam Guard, or a TOTP from the mobile authenticator app).
+    private var awaitingTypedCode: Bool {
+        if case .awaitingGuardCode(let t) = credentialAuth.step {
+            return t == .emailCode || t == .deviceCode
+        }
+        return false
+    }
+
+    private var guardCodeType: SteamCredentialAuth.GuardType? {
+        if case .awaitingGuardCode(let t) = credentialAuth.step { return t }
+        return nil
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Sign in to Steam")
                     .font(.title2).fontWeight(.bold)
-                Text("Meridian passes your credentials directly to Steam's own client running silently in the background. Your password is saved to Keychain for seamless re-authentication.")
+                Text("Meridian authenticates directly with Steam's servers. Your password is encrypted with Valve's public key in transit, then saved to Keychain for seamless re-authentication.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -181,11 +206,13 @@ private struct SteamLoginStepContent: View {
             // Adaptive content
             if !isSigningIn {
                 credentialFields
+            } else if awaitingTypedCode {
+                guardCodeFields
             } else {
                 signingInView
             }
 
-            if let error = errorMessage {
+            if let error = errorMessage ?? credentialAuth.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -194,7 +221,7 @@ private struct SteamLoginStepContent: View {
 
             HStack {
                 Button("Skip for now") {
-                    signInTask?.cancel()
+                    credentialAuth.cancel()
                     isSigningIn = false
                     onSkip()
                 }
@@ -208,9 +235,15 @@ private struct SteamLoginStepContent: View {
                         .controlSize(.large)
                         .keyboardShortcut(.defaultAction)
                         .disabled(!canSignIn)
+                } else if awaitingTypedCode {
+                    Button("Submit") { submitGuardCode() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(guardCode.trimmingCharacters(in: .whitespaces).isEmpty)
                 } else {
                     Button("Cancel") {
-                        signInTask?.cancel()
+                        credentialAuth.cancel()
                         isSigningIn = false
                     }
                 }
@@ -224,7 +257,7 @@ private struct SteamLoginStepContent: View {
             if let saved = steamAuth.loadSteamPassword(), !saved.isEmpty { password = saved }
         }
         .onDisappear {
-            signInTask?.cancel()
+            credentialAuth.cancel()
         }
     }
 
@@ -249,9 +282,9 @@ private struct SteamLoginStepContent: View {
         }
     }
 
-    /// Shown while steam.exe is doing the CM auth handshake.
-    /// For Mobile Authenticator: Valve pushes an approval to the phone;
-    /// user taps Approve; [Logged On,] arrives. No typed codes needed.
+    /// Shown while SteamCredentialAuth is polling Valve's auth servers.
+    /// For Mobile Authenticator accounts: Valve pushes an approval to the phone;
+    /// user taps Approve; polling picks up the new refresh_token. No typed codes.
     private var signingInView: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
@@ -275,11 +308,32 @@ private struct SteamLoginStepContent: View {
         }
     }
 
+    /// Shown when Valve demands a typed Steam Guard code instead of (or in
+    /// addition to) a mobile-app push. emailCode = 5-digit email code;
+    /// deviceCode = 5-digit TOTP from the Steam Mobile authenticator.
+    private var guardCodeFields: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: guardCodeType == SteamCredentialAuth.GuardType.emailCode ? "envelope" : "key.horizontal")
+                    .foregroundStyle(.tint)
+                Text(guardCodeType == SteamCredentialAuth.GuardType.emailCode ? "Enter the code sent to your email" : "Enter the code from your Steam Mobile app")
+                    .font(.callout).fontWeight(.semibold)
+            }
+            TextField("Steam Guard code", text: $guardCode)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+                .textContentType(.oneTimeCode)
+                .autocorrectionDisabled()
+                .onSubmit { submitGuardCode() }
+        }
+    }
+
     private func beginSignIn() {
         errorMessage = nil
         isSigningIn = true
 
-        // Persist password for seamless re-auth on prefix reset / ssfn expiry.
+        // Persist password to Keychain so explicit re-auth flows (after a
+        // refresh_token rotation, for example) can pre-fill the field.
         steamAuth.saveSteamPassword(password)
 
         let usr = username.trimmingCharacters(in: .whitespaces).lowercased()
@@ -288,33 +342,66 @@ private struct SteamLoginStepContent: View {
         let auth = steamAuth
         let advance = onSignedIn
 
-        signInTask = Task {
+        credentialAuth.authenticate(username: usr, password: pwd) { steamID, accountName, refreshToken in
+            // 1. Persist tokens to UserDefaults — used by BootstrapManager to
+            //    re-inject local.vdf on every subsequent cold start.
+            let settings = AppSettings.shared
+            settings.steamCredentialSteamID = steamID
+            settings.steamCredentialAccountName = accountName
+            settings.steamCredentialRefreshToken = refreshToken
+
+            // 2. Write loginusers.vdf — AllowAutoLogin=1 + RememberPassword=1
+            //    so Steam's own UI also auto-logs in if it ever appears.
+            try? WinePrefix.defaultPrefix.writeLoginUsers(
+                steamID: steamID,
+                accountName: accountName,
+                personaName: accountName
+            )
+
+            // 3. DPAPI-inject local.vdf using the refresh_token. This is the
+            //    file Steam reads on startup for silent auto-login. See
+            //    WinePrefix.writeSteamSessionLocalVdf for the encryption
+            //    contract (Wine CryptProtectData, "BObfuscateBuffer", crc32
+            //    key, accountName entropy).
             do {
-                try await session.signIn(
-                    username: usr,
-                    password: pwd,
-                    engine: eng
-                ) { steamID, accountName in
-                    // Write loginusers.vdf with AllowAutoLogin=1 so the next
-                    // -silent cold start finds these flags and uses the ssfn token.
-                    try? WinePrefix.defaultPrefix.writeLoginUsers(
-                        steamID: steamID,
-                        accountName: accountName,
-                        personaName: accountName
-                    )
-                    auth.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
-                    setupLog.info("[signIn] ✅ steamID=\(steamID) needsAPIKey=\(auth.needsAPIKey)")
-                    advance()
-                }
-            } catch is CancellationError {
-                await MainActor.run { isSigningIn = false }
+                try await WinePrefix.defaultPrefix.writeSteamSessionLocalVdf(
+                    engine: eng,
+                    steamID: steamID,
+                    accountName: accountName,
+                    refreshToken: refreshToken
+                )
+                setupLog.info("[signIn] DPAPI local.vdf written ✓")
             } catch {
                 await MainActor.run {
+                    errorMessage = "Could not write Steam session: \(error.localizedDescription)"
                     isSigningIn = false
-                    errorMessage = error.localizedDescription
                 }
+                return
             }
+
+            // 4. Snapshot the freshly-written local.vdf to AppSupport backup
+            //    so prefix-reset survival works on next cold start.
+            SteamSessionBackup.snapshot(prefix: WinePrefix.defaultPrefix)
+
+            // 5. Kill any prior steam.exe (orphan or previous unauth attempt)
+            //    and start a clean steam.exe -silent. Steam reads local.vdf
+            //    and auto-logs in.
+            await session.shutdown(engine: eng)
+            await session.start(engine: eng)
+
+            // 6. Update SteamAuthService → triggers SetupSheet advance.
+            auth.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
+            setupLog.info("[signIn] ✅ steamID=\(steamID) needsAPIKey=\(auth.needsAPIKey)")
+            isSigningIn = false
+            advance()
         }
+    }
+
+    private func submitGuardCode() {
+        let code = guardCode.trimmingCharacters(in: .whitespaces)
+        guard !code.isEmpty else { return }
+        credentialAuth.submitGuardCode(code)
+        guardCode = ""
     }
 }
 

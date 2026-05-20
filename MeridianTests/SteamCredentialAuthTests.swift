@@ -314,52 +314,114 @@ final class SteamCredentialAuthTests: XCTestCase {
                           "platform_type \"2\" (WebBrowser) produces aud:[\"web\"] tokens — Steam's ConnectCache requires aud:[\"client\"] to authenticate.")
     }
 
-    // MARK: - Sign-in flow architectural invariants (May 2026 — ssfn-based auth)
+    // MARK: - Sign-in flow architectural invariants (May 19 2026 — OAuth + DPAPI)
     //
-    // The sign-in path uses `steam.exe -login USER PASS` (SteamExeSignIn) so Steam
-    // performs its own CM auth handshake and writes an ssfn device-trust token.
-    // Subsequent cold starts use `steam.exe -silent` with the ssfn — no 2FA,
-    // no DPAPI, no JWT injection. The path must:
-    //   1. Use SteamExeSignIn (drives steam.exe -login natively).
-    //   2. Write loginusers.vdf with AllowAutoLogin=1 + RememberPassword=1 so that
-    //      the next -silent launch finds the auto-login flag.
-    //   3. Persist steamSelfManagedSession = true (ssfn is now the auth source).
-    //   4. NOT call writeSteamSessionLocalVdf (DPAPI local.vdf injection — replaced
-    //      by Steam's own on-disk token management via ssfn).
-    //   5. NOT call backupSteamSession (backup was for DPAPI local.vdf, now obsolete).
-    //   6. NOT call writeConnectCache or provisionNativeCache.
+    // CLI-verified May 19 2026: `steam.exe -login USER PASS` produces `persistence: 0`
+    // access-only JWTs that Steam refuses to persist to `local.vdf` → every cold start
+    // re-prompts for credentials. The ONLY architecture that yields `persistence: 1`
+    // refresh tokens is Meridian-side OAuth via Valve's IAuthenticationService REST API.
+    //
+    // The sign-in path must:
+    //   1. Drive `SteamCredentialAuth.authenticate()` (REST OAuth — never `session.signIn`,
+    //      never `steam.exe -login USER PASS`, never SteamCMD `+login`).
+    //   2. Write loginusers.vdf with AllowAutoLogin=1 + RememberPassword=1 so Steam's
+    //      own UI (if it ever appears) also auto-logs in.
+    //   3. DPAPI-inject local.vdf via `WinePrefix.writeSteamSessionLocalVdf` so
+    //      `steam.exe -silent` reads the encrypted refresh_token on next launch.
+    //   4. Snapshot local.vdf via `SteamSessionBackup.snapshot` for prefix-reset survival.
+    //   5. Start `steam.exe -silent` (via `session.start`) — never `-login`.
 
     func testSignInFlowInvariants() throws {
         let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
         let session  = try readSource("Meridian/Steam/SteamSession.swift")
 
-        // AuthView must use SteamSession.signIn() — the single owner of -login.
-        XCTAssertTrue(authView.contains("session.signIn("),
-                      "AuthView must drive sign-in via SteamSession.signIn() for native ssfn device-trust.")
+        // AuthView must drive SteamCredentialAuth (REST OAuth via IAuthenticationService).
+        XCTAssertTrue(authView.contains("SteamCredentialAuth()"),
+                      "AuthView must instantiate SteamCredentialAuth — the only path that yields persistence: 1 refresh tokens.")
+        XCTAssertTrue(authView.contains("credentialAuth.authenticate("),
+                      "AuthView must call credentialAuth.authenticate to begin the OAuth flow.")
 
-        // loginusers.vdf must be written after successful auth so the next -silent
-        // cold-start auto-logins.
+        // loginusers.vdf must be written after successful auth so Steam's own UI
+        // (if it ever appears) also auto-logs in.
         XCTAssertTrue(authView.contains("writeLoginUsers"),
-                      "Sign-in must write loginusers.vdf after auth so -silent auto-login works.")
+                      "Sign-in must write loginusers.vdf after auth so Steam UI auto-login works.")
 
-        // SteamSession.signIn pre-writes loginusers.vdf BEFORE launching -login
-        // so RememberPassword=1 is set and Valve returns persistence=1 → ssfn created.
-        XCTAssertTrue(session.contains("pre-wrote loginusers.vdf RememberPassword=1"),
-                      "SteamSession.signIn must pre-write loginusers.vdf before -login for ssfn creation.")
+        // DPAPI-inject local.vdf — this is the canonical persistent-auth mechanism
+        // (Pattern 12 in engine-research-findings: local.vdf is what CrossOver uses).
+        XCTAssertTrue(authView.contains("writeSteamSessionLocalVdf"),
+                      "Sign-in must DPAPI-inject local.vdf so steam.exe -silent auto-logs in on next launch.")
+        XCTAssertTrue(authView.contains("SteamSessionBackup.snapshot"),
+                      "Sign-in must snapshot local.vdf to AppSupport so prefix resets / engine upgrades survive without re-auth.")
 
-        // The sign-in flow must NOT use any legacy DPAPI/JWT/SteamCMD mechanisms.
+        // Steam must be started with -silent (never -login).
+        XCTAssertTrue(authView.contains("session.start("),
+                      "Sign-in must launch steam.exe -silent via session.start(); -login is forbidden because it yields persistence: 0.")
+
+        // The sign-in flow must NEVER use steam.exe -login (the path that produces
+        // persistence: 0). SteamSession.signIn was the wrapper for that path and is
+        // deleted; SteamCMD `+login` produces the same persistence: 0 problem.
         let forbidden = [
-            "SteamCredentialAuth()",
-            "writeSteamSessionLocalVdf",
-            "backupSteamSession",
+            "session.signIn(",
+            "SteamExeSignIn",
+            "extraArgs: [\"-login\"",
             "authenticateSteamCMD",
-            "writeConnectCache",
             "provisionNativeCache",
-            "SteamExeSignIn()",
         ]
         for step in forbidden {
             XCTAssertFalse(authView.contains(step),
-                           "\(step) MUST NOT be in the sign-in flow — legacy auth paths are deleted.")
+                           "AuthView MUST NOT contain `\(step)` — that path yields persistence: 0 (CLI-verified May 19 2026).")
+            XCTAssertFalse(session.contains(step),
+                           "SteamSession MUST NOT contain `\(step)` — that path yields persistence: 0 (CLI-verified May 19 2026).")
+        }
+
+        // SteamSession.launchSteamProcess must always launch -silent without -login args.
+        XCTAssertTrue(session.contains("[steamExePath, \"-silent\", \"-nofriendsui\"]"),
+                      "SteamSession.launchSteamProcess must hardcode -silent -nofriendsui with no extra auth args.")
+    }
+
+    // MARK: - ConnectCache key derivation (CRC32 mirror, Pattern 6/12)
+    //
+    // The ConnectCache map key in local.vdf is `(crc32(accountName) << 4) | 1`.
+    // CLI-verified April 23 2026 against CX Preview's working bottle:
+    //   crc32("nickjack876") = 0x07a611aa → key 0x7a611aa1
+    // Any other CRC variant produces a different key and Steam's lookup silently fails.
+
+    /// Mirror of WinePrefix.ieeeCRC32 — kept in sync via Mirror Contract.
+    private func ieeeCRC32(bytes: [UInt8]) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in bytes {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                let mask: UInt32 = (crc & 1) != 0 ? 0xEDB88320 : 0
+                crc = (crc >> 1) ^ mask
+            }
+        }
+        return crc ^ 0xFFFFFFFF
+    }
+
+    /// Mirror of WinePrefix.connectCacheKey.
+    private func connectCacheKey(for accountName: String) -> String {
+        let bytes = Array(accountName.utf8)
+        let crc = ieeeCRC32(bytes: bytes)
+        let key: UInt32 = (crc << 4) | 0x1
+        return String(format: "%08x", key)
+    }
+
+    func testConnectCacheKey_matchesCrossOverReferenceVector() {
+        // CLI-verified vector from CX Preview's working local.vdf:
+        //   accountName "nickjack876" → CRC32 0x07a611aa → key 0x7a611aa1
+        XCTAssertEqual(ieeeCRC32(bytes: Array("nickjack876".utf8)), 0x07a611aa,
+                       "CRC32 of 'nickjack876' must equal 0x07a611aa to match CrossOver's working local.vdf")
+        XCTAssertEqual(connectCacheKey(for: "nickjack876"), "7a611aa1",
+                       "ConnectCache key for 'nickjack876' must be 0x7a611aa1 (matches CX reference).")
+    }
+
+    func testConnectCacheKey_alwaysSetsSlotBitOne() {
+        // The low nibble is the slot number (always 1 in Meridian — single user per bottle).
+        for name in ["test", "user123", "long_account_name_with_underscores"] {
+            let key = connectCacheKey(for: name)
+            XCTAssertTrue(key.hasSuffix("1"),
+                          "Slot number is always 1 → key must end in '1', got \(key) for \(name)")
         }
     }
 

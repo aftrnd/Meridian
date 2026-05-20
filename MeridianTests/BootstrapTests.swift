@@ -148,18 +148,31 @@ final class BootstrapTests: XCTestCase {
         )
     }
 
-    /// SteamSession.start() must not send -login.
+    /// SteamSession is silent-only — never sends `-login USER PASS`.
+    ///
+    /// CLI-verified May 19 2026: `steam.exe -login USER PASS` yields a JWT with
+    /// `persistence: 0` which Steam refuses to persist to local.vdf. Every cold
+    /// start would re-prompt for credentials. The OAuth path (SteamCredentialAuth
+    /// + DPAPI local.vdf injection) is the only architecture that yields
+    /// persistence: 1 refresh tokens. SteamSession.signIn was the wrapper for the
+    /// broken -login path and is deleted.
     func testSteamSession_startIsSilentOnly() throws {
         let src = try readSource("Meridian/Steam/SteamSession.swift")
-        // The start() function must launch with empty extraArgs (no -login).
+
+        // start() / launchSteamProcess hardcodes -silent -nofriendsui — no auth args.
         XCTAssertTrue(
-            src.contains("extraArgs: [])"),
-            "SteamSession.start() must launch steam.exe with no extra args (silent-only)"
+            src.contains("[steamExePath, \"-silent\", \"-nofriendsui\"]"),
+            "SteamSession.launchSteamProcess must launch with exactly -silent -nofriendsui (no -login)"
         )
-        // signIn() is the only place -login appears.
-        XCTAssertTrue(
-            src.contains("\"-login\", username, password"),
-            "SteamSession.signIn() must send -login credentials"
+
+        // The deleted -login path must not return — guard against accidental restore.
+        XCTAssertFalse(
+            src.contains("\"-login\""),
+            "SteamSession MUST NOT contain `-login` anywhere — that path yields persistence: 0 (CLI-verified May 19 2026)."
+        )
+        XCTAssertFalse(
+            src.contains("func signIn("),
+            "SteamSession.signIn() is deleted — sign-in is driven by SteamCredentialAuth via OAuth, not by steam.exe -login."
         )
     }
 

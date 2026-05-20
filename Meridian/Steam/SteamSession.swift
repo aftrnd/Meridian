@@ -8,18 +8,22 @@ private let log = MeridianLog(category: "SteamSession")
 
 /// Single owner of the steam.exe lifecycle.
 ///
-/// Before this class, four different objects each started steam.exe under
-/// different conditions with different auth flags. This caused 2FA pushes during
-/// silent bootstrap, duplicate restarts, and 2-minute timeouts. Now there is
-/// exactly one path to start steam.exe, one path to stop it, and one path to
-/// authenticate through the sign-in sheet.
+/// `steam.exe` is ALWAYS launched with `-silent -nofriendsui`. Authentication is
+/// handled by `SteamCredentialAuth` (Meridian-side OAuth via Valve's
+/// `IAuthenticationService` REST API) which writes the resulting refresh_token
+/// into the prefix's `local.vdf` via DPAPI (`WinePrefix.writeSteamSessionLocalVdf`).
+/// `-login USER PASS` is NEVER sent — that path produces `persistence: 0` access-
+/// only JWTs that Steam refuses to persist, breaking auto-login on every cold
+/// start. CLI-verified May 19 2026.
 ///
-/// ## Rules (enforced by the type system and guards)
-/// - `start()` is ONLY for silent bootstrap (-silent, never -login).
-///   Never throws. Sets state to .failed on auth timeout — ContentView shows sheet.
-/// - `signIn()` is ONLY for user-initiated auth from the sign-in sheet (-login).
-///   Throws on failure so the sheet can surface the error.
-/// - `installGame()` and `launch()` refuse to run unless `isReady == true`.
+/// ## Rules
+/// - `start()` is the ONLY way to launch steam.exe — always `-silent`, never -login.
+///   Never throws. On auth failure sets `state = .failed` and ContentView
+///   surfaces the sign-in sheet (which in turn drives `SteamCredentialAuth`).
+/// - `shutdown()` always tears down the full process tree (graceful -shutdown
+///   IPC, then `wineserver -k`). Safe to call from anywhere, regardless of
+///   tracked state — orphans outside our tracking are cleaned up too.
+/// - `installGame()` and game launches refuse to run unless `isReady == true`.
 ///   No implicit Steam restart anywhere.
 @Observable
 @MainActor
@@ -34,8 +38,6 @@ final class SteamSession {
         case startingSilent
         /// steam.exe is running and authenticated.
         case running(pid: pid_t)
-        /// SteamExeSignIn (-login) is in progress from the sign-in sheet.
-        case signingIn
         /// Silent auth failed or steam.exe crashed. ContentView shows sign-in sheet.
         case failed(String)
     }
@@ -47,23 +49,10 @@ final class SteamSession {
         return false
     }
 
-    // MARK: - Sign-in progress (read by AuthView)
-
-    enum SignInProgress {
-        case idle
-        case startingSteam
-        case sendingCredentials
-        case awaitingResult
-    }
-
-    private(set) var signInProgress: SignInProgress = .idle
-    private(set) var signInError: String?
-
     // MARK: - Private state
 
     private var persistentProcess: Process?
     private var connectionLogOffset: Int = 0
-    private var activeSteamCMDProcess: Process?
     private let prefix = WinePrefix.defaultPrefix
 
     // MARK: - Dependency injection (set by MeridianApp)
@@ -88,7 +77,7 @@ final class SteamSession {
         steamWindow?.startSuppressing()
 
         do {
-            try await launchSteamProcess(engine: engine, extraArgs: [])
+            try await launchSteamProcess(engine: engine)
             let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
             let loggedOn = await waitForLoggedOn(
                 engine: engine,
@@ -108,93 +97,15 @@ final class SteamSession {
         }
     }
 
-    /// Sign in with credentials. ONLY called from the sign-in sheet (SetupSheet).
-    /// This is the ONLY place -login is ever sent. Throws on failure.
-    func signIn(
-        username: String,
-        password: String,
-        engine: WineEngine,
-        onAuthenticated: @escaping @MainActor (String, String) async -> Void
-    ) async throws {
-        signInProgress = .startingSteam
-        signInError = nil
-
-        // Kill any prior steam.exe session before starting fresh.
-        await shutdown(engine: engine)
-
-        // Pre-write loginusers.vdf with RememberPassword=1 BEFORE launching.
-        // Steam reads this flag at startup and sends should_remember_password=true
-        // in CMsgClientLogon → Valve returns persistence=1 → ssfn token written.
-        // steamID: stored value for re-auths; "0" placeholder on first sign-in
-        // (Steam overwrites it with the real steamID after successful auth).
-        let storedSteamID = AppSettings.shared.steamCredentialSteamID
-        try? prefix.writeLoginUsers(
-            steamID: storedSteamID.isEmpty ? "0" : storedSteamID,
-            accountName: username,
-            personaName: username
-        )
-        log.info("[signIn] pre-wrote loginusers.vdf RememberPassword=1 for ssfn creation")
-
-        // Truncate log files so we never match markers from a prior attempt.
-        truncateLogs()
-
-        // Capture offset before launch so we only read THIS session's output.
-        connectionLogOffset = connectionLogFileSize()
-
-        state = .signingIn
-        steamWindow?.startSuppressing()
-
-        signInProgress = .sendingCredentials
-        do {
-            try await launchSteamProcess(engine: engine, extraArgs: ["-login", username, password])
-        } catch {
-            state = .failed(error.localizedDescription)
-            signInProgress = .idle
-            throw SessionError.steamLaunchFailed(error.localizedDescription)
-        }
-
-        signInProgress = .awaitingResult
-        log.info("[signIn] steam.exe -login launched — watching for auth outcome")
-
-        // Watch connection_log.txt for [Logged On,]. Mobile Confirmation accounts
-        // trigger a phone push; user taps Approve; Logged On follows (~10-90 s).
-        let outcome = try await waitForSignInOutcome(engine: engine, timeout: .seconds(210))
-
-        signInProgress = .idle
-        let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
-        state = .running(pid: pid_t(pid))
-        log.info("[signIn] authenticated ✓ steamID=\(outcome.steamID) pid=\(pid)")
-
-        // Persist steamID and accountName immediately so bootstrap can restore the
-        // session on next cold start without re-prompting.
-        AppSettings.shared.steamCredentialSteamID = outcome.steamID
-        AppSettings.shared.steamCredentialAccountName = username
-
-        // Snapshot local.vdf after a short wait so Steam has time to flush the file.
-        // Steam writes local.vdf (DPAPI-encrypted refresh token) shortly after Logged On.
-        // The snapshot is picked up on the next cold start by SteamSessionBackup.restoreIfNeeded()
-        // so steam.exe -silent can auto-login without credentials.
-        //
-        // If local.vdf is NOT written (Valve returned persistence: 0), snapshot() logs a
-        // prominent PHASE 3 MAY BE REQUIRED warning — the gate signal for the DPAPI helper path.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: .seconds(5))
-            SteamSessionBackup.snapshot(prefix: self.prefix)
-        }
-
-        // Tell the caller (AuthView) so it can advance the setup sheet.
-        await onAuthenticated(outcome.steamID, outcome.accountName)
-    }
-
     /// Gracefully shut down steam.exe and wait for all Wine processes to exit.
+    ///
+    /// Always runs the full shutdown sequence regardless of tracked state.
+    /// Orphan Wine processes can exist outside our tracking (e.g. after a
+    /// code=42 self-update clears persistentProcess), so guarding on
+    /// `persistentProcess != nil || isReady` would skip cleanup of real
+    /// running processes. CLI-observed May 19 2026.
     func shutdown(engine: WineEngine) async {
-        guard persistentProcess != nil || isReady else {
-            state = .idle
-            return
-        }
-
-        log.info("[shutdown] stopping steam.exe")
+        log.info("[shutdown] stopping steam.exe (state=\(String(describing: state)))")
         steamWindow?.stopSuppressing()
 
         // Send steam.exe -shutdown via a second process instance. Steam's IPC
@@ -210,6 +121,7 @@ final class SteamSession {
             try? await Task.sleep(for: .seconds(2))
         }
 
+        // Always kill — orphan processes can exist outside our tracking.
         killAllWineProcesses(engine: engine)
         persistentProcess = nil
         state = .idle
@@ -236,8 +148,30 @@ final class SteamSession {
 
     // MARK: - Public API: game install
 
-    /// Install a game using SteamCMD. Requires `isReady == true` (steam.exe running).
-    /// Progress callbacks fire on @MainActor.
+    /// Initiate a game install via Steam IPC. Requires `isReady == true`
+    /// (a persistent `steam.exe -silent` process must be running and authenticated).
+    ///
+    /// The install is driven by the SAME mechanism Steam Desktop uses internally:
+    ///
+    ///   1. Pre-seed `appmanifest_<appID>.acf` with `StateFlags=1026` ("scheduled
+    ///      for download") so Steam knows the install location when it receives
+    ///      the IPC command — no install-location picker dialog will ever appear.
+    ///   2. Spawn `wine64 steam.exe steam://install/<appID>`. Wine's PE loader
+    ///      sees that a Steam instance already owns the IPC named pipe and
+    ///      forwards the URL to it instead of cold-starting a second Steam.
+    ///      The forwarder process exits in ~1 second.
+    ///   3. Steam dispatches the URL to its internal download manager, which
+    ///      reads the pre-seeded ACF and starts downloading immediately. No
+    ///      restart, no re-auth, no UI.
+    ///
+    /// Progress is observed by the caller (`Launcher.pollDownloadProgress`) by
+    /// reading `BytesDownloaded` / `BytesToDownload` from the ACF manifest.
+    ///
+    /// SteamCMD is NOT used. Meridian's native bootstrap stages `steam.exe` but
+    /// not `steamcmd.exe` (the `steam_cmd_win32` manifest was never wired in),
+    /// so SteamCMD-based installs always failed with "steamcmd.exe not found".
+    /// IPC works against the already-running, already-authenticated Steam — no
+    /// dependency on additional binaries.
     func installGame(
         appID: Int,
         name: String,
@@ -250,8 +184,10 @@ final class SteamSession {
             throw SessionError.steamNotReady
         }
 
-        // Write pre-seeded ACF so Steam knows install location when it receives
-        // the download request. Written before SteamCMD runs.
+        // 1. Pre-seed the ACF manifest. StateFlags=1026 means "scheduled for
+        //    download" — Steam picks this up on its next library scan or
+        //    immediately when the steam://install IPC arrives.
+        log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID) name=\"\(name)\"")
         try prefix.writePreseededAppManifest(
             appID: appID,
             name: name,
@@ -259,34 +195,72 @@ final class SteamSession {
             steamID64: steamID64
         )
 
-        let accountName = AppSettings.shared.steamCredentialAccountName
-        guard !accountName.isEmpty else {
-            throw SessionError.noCredentials
-        }
-        guard let password = loadSteamPassword() else {
-            throw SessionError.noCredentials
-        }
-
-        await onStatus?("Connecting to Steam…")
-        try await installViaSteamCMD(
-            appID: appID,
-            name: name,
-            accountName: accountName,
-            password: password,
-            engine: engine,
-            onStatus: onStatus
-        )
+        // 2. Send the IPC URL. The new wine64 process detects the running Steam
+        //    and forwards via named pipe; it exits in ~1s. Steam then starts the
+        //    download internally — no observable Steam UI thanks to the
+        //    SteamWindow suppressor + pre-seeded ACF (no picker dialog needed).
+        onStatus?("Asking Steam to start the download…")
+        log.info("[installGame] sending steam://install/\(appID) IPC to running Steam")
+        try sendSteamCommand(["steam://install/\(appID)"], engine: engine)
+        onStatus?("Downloading \(name)…")
+        log.info("[installGame] IPC dispatched — Launcher will poll ACF for progress")
     }
 
-    /// Cancel a running SteamCMD download.
+    /// Cancel an in-progress install.
+    ///
+    /// IPC installs run inside the persistent Steam process, not in a Meridian-
+    /// owned subprocess, so there's no local process to kill. `Launcher` handles
+    /// the UI side (sets state back to idle, stops polling). If we ever need to
+    /// genuinely pause/cancel the running Steam download, the IPC URL is
+    /// `steam://pauseDownloads` / `steam://uninstall/<id>` — not implemented yet
+    /// because Launcher's cancel is "stop tracking", not "tell Steam to stop".
     func cancelInstall() {
-        guard let proc = activeSteamCMDProcess, proc.isRunning else {
-            activeSteamCMDProcess = nil
-            return
+        log.info("[cancelInstall] no-op — IPC installs run inside the persistent Steam process; Launcher handles UI cancellation")
+    }
+
+    // MARK: - Private: Steam IPC
+
+    /// Send a command-line argument (or `steam://` URL) to the already-running
+    /// Steam instance via the standard Windows-Steam IPC pattern: spawn a new
+    /// `steam.exe` with the argument; the new process detects the running
+    /// instance's IPC named pipe and forwards instead of cold-starting.
+    ///
+    /// CLI-verified that this works for `steam://install/<id>` (commit `6501b4f`)
+    /// and `-applaunch <id>` (the DRM game launch path).
+    private func sendSteamCommand(_ args: [String], engine: WineEngine) throws {
+        let steamExe = prefix.steamExePath.path(percentEncoded: false)
+        let process = Process()
+        process.executableURL = engine.wine64URL
+        process.arguments = [steamExe] + args
+        process.environment = engine.steamCMDEnvironment(for: prefix)
+        process.standardOutput = FileHandle.nullDevice
+
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+
+        try process.run()
+        let pid = process.processIdentifier
+        log.info("[sendSteamCommand] sent \(args.joined(separator: " ")) via IPC pid=\(pid)")
+
+        // Register the short-lived IPC forwarder with the window suppressor so
+        // any transient Wine window it spawns is hidden immediately.
+        steamWindow?.registerPID(pid_t(pid))
+
+        // Wait asynchronously so we don't block the main actor, then log the
+        // outcome. The forwarder exits in <1s when Steam is already running.
+        Task.detached(priority: .utility) {
+            process.waitUntilExit()
+            let status = process.terminationStatus
+            let stderr = String(
+                data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            if status != 0 || !stderr.isEmpty {
+                log.warning("[sendSteamCommand] IPC forwarder exited status=\(status) args=\(args.joined(separator: " ")) stderr=\(stderr.prefix(500))")
+            } else {
+                log.info("[sendSteamCommand] IPC forwarder exited cleanly status=\(status) pid=\(pid)")
+            }
         }
-        log.info("[cancelInstall] terminating background SteamCMD pid=\(proc.processIdentifier)")
-        proc.terminate()
-        activeSteamCMDProcess = nil
     }
 
     // MARK: - Game launch environment
@@ -332,7 +306,7 @@ final class SteamSession {
 
     // MARK: - Private: launch steam.exe
 
-    private func launchSteamProcess(engine: WineEngine, extraArgs: [String]) async throws {
+    private func launchSteamProcess(engine: WineEngine) async throws {
         guard persistentProcess == nil || !(persistentProcess?.isRunning ?? false) else {
             log.info("[launchSteamProcess] already running — skipping")
             return
@@ -349,11 +323,12 @@ final class SteamSession {
         connectionLogOffset = connectionLogFileSize()
 
         let steamExePath = prefix.steamExePath.path(percentEncoded: false)
-        var args = [steamExePath, "-silent", "-nofriendsui"]
-        args.append(contentsOf: extraArgs)
+        // ALWAYS -silent. Auth comes from the DPAPI-injected local.vdf (written
+        // by WinePrefix.writeSteamSessionLocalVdf at sign-in time + on every
+        // BootstrapManager cold start from persisted credentials).
+        let args = [steamExePath, "-silent", "-nofriendsui"]
 
-        let sanitized = sanitizeArgsForLog(args)
-        log.info("[launchSteamProcess] wine64 \(sanitized.joined(separator: " "))")
+        log.info("[launchSteamProcess] wine64 \(args.joined(separator: " "))")
 
         let process = Process()
         process.executableURL = engine.wine64URL
@@ -500,207 +475,6 @@ final class SteamSession {
         return false
     }
 
-    private struct SignInOutcome {
-        let steamID: String
-        let accountName: String
-    }
-
-    /// Watch for `[Logged On,]` during user-initiated sign-in.
-    /// Throws on explicit rejection or timeout, so the sheet can surface the error.
-    private func waitForSignInOutcome(engine: WineEngine, timeout: Duration) async throws -> SignInOutcome {
-        let connLogPath = prefix.steamInstallDir
-            .appending(path: "logs/connection_log.txt")
-            .path(percentEncoded: false)
-
-        let started = ContinuousClock.now
-        var connectedAt: ContinuousClock.Instant?
-
-        while ContinuousClock.now - started < timeout {
-            try Task.checkCancellation()
-
-            if let p = persistentProcess, !p.isRunning {
-                let code = p.terminationStatus
-                if code == 42 {
-                    persistentProcess = nil
-                } else {
-                    throw SessionError.steamExitedUnexpectedly(code)
-                }
-            }
-
-            let content = readLogTail(path: connLogPath, from: connectionLogOffset)
-
-            if content.contains("[Logged On, ") {
-                killWebhelper()
-                if let steamID = extractSteamID(from: content) {
-                    log.info("[waitForSignInOutcome] ✓ steamID=\(steamID)")
-                    let accountName = AppSettings.shared.steamCredentialAccountName
-                    return SignInOutcome(steamID: steamID, accountName: accountName)
-                }
-                throw SessionError.couldNotExtractSteamID
-            }
-
-            if content.contains("LogonFailureReceived")
-                || content.contains("Sending SteamServerConnectFailure_t Invalid Password") {
-                killWebhelper()
-                throw SessionError.authenticationFailed
-            }
-
-            // Mobile 2FA was demanded (typed code, not push) — fail fast so user can retry.
-            if content.contains("need two-factor code") || content.contains("Two-factor code required") {
-                killWebhelper()
-                throw SessionError.twoFactorRequired
-            }
-
-            if connectedAt == nil, content.contains("Connectivity test: result=Connected") {
-                connectedAt = ContinuousClock.now
-            }
-
-            try? await Task.sleep(for: .milliseconds(500))
-        }
-
-        killWebhelper()
-        throw SessionError.timeout
-    }
-
-    private func extractSteamID(from log: String) -> String? {
-        guard let logonRange = log.range(of: "[Logged On, ") else { return nil }
-        let after = log[logonRange.upperBound...]
-        guard let startIdx = after.range(of: "[U:1:") else { return nil }
-        let tail = after[startIdx.upperBound...]
-        var accountID: UInt64 = 0
-        for ch in tail {
-            if let d = ch.hexDigitValue, ch.isNumber {
-                accountID = accountID * 10 + UInt64(d)
-            } else { break }
-        }
-        guard accountID > 0 else { return nil }
-        return String(accountID + 76561197960265728)
-    }
-
-    // MARK: - Private: SteamCMD install
-
-    private func installViaSteamCMD(
-        appID: Int,
-        name: String,
-        accountName: String,
-        password: String,
-        engine: WineEngine,
-        onStatus: (@MainActor (String) -> Void)?
-    ) async throws {
-        let steamcmdPath = prefix.steamInstallDir
-            .appending(path: "steamcmd.exe")
-            .path(percentEncoded: false)
-
-        guard FileManager.default.fileExists(atPath: steamcmdPath) else {
-            log.warning("[steamcmd] steamcmd.exe not found — cannot install via SteamCMD")
-            throw SessionError.steamCMDNotFound
-        }
-
-        let process = Process()
-        process.executableURL = URL(filePath: "/usr/bin/script")
-        // PTY wrapper: SteamCMD only line-buffers when stdout is a TTY.
-        // Pattern 3 from engine-research-findings: stdout buffering fixed by /usr/bin/script.
-        process.arguments = [
-            "-q", "/dev/null",
-            engine.wine64URL.path(percentEncoded: false),
-            steamcmdPath,
-            "-overrideminos",
-            "+login", accountName, password,
-            "+app_update", "\(appID)", "validate",
-            "+quit"
-        ]
-        process.environment = engine.steamCMDEnvironment(for: prefix)
-
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError  = outputPipe
-
-        try process.run()
-        activeSteamCMDProcess = process
-        let pid = process.processIdentifier
-        log.info("[steamcmd] launched pid=\(pid) appID=\(appID)")
-
-        let loginTimeout: Duration = .seconds(60)
-        let started = ContinuousClock.now
-        var loginConfirmed = false
-        var lineBuffer = ""
-        let handle = outputPipe.fileHandleForReading
-
-        readLoop: while process.isRunning || !lineBuffer.isEmpty {
-            if !loginConfirmed, ContinuousClock.now - started > loginTimeout {
-                log.warning("[steamcmd] login timeout — terminating")
-                process.terminate()
-                activeSteamCMDProcess = nil
-                throw SessionError.steamCMDLoginFailed
-            }
-
-            let fd = handle.fileDescriptor
-            let savedFlags = fcntl(fd, F_GETFL)
-            if savedFlags >= 0 {
-                _ = fcntl(fd, F_SETFL, savedFlags | O_NONBLOCK)
-                let chunk = handle.availableData
-                _ = fcntl(fd, F_SETFL, savedFlags)
-                if !chunk.isEmpty, let str = String(data: chunk, encoding: .utf8) {
-                    lineBuffer += str
-                }
-            }
-
-            while let sep = lineBuffer.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-                let rawLine = String(lineBuffer[lineBuffer.startIndex..<sep])
-                lineBuffer = String(lineBuffer[lineBuffer.index(after: sep)...])
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                guard !line.isEmpty else { continue }
-
-                let clean = line.replacingOccurrences(
-                    of: #"\x1B\[[0-9;]*[A-Za-z]"#,
-                    with: "", options: .regularExpression
-                )
-                guard !clean.isEmpty else { continue }
-                log.info("[steamcmd] \(clean)")
-
-                let isAuthError = clean.contains("Invalid Password")
-                    || clean.contains("Two-factor auth failed")
-                    || clean.contains("Rate Limit Exceeded")
-                    || clean.contains("code required")
-                let isConnError = clean.contains("No connection")
-                    || clean.contains("Failed to load Steam")
-                if isAuthError || isConnError {
-                    log.warning("[steamcmd] fail-fast: \(clean)")
-                    process.terminate()
-                    activeSteamCMDProcess = nil
-                    throw SessionError.steamCMDLoginFailed
-                }
-
-                if !loginConfirmed, clean.contains("Logged in OK") {
-                    loginConfirmed = true
-                    log.info("[steamcmd] logged in ✓ appID=\(appID)")
-                    await onStatus?("Downloading \(name)…")
-                }
-
-                if loginConfirmed,
-                   clean.contains("Update state (0x"), clean.contains("downloading") {
-                    log.info("[steamcmd] download started — handing off to ACF polling")
-                    return
-                }
-
-                if clean.contains("Success! App") {
-                    log.info("[steamcmd] download complete appID=\(appID)")
-                    activeSteamCMDProcess = nil
-                    return
-                }
-            }
-
-            if !process.isRunning { break readLoop }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-
-        activeSteamCMDProcess = nil
-        let exitCode = process.terminationStatus
-        if !loginConfirmed || exitCode != 0 {
-            throw SessionError.steamCMDLoginFailed
-        }
-    }
-
     // MARK: - Private: helpers
 
     private func connectionLogFileSize() -> Int {
@@ -718,30 +492,8 @@ final class SteamSession {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func truncateLogs() {
-        let dir = prefix.steamInstallDir.appending(path: "logs")
-        for name in ["connection_log.txt", "steamui_login.txt"] {
-            let path = dir.appending(path: name).path(percentEncoded: false)
-            try? "".write(toFile: path, atomically: true, encoding: .utf8)
-        }
-    }
-
     private func killWebhelper() {
         pkill(["-9", "-f", "steamwebhelper"])
-    }
-
-    private func loadSteamPassword() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: "com.meridian.app",
-            kSecAttrAccount as String: "meridian.steam.password",
-            kSecReturnData as String:  true,
-            kSecMatchLimit as String:  kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 
     @discardableResult
@@ -756,56 +508,17 @@ final class SteamSession {
         return t.terminationStatus
     }
 
-    private func sanitizeArgsForLog(_ args: [String]) -> [String] {
-        var result = args
-        for i in 0..<result.count {
-            if (result[i] == "-login" || result[i] == "-password") && i + 2 < result.count {
-                result[i + 2] = "<redacted>"
-            }
-        }
-        return result
-    }
 }
 
 // MARK: - Errors
 
 enum SessionError: LocalizedError {
-    case alreadyActive
     case steamNotReady
-    case steamLaunchFailed(String)
-    case steamExitedUnexpectedly(Int32)
-    case authenticationFailed
-    case twoFactorRequired
-    case timeout
-    case couldNotExtractSteamID
-    case noCredentials
-    case steamCMDNotFound
-    case steamCMDLoginFailed
 
     var errorDescription: String? {
         switch self {
-        case .alreadyActive:
-            return "Steam session is already active."
         case .steamNotReady:
             return "Steam is not ready. Please sign in first."
-        case .steamLaunchFailed(let detail):
-            return "Steam failed to start: \(detail)"
-        case .steamExitedUnexpectedly(let code):
-            return "Steam exited unexpectedly (code \(code))."
-        case .authenticationFailed:
-            return "Steam authentication failed. Check your username and password."
-        case .twoFactorRequired:
-            return "Steam requires a two-factor code. Please try again with the code from your Steam Mobile app."
-        case .timeout:
-            return "Steam sign-in timed out. Check your internet connection and try again."
-        case .couldNotExtractSteamID:
-            return "Signed in but could not read Steam account ID."
-        case .noCredentials:
-            return "No saved Steam credentials. Please sign in."
-        case .steamCMDNotFound:
-            return "SteamCMD not found. Reinstall Meridian or reset the Wine environment."
-        case .steamCMDLoginFailed:
-            return "SteamCMD login failed. Your password may have changed."
         }
     }
 }

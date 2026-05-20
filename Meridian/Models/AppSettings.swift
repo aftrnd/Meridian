@@ -260,9 +260,18 @@ final class AppSettings: @unchecked Sendable {
         UserDefaults.standard.removeObject(forKey: "isSteamLoggedIn")
         steamCredentialSteamID = ""
         steamCredentialAccountName = ""
+        steamCredentialRefreshToken = ""
     }
 
     // MARK: - Steam Credential Cache
+    //
+    // After a successful Meridian-side OAuth (SteamCredentialAuth via Valve's
+    // IAuthenticationService REST API), the resulting refresh_token is persisted
+    // here so it can be re-injected into the prefix's local.vdf on every cold
+    // start. The DPAPI ciphertext that lands in local.vdf is keyed to
+    // deterministic Wine inputs (user name "crossover" + accountName entropy +
+    // compile-time Wine secret + embedded salt) so the same refresh_token
+    // re-encrypts to a valid blob each launch.
 
     var steamCredentialSteamID: String {
         get { UserDefaults.standard.string(forKey: "steamCredentialSteamID") ?? "" }
@@ -272,6 +281,22 @@ final class AppSettings: @unchecked Sendable {
     var steamCredentialAccountName: String {
         get { UserDefaults.standard.string(forKey: "steamCredentialAccountName") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "steamCredentialAccountName") }
+    }
+
+    /// JWT refresh_token returned by Valve's IAuthenticationService after a
+    /// successful Meridian-side OAuth. Long-lived (months); only invalidated by
+    /// the user signing out of Steam Mobile or rotating account password.
+    var steamCredentialRefreshToken: String {
+        get { UserDefaults.standard.string(forKey: "steamCredentialRefreshToken") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "steamCredentialRefreshToken") }
+    }
+
+    /// True when all three credential pieces are present so bootstrap can
+    /// inject a fresh local.vdf and steam.exe -silent auto-logs in.
+    var hasSteamCredentials: Bool {
+        !steamCredentialSteamID.isEmpty
+            && !steamCredentialAccountName.isEmpty
+            && !steamCredentialRefreshToken.isEmpty
     }
 
 

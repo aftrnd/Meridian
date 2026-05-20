@@ -288,24 +288,51 @@ final class BootstrapManager {
         try? prefix.ensureSteamCFG()
         try? prefix.ensureDefaultLibrary()
 
-        // 5. Check whether a valid Steam session exists on disk.
+        // 5. Check whether a valid Steam session exists.
+        //    A session can come from any of:
+        //      • ssfn device-trust token on disk (legacy)
+        //      • loginusers.vdf with valid AllowAutoLogin entry (post-Steam-UI sign-in)
+        //      • persisted IAuthenticationService refresh_token in AppSettings
+        //        (Meridian OAuth) — this is the canonical path. Even with no
+        //        on-disk state in the prefix, hasSteamCredentials means we can
+        //        DPAPI-inject local.vdf from the refresh_token and Steam will
+        //        silently auto-log-in.
         transition(to: .syncingSession, message: "Checking Steam session…")
-        let hasSsfn     = prefix.hasSsfnToken
-        let hasLoginVdf = prefix.hasSteamLoginSession()
-        let hasLogin    = hasSsfn || hasLoginVdf
-        log.info("[bootstrap] Steam session check: hasSsfn=\(hasSsfn) hasLoginVdf=\(hasLoginVdf) → hasLogin=\(hasLogin)")
+        let hasSsfn         = prefix.hasSsfnToken
+        let hasLoginVdf     = prefix.hasSteamLoginSession()
+        let hasCredentials  = AppSettings.shared.hasSteamCredentials
+        let hasLogin        = hasSsfn || hasLoginVdf || hasCredentials
+        log.info("[bootstrap] Steam session check: hasSsfn=\(hasSsfn) hasLoginVdf=\(hasLoginVdf) hasCredentials=\(hasCredentials) → hasLogin=\(hasLogin)")
 
         guard !Task.isCancelled else { return }
 
         // 6. Engage window suppression now that all prefix operations are complete.
         steamWindow?.startSuppressing()
 
-        // 7. Restore local.vdf from backup (if present) before starting steam.exe.
-        //    Steam reads local.vdf (DPAPI-encrypted refresh token) at startup to auto-login.
-        //    restoreIfNeeded() is a no-op if the file is already in the prefix or no backup exists.
+        // 7. Ensure local.vdf is present and usable.
+        //    First try the on-disk backup (covers prefix-reset survival). Then,
+        //    if we have a persisted refresh_token, ALWAYS re-DPAPI-inject from
+        //    AppSettings — this makes local.vdf reproducible from purely Meridian-
+        //    owned state, so engine upgrades (new Wine crypt32 secret), prefix
+        //    resets, backup loss, etc. all self-heal without re-prompting the user.
         SteamSessionBackup.restoreIfNeeded(prefix: prefix)
 
-        // Start steam.exe -silent. NEVER -login from here.
+        if hasCredentials {
+            do {
+                let settings = AppSettings.shared
+                try await prefix.writeSteamSessionLocalVdf(
+                    engine: engine,
+                    steamID: settings.steamCredentialSteamID,
+                    accountName: settings.steamCredentialAccountName,
+                    refreshToken: settings.steamCredentialRefreshToken
+                )
+                log.info("[bootstrap] local.vdf re-injected from persisted credentials ✓")
+            } catch {
+                log.warning("[bootstrap] local.vdf re-inject failed: \(error.localizedDescription) — falling back to on-disk state")
+            }
+        }
+
+        // 8. Start steam.exe -silent. NEVER -login from here.
         //    Returns fast: ~5-10 s on success, 12 s on auth failure.
         //    If auth fails → session.state = .failed → ContentView shows sign-in sheet.
         if hasLogin {

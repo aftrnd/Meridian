@@ -396,24 +396,16 @@ final class GameInstallTests: XCTestCase {
                        "Game detail reset must not wipe the whole Wine prefix or other games.")
     }
 
-    // MARK: - SteamCMD stdout parsing tests
+    // MARK: - SteamCMD stdout parsing tests (deleted May 19 2026)
+    //
+    // SteamCMD-based installs were replaced by Steam IPC (`steam://install/<id>`)
+    // sent to the already-running persistent steam.exe. Stdout parsing of
+    // `Update state (0x61) downloading, progress:` lines no longer exists in
+    // production; progress now comes from `WinePrefix.gameDownloadProgress`
+    // reading the ACF manifest, which is covered by the existing
+    // `testProgress*` tests at the top of this file.
 
-    /// Mirror of GameLauncher.parseSteamCMDProgress(line:)
-    private func parseSteamCMDProgress(line: String) -> Double? {
-        if line.contains("downloading, progress:"),
-           let match = line.range(of: #"(\d+) / (\d+)"#, options: .regularExpression),
-           case let parts = String(line[match]).components(separatedBy: " / "),
-           parts.count == 2,
-           let downloaded = Double(parts[0]),
-           let total = Double(parts[1]),
-           total > 0,
-           downloaded / total > 0 {
-            return downloaded / total
-        } else if line.contains("Success! App") {
-            return 1.0
-        }
-        return nil
-    }
+    // MARK: - formatBytes tests
 
     /// Mirror of GameLauncher.formatBytes(_:)
     private func formatBytes(_ bytes: Int64) -> String {
@@ -423,103 +415,6 @@ final class GameInstallTests: XCTestCase {
         if mb >= 1 { return String(format: "%.0f MB", mb) }
         return String(format: "%.0f KB", Double(bytes) / 1024)
     }
-
-    private enum TestInstallPhase {
-        case preparing
-        case downloading
-        case installing
-        case installed
-
-        var userDescription: String {
-            switch self {
-            case .preparing:   return "Preparing"
-            case .downloading: return "Downloading"
-            case .installing:  return "Installing"
-            case .installed:   return "Installed"
-            }
-        }
-    }
-
-    /// Mirror of GameLauncher.installActivityMessage(...)
-    private func installActivityMessage(
-        gameName: String,
-        phase: TestInstallPhase,
-        downloadedBytes: Int64,
-        downloadTotalBytes: Int64,
-        installedBytes: Int64,
-        installTotalBytes: Int64,
-        percent: Int
-    ) -> String {
-        let verb = phase.userDescription
-        switch phase {
-        case .downloading:
-            return "\(verb) \(gameName) — \(formatBytes(downloadedBytes)) / \(formatBytes(downloadTotalBytes)) (\(percent)%)"
-        case .installing:
-            guard installedBytes > 0 else {
-                if downloadedBytes > 0 && downloadTotalBytes > 0 {
-                    return "\(verb) \(gameName) — download complete, preparing files (\(percent)%)"
-                }
-                return "\(verb) \(gameName) — preparing files (\(percent)%)"
-            }
-            return "\(verb) \(gameName) — \(formatBytes(installedBytes)) / \(formatBytes(installTotalBytes)) (\(percent)%)"
-        case .installed:
-            return "\(verb) \(gameName)"
-        case .preparing:
-            return "\(verb) \(gameName)…"
-        }
-    }
-
-    func testParseSteamCMDProgressDownloading() {
-        let line = "Update state (0x61) downloading, progress: 43.50 (3362453174 / 7729379123)"
-        let result = parseSteamCMDProgress(line: line)
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result!, 3362453174.0 / 7729379123.0, accuracy: 0.0001)
-    }
-
-    func testParseSteamCMDProgressSmallGame() {
-        let line = "Update state (0x61) downloading, progress: 62.47 (694855688 / 1112250025)"
-        let result = parseSteamCMDProgress(line: line)
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result!, 694855688.0 / 1112250025.0, accuracy: 0.0001)
-    }
-
-    func testParseSteamCMDProgressSuccess() {
-        let line = "Success! App '3527290' fully installed."
-        XCTAssertEqual(parseSteamCMDProgress(line: line), 1.0)
-    }
-
-    func testParseSteamCMDProgressReturnsNilForNonProgressLine() {
-        XCTAssertNil(parseSteamCMDProgress(line: "Loading Steam API...OK"))
-        XCTAssertNil(parseSteamCMDProgress(line: "Logging in using cached credentials."))
-        XCTAssertNil(parseSteamCMDProgress(line: "[  0%] Checking for available updates..."))
-        XCTAssertNil(parseSteamCMDProgress(line: "[----] Verifying installation..."))
-        XCTAssertNil(parseSteamCMDProgress(line: "-- type 'quit' to exit --"))
-    }
-
-    func testParseSteamCMDProgressIgnoresSelfUpdate() {
-        XCTAssertNil(parseSteamCMDProgress(line: "[----] Installing update..."))
-    }
-
-    func testParseSteamCMDProgressZeroBytesOfTotal() {
-        let line = "Update state (0x61) downloading, progress: 0.00 (0 / 7729379123)"
-        XCTAssertNil(parseSteamCMDProgress(line: line),
-                     "0 bytes downloaded should return nil (guard downloaded/total > 0)")
-    }
-
-    func testParseSteamCMDProgressZeroTotal() {
-        let line = "Update state (0x0) unknown, progress: 0.00 (0 / 0)"
-        XCTAssertNil(parseSteamCMDProgress(line: line),
-                     "0 / 0 should return nil (total == 0)")
-    }
-
-    func testParseSteamCMDProgressFullDownload() {
-        let line = "Update state (0x61) downloading, progress: 99.15 (7663962059 / 7729379123)"
-        let result = parseSteamCMDProgress(line: line)
-        XCTAssertNotNil(result)
-        XCTAssertGreaterThan(result!, 0.99)
-    }
-
-    // MARK: - formatBytes tests
 
     func testFormatBytesGB() {
         XCTAssertEqual(formatBytes(7_729_379_123), "7.2 GB")
@@ -537,34 +432,9 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(formatBytes(1024), "1 KB")
     }
 
-    func testInstallActivityDoesNotShowZeroCommittedBytesAtPhaseBoundary() {
-        let message = installActivityMessage(
-            gameName: "Half-Life 2",
-            phase: .installing,
-            downloadedBytes: 3_187_105_792,
-            downloadTotalBytes: 3_172_218_096,
-            installedBytes: 0,
-            installTotalBytes: 6_197_695_726,
-            percent: 90
-        )
-
-        XCTAssertEqual(message, "Installing Half-Life 2 — download complete, preparing files (90%)")
-        XCTAssertFalse(message.contains("0 KB / 5.8 GB"))
-    }
-
-    func testInstallActivityShowsCommittedBytesOnceFilesAppear() {
-        let message = installActivityMessage(
-            gameName: "Half-Life 2",
-            phase: .installing,
-            downloadedBytes: 3_187_105_792,
-            downloadTotalBytes: 3_172_218_096,
-            installedBytes: 1_610_612_736,
-            installTotalBytes: 6_197_695_726,
-            percent: 92
-        )
-
-        XCTAssertEqual(message, "Installing Half-Life 2 — 1.5 GB / 5.8 GB (92%)")
-    }
+    // installActivityMessage mirror tests deleted May 19 2026 — the production
+    // function no longer exists. Status messages now come from the simpler
+    // `currentActivity` updates set directly in Launcher.executeLaunchPipeline.
 
     func testInstallProgressUsesManifestInstallDirForCommittedBytes() throws {
         let root = URL(fileURLWithPath: #filePath)
@@ -996,8 +866,16 @@ final class GameInstallTests: XCTestCase {
 
     // MARK: - Rewrite architecture guards
 
-    /// SteamSession.installGame must use SteamCMD with PTY wrapper for real-time output.
-    func testSteamSession_installUsessteamCMDWithPTYWrapper() throws {
+    /// SteamSession.installGame must drive installs via Steam IPC, not SteamCMD.
+    ///
+    /// CLI-verified May 19 2026: Meridian's native bootstrap (`SteamClientBootstrap`)
+    /// only stages `steam.exe`, never `steamcmd.exe`. Any SteamCMD-based path fails
+    /// with "steamcmd.exe not found" on every install attempt. The working path is
+    /// `wine64 steam.exe steam://install/<appID>` — the new process detects the
+    /// running Steam's IPC named pipe and forwards the URL, then exits in <1s.
+    /// Steam dispatches the URL to its internal download manager which reads the
+    /// pre-seeded ACF manifest and starts downloading.
+    func testSteamSession_installUsesSteamIPC() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1005,16 +883,37 @@ final class GameInstallTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(src.contains("\"/usr/bin/script\""),
-                      "SteamCMD must run inside /usr/bin/script PTY wrapper for line-buffered output")
-        XCTAssertTrue(src.contains("\"-overrideminos\""),
-                      "SteamCMD invocation must include -overrideminos flag")
-        XCTAssertTrue(src.contains("activeSteamCMDProcess"),
-                      "activeSteamCMDProcess must be stored for cancellation")
+
+        // Must send the steam://install URL via IPC.
+        XCTAssertTrue(src.contains("steam://install/\\(appID)"),
+                      "installGame must dispatch steam://install/<appID> to the running Steam via IPC")
+        XCTAssertTrue(src.contains("sendSteamCommand("),
+                      "installGame must call sendSteamCommand to forward the IPC URL")
+
+        // Must pre-seed the ACF manifest before sending IPC.
+        XCTAssertTrue(src.contains("writePreseededAppManifest("),
+                      "installGame must pre-seed the ACF manifest so Steam has the install location")
+
+        // Must NOT contain executable code that runs SteamCMD. (Documentation
+        // comments may mention `steamcmd.exe` to explain WHY it's not used —
+        // we check for the specific syntactic forms an implementation would use.)
+        let forbidden = [
+            "\"/usr/bin/script\"",       // PTY wrapper used to line-buffer SteamCMD stdout
+            "\"-overrideminos\"",        // SteamCMD-specific flag
+            "activeSteamCMDProcess",     // Stored Process handle for SteamCMD
+            "\"+login\"",                // SteamCMD-style +command syntax
+            "\"+app_update\"",
+            "\"+quit\"",
+            ".appending(path: \"steamcmd.exe\")",  // path resolution to the binary
+        ]
+        for token in forbidden {
+            XCTAssertFalse(src.contains(token),
+                           "SteamSession MUST NOT contain `\(token)` — SteamCMD code path was deleted May 19 2026 (Meridian's native bootstrap doesn't ship steamcmd.exe; installs use Steam IPC instead).")
+        }
     }
 
-    /// Launcher.cancelLaunch must cancel the SteamCMD process.
-    func testLauncher_cancelLaunchCancelsSteamCMD() throws {
+    /// Launcher.cancelLaunch must call session.cancelInstall() so the UI returns to idle.
+    func testLauncher_cancelLaunchCallsCancelInstall() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1023,7 +922,7 @@ final class GameInstallTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(src.contains("cancelInstall()"),
-                      "Launcher.cancelLaunch must call session.cancelInstall() to stop SteamCMD downloads")
+                      "Launcher.cancelLaunch must call session.cancelInstall() to notify SteamSession of UI cancellation")
     }
 
     /// SteamSession.installGame must require isReady before starting.
