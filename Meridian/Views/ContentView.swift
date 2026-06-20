@@ -169,6 +169,10 @@ struct ContentView: View {
 extension Notification.Name {
     static let meridianBootstrapReady = Notification.Name("meridianBootstrapReady")
     static let meridianOpenSettings   = Notification.Name("meridianOpenSettings")
+    /// Posted when an operation discovers the persisted Steam refresh token is
+    /// dead (e.g. DepotDownloader exit 3). SteamAuthService observes this and
+    /// marks the session expired so the sign-in sheet appears.
+    static let meridianSteamSessionExpired = Notification.Name("meridianSteamSessionExpired")
 }
 
 // MARK: - Sidebar

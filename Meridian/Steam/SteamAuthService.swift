@@ -82,6 +82,16 @@ final class SteamAuthService: NSObject {
     override init() {
         super.init()
         restoreSession()
+        // A dead refresh token discovered at the point of use (e.g. DepotDownloader
+        // exit 3) posts this notification; treat it exactly like a startup-renewal
+        // failure so the sign-in sheet appears instead of silently failing.
+        NotificationCenter.default.addObserver(
+            forName: .meridianSteamSessionExpired,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.markSessionExpired() }
+        }
     }
 
     // MARK: - Public API
@@ -118,6 +128,63 @@ final class SteamAuthService: NSObject {
         let liveLocalVdf = WinePrefix.defaultPrefix.localAppDataSteamDir.appending(path: "local.vdf")
         try? FileManager.default.removeItem(at: liveLocalVdf)
         log.info("[signOut] Keychain cleared, account data + session backup reset")
+    }
+
+    /// Marks the current Steam session as expired WITHOUT a full sign-out.
+    ///
+    /// Used when the persisted OAuth `refresh_token` is rejected by Valve — either
+    /// proactively at startup (`renewSessionIfNeeded`) or at the point of use
+    /// (DepotDownloader exit 3 → `.meridianSteamSessionExpired`). Flipping
+    /// `isAuthenticated` to false makes `ContentView` present the sign-in sheet so
+    /// the user mints a fresh token in one tap.
+    ///
+    /// Unlike `signOut()`, this PRESERVES the Web API key and saved password so the
+    /// library keeps working and re-auth pre-fills the password — only the dead
+    /// token (UserDefaults + the live prefix `local.vdf`) is discarded.
+    func markSessionExpired() {
+        guard isAuthenticated || !AppSettings.shared.steamCredentialRefreshToken.isEmpty else { return }
+        log.warning("[markSessionExpired] refresh token rejected — prompting re-auth (API key preserved)")
+        isAuthenticated = false
+        AppSettings.shared.steamCredentialRefreshToken = ""
+        // Remove the live local.vdf so a stale DPAPI token can't drive a doomed
+        // steam.exe -silent auto-login on the next DRM launch.
+        let liveLocalVdf = WinePrefix.defaultPrefix.localAppDataSteamDir.appending(path: "local.vdf")
+        try? FileManager.default.removeItem(at: liveLocalVdf)
+    }
+
+    /// Proactively renews the persisted refresh token on startup so it never
+    /// silently ages out and breaks installs (the "get a fresh token on startup"
+    /// path). Network-safe: a transient failure leaves the stored token untouched.
+    ///
+    /// - `.renewed` → persist the rotated token (extends lifetime indefinitely).
+    /// - `.valid`   → nothing to do.
+    /// - `.invalid` → `markSessionExpired()` so the sign-in sheet appears up front.
+    /// - `.networkError` → leave the token alone; retry next launch.
+    func renewSessionIfNeeded() async {
+        let token = AppSettings.shared.steamCredentialRefreshToken
+        let id = steamID.isEmpty ? AppSettings.shared.steamCredentialSteamID : steamID
+
+        // Authenticated identity but no usable token → must re-auth.
+        guard !token.isEmpty, !id.isEmpty else {
+            if isAuthenticated && token.isEmpty {
+                log.warning("[renewSession] authenticated but no refresh token — prompting re-auth")
+                markSessionExpired()
+            }
+            return
+        }
+
+        log.info("[renewSession] validating/renewing stored refresh token")
+        switch await SteamCredentialAuth.renewRefreshToken(steamID: id, refreshToken: token) {
+        case .renewed(let newToken):
+            AppSettings.shared.steamCredentialRefreshToken = newToken
+            log.info("[renewSession] persisted rotated refresh token ✓")
+        case .valid:
+            log.info("[renewSession] stored token still valid ✓")
+        case .invalid:
+            markSessionExpired()
+        case .networkError(let msg):
+            log.warning("[renewSession] could not reach Valve (\(msg)) — keeping token, will retry next launch")
+        }
     }
 
     // MARK: - Private helpers
@@ -164,6 +231,10 @@ final class SteamAuthService: NSObject {
 
         Task {
             await refreshProfile(steamID: savedID)
+            // Proactively validate/renew the persisted refresh token so a stale
+            // token is caught at startup (and rotated forward) rather than failing
+            // mid-install. Pure HTTPS — no engine/prefix dependency.
+            await renewSessionIfNeeded()
         }
     }
 

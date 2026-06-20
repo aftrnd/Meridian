@@ -201,6 +201,17 @@ final class Launcher {
                 currentActivity = nil
                 downloadProgress = nil
                 return
+            } catch let dd as DepotDownloaderInstall.DDError {
+                if case .refreshTokenInvalid = dd {
+                    // Dead OAuth token. Don't dead-end on the Install button —
+                    // route the user to re-auth so they mint a fresh token.
+                    log.warning("[pipeline] refresh token invalid — prompting re-auth")
+                    NotificationCenter.default.post(name: .meridianSteamSessionExpired, object: nil)
+                    fail("Your Steam session expired. Please sign in again to install \(game.name).", error: dd)
+                } else {
+                    fail("Could not install \(game.name): \(dd.localizedDescription)", error: dd)
+                }
+                return
             } catch {
                 fail("Could not install \(game.name): \(error.localizedDescription)", error: error)
                 return

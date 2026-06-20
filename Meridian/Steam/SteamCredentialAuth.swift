@@ -458,6 +458,104 @@ final class SteamCredentialAuth {
         throw AuthError.pollingTimeout
     }
 
+    // MARK: - API: GenerateAccessTokenForApp (token renewal / health-check)
+
+    /// Outcome of a refresh-token renewal attempt against Valve's
+    /// `IAuthenticationService/GenerateAccessTokenForApp` endpoint.
+    enum RenewalOutcome: Equatable {
+        /// Valve rotated the refresh token — caller MUST persist the new value.
+        case renewed(refreshToken: String)
+        /// Token is still valid; Valve returned a fresh access token but did not
+        /// rotate the refresh token. Nothing to persist.
+        case valid
+        /// Valve rejected the token (expired / revoked). The user must re-auth.
+        case invalid
+        /// Could not reach Valve (offline, 5xx, timeout). Token state is UNKNOWN —
+        /// callers MUST NOT discard the stored token on this outcome.
+        case networkError(String)
+    }
+
+    /// Renews (or validates) a stored client refresh token without any Wine
+    /// processes or Steam UI. This is the proactive "get a fresh token on
+    /// startup" path AND a cheap liveness check: a dead token here lets us
+    /// prompt re-auth up front instead of failing mid-install.
+    ///
+    /// Request shape is CLI-verified (June 2026) against the live endpoint and
+    /// matches the canonical form used by the Steam-internals community
+    /// (Dr. McKay): a form POST of `steamid` + `refresh_token`, with
+    /// `renewal_type=1` (Allow) so Valve rotates the token when appropriate.
+    /// Responses:
+    ///   - 200 `{"response":{"access_token":…,"refresh_token":…}}` → `.renewed`
+    ///   - 200 `{"response":{"access_token":…}}`                   → `.valid`
+    ///   - 200 `{"response":{}}`                                   → `.invalid`
+    ///   - 400 (router can't resolve a malformed/dead token)        → `.invalid`
+    ///   - 5xx / transport failure                                  → `.networkError`
+    nonisolated static func renewRefreshToken(
+        steamID: String,
+        refreshToken: String
+    ) async -> RenewalOutcome {
+        guard !steamID.isEmpty, !refreshToken.isEmpty else { return .invalid }
+
+        let url = URL(string: "https://api.steampowered.com/IAuthenticationService/GenerateAccessTokenForApp/v1/")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 20
+        request.httpBody = formEncodeStatic([
+            "steamid":       steamID,
+            "refresh_token": refreshToken,
+            "renewal_type":  "1",
+        ]).data(using: .utf8)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .networkError("no HTTP response")
+            }
+            // 5xx is a server-side blip — keep the token, try again next launch.
+            if http.statusCode >= 500 {
+                return .networkError("HTTP \(http.statusCode)")
+            }
+            // 200 → parse the response envelope. Any other 4xx means the router
+            // could not resolve the token (malformed/dead) → treat as invalid.
+            guard http.statusCode == 200 else {
+                log.warning("[renew] non-200 (\(http.statusCode)) — treating token as invalid")
+                return .invalid
+            }
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let resp = json?["response"] as? [String: Any] ?? [:]
+            if let newRT = resp["refresh_token"] as? String, !newRT.isEmpty {
+                log.info("[renew] Valve rotated the refresh token ✓")
+                return .renewed(refreshToken: newRT)
+            }
+            if let at = resp["access_token"] as? String, !at.isEmpty {
+                log.info("[renew] token still valid (no rotation) ✓")
+                return .valid
+            }
+            // {"response":{}} → expired / revoked.
+            log.warning("[renew] empty response — token expired/revoked")
+            return .invalid
+        } catch {
+            return .networkError(error.localizedDescription)
+        }
+    }
+
+    /// `application/x-www-form-urlencoded` encoder usable from nonisolated
+    /// contexts. Mirror of the instance `formEncode`; strict percent-encoding so
+    /// base64 / JWT characters survive intact.
+    nonisolated private static func formEncodeStatic(_ params: [String: String]) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return params
+            .sorted { $0.key < $1.key }
+            .map { k, v in
+                let ek = k.addingPercentEncoding(withAllowedCharacters: allowed) ?? k
+                let ev = v.addingPercentEncoding(withAllowedCharacters: allowed) ?? v
+                return "\(ek)=\(ev)"
+            }
+            .joined(separator: "&")
+    }
+
     // MARK: - RSA encryption
 
     private func encryptPassword(
