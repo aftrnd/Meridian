@@ -61,6 +61,16 @@ struct GameProfile {
     /// Extra environment variables specific to this game.
     let extraEnv: [String: String]
 
+    /// When true, route D3D11/DXGI/D3D12 through Apple GPTK (D3DMetal) instead of
+    /// the default DXMT path, using CX Wine's native graphics-backend switch
+    /// (`CX_GRAPHICS_BACKEND=d3dmetal` + `CX_ROOT`). DXMT cannot service the Media
+    /// Foundation video processor's D3D11 texture path, so Unity VideoPlayer /
+    /// MF video cutscenes render black under DXMT. D3DMetal is a complete D3D11
+    /// implementation that DOES service it (CLI + user-verified June 2026 on
+    /// "No, I'm not a Human" — same path CrossOver 26 uses). See
+    /// `SteamSession.gameEnvironment` and `engine-research-findings.mdc` Pattern 22.
+    let preferD3DMetal: Bool
+
     /// Command-line arguments appended to the game executable when launching.
     /// Use for engine-level flags like `-force-d3d11` (Unity) that change
     /// rendering path without needing DLL overrides.
@@ -92,6 +102,7 @@ struct GameProfile {
         dllOverrides: String? = nil,
         dxmtMode: DXMTMode = .auto,
         extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -106,6 +117,7 @@ struct GameProfile {
         self.dllOverrides = dllOverrides
         self.dxmtMode = dxmtMode
         self.extraEnv = extraEnv
+        self.preferD3DMetal = preferD3DMetal
         self.launchArgs = launchArgs
         self.skipSteamDRM = skipSteamDRM
         self.launchViaSteam = launchViaSteam
@@ -158,6 +170,7 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -169,7 +182,7 @@ struct GameProfile {
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, launchArgs: launchArgs,
+            extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
             launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
@@ -184,6 +197,7 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -195,7 +209,7 @@ struct GameProfile {
             gameEngine: .unreal, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, launchArgs: launchArgs,
+            extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
             launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
@@ -210,6 +224,7 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -221,7 +236,7 @@ struct GameProfile {
             gameEngine: .source, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, launchArgs: launchArgs,
+            extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
             launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes
@@ -236,6 +251,7 @@ struct GameProfile {
         dxmtMode: DXMTMode = .auto,
         dllOverrides: String? = nil,
         extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -247,7 +263,7 @@ struct GameProfile {
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: status,
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
-            extraEnv: extraEnv, launchArgs: launchArgs,
+            extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
             launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes

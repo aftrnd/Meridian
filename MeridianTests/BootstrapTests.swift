@@ -399,6 +399,39 @@ final class BootstrapTests: XCTestCase {
                       "the GStreamer plugin path must point at lib64/gstreamer-1.0")
     }
 
+    /// D3DMetal opt-in (preferD3DMetal) must route D3D11 through Apple GPTK using
+    /// CX Wine's native graphics-backend switch (CX_GRAPHICS_BACKEND=d3dmetal +
+    /// CX_ROOT), NOT a WINEDLLOVERRIDES hack (which loads wined3d's builtin, not
+    /// GPTK — proven June 19 2026). Required so Media Foundation / Unity
+    /// VideoPlayer cutscenes render (DXMT cannot service the MF D3D11 texture
+    /// path). See engine-research-findings.mdc Pattern 22.
+    func testSteamSession_preferD3DMetalUsesGraphicsBackendSwitch() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(src.contains("preferD3DMetal"),
+                      "gameEnvironment must branch on profile.preferD3DMetal")
+        XCTAssertTrue(src.contains("CX_GRAPHICS_BACKEND") && src.contains("d3dmetal"),
+                      "preferD3DMetal must set CX_GRAPHICS_BACKEND=d3dmetal (CX-native backend switch)")
+        XCTAssertTrue(src.contains("CX_ROOT"),
+                      "preferD3DMetal must set CX_ROOT so cxcompatdb resolves $CX_ROOT/lib64/apple_gptk")
+        XCTAssertTrue(src.contains("env.removeValue(forKey: \"WINEDLLOVERRIDES\")"),
+                      "preferD3DMetal must strip the DXMT-first WINEDLLOVERRIDES so GPTK's cxcompatdb-prepended builtins win")
+    }
+
+    /// The engine must self-heal the `lib64/apple_gptk -> ../lib/gptk` symlink
+    /// that CX Wine's cxcompatdb.so requires for CX_GRAPHICS_BACKEND=d3dmetal.
+    /// Covers engines downloaded before the symlink was added to release-engine.sh.
+    func testWineEngine_ensuresAppleGptkSymlink() throws {
+        let src = try readSource("Meridian/Engine/WineEngine.swift")
+        XCTAssertTrue(src.contains("ensureAppleGptkSymlink"),
+                      "WineEngine must define ensureAppleGptkSymlink()")
+        XCTAssertTrue(src.contains("apple_gptk") && src.contains("../lib/gptk"),
+                      "ensureAppleGptkSymlink must create lib64/apple_gptk -> ../lib/gptk")
+        XCTAssertTrue(src.contains("if gptkPath != nil { Self.ensureAppleGptkSymlink() }"),
+                      "detect() must call ensureAppleGptkSymlink when GPTK is present")
+        XCTAssertTrue(src.contains("var cxRootPath"),
+                      "WineEngine must expose cxRootPath (the wine root used as CX_ROOT)")
+    }
+
     // MARK: - Package directory quiescence logic
 
     /// Mirror of WineSteamManager.bootstrap() quiescence detection.

@@ -71,6 +71,15 @@ final class WineEngine {
     /// Set when `wine/lib/gptk/external/D3DMetal.framework/D3DMetal` exists.
     private(set) var gptkPath: String?
 
+    /// The Wine engine root (`…/engine/wine`) — the directory that contains
+    /// `lib64`, `lib`, `bin`. Used as `CX_ROOT` for CX Wine's native
+    /// graphics-backend switch (`CX_GRAPHICS_BACKEND=d3dmetal`): `cxcompatdb.so`
+    /// resolves `$CX_ROOT/lib64/apple_gptk/wine/x86_64-windows` (the GPTK
+    /// d3d11/dxgi/d3d12 builtins) and prepends it to the DLL search. Required by
+    /// the D3DMetal D3D11 path for Media Foundation video — see
+    /// `SteamSession.gameEnvironment` and `engine-research-findings.mdc` Pattern 22.
+    var cxRootPath: String { Self.engineDir.appending(path: "wine").path(percentEncoded: false) }
+
     /// Path to lib64/ (MoltenVK, GnuTLS, GStreamer, libgmp).
     /// Required on DYLD_FALLBACK_LIBRARY_PATH so secur32.so can dlopen libgnutls
     /// for Wine's TLS stack. Without this, all Wine HTTPS operations fail.
@@ -246,6 +255,16 @@ final class WineEngine {
             ? Self.engineDir.appending(path: "wine/lib/gptk").path(percentEncoded: false)
             : nil
 
+        // CX Wine's `cxcompatdb.so` hard-codes the GPTK location as
+        // `$CX_ROOT/lib64/apple_gptk/wine/x86_64-windows` (CrossOver's native
+        // layout). Meridian ships GPTK at `wine/lib/gptk`, so create a
+        // `wine/lib64/apple_gptk -> ../lib/gptk` symlink to satisfy that path.
+        // Without it `CX_GRAPHICS_BACKEND=d3dmetal` silently falls back to
+        // wined3d (D3DMetal never loads → MF video stays black). Idempotent;
+        // `release-engine.sh` also creates it for fresh installs, this covers
+        // engines downloaded before the symlink was added.
+        if gptkPath != nil { Self.ensureAppleGptkSymlink() }
+
         backendName   = "Meridian"
         engineVersion = readEngineVersion()
         state         = .ready
@@ -406,6 +425,37 @@ final class WineEngine {
     ///
     /// Also seeds `meridian-wine-accessory.dylib` into the engine if the
     /// engine tarball didn't ship one (same pattern as `meridian-dpapi.exe`).
+    /// Ensures `wine/lib64/apple_gptk` exists as a symlink to `../lib/gptk`, the
+    /// CrossOver-native GPTK location that `cxcompatdb.so` expects when
+    /// `CX_GRAPHICS_BACKEND=d3dmetal` is set. Idempotent and cheap — only creates
+    /// the link when missing or pointing somewhere else. CLI/user-verified June
+    /// 2026: with this link + `CX_ROOT` set, "No, I'm not a Human" plays its MF
+    /// video cutscenes correctly (D3D11 routed through D3DMetal instead of DXMT).
+    static func ensureAppleGptkSymlink() {
+        let fm = FileManager.default
+        let lib64 = Self.engineDir.appending(path: "wine/lib64")
+        guard fm.fileExists(atPath: lib64.path(percentEncoded: false)) else { return }
+        let gptk = Self.engineDir.appending(path: "wine/lib/gptk")
+        guard fm.fileExists(atPath: gptk.path(percentEncoded: false)) else { return }
+
+        let link = lib64.appending(path: "apple_gptk")
+        let linkPath = link.path(percentEncoded: false)
+        // Already a symlink resolving to the gptk dir? Nothing to do.
+        if let dest = try? fm.destinationOfSymbolicLink(atPath: linkPath), dest == "../lib/gptk" {
+            return
+        }
+        // Remove any stale entry (wrong target, or a real dir) before re-linking.
+        if fm.fileExists(atPath: linkPath) || (try? fm.destinationOfSymbolicLink(atPath: linkPath)) != nil {
+            try? fm.removeItem(atPath: linkPath)
+        }
+        do {
+            try fm.createSymbolicLink(atPath: linkPath, withDestinationPath: "../lib/gptk")
+            log.info("[ensureAppleGptk] created lib64/apple_gptk -> ../lib/gptk")
+        } catch {
+            log.warning("[ensureAppleGptk] failed to create symlink: \(error.localizedDescription)")
+        }
+    }
+
     static func ensureDyldInjection() {
         let fm = FileManager.default
         let wine64 = Self.engineDir.appending(path: "wine/bin/wine64")

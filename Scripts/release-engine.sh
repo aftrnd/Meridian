@@ -275,6 +275,29 @@ else
     yellow "  Warning: libgnutls.30.dylib not found in lib64 — Wine TLS will not work"
 fi
 
+# ---------- apple_gptk symlink for CX_GRAPHICS_BACKEND=d3dmetal ----------
+# CX Wine's cxcompatdb.so hard-codes the GPTK location as
+# $CX_ROOT/lib64/apple_gptk/wine/x86_64-windows (CrossOver's native layout).
+# Meridian stages GPTK at wine/lib/gptk, so create a relative symlink
+# wine/lib64/apple_gptk -> ../lib/gptk. With CX_ROOT=wine/ set at launch, this
+# makes CX_GRAPHICS_BACKEND=d3dmetal route D3D11/DXGI/D3D12 through Apple GPTK
+# (D3DMetal). REQUIRED for Media Foundation video cutscenes (Unity VideoPlayer):
+# DXMT cannot service the MF video processor's D3D11 texture path, so videos
+# render black under DXMT. D3DMetal (the same backend CrossOver 26 uses) does.
+# CLI + user-verified June 19 2026 on "No, I'm not a Human".
+# WineEngine.ensureAppleGptkSymlink() also creates this at runtime for engines
+# downloaded before this was added.
+if [ -d "${STAGING}/wine/lib/gptk" ] && [ -d "${STAGING}/wine/lib64" ]; then
+    ln -sfn "../lib/gptk" "${STAGING}/wine/lib64/apple_gptk"
+    if [ -f "${STAGING}/wine/lib64/apple_gptk/wine/x86_64-windows/d3d11.dll" ]; then
+        info "  lib64/apple_gptk -> ../lib/gptk symlink created (d3dmetal D3D11 path) ✓"
+    else
+        die "apple_gptk symlink does not resolve to GPTK d3d11.dll"
+    fi
+else
+    yellow "  Warning: gptk or lib64 missing — apple_gptk symlink not created (d3dmetal D3D11 unavailable)"
+fi
+
 # ---------- verify Wine works ----------
 
 [ -x "${STAGING}/wine/bin/wine64" ]     || die "wine64 not executable"

@@ -468,6 +468,7 @@ final class GameInstallTests: XCTestCase {
         let dllOverrides: String?
         let dxmtMode: TestDXMTMode
         let extraEnv: [String: String]
+        let preferD3DMetal: Bool
         let launchViaSteam: Bool
     }
 
@@ -475,29 +476,48 @@ final class GameInstallTests: XCTestCase {
         3180070: TestGameProfile(
             appID: 3180070, name: "No, I'm not a Human",
             gameEngine: .unity, graphicsAPI: .dx11, status: .verified,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: true, launchViaSteam: false
         ),
         813230: TestGameProfile(
             appID: 813230, name: "ANIMAL WELL",
             gameEngine: .custom, graphicsAPI: .dx12, status: .verified,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         ),
         3527290: TestGameProfile(
             appID: 3527290, name: "PEAK",
             gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         ),
         4069520: TestGameProfile(
             appID: 4069520, name: "Super Battle Golf",
             gameEngine: .unity, graphicsAPI: .dx12, status: .broken,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         ),
         220: TestGameProfile(
             appID: 220, name: "Half-Life 2",
             gameEngine: .source, graphicsAPI: .dx9, status: .verified,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         ),
     ]
+
+    /// No, I'm not a Human must opt into the D3DMetal D3D11 path so its
+    /// Media Foundation video cutscenes render (DXMT serves black). Mirror
+    /// of the GameCompatibilityDB+Unity entry; production wiring guarded by
+    /// `testSteamSession_preferD3DMetalUsesGraphicsBackendSwitch` (BootstrapTests).
+    func testNoImNotAHumanPrefersD3DMetal() throws {
+        XCTAssertEqual(testProfiles[3180070]?.preferD3DMetal, true,
+                       "No I'm not a Human needs preferD3DMetal for MF video cutscenes")
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let unity = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Engine/GameCompatibilityDB+Unity.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(unity.contains("preferD3DMetal: true"),
+                      "appID 3180070 entry must set preferD3DMetal: true")
+    }
 
     func testAllKnownGamesHaveProfiles() {
         for (appID, expected) in testProfiles {
@@ -586,7 +606,7 @@ final class GameInstallTests: XCTestCase {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .unity, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: dxmtMode, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         )
     }
 
@@ -600,7 +620,7 @@ final class GameInstallTests: XCTestCase {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .source, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: launchViaSteam
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: launchViaSteam
         )
     }
 
@@ -613,7 +633,7 @@ final class GameInstallTests: XCTestCase {
         TestGameProfile(
             appID: appID, name: name,
             gameEngine: .custom, graphicsAPI: graphicsAPI, status: .untested,
-            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], launchViaSteam: false
+            dllOverrides: nil, dxmtMode: .auto, extraEnv: [:], preferD3DMetal: false, launchViaSteam: false
         )
     }
 

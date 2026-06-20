@@ -709,6 +709,36 @@ final class SteamSession {
                 with: "b"
             )
         }
+
+        // D3DMetal opt-in (per-game). Routes D3D11/DXGI/D3D12 through Apple GPTK
+        // (D3DMetal) using CX Wine's NATIVE graphics-backend switch rather than
+        // hand-hacked WINEDLLOVERRIDES (the latter was tried June 2026 and failed
+        // — `d3d11=b` always loads wined3d's builtin from lib/wine, never GPTK's).
+        //
+        // Mechanism: `CX_GRAPHICS_BACKEND=d3dmetal` makes CX Wine's `cxcompatdb.so`
+        // prepend `$CX_ROOT/lib64/apple_gptk/wine/x86_64-windows` (the GPTK
+        // d3d11/dxgi/d3d12 PE builtins) to the DLL search path, so they win as
+        // builtins. We therefore STRIP the DXMT-first WINEDLLOVERRIDES that
+        // engine.environment(for:) sets and clear WINEDLLPATH's DXMT entry so the
+        // prepended GPTK builtins are not shadowed. `WineEngine.ensureAppleGptkSymlink`
+        // guarantees the `lib64/apple_gptk` path resolves.
+        //
+        // Why: DXMT cannot service the Media Foundation video processor's D3D11
+        // texture path → Unity VideoPlayer / MF cutscenes render black. D3DMetal
+        // is a complete D3D11 implementation that DOES service it. CLI + user-
+        // verified June 2026 on "No, I'm not a Human" (matches CrossOver 26).
+        // See engine-research-findings.mdc Pattern 22.
+        if profile?.preferD3DMetal == true,
+           let gptk = engine.gptkPath {
+            env["CX_ROOT"] = engine.cxRootPath
+            env["CX_GRAPHICS_BACKEND"] = "d3dmetal"
+            env.removeValue(forKey: "WINEDLLOVERRIDES")
+            if let lib = engine.libraryPath {
+                env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+            } else {
+                env.removeValue(forKey: "WINEDLLPATH")
+            }
+        }
         return env
     }
 
