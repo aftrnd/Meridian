@@ -136,8 +136,26 @@ final class SteamAppInfoResolverTests: XCTestCase {
         let src = try readSource("Meridian/Steam/SteamLibraryStore.swift")
         XCTAssertTrue(src.contains("SteamAppInfoResolver.resolve"),
                       "prefetchLibraryCapsuleHashes must run the appinfo logo-hash pass (Pass 3)")
-        XCTAssertTrue(src.contains("stillMissingLogo"),
-                      "the appinfo pass must target only games still missing a logo hash after GetItems + librarycache")
+        XCTAssertTrue(src.contains("func needsAppinfo"),
+                      "the appinfo pass must target only games still missing a logo hash/placement after GetItems + librarycache")
+        XCTAssertTrue(src.contains("recentNeeding"),
+                      "the appinfo pass must resolve recent/visible games first for fast first-run paint")
+    }
+
+    /// The slow PICS-appinfo pass must be cached to disk so logos + positions
+    /// apply instantly on later launches (no 1–2 min re-resolve every time).
+    func testLibraryStorePersistsAndAppliesArtCache() throws {
+        let src = try readSource("Meridian/Steam/SteamLibraryStore.swift")
+        XCTAssertTrue(src.contains("library-art-cache.json"),
+                      "resolved art hashes + placement must persist to a disk cache")
+        XCTAssertTrue(src.contains("func applyArtCache"),
+                      "the cache must be applied on launch so logos are positioned on the first frame")
+        XCTAssertTrue(src.contains("func persistArtCache"),
+                      "resolved art must be written back to the cache after the network passes")
+        XCTAssertTrue(src.contains("appinfoResolved"),
+                      "resolved apps (incl. legacy titles with no new-CDN logo) must not be re-queried every launch")
+        XCTAssertTrue(src.contains("applyArtCache()"),
+                      "refresh() must apply the cached art before the network passes run")
     }
 
     // MARK: - Logo placement (game detail only)

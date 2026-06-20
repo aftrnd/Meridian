@@ -387,6 +387,18 @@ final class BootstrapTests: XCTestCase {
                       "WINEDLLOVERRIDES must force d3d10core to native-first so DXMT covers the full D3D10/11 surface")
     }
 
+    /// winegstreamer needs GST_PLUGIN_SYSTEM_PATH_1_0 pointed at the bundled
+    /// lib64/gstreamer-1.0 or Unity VideoPlayer / Media Foundation video renders
+    /// black (no decoder discovered). Regression guard for the No-I'm-not-a-Human
+    /// intro-video fix (June 2026).
+    func testWineEngine_setsGStreamerPluginPathForVideo() throws {
+        let src = try readSource("Meridian/Engine/WineEngine.swift")
+        XCTAssertTrue(src.contains("GST_PLUGIN_SYSTEM_PATH_1_0"),
+                      "environment(for:) must set GST_PLUGIN_SYSTEM_PATH_1_0 so winegstreamer finds the bundled video decoders")
+        XCTAssertTrue(src.contains("gstreamer-1.0"),
+                      "the GStreamer plugin path must point at lib64/gstreamer-1.0")
+    }
+
     // MARK: - Package directory quiescence logic
 
     /// Mirror of WineSteamManager.bootstrap() quiescence detection.

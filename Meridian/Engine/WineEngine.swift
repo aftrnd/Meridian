@@ -608,6 +608,24 @@ final class WineEngine {
             }
         }
 
+        // GStreamer plugin discovery for winegstreamer (Unity VideoPlayer / any
+        // Media Foundation video playback). The bundled GStreamer plugins live in
+        // lib64/gstreamer-1.0, but GStreamer's compiled-in default scan path points
+        // at CrossOver's build location, which doesn't exist on the user's machine.
+        // Without GST_PLUGIN_SYSTEM_PATH_1_0 the MF video pipeline finds ZERO
+        // decoders, so intro/cutscene videos render black while the dialogue text
+        // still draws over them. CLI-diagnosed June 2026 from
+        // logs/games/3180070.log (No I'm not a Human): the video path reached
+        // winegstreamer but failed caps negotiation ("gst_video_info_from_caps:
+        // caps not fixed") because no decoder plugin was discovered. CrossOver
+        // ships the identical plugin set (applemedia/VideoToolbox is the H.264
+        // decoder) — the only missing piece was telling GStreamer where to look.
+        if let l64 = lib64Path {
+            let pluginDir = "\(l64)/gstreamer-1.0"
+            env["GST_PLUGIN_SYSTEM_PATH_1_0"] = pluginDir
+            env["GST_PLUGIN_PATH_1_0"]        = pluginDir
+        }
+
         log.debug("[env] full environment: \(env.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " | "))")
 
         return env

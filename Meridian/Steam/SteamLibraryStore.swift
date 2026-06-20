@@ -25,6 +25,38 @@ final class SteamLibraryStore {
     var filter: LibraryFilter = .all
     private let settings = AppSettings.shared
 
+    // MARK: - Persistent library-art cache
+    //
+    // CDN art hashes (capsule/logo/hero) + Steam logo placement resolved on the
+    // first launch are cached to disk, so every later launch applies the correct
+    // logo + position INSTANTLY instead of re-running the slow anonymous PICS-
+    // appinfo pass (which took 1–2 min and left logos at the default position
+    // until it finished). The cache also records which apps the appinfo pass has
+    // already queried, so resolved games (incl. legacy titles with no new-CDN
+    // logo hash) are never re-queried.
+    struct ArtCacheEntry: Codable, Equatable {
+        var capsuleHash: String? = nil
+        var logoHash: String? = nil
+        var heroHash: String? = nil
+        var logoPinned: String? = nil
+        var logoWidthPct: Double? = nil
+        var logoHeightPct: Double? = nil
+        /// True once the PICS-appinfo pass has queried this app (even when it has
+        /// no new-CDN logo, e.g. legacy titles). Prevents re-querying every launch.
+        var appinfoResolved: Bool = false
+    }
+
+    @ObservationIgnored private var artCache: [Int: ArtCacheEntry] = [:]
+
+    nonisolated static let artCacheURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appending(path: "com.meridian.app/library-art-cache.json")
+    }()
+
+    init() {
+        artCache = Self.loadArtCache()
+    }
+
     // Stored so @Observable can track changes and re-evaluate filteredGames immediately.
     // AppSettings persists to UserDefaults; this mirrors it for reactive updates.
     private(set) var hiddenAppIDs: Set<Int> = AppSettings.shared.hiddenAppIDs
@@ -86,6 +118,10 @@ final class SteamLibraryStore {
             let (ownedGames, recentlyPlayed) = try await (owned, recent)
             games = applyInstallCache(to: ownedGames)
             recentGames = applyInstallCache(to: recentlyPlayed)
+            // Apply cached art hashes + logo placement immediately so logos
+            // render at their correct Steam position on this frame — no waiting
+            // for the network passes below.
+            applyArtCache()
             lastRefreshed = .now
             log.info("[refresh] complete: \(ownedGames.count) owned, \(recentlyPlayed.count) recent")
             startInstallStatePolling()
@@ -218,15 +254,34 @@ final class SteamLibraryStore {
         // positioning on the detail page. Older titles return an empty logo hash
         // (bare legacy filename) but a valid position, which the detail hero
         // applies to their working legacy-CDN logo.
-        let stillMissingLogo = games.indices
-            .filter { games[$0].logoHash == nil || games[$0].logoPinned == nil }
-            .map { games[$0].id }
+        // Skip games the appinfo pass has already resolved (cached) — including
+        // legacy titles that have a placement but no new-CDN logo hash, which
+        // would otherwise be re-queried on every launch.
+        // Resolve in a recent/visible-first order so the games the user is
+        // actually looking at get their logo + position within seconds, while
+        // the long tail fills in behind them. Each resolve() call spins up the
+        // fork with its own anonymous Steam logon (~5s), so the visible games go
+        // in one small first batch, then the rest in large batches.
+        func needsAppinfo(_ id: Int) -> Bool {
+            if artCache[id]?.appinfoResolved == true { return false }
+            guard let g = games.first(where: { $0.id == id }) else { return false }
+            return g.logoHash == nil || g.logoPinned == nil
+        }
+        let recentNeeding = recentlyPlayedGames.map(\.id).filter(needsAppinfo)
+        let recentSet = Set(recentNeeding)
+        let restNeeding = games.map(\.id).filter { needsAppinfo($0) && !recentSet.contains($0) }
+        let appInfoBatches: [[Int]] =
+            (recentNeeding.isEmpty ? [] : [recentNeeding]) + restNeeding.chunked(into: 200)
+
         var appInfoLogoCount = 0
-        if !stillMissingLogo.isEmpty {
-            for batch in stillMissingLogo.chunked(into: 200) {
+        if !appInfoBatches.isEmpty {
+            for batch in appInfoBatches {
                 let resolved = await SteamAppInfoResolver.resolve(appIDs: batch)
                 guard !resolved.isEmpty else { continue }
                 for (appID, hashes) in resolved {
+                    // Mark as appinfo-resolved so we never re-query it (even if it
+                    // returned no new-CDN logo, like a legacy title).
+                    artCache[appID, default: ArtCacheEntry()].appinfoResolved = true
                     if let idx = games.firstIndex(where: { $0.id == appID }) {
                         if let logo = hashes.logo { games[idx].logoHash = logo; appInfoLogoCount += 1 }
                         if games[idx].libraryCapsuleHash == nil, let c = hashes.capsule { games[idx].libraryCapsuleHash = c }
@@ -248,9 +303,76 @@ final class SteamLibraryStore {
                         }
                     }
                 }
+                // Persist after each batch so progress survives a crash and the
+                // visible games are cached the instant their batch finishes.
+                persistArtCache()
             }
+        } else {
+            // Nothing to appinfo-resolve, but Pass 1/2 may have updated capsule
+            // hashes — cache those too.
+            persistArtCache()
         }
-        log.info("[prefetchLibraryCapsuleHashes] complete — localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule; appinfo resolved \(appInfoLogoCount) logo")
+        log.info("[prefetchLibraryCapsuleHashes] complete — localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule; appinfo resolved \(appInfoLogoCount) logo; art cache has \(self.artCache.count) entries")
+    }
+
+    // MARK: - Library-art cache (disk persistence)
+
+    private static func loadArtCache() -> [Int: ArtCacheEntry] {
+        guard let data = try? Data(contentsOf: artCacheURL),
+              let decoded = try? JSONDecoder().decode([String: ArtCacheEntry].self, from: data)
+        else { return [:] }
+        return Dictionary(uniqueKeysWithValues: decoded.compactMap { key, value in
+            Int(key).map { ($0, value) }
+        })
+    }
+
+    private func saveArtCache() {
+        let keyed = Dictionary(uniqueKeysWithValues: artCache.map { (String($0.key), $0.value) })
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(keyed) else { return }
+        try? FileManager.default.createDirectory(
+            at: Self.artCacheURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: Self.artCacheURL, options: .atomic)
+    }
+
+    /// Fills art hashes + logo placement on the in-memory games from the on-disk
+    /// cache. Only fills fields that are still nil, so a fresh API value always
+    /// wins. Applied at the top of every refresh so logos are positioned on the
+    /// first frame.
+    private func applyArtCache() {
+        guard !artCache.isEmpty else { return }
+        func fill(_ g: inout Game) {
+            guard let e = artCache[g.id] else { return }
+            if g.libraryCapsuleHash == nil { g.libraryCapsuleHash = e.capsuleHash }
+            if g.logoHash == nil          { g.logoHash = e.logoHash }
+            if g.heroHash == nil          { g.heroHash = e.heroHash }
+            if g.logoPinned == nil        { g.logoPinned = e.logoPinned }
+            if g.logoWidthPct == nil      { g.logoWidthPct = e.logoWidthPct }
+            if g.logoHeightPct == nil     { g.logoHeightPct = e.logoHeightPct }
+        }
+        for idx in games.indices       { fill(&games[idx]) }
+        for idx in recentGames.indices { fill(&recentGames[idx]) }
+    }
+
+    /// Merges currently-resolved art fields from the in-memory games into the
+    /// cache and writes it to disk (preserving the `appinfoResolved` flags).
+    private func persistArtCache() {
+        func capture(_ g: Game) {
+            var e = artCache[g.id] ?? ArtCacheEntry()
+            if let h = g.libraryCapsuleHash { e.capsuleHash = h }
+            if let h = g.logoHash           { e.logoHash = h }
+            if let h = g.heroHash           { e.heroHash = h }
+            if let p = g.logoPinned         { e.logoPinned = p }
+            if let w = g.logoWidthPct       { e.logoWidthPct = w }
+            if let h = g.logoHeightPct      { e.logoHeightPct = h }
+            artCache[g.id] = e
+        }
+        for g in games       { capture(g) }
+        for g in recentGames { capture(g) }
+        saveArtCache()
     }
 
     /// Applies a hash dictionary to both the main games array and recentGames.

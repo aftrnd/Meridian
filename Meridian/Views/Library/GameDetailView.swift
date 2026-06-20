@@ -370,8 +370,13 @@ struct GameDetailView: View {
     /// pipeline. Replaces the small banner seal icon.
     private var compatStatusCard: some View {
         let compatProfile = GameCompatibilityDB.shared.profile(for: currentGame.id)
+        let status = GameCompatibilityDB.shared.effectiveStatus(
+            for: currentGame.id,
+            resolved: resolvedStack?.status,
+            profile: compatProfile?.status
+        )
         return BannerCompatBadge(
-            status: resolvedStack?.status ?? compatProfile?.status ?? .untested,
+            status: status,
             profile: compatProfile,
             resolved: resolvedStack,
             style: .card
@@ -398,7 +403,118 @@ struct GameDetailView: View {
 
         // Steam Store link
         steamStoreLink
+
+        #if DEBUG
+        // Developer-only: record a compatibility verdict while testing. Compiled
+        // out of Release builds — end users never see this.
+        devVerdictCard
+        #endif
     }
+
+    #if DEBUG
+    /// Developer compatibility-verdict recorder. Tapping a button stores the
+    /// verdict (overlaying the compiled DB instantly) so we don't have to hand-
+    /// edit `GameCompatibilityDB` for every game we test. "Copy for commit"
+    /// yields ready-to-paste lines for folding into the curated source.
+    @ViewBuilder
+    private var devVerdictCard: some View {
+        let current = CompatVerdictStore.shared.verdict(for: currentGame.id)
+        let currentStatus = current.flatMap { CompatStatus(rawValue: $0.status) }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "hammer.fill")
+                Text("Developer · Compatibility Verdict")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if current != nil {
+                    Button("Clear") { CompatVerdictStore.shared.clearVerdict(for: currentGame.id) }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            HStack(spacing: 6) {
+                verdictButton("Runs Great",  .verified, "checkmark.seal.fill",        .green,  currentStatus)
+                verdictButton("Some Issues", .playable, "exclamationmark.triangle.fill", .yellow, currentStatus)
+                verdictButton("Doesn't Run", .broken,   "xmark.seal.fill",            .red,    currentStatus)
+                verdictButton("Untested",    .untested, "questionmark.circle.fill",   .gray,   currentStatus)
+            }
+
+            if let current {
+                Text("Saved \(current.date.formatted(date: .abbreviated, time: .shortened)) · \(current.engineTag)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            HStack(spacing: 14) {
+                Button("Copy for commit") { copyVerdictsForCommit() }
+                Button("Reveal JSON") {
+                    NSWorkspace.shared.activateFileViewerSelecting([CompatVerdictStore.fileURL])
+                }
+            }
+            .font(.caption)
+            .buttonStyle(.link)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.yellow.opacity(0.3), lineWidth: 0.5))
+    }
+
+    private func verdictButton(
+        _ label: String,
+        _ status: CompatStatus,
+        _ icon: String,
+        _ color: Color,
+        _ current: CompatStatus?
+    ) -> some View {
+        let selected = current == status
+        return Button {
+            let tag = engine.engineVersion ?? WineEngine.installedEngineTagOnDisk() ?? "unknown"
+            CompatVerdictStore.shared.setVerdict(status, engineTag: tag, for: currentGame.id)
+        } label: {
+            VStack(spacing: 4) {
+                // Fixed icon height normalizes glyph differences (triangle vs
+                // seal vs question-mark) so all four rows are exactly equal height.
+                Image(systemName: icon)
+                    .font(.callout)
+                    .frame(height: 18)
+                Text(label)
+                    .font(.caption2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .frame(maxWidth: .infinity, minHeight: 30)
+            .padding(.vertical, 8)
+            .background(
+                selected ? color.opacity(0.22) : Color.gray.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(selected ? color : .clear, lineWidth: 1)
+            )
+            .foregroundStyle(selected ? color : .secondary)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        // Flex at the Button level so all four share the row equally — a plain
+        // button otherwise sizes to its label and the last item absorbs the slack.
+        .frame(maxWidth: .infinity)
+    }
+
+    private func copyVerdictsForCommit() {
+        let text = CompatVerdictStore.shared.exportSwiftSnippets { appID in
+            library.games.first { $0.id == appID }?.name
+                ?? GameCompatibilityDB.shared.profile(for: appID)?.name
+                ?? "App \(appID)"
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+    #endif
 
     private var playtimeCard: some View {
         VStack(spacing: 0) {
@@ -1331,9 +1447,9 @@ private struct BannerCompatBadge: View {
     private var icon: String {
         switch status {
         case .verified, .playable: return "checkmark.seal.fill"
-        case .launches:            return "seal.fill"
+        case .launches:            return "exclamationmark.triangle.fill"
         case .broken:              return "xmark.seal.fill"
-        case .untested:            return "xmark.seal.fill"
+        case .untested:            return "questionmark.circle.fill"
         }
     }
 
@@ -1349,25 +1465,25 @@ private struct BannerCompatBadge: View {
     private var statusTitle: String {
         switch status {
         case .verified: return "Meridian Verified"
-        case .playable:  return "Playable"
-        case .launches:  return "Launches with Issues"
-        case .broken:    return "Not Compatible"
-        case .untested:  return "Not Yet Tested"
+        case .playable: return "Works Well"
+        case .launches: return "Runs with Issues"
+        case .broken:   return "Not Compatible"
+        case .untested: return "Not Yet Tested"
         }
     }
 
     private var statusDetail: String {
         switch status {
         case .verified:
-            return "This game has been tested and runs well on your Mac with Meridian."
+            return "This game is verified with Meridian and optimized for your Mac."
         case .playable:
-            return "This game runs with minor issues. Expect a generally good experience."
+            return "This game is verified with Meridian, but has some known issues."
         case .launches:
-            return "This game starts but may have significant issues during play."
+            return "This game runs, but has significant known issues during play."
         case .broken:
-            return "This game currently does not work with Meridian."
+            return "This game isn’t compatible with Meridian."
         case .untested:
-            return "This game has not yet been tested with Meridian. It may or may not work."
+            return "This game hasn’t been tested with Meridian yet."
         }
     }
 
@@ -1383,9 +1499,10 @@ private struct BannerCompatBadge: View {
     /// One-line reassurance shown under the status title in the card style.
     private var cardSubtitle: String {
         switch status {
-        case .verified, .playable:
+        case .verified:
             return showAppleSiliconBadge ? "Optimized for Apple Silicon" : "Runs well on your Mac"
-        case .launches: return "Playable, with some known issues"
+        case .playable: return "Verified, with a few known issues"
+        case .launches: return "Runs, with some known issues"
         case .broken:   return "Not currently compatible"
         case .untested: return "Not yet tested — give it a try"
         }
@@ -1641,9 +1758,9 @@ private struct CompatBadge: View {
     private var label: String {
         switch status {
         case .verified: return "Verified"
-        case .playable:  return "Playable"
-        case .launches:  return "Launches"
-        case .broken:    return "Broken"
+        case .playable:  return "Works Well"
+        case .launches:  return "Issues"
+        case .broken:    return "Not Compatible"
         case .untested:  return "Untested"
         }
     }
