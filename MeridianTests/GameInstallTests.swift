@@ -34,6 +34,7 @@ import Foundation
 ///   • sourceFactory(...)           ← GameProfile.source(...) factory defaults
 ///   • customFactory(...)           ← GameProfile.custom(...) factory defaults
 ///   • dxmtDisabledOverride(...)    ← SteamSession.gameEnvironment dxmtMode .disabled logic
+///   • resolveRenderer(env:)        ← GameStackReport.resolve renderer inference
 /// ─────────────────────────────────────────────────────────────────────────────
 final class GameInstallTests: XCTestCase {
 
@@ -866,16 +867,15 @@ final class GameInstallTests: XCTestCase {
 
     // MARK: - Rewrite architecture guards
 
-    /// SteamSession.installGame must drive installs via Steam IPC, not SteamCMD.
-    ///
-    /// CLI-verified May 19 2026: Meridian's native bootstrap (`SteamClientBootstrap`)
-    /// only stages `steam.exe`, never `steamcmd.exe`. Any SteamCMD-based path fails
-    /// with "steamcmd.exe not found" on every install attempt. The working path is
-    /// `wine64 steam.exe steam://install/<appID>` — the new process detects the
-    /// running Steam's IPC named pipe and forwards the URL, then exits in <1s.
-    /// Steam dispatches the URL to its internal download manager which reads the
-    /// pre-seeded ACF manifest and starts downloading.
-    func testSteamSession_installUsesSteamIPC() throws {
+    /// SteamSession.installGame must drive installs silently via the
+    /// pre-seeded-ACF + Steam-restart pattern. `steam://install` URL
+    /// dispatch always shows Steam's install-location picker dialog —
+    /// CLI-confirmed user report May 20 2026 ("I get the full steam UI
+    /// with the standard steam install window to chose where to
+    /// download"). Pre-seeded ACF + Steam restart triggers Steam's
+    /// login-post-callback library scan which silently begins the
+    /// download with no picker dialog.
+    func testSteamSession_installIsSilent() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -884,19 +884,27 @@ final class GameInstallTests: XCTestCase {
             encoding: .utf8
         )
 
-        // Must send the steam://install URL via IPC.
-        XCTAssertTrue(src.contains("steam://install/\\(appID)"),
-                      "installGame must dispatch steam://install/<appID> to the running Steam via IPC")
-        XCTAssertTrue(src.contains("sendSteamCommand("),
-                      "installGame must call sendSteamCommand to forward the IPC URL")
-
-        // Must pre-seed the ACF manifest before sending IPC.
+        // Must pre-seed the ACF — the install location goes here, not
+        // into a Steam-rendered picker.
         XCTAssertTrue(src.contains("writePreseededAppManifest("),
-                      "installGame must pre-seed the ACF manifest so Steam has the install location")
+                      "installGame must pre-seed the ACF manifest with installdir/name/StateFlags=1026 so Steam doesn't need to ask the user where to install")
 
-        // Must NOT contain executable code that runs SteamCMD. (Documentation
-        // comments may mention `steamcmd.exe` to explain WHY it's not used —
-        // we check for the specific syntactic forms an implementation would use.)
+        // Must cycle Steam so its startup library scan picks up the
+        // pre-seeded ACF and begins the silent download.
+        XCTAssertTrue(src.contains("await shutdown(engine:") || src.contains("await shutdown(engine: engine)"),
+                      "installGame must call shutdown(engine:) so Steam tears down before we re-start it with the pre-seeded ACF visible")
+        XCTAssertTrue(src.contains("await start(engine:") || src.contains("await start(engine: engine)"),
+                      "installGame must call start(engine:) after writing the ACF so Steam re-runs its login-post-callback library scan and begins the download silently")
+
+        // Must NOT dispatch `steam://install/<id>` — that URL is the
+        // bug being fixed; it triggers Valve's install picker dialog.
+        // Documentation comments may mention the URL to explain why we
+        // don't use it, but no source-code dispatch.
+        let installDispatch = "sendSteamCommand([\"steam://install/"
+        XCTAssertFalse(src.contains(installDispatch),
+                       "installGame MUST NOT dispatch steam://install/<id> — that URL ALWAYS opens Valve's install-location picker dialog. CLI-confirmed user report May 20 2026.")
+
+        // Must NOT contain executable code that runs SteamCMD.
         let forbidden = [
             "\"/usr/bin/script\"",       // PTY wrapper used to line-buffer SteamCMD stdout
             "\"-overrideminos\"",        // SteamCMD-specific flag
@@ -904,12 +912,75 @@ final class GameInstallTests: XCTestCase {
             "\"+login\"",                // SteamCMD-style +command syntax
             "\"+app_update\"",
             "\"+quit\"",
-            ".appending(path: \"steamcmd.exe\")",  // path resolution to the binary
+            ".appending(path: \"steamcmd.exe\")",
         ]
         for token in forbidden {
             XCTAssertFalse(src.contains(token),
-                           "SteamSession MUST NOT contain `\(token)` — SteamCMD code path was deleted May 19 2026 (Meridian's native bootstrap doesn't ship steamcmd.exe; installs use Steam IPC instead).")
+                           "SteamSession MUST NOT contain `\(token)` — SteamCMD code path was deleted May 19 2026.")
         }
+    }
+
+    /// Phase 4 (HANDOFF-2026-06-19): DRM-game launches use the Steamworks API
+    /// shim (gbe_fork emulator replacing the game's Valve steam_api(64).dll)
+    /// and then launch directly via wine64 — NO steam.exe, no `-applaunch`, no
+    /// silent-auth wall. This replaces the steam.exe IPC path, which was
+    /// blocked by steam.exe's unreliable silent auto-login (it loads local.vdf
+    /// but never authenticates — the "Who's playing" wall). SteamSession's
+    /// `launchGameViaSteam` is retained as a documented SteamStub fallback.
+    func testLauncher_drmGamesUseSteamworksShim() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let launcher = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+        // Phase 4: DRM games are satisfied in-process by the gbe_fork
+        // Steamworks API shim, then launched directly via wine64 — NOT via
+        // steam.exe -applaunch.
+        XCTAssertTrue(launcher.contains("installSteamEmulator"),
+                      "Launcher must install the Steamworks API shim for DRM games")
+        XCTAssertTrue(launcher.contains("gameRequiresSteamAPI"),
+                      "Launcher must branch on prefix.gameRequiresSteamAPI to decide whether to shim")
+        XCTAssertFalse(launcher.contains("launchViaSteam"),
+                      "Launcher must no longer use the steam.exe -applaunch path (replaced by the shim)")
+
+        // SteamSession retains launchGameViaSteam as the documented SteamStub
+        // fallback (not used on the default path).
+        let session = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(session.contains("launchGameViaSteam"),
+                      "SteamSession must retain launchGameViaSteam(appID:engine:) as the SteamStub fallback")
+    }
+
+    /// Launcher.uninstallGame must resolve the ACF via `prefix.acfURL(for:)`
+    /// which searches `<library>/steamapps/appmanifest_<id>.acf` — NOT
+    /// `<library>/appmanifest_<id>.acf` directly. CLI-confirmed user
+    /// report May 20 2026: every uninstall attempt logged
+    /// `ACF not found — nothing to remove` because the old code missed
+    /// the `steamapps/` path component, leaving the user unable to
+    /// uninstall games via Meridian even when the ACF was right there.
+    func testLauncher_uninstallResolvesACFCorrectly() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+
+        // Must use prefix.acfURL — the helper that already knows the
+        // `steamapps/` subdirectory layout.
+        XCTAssertTrue(src.contains("prefix.acfURL(for: game.id)"),
+                      "Launcher.uninstallGame must use prefix.acfURL(for:) to find the ACF — manual <library>/appmanifest_<id>.acf path is missing the steamapps/ component and never matches")
+
+        // Must NOT do the old broken manual concatenation. That pattern
+        // was the bug.
+        XCTAssertFalse(src.contains("lib + \"/appmanifest_"),
+                       "Launcher.uninstallGame MUST NOT manually concatenate `<library>/appmanifest_<id>.acf` — the steamapps/ subdir is missing from that path; use prefix.acfURL instead")
     }
 
     /// Launcher.cancelLaunch must call session.cancelInstall() so the UI returns to idle.
@@ -936,5 +1007,299 @@ final class GameInstallTests: XCTestCase {
         )
         XCTAssertTrue(src.contains("guard isReady else"),
                       "SteamSession.installGame must guard on isReady — no implicit Steam restart")
+    }
+
+    // MARK: - Launch state machine guards (May 19 2026 fix)
+
+    /// Launcher.executePipeline must pass `gamePattern` (the game's installdir)
+    /// to GameProcess.startMonitoring. Without it, the monitor falls back to
+    /// PID-set baseline detection which can't see the game's process when
+    /// wineserver hands it off, leaving the user stuck at "Launching…" until
+    /// the 120 s timeout fires. CLI-observed May 19 2026.
+    func testLauncher_passesGamePatternToMonitor() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(src.contains("prefix.gameInstallDir(appID:"),
+                      "Launcher.executePipeline must read gameInstallDir to use as gamePattern")
+        XCTAssertTrue(src.contains("gamePattern: gamePattern"),
+                      "Launcher.executePipeline must pass the resolved gamePattern through to startMonitoring")
+    }
+
+    /// `launchState = .running(appID:)` must NOT be set immediately after
+    /// `launchDirect`. It must wait for `gameProcess.monitorPhase == .running`
+    /// (i.e. Phase 1 startup confirmation). Otherwise the UI claims "Game
+    /// running" while the wine64 process has already crashed silently — the
+    /// "claims running but nothing launches" symptom user reported May 19 2026.
+    func testLauncher_doesNotFlipRunningOptimistically() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+
+        // The state must be set inside a switch on `gameProcess.monitorPhase`,
+        // not on the line immediately after `launchDirect` returns. We require
+        // the new state machine pattern (switch over MonitorPhase) is present.
+        XCTAssertTrue(src.contains("switch gameProcess.monitorPhase"),
+                      "Launcher must select launchState by switching on gameProcess.monitorPhase, not flipping to .running optimistically")
+        XCTAssertTrue(src.contains("while gameProcess.monitorPhase == .startup"),
+                      "Launcher must wait for the startup phase to complete before deciding running vs failed")
+        XCTAssertTrue(src.contains("case .timedOut:"),
+                      "Launcher must surface monitor .timedOut as a user-visible failure, not a silent hang")
+        XCTAssertTrue(src.contains("case .failed("),
+                      "Launcher must surface monitor .failed as a user-visible failure")
+    }
+
+    /// SteamSession.configureSteamRegistry must write `NotifyAvailableGames=0`
+    /// alongside the StartMinimized + WebProcessCmdLine keys. Without it,
+    /// Steam fires its post-login "X is installed" toast burst into macOS
+    /// Notification Center for every ACF manifest in the prefix — toasts the
+    /// user can't dismiss because Steam's UI is suppressed. User-reported
+    /// May 19 2026.
+    func testSteamSession_configuresNotifyAvailableGamesOff() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(src.contains("\"NotifyAvailableGames\""),
+                      "SteamSession.configureSteamRegistry must write HKCU\\Software\\Valve\\Steam\\NotifyAvailableGames=0 to silence the post-login installed-games toast burst")
+        XCTAssertTrue(src.contains("\"DesktopNotifications\""),
+                      "SteamSession.configureSteamRegistry must write HKCU\\Software\\Valve\\Steam\\DesktopNotifications=0 (native-UI toast suppression)")
+    }
+
+    /// Per-game logs (logs/games/<appID>.log) must be created on every
+    /// game launch. Without this, the only way to diagnose a launch
+    /// failure is to read meridian.log which interleaves output from all
+    /// subsystems and truncates after 200 lines per game session. The
+    /// per-game file uses kernel-level FileHandle for stdout/stderr,
+    /// avoiding the availableData blocking pattern (engine-research-
+    /// findings.mdc Pattern 1).
+    func testLauncher_writesPerGameLog() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let launcher = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(launcher.contains("GameLogFile.beginSession"),
+                      "Launcher.launchDirect must call GameLogFile.beginSession to open the per-game log before launching")
+        XCTAssertTrue(launcher.contains("GameLogFile.endSession") || launcher.contains("closeActiveGameLog"),
+                      "Launcher must close the per-game log on every exit path so the file has a useful trailer")
+        XCTAssertTrue(launcher.contains("process.standardOutput = logHandle"),
+                      "Launcher.launchDirect must wire the game process's stdout to the per-game FileHandle (not a Pipe — Pipes block when wineserver inherits the write end)")
+        XCTAssertTrue(launcher.contains("process.standardError = logHandle"),
+                      "Launcher.launchDirect must wire the game process's stderr to the per-game FileHandle for the same reason")
+
+        // The utility itself must exist.
+        let gameLogFile = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Utilities/GameLogFile.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(gameLogFile.contains("static func beginSession"),
+                      "GameLogFile.beginSession(appID:gameName:executable:launchArgs:environment:) must exist")
+        XCTAssertTrue(gameLogFile.contains("static func endSession"),
+                      "GameLogFile.endSession(handle:appID:reason:exitCode:) must exist")
+        XCTAssertTrue(gameLogFile.contains("currentURL") && gameLogFile.contains("previousURL"),
+                      "GameLogFile must rotate one generation: <appID>.log → <appID>-previous.log on every new launch")
+    }
+
+    /// Install progress now comes from the DepotDownloader fork's `-json`
+    /// NDJSON stream (authoritative `bytesDone`/`bytesTotal` known up front),
+    /// NOT from polling ACF `BytesDownloaded` (Valve buffers it in memory) or
+    /// on-disk byte counts (that was the steam.exe-install workaround, now
+    /// removed along with `pollDownloadProgress`). The UI byte/rate properties
+    /// are still populated — driven by the DepotDownloader progress callbacks.
+    func testLauncher_surfacesLiveDownloadProgress() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(src.contains("DepotDownloaderInstall.run"),
+                      "install progress must be driven by the DepotDownloader -json stream")
+        XCTAssertTrue(src.contains("onProgress:"),
+                      "Launcher must consume DepotDownloader's onProgress callback")
+        XCTAssertTrue(src.contains("downloadRateBps"),
+                      "Launcher must expose download rate (bytes/s) for the UI to render MB/s")
+        XCTAssertTrue(src.contains("downloadBytesDone") && src.contains("downloadBytesTotal"),
+                      "Launcher must expose raw byte counts so the UI can render '123 MB / 456 MB' style progress")
+        // The ACF/on-disk polling workaround is gone (DepotDownloader reports
+        // authoritative totals directly).
+        XCTAssertFalse(src.contains("pollDownloadProgress"),
+                       "pollDownloadProgress (ACF/on-disk polling) is removed — DepotDownloader reports progress directly")
+    }
+
+    /// `WinePrefix.writeUserNotificationPreferences` must be called from BOTH
+    /// the sign-in callback (fresh sign-in) AND the lazy DRM Steam bring-up
+    /// (returning users with persisted credentials). The function writes the
+    /// per-user `localconfig.vdf` keys that suppress webhelper-side toasts; the
+    /// registry keys only cover native-UI toasts. Both layers are needed
+    /// because Steam routes different toasts through different paths.
+    ///
+    /// Phase 3: the returning-user pre-write moved from BootstrapManager (cold
+    /// start) to SteamSession.ensureReadyForDRM — Steam is no longer started on
+    /// boot, so the pre-write happens just before the lazy `steam.exe -silent`.
+    func testNotificationPrefs_calledAfterSignIn() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let authView = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Views/Auth/AuthView.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(authView.contains("writeUserNotificationPreferences"),
+                      "SetupSheet.beginSignIn must call writeUserNotificationPreferences after a successful sign-in to silence the post-login toast burst")
+
+        let session = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(session.contains("writeUserNotificationPreferences"),
+                      "SteamSession.ensureReadyForDRM must call writeUserNotificationPreferences before the lazy steam.exe -silent so returning users' post-login toast burst is silenced")
+    }
+
+    // MARK: - GameStackReport renderer inference
+
+    /// Mirror of `GameStackReport.parseOverrides` — WINEDLLOVERRIDES → mode map.
+    private func parseOverridesMirror(_ s: String) -> [String: String] {
+        var map: [String: String] = [:]
+        for entry in s.split(separator: ";", omittingEmptySubsequences: true) {
+            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let mode = parts[1]
+            for dll in parts[0].split(separator: ",") { map[String(dll)] = mode }
+        }
+        return map
+    }
+
+    /// Mirror of `GameStackReport.resolve` renderer inference. Returns the
+    /// `Renderer.rawValue` Wine will actually use for a given resolved env.
+    /// WHENEVER the production inference changes, update this mirror.
+    private func resolveRenderer(env: [String: String]) -> String {
+        let dllPath = env["WINEDLLPATH"] ?? ""
+        let overrides = parseOverridesMirror(env["WINEDLLOVERRIDES"] ?? "")
+        if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
+            return "gptk"
+        } else if dllPath.contains("/dxvk") {
+            return "dxvk"
+        } else if dllPath.contains("/dxmt"), let m = overrides["d3d11"], m.hasPrefix("n") {
+            return "dxmt"
+        } else if overrides["d3d11"] == "b" {
+            return "wined3d"
+        } else {
+            return "unknown"
+        }
+    }
+
+    func testStackReport_inferDXMTForDefaultDX11Env() {
+        // The default DX11 game env from WineEngine.environment(for:).
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/dxmt:/engine/wine/lib/wine",
+            "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b;d3d10core=n,b",
+        ]
+        XCTAssertEqual(resolveRenderer(env: env), "dxmt")
+    }
+
+    func testStackReport_inferGPTKForDX12Env() {
+        // The DX12 game env from SteamSession.gameEnvironment (profile.graphicsAPI == .dx12).
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/gptk/wine:/engine/wine/lib/wine",
+            "WINEDLLOVERRIDES": "d3d11=n,b;d3d10core=n,b;d3d12,dxgi=b",
+        ]
+        XCTAssertEqual(resolveRenderer(env: env), "gptk")
+    }
+
+    func testStackReport_inferDXVKWhenOnPath() {
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/dxvk:/engine/wine/lib/wine",
+            "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b",
+        ]
+        XCTAssertEqual(resolveRenderer(env: env), "dxvk")
+    }
+
+    func testStackReport_inferWined3dWhenDXMTDisabled() {
+        // A game with dxmtMode == .disabled: d3d11 forced to builtin.
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/dxmt:/engine/wine/lib/wine",
+            "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b;d3d10core=n,b;d3d11,dxgi=b",
+        ]
+        // Last entry wins per Wine: d3d11=b → wined3d.
+        XCTAssertEqual(resolveRenderer(env: env), "wined3d")
+    }
+
+    func testStackReport_inferUnknownWhenNoD3DOverride() {
+        let env = ["WINEDLLPATH": "/engine/wine/lib/wine"]
+        XCTAssertEqual(resolveRenderer(env: env), "unknown")
+    }
+
+    /// Wiring guard: GameStackReport, engine-log collection, and the enriched
+    /// per-game header must all be present and wired into the launch pipeline.
+    /// This is the "see what each game is running + diagnose crashes" feature
+    /// (HANDOFF-2026-06-19 follow-up). Without these the only diagnostic is
+    /// meridian.log, which interleaves every subsystem.
+    func testStackReportAndEngineLog_wiredIntoLaunchPipeline() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let gameLog = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Utilities/GameLogFile.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(gameLog.contains("struct GameStackReport"),
+                      "GameStackReport must exist to summarise the resolved graphics stack")
+        XCTAssertTrue(gameLog.contains("static func resolve"),
+                      "GameStackReport.resolve must derive the stack from the resolved env")
+        XCTAssertTrue(gameLog.contains("var summaryLine") && gameLog.contains("var detailBlock"),
+                      "GameStackReport must expose summaryLine (meridian.log) + detailBlock (per-game header)")
+        XCTAssertTrue(gameLog.contains("case dxmt") && gameLog.contains("case gptk")
+                      && gameLog.contains("case dxvk") && gameLog.contains("case wined3d"),
+                      "GameStackReport.Renderer must enumerate every renderer Meridian can route to")
+        XCTAssertTrue(gameLog.contains("static func collectEngineLogs"),
+                      "GameLogFile.collectEngineLogs must copy the game's own Unity/Unreal log for diagnosis")
+        XCTAssertTrue(gameLog.contains("static func engineLogURL"),
+                      "GameLogFile.engineLogURL must expose the <appID>-engine.log path for the UI to open")
+        XCTAssertTrue(gameLog.contains("stackReport: GameStackReport?"),
+                      "GameLogFile.beginSession must accept the stack report so it lands in the per-game header")
+
+        let launcher = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(launcher.contains("GameStackReport.resolve"),
+                      "Launcher.launchDirect must resolve the stack report before launching")
+        XCTAssertTrue(launcher.contains("stackReport.summaryLine"),
+                      "Launcher must log the stack summary to meridian.log at launch")
+        XCTAssertTrue(launcher.contains("stackReport: stackReport"),
+                      "Launcher must pass the stack report into GameLogFile.beginSession")
+        XCTAssertTrue(launcher.contains("GameLogFile.collectEngineLogs"),
+                      "Launcher.closeActiveGameLog must collect the engine log on every exit path")
+        XCTAssertTrue(launcher.contains("activeLaunchStartedAt"),
+                      "Launcher must record the launch instant so only this session's engine log is collected")
+
+        let detail = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Views/Library/GameDetailView.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(detail.contains("GameLogFile.engineLogURL") && detail.contains("Open Engine Log"),
+                      "GameDetailView must offer an 'Open Engine Log' action so users can read the game's own log")
+        XCTAssertTrue(detail.contains("GameLogFile.currentURL") && detail.contains("Open Game Log"),
+                      "GameDetailView must offer an 'Open Game Log' action so users can read the raw Wine output + resolved stack")
     }
 }

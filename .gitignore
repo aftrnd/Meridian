@@ -31,3 +31,9 @@ build/
 Scripts/cx-engine-research.md
 Scripts/test-steamcmd-login.sh
 .cursor/debug-*.log
+
+# Internal / AI session docs — development handoffs and working-state notes,
+# not part of the public source distribution.
+Scripts/HANDOFF-*.md
+Scripts/verified-architecture.md
+/docs/

@@ -53,19 +53,19 @@ struct SetupSheet: View {
         }
         .animation(.easeInOut(duration: 0.25), value: step)
         .onAppear {
-            if steamAuth.isAuthenticated && !session.isReady {
-                step = .steamLogin
-            } else if steamAuth.isAuthenticated && session.isReady {
+            // Onboarding gates on IDENTITY only, never on steam.exe readiness.
+            // Steam is lazy + DRM-only (Phase 3, HANDOFF-2026-06-19) and is not
+            // started on boot, so `session.isReady` is normally false for an
+            // already-authenticated returning user. Gating on it would wrongly
+            // push such a user back to the Steam login step when the sheet
+            // re-appears (e.g. to enter a Web API key). A user with a persisted
+            // OAuth identity is past sign-in — send them straight to the API
+            // key step or completion.
+            if steamAuth.isAuthenticated {
                 step = steamAuth.needsAPIKey ? .apiKey : .complete
             } else {
                 step = .welcome
             }
-        }
-        .onChange(of: session.isReady) { _, ready in
-            guard ready, step == .steamLogin else { return }
-            let needs = steamAuth.needsAPIKey
-            setupLog.info("[onboarding] session.isReady→true | needsAPIKey=\(needs)")
-            step = needs ? .apiKey : .complete
         }
     }
 
@@ -377,6 +377,24 @@ private struct SteamLoginStepContent: View {
                     isSigningIn = false
                 }
                 return
+            }
+
+            // 3b. Pre-write per-user webhelper notification toggles BEFORE
+            //     Steam starts. Steam reads `userdata/<accountID>/config/
+            //     localconfig.vdf` at post-login hydration and merges its
+            //     in-memory state with the file on disk. Writing the
+            //     suppression keys ahead of `steam.exe -silent` means the
+            //     "X is installed" / "Download complete" toast burst that
+            //     Steam fires immediately after a fresh sign-in is silenced
+            //     before the first toast can render. Pairs with the
+            //     `NotifyAvailableGames=0` HKCU registry key written by
+            //     `SteamSession.configureSteamRegistry` for the native-UI
+            //     side. Both layers are needed.
+            do {
+                try WinePrefix.defaultPrefix.writeUserNotificationPreferences(steamID64: steamID)
+                setupLog.info("[signIn] notification preferences pre-written ✓")
+            } catch {
+                setupLog.warning("[signIn] could not pre-write notification prefs: \(error.localizedDescription)")
             }
 
             // 4. Snapshot the freshly-written local.vdf to AppSupport backup

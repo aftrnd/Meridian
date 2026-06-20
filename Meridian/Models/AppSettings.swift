@@ -229,6 +229,21 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "staleSteamServiceCleanupVersion") }
     }
 
+    /// Tracks the 32-bit (WoW64) COM class registration applied to the current
+    /// prefix. Wine's prefix template ships with the 64-bit `HKLM\Software\
+    /// Classes\CLSID` hive fully populated (1935 classes) but the 32-bit
+    /// `Software\Classes\Wow6432Node\CLSID` view EMPTY — the release-engine
+    /// `wineboot --init` was killed before its 32-bit wine.inf registration
+    /// pass ran (Pattern 7). 32-bit games (Half-Life 2, any Source/DX9 title)
+    /// then get `REGDB_E_CLASSNOTREG` from `CoCreateInstance` — most visibly
+    /// for `MMDeviceEnumerator` (no audio device → NO SOUND), plus
+    /// `DirectInput8` and the WBEM locator. Increment
+    /// `WinePrefix.wow64ComRegistrationVersion` to force a re-write.
+    var wow64ComRegistrationAppliedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "wow64ComRegistrationAppliedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "wow64ComRegistrationAppliedVersion") }
+    }
+
     // MARK: - Favorites
 
     var favoriteAppIDs: Set<Int> {

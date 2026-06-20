@@ -8,10 +8,17 @@ private let log = MeridianLog(category: "Launcher")
 
 /// Orchestrates game installs and launches. Does NOT own steam.exe.
 ///
-/// All game installs go through SteamSession.installGame (SteamCMD-based).
-/// All game launches go through wine64 direct execution.
-/// For DRM games, SteamSession must be .running (steam.exe already authenticated)
-/// before the game is launched — no implicit Steam restarts here.
+/// - Installs run headlessly via the DepotDownloader fork (`installHeadless`)
+///   using the persisted OAuth refresh_token — no steam.exe involvement.
+/// - ALL launches (DRM and DRM-free) go through wine64 direct execution
+///   (`launchDirect`) — no steam.exe, no Steam IPC.
+/// - DRM games (those shipping `steam_api64.dll`) get a Steamworks API shim
+///   first (Phase 4, HANDOFF-2026-06-19): `prefix.installSteamEmulator`
+///   replaces the game's Valve steam_api(64).dll with the open-source gbe_fork
+///   emulator, so `SteamAPI_Init()` succeeds locally using the user's steamID +
+///   the appID — no steam.exe, no auth, no "Who's playing" window. The
+///   steam.exe `-applaunch` path (`SteamSession.launchGameViaSteam`) is kept
+///   only as a documented fallback for SteamStub exe-encrypted titles.
 @Observable
 @MainActor
 final class Launcher {
@@ -45,6 +52,9 @@ final class Launcher {
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
     private(set) var downloadProgress: Double?
+    private(set) var downloadBytesDone: Int64 = 0
+    private(set) var downloadBytesTotal: Int64 = 0
+    private(set) var downloadRateBps: Double = 0
     private(set) var logs: [String] = []
     private(set) var activeAppID: Int?
     private(set) var processesConfirmed: Bool = false
@@ -53,6 +63,21 @@ final class Launcher {
     private let gameProcess = GameProcess()
     private let prefix = WinePrefix.defaultPrefix
     private var launchTask: Task<Void, Never>?
+
+    /// Per-game stderr file handle, opened in `launchDirect` and closed
+    /// in the pipeline's exit path. Held across the running phase so the
+    /// kernel can keep writing every byte the game emits straight to disk
+    /// without Meridian-side draining (avoids the
+    /// `availableData` blocking issue described in
+    /// `engine-research-findings.mdc` Pattern 1).
+    private var activeGameLogHandle: FileHandle?
+
+    /// The game's `steamapps/common/<dir>` directory for the active session,
+    /// and the instant its process started. Used by `closeActiveGameLog` to
+    /// collect the game's own engine log (Unity `Player.log` / Unreal
+    /// `Saved/Logs`) for THIS session into `<appID>-engine.log`.
+    private var activeGameInstallDir: URL?
+    private var activeLaunchStartedAt: Date?
 
     var steamWindow: SteamWindow?
 
@@ -93,9 +118,13 @@ final class Launcher {
     func cancelLaunch() {
         launchTask?.cancel()
         activeSession?.cancelInstall()
+        closeActiveGameLog(reason: "user cancelled launch", exitCode: nil)
         launchState = .idle
         currentActivity = nil
         downloadProgress = nil
+        downloadBytesDone = 0
+        downloadBytesTotal = 0
+        downloadRateBps = 0
         activeAppID = nil
     }
 
@@ -109,6 +138,7 @@ final class Launcher {
         Task { [weak self] in
             guard let self else { return }
             await gameProcess.stopGame(engine: engine, prefix: prefix)
+            closeActiveGameLog(reason: "user requested stop", exitCode: nil)
             launchState = .idle
             currentActivity = nil
         }
@@ -159,65 +189,27 @@ final class Launcher {
         runningSince = nil
         processesConfirmed = false
 
-        let steamID = steamAuth?.steamID ?? ""
+        let steamID = steamAuth?.steamID ?? AppSettings.shared.steamCredentialSteamID
 
-        // Install if needed.
+        // Install if needed — headless via the DepotDownloader fork (no steam.exe).
         if !prefix.isGameFullyInstalled(appID: game.id) {
-            guard session.isReady else {
-                fail("Steam is not ready. Please sign in before installing games.")
-                return
-            }
-            guard !steamID.isEmpty else {
-                fail("Not signed in to Steam.")
-                return
-            }
-
-            let alreadyPartial = prefix.isGameInstalled(appID: game.id)
-            launchState = .installing(appID: game.id)
-            currentActivity = alreadyPartial
-                ? "Resuming download for \(game.name)…"
-                : "Preparing download for \(game.name)…"
-            appendLog("Starting install for \(game.name)")
-
             do {
-                try await session.installGame(
-                    appID: game.id,
-                    name: game.name,
-                    installDir: game.name,
-                    steamID64: steamID,
-                    engine: engine,
-                    onStatus: { [weak self] msg in
-                        self?.currentActivity = msg
-                        self?.appendLog(msg)
-                    }
-                )
+                try await installHeadless(game: game, engine: engine, steamID: steamID)
             } catch is CancellationError {
                 log.info("[pipeline] install cancelled")
                 launchState = .idle
                 currentActivity = nil
+                downloadProgress = nil
                 return
             } catch {
-                fail("Could not start install: \(error.localizedDescription)", error: error)
-                return
-            }
-
-            // Poll ACF for download progress.
-            launchState = .downloading(appID: game.id)
-            do {
-                try await pollDownloadProgress(game: game, library: library)
-            } catch {
-                if error is CancellationError {
-                    log.info("[pipeline] download polling cancelled")
-                } else {
-                    log.warning("[pipeline] download polling ended: \(error.localizedDescription)")
-                }
-                launchState = .idle
-                currentActivity = nil
+                fail("Could not install \(game.name): \(error.localizedDescription)", error: error)
                 return
             }
 
             AppSettings.shared.markInstalled(appID: game.id)
-            if let lib = library { await lib.refresh(steamID: steamID, apiKey: steamAuth?.apiKey ?? "") }
+            if let lib = library {
+                await lib.refresh(steamID: steamID, apiKey: steamAuth?.apiKey ?? "")
+            }
         }
 
         guard launchAfterInstall else {
@@ -226,59 +218,146 @@ final class Launcher {
             return
         }
 
-        // Launch.
-        guard session.isReady else {
-            fail("Steam is not ready. Please sign in before launching games.")
-            return
+        // DRM games (those shipping `steam_api64.dll`) call SteamAPI_Init(),
+        // which normally needs a running, logged-in steam.exe. Phase 4
+        // (HANDOFF-2026-06-19) replaces that with a Steamworks API shim:
+        // `installSteamEmulator` swaps the game's Valve steam_api(64).dll for
+        // the open-source gbe_fork emulator, so SteamAPI_Init() succeeds
+        // locally using the user's steamID + the appID — NO steam.exe, no
+        // auth, no "Who's playing" window. Ownership is already proven (the
+        // game was downloaded by DepotDownloader with the user's OAuth token).
+        // DRM-free games skip this entirely.
+        let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)
+        if needsDRM {
+            launchState = .launching(appID: game.id)
+            currentActivity = "Preparing \(game.name)…"
+            appendLog("Installing Steamworks compatibility shim for \(game.name)")
+            do {
+                try await prefix.installSteamEmulator(
+                    appID: game.id,
+                    steamID: steamID,
+                    accountName: AppSettings.shared.steamCredentialAccountName,
+                    engine: engine
+                )
+            } catch is CancellationError {
+                launchState = .idle
+                currentActivity = nil
+                return
+            } catch {
+                fail("Couldn't prepare \(game.name) to run without Steam: \(error.localizedDescription)", error: error)
+                return
+            }
         }
 
         launchState = .launching(appID: game.id)
         currentActivity = "Launching \(game.name)…"
         appendLog("Launching \(game.name)")
 
-        // Write steam_appid.txt for DRM games so the game can find its own appID.
-        let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)
-        if needsDRM {
-            prefix.writeSteamAppID(game.id)
-            log.info("[pipeline] DRM detected for appID=\(game.id) — steam.exe already running from bootstrap")
-        }
-
         // Pause window suppression so the game window appears naturally.
         steamWindow?.pauseForGame()
 
+        // Both DRM (now satisfied in-process by the Steamworks emulator shim)
+        // and DRM-free games launch directly via `wine64 game.exe`. No
+        // steam.exe, no Steam IPC. The steam.exe `-applaunch` path
+        // (`SteamSession.ensureReadyForDRM` / `launchGameViaSteam`) is retained
+        // as a documented fallback for SteamStub exe-encrypted titles the shim
+        // can't satisfy, but is not used on the default launch path.
+        if needsDRM {
+            prefix.writeSteamAppID(game.id)
+        }
+
         let result: GameLaunchResult
         do {
-            result = try await launchDirect(game: game, engine: engine, session: session)
+            result = try await launchDirect(game: game, engine: engine, session: session, drmShimActive: needsDRM)
         } catch {
             steamWindow?.resumeAfterGame(steamPID: 0)
             fail("Could not launch game: \(error.localizedDescription)", error: error)
             return
         }
 
-        // Record launch.
-        AppSettings.shared.recordLaunch(appID: game.id)
-        runningSince = Date()
-        launchState = .running(appID: game.id)
-        currentActivity = nil
-        appendLog("Game running")
-
-        // Monitor until exit.
+        // Begin process monitoring. Pass the game's installdir as `gamePattern`
+        // so detection uses `pgrep -f "<installdir>"` against the game's own
+        // process — the game-specific path. With nil (the previous behaviour)
+        // the monitor falls back to PID-set baseline tracking which can't see
+        // the game's process when wineserver hands it off, leaving the user
+        // stuck at "Launching…" until the 120 s timeout fires.
+        let gamePattern = prefix.gameInstallDir(appID: game.id)
+        if gamePattern == nil {
+            log.warning("[pipeline] no installdir for appID=\(game.id) — monitor will use fallback PID-set detection")
+        }
         gameProcess.startMonitoring(
             appID: game.id,
             launchedPID: result.pid,
             engine: engine,
-            prefix: prefix
+            prefix: prefix,
+            gamePattern: gamePattern,
+            onLog: { [weak self] msg in
+                // Already invoked on the main actor — GameProcess is
+                // @MainActor and the monitor loop runs there.
+                self?.currentActivity = msg
+            }
         )
 
-        processesConfirmed = gameProcess.monitorPhase != .idle
-
-        // Poll until GameProcess returns to idle (game exited).
-        while gameProcess.monitorPhase != .idle {
+        // Don't flip `launchState` to `.running` until Phase 1 confirms the
+        // game's own process is actually alive. Set state from observed
+        // monitor outcome — never optimistically. UI stays in `.launching`
+        // (showing "Launching <game>…") until the game is genuinely running
+        // OR a real failure surfaces. Previously `.running` was set
+        // immediately after `launchDirect` returned, so any silent crash
+        // during startup left the UI claiming "running" while nothing was
+        // visible — the symptom user reported May 19 2026.
+        appendLog("Waiting for game to start")
+        while gameProcess.monitorPhase == .startup {
             try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled else { break }
+            if Task.isCancelled { break }
+        }
+
+        switch gameProcess.monitorPhase {
+        case .running:
+            AppSettings.shared.recordLaunch(appID: game.id)
+            runningSince = Date()
+            launchState = .running(appID: game.id)
+            currentActivity = nil
+            processesConfirmed = true
+            appendLog("Game running")
+            log.info("[pipeline] game confirmed running appID=\(game.id)")
+        case .timedOut:
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "startup timeout (game process never appeared)", exitCode: nil)
+            fail("\(game.name) didn't start in time. Check ~/Library/Application Support/com.meridian.app/logs/games/\(game.id).log for the game's own output.")
+            return
+        case .failed(let reason):
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "monitor failed: \(reason)", exitCode: nil)
+            fail("\(game.name) couldn't start: \(reason)")
+            return
+        case .exited, .idle:
+            // Game's startup phase completed without ever entering `.running`
+            // — the game process either never appeared or appeared and
+            // disappeared faster than the monitor's confirm window. Either
+            // way the user sees nothing, so report it as a fast-exit.
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "game exited during startup phase before confirmation", exitCode: nil)
+            fail("\(game.name) exited immediately. Check ~/Library/Application Support/com.meridian.app/logs/games/\(game.id).log for the game's own output.")
+            return
+        case .startup:
+            // Cancelled during startup polling — task cancellation path.
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "launch cancelled by user during startup", exitCode: nil)
+            launchState = .idle
+            currentActivity = nil
+            return
+        }
+
+        // Wait for runningPhase to detect normal exit. Polls until the
+        // monitor leaves `.running` (becomes `.exited` or `.idle`).
+        while gameProcess.monitorPhase == .running {
+            try? await Task.sleep(for: .milliseconds(500))
+            if Task.isCancelled { break }
         }
 
         steamWindow?.resumeAfterGame(steamPID: 0)
+        closeActiveGameLog(reason: "game exited normally", exitCode: nil)
         launchState = .idle
         currentActivity = nil
         runningSince = nil
@@ -287,12 +366,120 @@ final class Launcher {
         log.info("[pipeline] game exited appID=\(game.id)")
     }
 
+    // MARK: - Private: headless install (DepotDownloader)
+
+    /// Installs an owned game headlessly via the DepotDownloader fork — no
+    /// `steam.exe`, no Steam UI. Authenticates with Meridian's OAuth
+    /// `refresh_token` (the same token Wine's `steam.exe` rejects but SteamKit2
+    /// accepts), downloads depot files into `steamapps/common/<name>/`, and on
+    /// success writes a `StateFlags=4` appmanifest so the rest of the app
+    /// (launch, uninstall, installed-state) reads the game as installed.
+    private func installHeadless(game: Game, engine: WineEngine, steamID: String) async throws {
+        let token = AppSettings.shared.steamCredentialRefreshToken
+        let account = AppSettings.shared.steamCredentialAccountName
+        guard !token.isEmpty, !account.isEmpty else {
+            throw InstallError.notSignedIn
+        }
+        guard let binary = engine.depotDownloaderURL else {
+            throw InstallError.installerMissing
+        }
+
+        let installDirName = game.name
+        let installDir = prefix.steamInstallDir
+            .appending(path: "steamapps/common/\(installDirName)")
+
+        let resuming = prefix.isGameInstalled(appID: game.id)
+            || FileManager.default.fileExists(atPath: installDir.path(percentEncoded: false))
+        launchState = .installing(appID: game.id)
+        currentActivity = resuming
+            ? "Resuming download for \(game.name)…"
+            : "Preparing download for \(game.name)…"
+        downloadProgress = nil
+        downloadBytesDone = 0
+        downloadBytesTotal = 0
+        downloadRateBps = 0
+        appendLog("Starting install for \(game.name)")
+
+        // Rate smoothing across progress callbacks.
+        var lastBytes: Int64 = 0
+        var lastSampleAt = ContinuousClock.now
+
+        let downloaded = try await DepotDownloaderInstall.run(
+            binary: binary,
+            appID: game.id,
+            installDir: installDir,
+            username: account,
+            refreshToken: token,
+            onPhase: { [weak self] phase, _ in
+                guard let self else { return }
+                switch phase {
+                case "connecting": self.currentActivity = "Connecting to Steam…"
+                case "loggedon":   self.currentActivity = "Starting download for \(game.name)…"
+                default:           break
+                }
+            },
+            onProgress: { [weak self] done, total, _ in
+                guard let self else { return }
+                if case .downloading = self.launchState {} else {
+                    self.launchState = .downloading(appID: game.id)
+                }
+                self.downloadBytesDone = done
+                self.downloadBytesTotal = total
+                let fraction = total > 0 ? min(1.0, Double(done) / Double(total)) : 0
+                self.downloadProgress = total > 0 ? fraction : nil
+
+                let now = ContinuousClock.now
+                let elapsed = now - lastSampleAt
+                if elapsed >= .seconds(1) {
+                    let secs = Double(elapsed.components.seconds)
+                        + Double(elapsed.components.attoseconds) * 1e-18
+                    if secs > 0 {
+                        let instant = Double(done - lastBytes) / secs
+                        self.downloadRateBps = self.downloadRateBps == 0
+                            ? instant
+                            : (0.7 * self.downloadRateBps + 0.3 * instant)
+                    }
+                    lastBytes = done
+                    lastSampleAt = now
+                }
+
+                let pctInt = Int(fraction * 100)
+                let doneMB = done / (1024 * 1024)
+                let totalMB = total / (1024 * 1024)
+                let rateText = self.downloadRateBps > 0
+                    ? String(format: " · %.1f MB/s", self.downloadRateBps / (1024 * 1024))
+                    : ""
+                self.currentActivity = total > 0
+                    ? "Downloading \(game.name)… \(pctInt)% (\(doneMB) / \(totalMB) MB\(rateText))"
+                    : "Downloading \(game.name)…"
+            }
+        )
+
+        // DepotDownloader writes no ACF — write a StateFlags=4 manifest so the
+        // launch path, uninstall, and installed-state checks all read the game
+        // as installed.
+        try prefix.writeInstalledAppManifest(
+            appID: game.id,
+            name: game.name,
+            installDir: installDirName,
+            steamID64: steamID,
+            sizeOnDisk: downloaded
+        )
+
+        downloadProgress = 1.0
+        downloadRateBps = 0
+        currentActivity = "\(game.name) installed"
+        appendLog("\(game.name) install complete (\(downloaded / (1024 * 1024)) MB)")
+        log.info("[installHeadless] ✓ appID=\(game.id) bytes=\(downloaded)")
+    }
+
     // MARK: - Private: launch via wine64
 
     private func launchDirect(
         game: Game,
         engine: WineEngine,
-        session: SteamSession
+        session: SteamSession,
+        drmShimActive: Bool
     ) async throws -> GameLaunchResult {
         guard let installDir = prefix.gameInstallDir(appID: game.id) else {
             throw LaunchError.noInstallDir(game.id)
@@ -320,9 +507,36 @@ final class Launcher {
         let exePath = gamePath.appending(path: mainExe).path(percentEncoded: false)
         log.info("[launch] appID=\(game.id) exe=\(exePath)")
 
-        var env = session.gameEnvironment(for: game.id, engine: engine)
         let compat = GameCompatibilityDB.shared
-        let launchArgs = compat.profile(for: game.id)?.launchArgs ?? []
+        let profile = compat.profile(for: game.id)
+        let launchArgs = profile?.launchArgs ?? []
+
+        // Warm the stack resolver (local file detection + cached PCGamingWiki
+        // enrichment, merged with any explicit compat profile) BEFORE building
+        // the env, so `gameEnvironment` can route a detected/PCGW DX12 game
+        // through GPTK even when it has no hand-written compat entry. On a
+        // network failure / offline this still returns local-only detection;
+        // on a cold cache `gameEnvironment` falls back to prior behaviour.
+        let resolvedStack = await GameStackResolver.shared.resolve(appID: game.id, installDir: gamePath)
+
+        let env = session.gameEnvironment(for: game.id, engine: engine)
+
+        // Resolve the graphics/translation stack from the FINAL env (+ the
+        // merged metadata) and log a one-liner to meridian.log + embed a detail
+        // block in the per-game header. This makes "what stack did this game
+        // run with?" answerable at a glance — active renderer (DXMT / GPTK /
+        // DXVK / wined3d), translation layer, bitness, DRM shim, Metal HUD,
+        // compat status, and the provenance of each fact.
+        let stackReport = GameStackReport.resolve(
+            appID: game.id,
+            gameName: game.name,
+            profile: profile,
+            resolved: resolvedStack,
+            environment: env,
+            drmShimActive: drmShimActive,
+            engineVersion: engine.engineVersion
+        )
+        log.info("[launch] \(stackReport.summaryLine)")
 
         let process = Process()
         process.executableURL = engine.wine64URL
@@ -330,62 +544,78 @@ final class Launcher {
         process.arguments = [exePath] + launchArgs
         process.environment = env
 
-        let stderrPipe = Pipe()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = stderrPipe
+        // Record session context so the engine-log collector (run on exit in
+        // closeActiveGameLog) knows which install dir to scan for Unreal logs
+        // and which launch instant to filter Unity Player.log freshness
+        // against. Without launchStartedAt we could copy a stale log from a
+        // previous run.
+        activeGameInstallDir = gamePath
+        activeLaunchStartedAt = Date()
+
+        // Per-game log: hand Wine a kernel-level FileHandle for stdout and
+        // stderr. The Wine subprocess tree writes every byte directly to
+        // disk; no Meridian-side draining required. This avoids the
+        // availableData blocking issue (Pattern 1 in
+        // engine-research-findings.mdc) AND gives us a complete game log
+        // even when wineserver outlives the parent wine64 process.
+        let logHandle = GameLogFile.beginSession(
+            appID: game.id,
+            gameName: game.name,
+            executable: exePath,
+            launchArgs: launchArgs,
+            environment: env,
+            stackReport: stackReport
+        )
+        activeGameLogHandle = logHandle
+        if let logHandle {
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+            log.info("[launch] per-game log → \(GameLogFile.currentURL(for: game.id).path(percentEncoded: false))")
+        } else {
+            // Fallback: black-hole both streams. Better than reintroducing
+            // a Pipe that may block; the user can still read meridian.log
+            // for Wine errors that bubble up through other layers.
+            log.warning("[launch] per-game log unavailable — stderr will not be captured")
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+        }
 
         try process.run()
         let pid = process.processIdentifier
         log.info("[launch] pid=\(pid)")
 
-        Task.detached {
-            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            if let raw = String(data: data, encoding: .utf8), !raw.isEmpty {
-                let lines = raw.components(separatedBy: .newlines).prefix(200)
-                for line in lines where !line.isEmpty {
-                    log.info("[game:stderr] \(line)")
-                }
-            }
-        }
-
         return GameLaunchResult(pid: pid, process: process)
     }
 
-    // MARK: - Private: download progress polling
+    /// Append a `Reason:` trailer to the active per-game log and release
+    /// the file handle. Called from every exit path of `executePipeline`.
+    /// Safe to call when no log is active.
+    private func closeActiveGameLog(reason: String, exitCode: Int32?) {
+        guard let handle = activeGameLogHandle else { return }
+        let appID = activeAppID ?? 0
 
-    private func pollDownloadProgress(game: Game, library: SteamLibraryStore?) async throws {
-        let checkInterval = Duration.milliseconds(500)
-        let maxWaitForStart = Duration.seconds(60)
-        let started = ContinuousClock.now
+        // Collect the game's own engine log (Unity Player.log / Unreal
+        // Saved/Logs) for this session into <appID>-engine.log BEFORE writing
+        // the trailer, so the diagnostic artifact is captured even on the
+        // crash / timeout / fast-exit paths — exactly when it's most needed.
+        let lowLevelDir = prefix.driveC
+            .appending(path: "users/crossover/AppData/LocalLow")
+        GameLogFile.collectEngineLogs(
+            appID: appID,
+            lowLevelDir: lowLevelDir,
+            installDir: activeGameInstallDir,
+            launchStartedAt: activeLaunchStartedAt
+        )
 
-        while true {
-            try Task.checkCancellation()
-
-            if prefix.isGameFullyInstalled(appID: game.id) {
-                currentActivity = "\(game.name) installed"
-                appendLog("\(game.name) download complete")
-                return
-            }
-
-            if let progressTuple = prefix.gameDownloadProgress(appID: game.id),
-               progressTuple.total > 0 {
-                let progress = Double(progressTuple.downloaded) / Double(progressTuple.total)
-                downloadProgress = progress
-                let pct = Int(progress * 100)
-                currentActivity = "Downloading \(game.name)… \(pct)%"
-            } else if ContinuousClock.now - started > maxWaitForStart {
-                // If SteamCMD already finished (small game), check fully installed.
-                if prefix.isGameInstalled(appID: game.id) {
-                    currentActivity = "\(game.name) installed"
-                    return
-                }
-                // SteamCMD process may have exited without ACF update — treat as done.
-                log.warning("[poll] no download progress after \(maxWaitForStart) — treating as complete")
-                return
-            }
-
-            try? await Task.sleep(for: checkInterval)
-        }
+        GameLogFile.endSession(
+            handle: handle,
+            appID: appID,
+            reason: reason,
+            exitCode: exitCode
+        )
+        activeGameLogHandle = nil
+        activeGameInstallDir = nil
+        activeLaunchStartedAt = nil
     }
 
     // MARK: - Private: uninstall
@@ -394,31 +624,60 @@ final class Launcher {
         log.info("[uninstall] appID=\(game.id)")
         let fm = FileManager.default
 
-        let libraries = prefix.steamLibraryFolders.map { $0.path(percentEncoded: false) }
-        var acfPath: String?
+        // Resolve the ACF via `prefix.acfURL` — it searches each library
+        // folder's `steamapps/` subdir (the correct location). Previously
+        // this function searched `<library>/appmanifest_*.acf` directly,
+        // missing the `steamapps/` prefix; result was that EVERY uninstall
+        // attempt logged `ACF not found — nothing to remove` even though
+        // the ACF was right there on disk. CLI-confirmed user report
+        // May 20 2026.
+        //
+        // We capture the install dir BEFORE removing the ACF — `gameInstallDir`
+        // reads the ACF for the `installdir` field, so once the ACF is gone
+        // we can no longer derive the real install path.
+        let installDirFromACF = prefix.gameInstallDir(appID: game.id)
 
-        for lib in libraries {
-            let candidate = lib + "/appmanifest_\(game.id).acf"
-            if fm.fileExists(atPath: candidate) {
-                acfPath = candidate
-                break
-            }
-        }
-
-        if let acfPath {
-            let installDir = prefix.gameInstallDir(appID: game.id) ?? game.name
+        guard let acfURL = prefix.acfURL(for: game.id) else {
+            // Even with no ACF, the game files may still exist on disk
+            // (orphan dir from a partial uninstall, or a manual install).
+            // Try a best-effort cleanup using the display name as fallback.
+            let installDir = installDirFromACF ?? game.name
             let gameDir = prefix.steamInstallDir
                 .appending(path: "steamapps/common/\(installDir)")
                 .path(percentEncoded: false)
             if fm.fileExists(atPath: gameDir) {
                 try fm.removeItem(atPath: gameDir)
-                log.info("[uninstall] removed game dir: \(gameDir)")
+                log.info("[uninstall] no ACF; removed orphan game dir: \(gameDir)")
+            } else {
+                log.info("[uninstall] no ACF and no game dir — nothing to remove for appID=\(game.id)")
             }
-            try fm.removeItem(atPath: acfPath)
-            log.info("[uninstall] removed ACF: \(acfPath)")
-        } else {
-            log.info("[uninstall] ACF not found for appID=\(game.id) — nothing to remove")
+            return
         }
+
+        let acfPath = acfURL.path(percentEncoded: false)
+        let installDir = installDirFromACF ?? game.name
+        let gameDir = prefix.steamInstallDir
+            .appending(path: "steamapps/common/\(installDir)")
+            .path(percentEncoded: false)
+
+        // Order: game files first, then ACF. If the game-dir removal
+        // fails (permissions, in-use), the ACF still reflects "installed"
+        // and we don't end up in an inconsistent state where Steam thinks
+        // the game is gone but multi-GB of files linger.
+        if fm.fileExists(atPath: gameDir) {
+            try fm.removeItem(atPath: gameDir)
+            log.info("[uninstall] removed game dir: \(gameDir)")
+        }
+        // Also clean any incomplete download under steamapps/downloading/<id>/
+        let downloadingDir = prefix.steamInstallDir
+            .appending(path: "steamapps/downloading/\(game.id)")
+            .path(percentEncoded: false)
+        if fm.fileExists(atPath: downloadingDir) {
+            try? fm.removeItem(atPath: downloadingDir)
+            log.info("[uninstall] removed in-flight download dir: \(downloadingDir)")
+        }
+        try fm.removeItem(atPath: acfPath)
+        log.info("[uninstall] removed ACF: \(acfPath)")
     }
 
     // MARK: - Private: helpers
@@ -477,6 +736,20 @@ enum LaunchError: LocalizedError {
         case .noInstallDir(let id):  return "Cannot find install directory for appID \(id)."
         case .cannotListDir(let p):  return "Cannot list game directory: \(p)"
         case .noExecutable(let p):   return "No game executable found in \(p)"
+        }
+    }
+}
+
+enum InstallError: LocalizedError {
+    case notSignedIn
+    case installerMissing
+
+    var errorDescription: String? {
+        switch self {
+        case .notSignedIn:
+            return "Not signed in to Steam. Please sign in before installing games."
+        case .installerMissing:
+            return "The game installer component is missing. Re-download the engine from Settings."
         }
     }
 }

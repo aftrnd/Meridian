@@ -47,6 +47,10 @@ struct GameDetailView: View {
     /// Using `sheet(item:)` so each selection replaces the previous without
     /// a dismiss bounce.
     @State private var selectedAchievement: GameAchievement? = nil
+    /// Resolved tech stack (engine/API/bitness/DRM, merged from local
+    /// detection + PCGamingWiki + any explicit compat profile). Populated by
+    /// `resolveStack()` when the game is installed; drives the compat popover.
+    @State private var resolvedStack: ResolvedGameStack? = nil
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
@@ -164,6 +168,22 @@ struct GameDetailView: View {
                         Label("View Launch Logs", systemImage: "terminal")
                     }
 
+                    Button {
+                        NSWorkspace.shared.open(GameLogFile.currentURL(for: currentGame.id))
+                    } label: {
+                        Label("Open Game Log", systemImage: "doc.text")
+                    }
+                    .disabled(!gameLogExists)
+                    .help("Raw Wine output + the resolved graphics stack for the last launch")
+
+                    Button {
+                        NSWorkspace.shared.open(GameLogFile.engineLogURL(for: currentGame.id))
+                    } label: {
+                        Label("Open Engine Log", systemImage: "doc.text.magnifyingglass")
+                    }
+                    .disabled(!engineLogExists)
+                    .help("The game engine's own log (Unity Player.log / Unreal) from the last launch")
+
                     if currentGame.isInstalled {
                         Divider()
                         Button(role: .destructive) {
@@ -191,6 +211,7 @@ struct GameDetailView: View {
             achievements = []
             achievementsLoading = false
             achievementsUnavailable = false
+            resolvedStack = nil
         }
         .task(id: game.id) {
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
@@ -200,6 +221,9 @@ struct GameDetailView: View {
         }
         .task(id: game.id) {
             await loadAchievements()
+        }
+        .task(id: game.id) {
+            await resolveStack()
         }
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
@@ -256,32 +280,36 @@ struct GameDetailView: View {
                 .allowsHitTesting(false)
             }
             .overlay {
-                HeroLogoImage(
-                    urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
-                    fallbackName: g.name
-                )
-                .padding(.leading, GameDetailMetrics.horizontalPadding)
-                .padding(.trailing, 24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                // When Steam publishes a logo_position (via PICS appinfo), place
+                // the logo exactly as Steam's own library does — pinned corner +
+                // width/height-percent box. Otherwise fall back to the fixed
+                // leading layout. (Game detail only — the Home carousel keeps the
+                // fixed layout regardless.)
+                Group {
+                    if let placement = g.effectiveLogoPlacement {
+                        HeroLogoPositioned(
+                            urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
+                            fallbackName: g.name,
+                            placement: placement,
+                            containerSize: CGSize(width: w, height: h)
+                        )
+                    } else {
+                        HeroLogoImage(
+                            urls: g.newCDNLogoURLs + [g.logoURL] + g.logoURLFallbacks,
+                            fallbackName: g.name
+                        )
+                        .padding(.leading, GameDetailMetrics.horizontalPadding)
+                        .padding(.trailing, 24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    }
+                }
                 .id(g.id)
                 .allowsHitTesting(false)
             }
-            .overlay(alignment: .bottomLeading) {
-                let compatProfile = GameCompatibilityDB.shared.profile(for: g.id)
-                HStack(alignment: .bottom, spacing: 6) {
-                    BannerCompatBadge(status: compatProfile?.status ?? .untested,
-                                      profile: compatProfile)
-                    if g.playtimeMinutes > 0 {
-                        Text(g.playtimeFormatted + " played")
-                            .font(.subheadline)
-                            .foregroundStyle(.white.opacity(0.85))
-                            .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .padding(.horizontal, GameDetailMetrics.horizontalPadding)
-                .padding(.bottom, 16)
-            }
+            // Playtime moved to the stats panel (Total Playtime row); the
+            // compatibility badge moved to a dedicated premium card under the
+            // Play button (`compatStatusCard`). The banner now shows only the
+            // hero art + positioned logo, matching Steam's clean library look.
             .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
     }
 
@@ -323,14 +351,31 @@ struct GameDetailView: View {
 
     @ViewBuilder
     private var launchSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        // Spacing matches the card's top inset (horizontalPadding) so the gap
+        // above and below the Play button is visually equal.
+        VStack(alignment: .leading, spacing: GameDetailMetrics.horizontalPadding) {
             playButton
+            compatStatusCard
             if isThisGameActive {
                 StatusCard(game: currentGame, launcher: launcher, openWindow: openWindow)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .animation(.easeInOut(duration: 0.2), value: isThisGameActive)
             }
         }
+    }
+
+    /// Premium compatibility badge — the reassuring "Meridian Verified /
+    /// Optimized for Apple Silicon" confirmation, sitting directly under the
+    /// Play button (moved out of the banner). Tap reveals the full rendering
+    /// pipeline. Replaces the small banner seal icon.
+    private var compatStatusCard: some View {
+        let compatProfile = GameCompatibilityDB.shared.profile(for: currentGame.id)
+        return BannerCompatBadge(
+            status: resolvedStack?.status ?? compatProfile?.status ?? .untested,
+            profile: compatProfile,
+            resolved: resolvedStack,
+            style: .card
+        )
     }
 
     // MARK: - Stats / Info section
@@ -612,6 +657,23 @@ struct GameDetailView: View {
         }
     }
 
+    // MARK: - Tech stack resolution
+
+    /// Resolves the game's tech stack for display in the compatibility popover.
+    /// Only runs for installed games (detection needs the files on disk);
+    /// PCGamingWiki enrichment is cached, so repeat opens are cheap.
+    private func resolveStack() async {
+        guard currentGame.isInstalled else { return }
+        let prefix = WinePrefix.defaultPrefix
+        let installDir = prefix.gameInstallDir(appID: currentGame.id).map {
+            prefix.steamInstallDir.appending(path: "steamapps/common/\($0)")
+        }
+        resolvedStack = await GameStackResolver.shared.resolve(
+            appID: currentGame.id,
+            installDir: installDir
+        )
+    }
+
     // MARK: - Per-game gating
 
     private var isThisGame: Bool {
@@ -790,6 +852,22 @@ struct GameDetailView: View {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    /// Whether the raw per-game Wine log exists for this game (i.e. it has
+    /// been launched at least once this engine install). Gates the
+    /// "Open Game Log" menu item.
+    private var gameLogExists: Bool {
+        FileManager.default.fileExists(
+            atPath: GameLogFile.currentURL(for: currentGame.id).path(percentEncoded: false)
+        )
+    }
+
+    /// Whether a collected engine log (Unity/Unreal) exists for this game.
+    private var engineLogExists: Bool {
+        FileManager.default.fileExists(
+            atPath: GameLogFile.engineLogURL(for: currentGame.id).path(percentEncoded: false)
+        )
     }
 
     private func handleInstallTapped() {
@@ -1240,8 +1318,14 @@ private struct AchievementIcon: View {
 ///   - Gray   checkmark.seal (outline)  → untracked / not yet tested
 /// Tapping shows a popover with compatibility status and the rendering pipeline.
 private struct BannerCompatBadge: View {
+    /// Presentation: a bare seal icon (legacy banner overlay) or the premium
+    /// full-width confirmation card shown under the Play button.
+    enum Style { case icon, card }
+
     let status: CompatStatus
     var profile: GameProfile?
+    var resolved: ResolvedGameStack? = nil
+    var style: Style = .icon
     @State private var showingPopover = false
 
     private var icon: String {
@@ -1291,12 +1375,119 @@ private struct BannerCompatBadge: View {
     /// Only shown when the game is known to be working and has a confirmed rendering path.
     private var showAppleSiliconBadge: Bool {
         switch status {
-        case .verified, .playable: return profile != nil
+        case .verified, .playable: return pipelineInfo != nil
         default:                   return false
         }
     }
 
+    /// One-line reassurance shown under the status title in the card style.
+    private var cardSubtitle: String {
+        switch status {
+        case .verified, .playable:
+            return showAppleSiliconBadge ? "Optimized for Apple Silicon" : "Runs well on your Mac"
+        case .launches: return "Playable, with some known issues"
+        case .broken:   return "Not currently compatible"
+        case .untested: return "Not yet tested — give it a try"
+        }
+    }
+
+    // MARK: Pipeline info (resolved stack preferred, explicit profile fallback)
+
+    private struct PipelineInfo {
+        let engine: String
+        let api: String
+        let translation: String
+        let bitness: String?
+        /// Provenance of the engine / API facts, shown as a small gray SF
+        /// symbol next to each row (verified / PCGamingWiki / detected).
+        let engineSource: ResolvedGameStack.Source?
+        let apiSource: ResolvedGameStack.Source?
+    }
+
+    private var pipelineInfo: PipelineInfo? {
+        if let r = resolved {
+            return PipelineInfo(
+                engine: engineDisplay(r.engine),
+                api: apiDisplay(r.graphicsAPI),
+                translation: translationDisplay(r.graphicsAPI),
+                bitness: r.bitness != nil ? r.bitnessDescription : nil,
+                engineSource: r.engineSource,
+                apiSource: r.apiSource
+            )
+        }
+        if let p = profile {
+            // A hand-written compat profile is, by definition, verified.
+            return PipelineInfo(
+                engine: p.gameEngineDisplayName,
+                api: p.graphicsAPIDisplayName,
+                translation: p.translationLayerDescription,
+                bitness: nil,
+                engineSource: .explicit,
+                apiSource: .explicit
+            )
+        }
+        return nil
+    }
+
+    /// SF symbol representing where a tech fact came from. Kept gray (matching
+    /// the row text) in the popover.
+    private func sourceIcon(_ s: ResolvedGameStack.Source) -> String {
+        switch s {
+        case .explicit: return "checkmark.seal"
+        case .pcgw:     return "globe"
+        case .detected: return "magnifyingglass"
+        case .unknown:  return "questionmark.circle"
+        }
+    }
+
+    private func sourceHelp(_ s: ResolvedGameStack.Source) -> String {
+        switch s {
+        case .explicit: return "Verified by Meridian"
+        case .pcgw:     return "From PCGamingWiki"
+        case .detected: return "Detected from the game's files"
+        case .unknown:  return "Inferred"
+        }
+    }
+
+    private func engineDisplay(_ e: GameEngine) -> String {
+        switch e {
+        case .unity:   return "Unity"
+        case .unreal:  return "Unreal Engine"
+        case .godot:   return "Godot"
+        case .source:  return "Source"
+        case .custom:  return "Custom Engine"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    private func apiDisplay(_ a: GraphicsAPI) -> String {
+        switch a {
+        case .dx9:     return "DirectX 9"
+        case .dx11:    return "DirectX 11"
+        case .dx12:    return "DirectX 12"
+        case .vulkan:  return "Vulkan"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    private func translationDisplay(_ a: GraphicsAPI) -> String {
+        switch a {
+        case .dx9:     return "DXVK → MoltenVK → Metal"
+        case .dx11:    return "DXMT → Metal"
+        case .dx12:    return "GPTK → D3DMetal → Metal"
+        case .vulkan:  return "MoltenVK"
+        case .unknown: return "Wine default"
+        }
+    }
+
     var body: some View {
+        switch style {
+        case .icon: iconBody
+        case .card: cardBody
+        }
+    }
+
+    private var iconBody: some View {
         Image(systemName: icon)
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(color)
@@ -1306,6 +1497,45 @@ private struct BannerCompatBadge: View {
                 pipelinePopover
             }
             .contentShape(Rectangle())
+    }
+
+    private var cardBody: some View {
+        Button { showingPopover.toggle() } label: {
+            HStack(spacing: 11) {
+                Image(systemName: icon)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(color)
+                    .symbolRenderingMode(.hierarchical)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(statusTitle)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text(cardSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 6)
+
+                Image(systemName: "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(color.opacity(0.35), lineWidth: 0.5)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showingPopover, arrowEdge: .bottom) {
+            pipelinePopover
+        }
     }
 
     @ViewBuilder
@@ -1332,8 +1562,12 @@ private struct BannerCompatBadge: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 12)
 
-            // ── Rendering pipeline card (shown when profile exists) ──────────
-            if let p = profile {
+            // ── Rendering pipeline card ──────────────────────────────────────
+            // Prefer the resolved stack (local detection + PCGamingWiki +
+            // explicit profile, merged) so the pipeline shows even for games
+            // with no hand-written compat entry. Falls back to the explicit
+            // profile when the resolver hasn't run (e.g. not installed yet).
+            if let pipeline = pipelineInfo {
                 Divider()
                     .padding(.horizontal, 8)
 
@@ -1344,9 +1578,12 @@ private struct BannerCompatBadge: View {
                         .textCase(.uppercase)
                         .kerning(0.4)
 
-                    pipelineRow(label: "Game Engine",   value: p.gameEngineDisplayName)
-                    pipelineRow(label: "Graphics API",  value: p.graphicsAPIDisplayName)
-                    pipelineRow(label: "Translation",   value: p.translationLayerDescription)
+                    pipelineRow(label: "Game Engine",   value: pipeline.engine, source: pipeline.engineSource)
+                    pipelineRow(label: "Graphics API",  value: pipeline.api,    source: pipeline.apiSource)
+                    pipelineRow(label: "Translation",   value: pipeline.translation)
+                    if let bitness = pipeline.bitness {
+                        pipelineRow(label: "Architecture", value: bitness)
+                    }
                     pipelineRow(label: "Output",        value: "Apple Metal")
                 }
                 .padding(.horizontal, 16)
@@ -1363,7 +1600,7 @@ private struct BannerCompatBadge: View {
                         Text("Optimized for Apple Silicon")
                             .font(.caption.weight(.semibold))
                     }
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                 }
@@ -1372,8 +1609,12 @@ private struct BannerCompatBadge: View {
         .frame(width: 280)
     }
 
-    private func pipelineRow(label: String, value: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
+    private func pipelineRow(
+        label: String,
+        value: String,
+        source: ResolvedGameStack.Source? = nil
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1381,6 +1622,13 @@ private struct BannerCompatBadge: View {
             Text(value)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.primary)
+            if let source {
+                // Provenance marker — same gray as the row label text.
+                Image(systemName: sourceIcon(source))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help(sourceHelp(source))
+            }
         }
     }
 }

@@ -34,6 +34,59 @@ extension View {
     }
 }
 
+// MARK: - Shared logo loading
+
+/// Shared loader for the transparent title-logo PNG. Used by both the Home
+/// carousel (`HeroLogoImage`) and the game-detail positioned logo
+/// (`HeroLogoPositioned`) so the alpha-rejection rule stays identical.
+enum HeroLogoLoader {
+    /// Returns the first URL whose image has a real alpha channel (a genuine
+    /// transparent logo lockup), checking the two-tier cache then network.
+    /// Opaque images (key art mistakenly published as logo.png) are rejected.
+    static func load(urls: [URL]) async -> NSImage? {
+        for url in urls {
+            if let cached = ImageCache.shared.image(for: url) {
+                if hasAlpha(cached) { return cached }
+                continue
+            }
+            guard !Task.isCancelled else { return nil }
+            do {
+                let (data, response) = try await URLSession.imageSession.data(from: url)
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+                guard let nsImage = NSImage(data: data), hasAlpha(nsImage) else { continue }
+                ImageCache.shared.store(nsImage, for: url, rawData: data)
+                return nsImage
+            } catch { continue }
+        }
+        return nil
+    }
+
+    static func hasAlpha(_ image: NSImage) -> Bool {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return false
+        }
+        let alpha = cgImage.alphaInfo
+        return alpha != .none && alpha != .noneSkipFirst && alpha != .noneSkipLast
+    }
+
+    /// Maps Steam's `pinned_position` string to a SwiftUI alignment.
+    /// Steam's default (and most common) is bottom-left.
+    static func alignment(for pinned: String) -> Alignment {
+        switch pinned {
+        case "BottomLeft":    return .bottomLeading
+        case "BottomCenter":  return .bottom
+        case "BottomRight":   return .bottomTrailing
+        case "CenterLeft":    return .leading
+        case "CenterCenter":  return .center
+        case "CenterRight":   return .trailing
+        case "UpperLeft", "TopLeft":     return .topLeading
+        case "UpperCenter", "TopCenter": return .top
+        case "UpperRight", "TopRight":   return .topTrailing
+        default:              return .bottomLeading
+        }
+    }
+}
+
 // MARK: - Hero Logo (styled title PNG)
 
 /// Loads the game's logo PNG (transparent title lockup) from Steam CDN.
@@ -75,43 +128,84 @@ struct HeroLogoImage: View {
     private func loadLogo() async {
         loadFailed = false
         loadedImage = nil
-
-        for url in urls {
-            // Two-tier cache check (memory + disk).
-            if let cached = ImageCache.shared.image(for: url) {
-                if hasAlpha(cached) {
-                    loadedImage = cached
-                    return
-                }
-                // Cached image has no alpha — it's opaque art, not a logo lockup. Skip it.
-                continue
-            }
-
-            guard !Task.isCancelled else { return }
-            do {
-                let (data, response) = try await URLSession.imageSession.data(from: url)
-                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
-                guard let nsImage = NSImage(data: data) else { continue }
-                // Only accept images with an alpha channel as logo overlays.
-                guard hasAlpha(nsImage) else { continue }
-                ImageCache.shared.store(nsImage, for: url, rawData: data)
-                loadedImage = nsImage
-                return
-            } catch {
-                continue
-            }
+        if let image = await HeroLogoLoader.load(urls: urls) {
+            loadedImage = image
+        } else {
+            loadFailed = true
         }
+    }
+}
 
-        loadFailed = true
+// MARK: - Positioned Hero Logo (game detail — Steam-accurate placement)
+
+/// Renders the title logo using Steam's own `logo_position` data — the pinned
+/// corner and width/height-percent box from PICS appinfo. This reproduces the
+/// exact placement Steam uses in its library detail view (e.g. a small
+/// bottom-left lockup, or a large centred wordmark). Used ONLY on the game
+/// detail hero; the Home carousel keeps its fixed leading layout via
+/// `HeroLogoImage`.
+///
+/// Falls back to positioned bold text (anchored at the same corner) when no
+/// transparent logo is available.
+struct HeroLogoPositioned: View {
+    let urls: [URL]
+    let fallbackName: String
+    let placement: LogoPlacement
+    /// The hero banner's rendered size, so the percent box can be resolved.
+    let containerSize: CGSize
+    /// Inset from the hero edges so the logo never sits flush against the
+    /// rounded corners. Matches the detail hero's content padding feel.
+    var inset: CGFloat = 24
+
+    @State private var loadedImage: NSImage?
+    @State private var loadFailed = false
+
+    private var alignment: Alignment { HeroLogoLoader.alignment(for: placement.pinned) }
+
+    var body: some View {
+        // Steam's box is a fraction of the FULL hero; clamp to the inset area.
+        let boxW = max(40, containerSize.width  * placement.widthPct  / 100.0)
+        let boxH = max(24, containerSize.height * placement.heightPct / 100.0)
+
+        return Color.clear
+            .overlay(alignment: alignment) {
+                Group {
+                    if let image = loadedImage {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: boxW, maxHeight: boxH, alignment: alignment)
+                            .shadow(color: .black.opacity(0.6), radius: 8, y: 4)
+                    } else if loadFailed {
+                        Text(fallbackName)
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.5), radius: 4, y: 2)
+                            .lineLimit(2)
+                            .multilineTextAlignment(textAlignment)
+                            .frame(maxWidth: boxW, alignment: alignment)
+                    }
+                }
+            }
+            .padding(inset)
+            .task(id: urls.first) {
+                loadFailed = false
+                loadedImage = nil
+                if let image = await HeroLogoLoader.load(urls: urls) {
+                    loadedImage = image
+                } else {
+                    loadFailed = true
+                }
+            }
     }
 
-    /// Returns true when the image has a meaningful alpha channel (i.e. can be transparent).
-    private func hasAlpha(_ image: NSImage) -> Bool {
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return false
+    private var textAlignment: TextAlignment {
+        switch alignment {
+        case .center, .top, .bottom: return .center
+        case .trailing, .topTrailing, .bottomTrailing: return .trailing
+        default: return .leading
         }
-        let alpha = cgImage.alphaInfo
-        return alpha != .none && alpha != .noneSkipFirst && alpha != .noneSkipLast
     }
 }
 

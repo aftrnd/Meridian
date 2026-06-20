@@ -134,18 +134,84 @@ final class BootstrapTests: XCTestCase {
 
     // MARK: - Rewrite invariant guards
 
-    /// Bootstrap MUST NEVER send -login (triggers unsolicited 2FA).
-    /// Only SteamSession.signIn() (called from the sign-in sheet) sends -login.
+    /// Bootstrap MUST NEVER send -login (triggers unsolicited 2FA), and as of
+    /// Phase 3 (HANDOFF-2026-06-19) must NEVER start steam.exe at all — Steam is
+    /// lazy + DRM-only. Starting steam.exe on boot is exactly what surfaced the
+    /// "Who's playing" account-picker window and forced a silent-auth wait on
+    /// every cold start. The Steam runtime is now brought up on demand by
+    /// SteamSession.ensureReadyForDRM the first time a DRM game is launched.
     func testBootstrap_neverSendsLoginFlag() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
         XCTAssertFalse(
             src.contains("\"-login\""),
-            "BootstrapManager MUST NOT contain -login — only SteamSession.signIn() from the sign-in sheet sends it"
+            "BootstrapManager MUST NOT contain -login — credential login only happens in the sign-in sheet"
         )
-        XCTAssertTrue(
-            src.contains("session.start(engine: engine)"),
-            "BootstrapManager step 7 must delegate to SteamSession.start()"
+        XCTAssertFalse(
+            src.contains("session.start("),
+            "BootstrapManager MUST NOT start steam.exe — Steam is lazy/DRM-only (Phase 3). SteamSession.ensureReadyForDRM warms it on DRM launch."
         )
+    }
+
+    /// Phase 3: bootstrap must NOT download the Steam client nor inject
+    /// local.vdf — those are deferred to the lazy DRM path. A DRM-free-only
+    /// user must never pull the ~336 MB Steam client on cold start.
+    func testBootstrap_doesNotDownloadSteamClientOrInjectSession() throws {
+        let src = try readSource("Meridian/App/BootstrapManager.swift")
+        XCTAssertFalse(src.contains("SteamClientBootstrap.downloadAndInstall"),
+                       "BootstrapManager MUST NOT download the Steam client — that is lazy/DRM-only now (SteamSession.bootstrapSteamClientIfNeeded)")
+        XCTAssertFalse(src.contains("writeSteamSessionLocalVdf"),
+                       "BootstrapManager MUST NOT inject local.vdf — deferred to SteamSession.ensureReadyForDRM")
+        // But the GENERAL prefix setup that all games need must remain.
+        XCTAssertTrue(src.contains("ensureCoreServices"),
+                      "BootstrapManager must still register core Wine services (general, needed by all games)")
+        XCTAssertTrue(src.contains("writeSteamInstallPathRegistryKeys"),
+                      "BootstrapManager must still write WoW64 crypto provider types (Pattern 11 — needed by 32-bit DRM-free games)")
+    }
+
+    /// Pattern 11 recurrence guard (Jun 19 2026). The versioned prefix-registry
+    /// counters (winRT / steamInstallPath / windowsVersion / staleSteamService)
+    /// live in global UserDefaults, NOT tied to prefix identity. When a prefix
+    /// is (re)built — fresh `create()` on a wiped bottle, OR
+    /// `resetToEngineTemplate()` on an engine change — the on-disk system.reg is
+    /// empty but the counters still read "already applied", so the step-3 setup
+    /// block SKIPS the writes. That left HL2's 32-bit `filesystem_stdio.dll`
+    /// without the WoW64 crypto provider types → `CryptAcquireContextA` crash.
+    ///
+    /// Both (re)build paths MUST zero ALL the counters via the shared
+    /// `resetVersionedRegistryCounters()` so step 3 re-applies the full registry
+    /// setup. A bug where only the engine-reset path reset only 2 of the 4
+    /// counters (and the fresh-create path reset none) is what re-broke HL2.
+    func testBootstrap_resetsVersionedRegistryCountersOnPrefixRebuild() throws {
+        let src = try readSource("Meridian/App/BootstrapManager.swift")
+
+        // The shared helper must exist and zero all four versioned counters.
+        XCTAssertTrue(src.contains("func resetVersionedRegistryCounters"),
+                      "BootstrapManager must define resetVersionedRegistryCounters() — the single source of truth for clearing prefix-registry counters")
+        for counter in [
+            "winRTRegistrationAppliedVersion = 0",
+            "steamInstallPathRegistrationVersion = 0",
+            "windowsVersionAppliedVersion = 0",
+            "staleSteamServiceCleanupVersion = 0",
+        ] {
+            XCTAssertTrue(src.contains(counter),
+                          "resetVersionedRegistryCounters() must zero \(counter) so a rebuilt prefix re-applies every versioned registry mutation")
+        }
+
+        // It must be invoked from BOTH (re)build paths — at least twice
+        // (fresh create + engine reset). A single call site means one path
+        // still skips the registry setup.
+        // Invoked from BOTH (re)build paths PLUS its own definition line, so
+        // the source mentions the symbol at least 3 times (1 def + 2 calls).
+        // Fewer than 3 means a call site is missing and one rebuild path still
+        // skips the registry setup.
+        let mentions = src.components(separatedBy: "resetVersionedRegistryCounters()").count - 1
+        XCTAssertGreaterThanOrEqual(mentions, 3,
+                      "resetVersionedRegistryCounters() must be called on BOTH prefix create (!prefix.exists) AND engine reset (resetToEngineTemplate) — found \(mentions) mention(s) incl. definition")
+
+        // The counter must also be re-applied (not just zeroed) by the step-3
+        // block, so the live prefix actually gets the keys after a reset.
+        XCTAssertTrue(src.contains("writeSteamInstallPathRegistryKeys"),
+                      "step 3 must re-run writeSteamInstallPathRegistryKeys once the counter is zeroed")
     }
 
     /// SteamSession is silent-only — never sends `-login USER PASS`.
@@ -176,16 +242,149 @@ final class BootstrapTests: XCTestCase {
         )
     }
 
+    /// The Steam-client self-bootstrap now lives in SteamSession (lazy/DRM-only,
+    /// Phase 3). Window suppression must engage before the steamui.dll download
+    /// in case Steam ever renders UI mid-download.
     func testBootstrapEngagesSuppressionBeforeSteamSelfBootstrap() throws {
-        let src = try readSource("Meridian/App/BootstrapManager.swift")
-        // Suppression must start before the Steam self-bootstrap (steamui.dll download).
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
         guard let suppressorCall = src.range(of: "steamWindow?.startSuppressing()"),
-              let bootstrapCall = src.range(of: "bootstrapSteamClient(engine: engine")
+              let bootstrapCall = src.range(of: "SteamClientBootstrap.downloadAndInstall")
         else {
-            XCTFail("BootstrapManager must call steamWindow?.startSuppressing() before bootstrapSteamClient")
+            XCTFail("SteamSession.bootstrapSteamClientIfNeeded must call steamWindow?.startSuppressing() before SteamClientBootstrap.downloadAndInstall")
             return
         }
         XCTAssertLessThan(suppressorCall.lowerBound, bootstrapCall.lowerBound)
+    }
+
+    /// SteamSession.launchSteamProcess must log the value of
+    /// `DYLD_INSERT_LIBRARIES` so we can post-mortem-verify whether the
+    /// dock-suppression payload (`meridian-wine-accessory.dylib`) was
+    /// actually injected. Without this diagnostic, a missing dylib looks
+    /// identical to "dylib loaded but ineffective" — both produce a
+    /// wine64 Dock icon. CLI-investigated May 19 2026.
+    func testSteamSession_logsDyldInsertLibrariesAtLaunch() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(src.contains("env[\"DYLD_INSERT_LIBRARIES\"]"),
+                      "SteamSession.launchSteamProcess must read env[\"DYLD_INSERT_LIBRARIES\"] for diagnostic logging")
+        XCTAssertTrue(src.contains("DYLD_INSERT_LIBRARIES="),
+                      "SteamSession.launchSteamProcess must emit a log line that includes the resolved DYLD_INSERT_LIBRARIES path so future debug sessions can verify dylib presence on disk")
+    }
+
+    /// When steam.exe fails to start / authenticate, SteamSession must dump
+    /// steam.exe's OWN diagnostic logs (bootstrap_log.txt + connection_log.txt)
+    /// into meridian.log so the failure is self-explanatory without attaching
+    /// Xcode or hand-reading the prefix (user ask 2026-06-18: "add logs so I
+    /// can just see"). Guards against the failure paths silently swallowing the
+    /// underlying steam.exe error (e.g. `http error 0` on the update check).
+    func testSteamSession_dumpsSteamLogsOnFailure() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(src.contains("func logSteamFailureDiagnostics"),
+                      "SteamSession must define logSteamFailureDiagnostics(reason:) to dump steam.exe logs on failure")
+        XCTAssertTrue(src.contains("bootstrap_log.txt") && src.contains("connection_log.txt"),
+                      "logSteamFailureDiagnostics must read both bootstrap_log.txt and connection_log.txt — the two authoritative steam.exe diagnostic logs")
+        // It must actually be invoked from the start() failure branches, not
+        // just defined.
+        let invocations = src.components(separatedBy: "logSteamFailureDiagnostics(reason:").count - 1
+        XCTAssertGreaterThanOrEqual(invocations, 2,
+                      "logSteamFailureDiagnostics must be called from the silent-auth-timeout AND the launch-throw failure paths in start()")
+    }
+
+    /// The DYLD_INSERT payload must auto-refresh from the bundle to the
+    /// engine when the bundled copy is newer. A previous version of
+    /// `ensureDyldInjection` only copied when the engine copy was MISSING,
+    /// so dylib bug fixes shipped in a Meridian update were silently
+    /// ignored on hosts that had a stale engine-internal copy.
+    func testEnsureDyldInjection_refreshesOnNewerBundle() throws {
+        let src = try readSource("Meridian/Engine/WineEngine.swift")
+        XCTAssertTrue(src.contains("contentModificationDateKey"),
+                      "ensureDyldInjection must compare bundle vs engine mtimes so newer bundled dylibs replace stale engine copies")
+    }
+
+    /// SteamSession must transparently restart steam.exe when it exits
+    /// with code=42 — Steam's "self-update completed, please restart me"
+    /// sentinel. Without this, Valve pushing a new client mid-session
+    /// (CLI-observed May 20 2026: log line `[steam.exe] exited code=42`
+    /// during a Bogos Binted launch) kills wineserver and the running
+    /// game with it. The health monitor must be started in
+    /// `SteamSession.start()` after silent auth succeeds.
+    func testSteamSession_relaunchesOnSelfUpdateExit42() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+
+        // The health monitor task field must exist.
+        XCTAssertTrue(src.contains("healthMonitorTask"),
+                      "SteamSession must hold a background task that watches the persistent steam.exe process")
+        XCTAssertTrue(src.contains("monitorSteamHealth"),
+                      "SteamSession must define monitorSteamHealth() to handle code=42 self-update restarts")
+        XCTAssertTrue(src.contains("startHealthMonitor"),
+                      "SteamSession must define startHealthMonitor() to spin up the watcher after Logged On")
+
+        // start() must spin up the monitor on success — not before, not
+        // on failure (the user signs in via the sheet in those cases).
+        XCTAssertTrue(src.contains("startHealthMonitor(engine: engine)"),
+                      "SteamSession.start() must call startHealthMonitor after a successful silent auth so subsequent code=42 exits get handled")
+
+        // Must check for code 42 explicitly — any other value is treated
+        // as a normal exit and surfaced as `.failed`.
+        XCTAssertTrue(src.contains("guard code == 42"),
+                      "monitorSteamHealth must only restart on code=42 (Steam's intentional-restart sentinel); other exit codes are real failures")
+
+        // Restart budget — protect against runaway loops if Steam is
+        // genuinely broken.
+        XCTAssertTrue(src.contains("maxRestartAttempts"),
+                      "monitorSteamHealth must cap restart attempts in a rolling window to avoid runaway loops")
+
+        // shutdown() must cancel the monitor to prevent a race where
+        // we relaunch right after the user explicitly signed out.
+        XCTAssertTrue(src.contains("healthMonitorTask?.cancel()"),
+                      "SteamSession.shutdown() must cancel healthMonitorTask so it doesn't fight the user-initiated shutdown")
+    }
+
+    /// `WinePrefix.refreshSteamStubFromEngineIfStale` must NEVER
+    /// overwrite a healthy on-disk `steam.exe` with the engine's
+    /// bundled stub. Steam self-updates its own `steam.exe` as Valve
+    /// ships releases; the bundled stub in the engine drifts behind
+    /// Valve within days. Forcing a "refresh on size mismatch" rolled
+    /// Steam back on every Meridian launch, then Steam re-downloaded
+    /// its update + exited code=42 → wineserver tore down → games died.
+    /// CLI-verified May 20 2026 in `bootstrap_log.txt`:
+    /// `steam.exe is 5767832 bytes, expected 5771928`. With this fix,
+    /// the prefix's steam.exe stays at Valve-current and the update
+    /// loop is broken.
+    func testRefreshSteamStub_neverRollsBackHealthyStub() throws {
+        let src = try readSource("Meridian/Engine/WinePrefix.swift")
+
+        // The function must check whether the prefix's stub is HEALTHY
+        // (file exists, size > 0) and skip the overwrite when it is.
+        // Just looking for the "size mismatch → copy" pattern would
+        // miss the real bug.
+        XCTAssertTrue(src.contains("prefixHealthy"),
+                      "refreshSteamStubFromEngineIfStale must gate the overwrite on a prefixHealthy check (file exists AND size > 0) — never on size mismatch alone")
+        XCTAssertTrue(src.contains("ourSize > 0"),
+                      "refreshSteamStubFromEngineIfStale must consider a non-zero stub healthy regardless of whether it matches the engine bundle size")
+        XCTAssertTrue(src.contains("guard !prefixHealthy"),
+                      "refreshSteamStubFromEngineIfStale must early-return when prefix steam.exe is healthy (Steam self-updates this; rolling back triggers a self-update loop)")
+    }
+
+    /// WineEngine.environment(for:) must explicitly set
+    /// `WINEDLLOVERRIDES=d3d11,dxgi,d3d10core=n,b` (or merge equivalent)
+    /// so Wine prefers the native DXMT PE DLLs in `lib/dxmt/` over the
+    /// 426 KB wined3d builtins in `lib/wine/x86_64-windows/`. Without
+    /// the override, CLI-verified May 20 2026 that a Bogos Binted launch
+    /// produced 30+ lines of
+    /// `err:winediag:wined3d_adapter_create Using the Vulkan renderer
+    ///  for d3d10/11 applications` and `partial-stub` format errors,
+    /// because Wine loaded its built-in wined3d d3d11 ahead of DXMT.
+    func testWineEngine_forcesDXMTLoadOrder() throws {
+        let src = try readSource("Meridian/Engine/WineEngine.swift")
+
+        XCTAssertTrue(src.contains("WINEDLLOVERRIDES"),
+                      "WineEngine.environment must set WINEDLLOVERRIDES so DXMT wins over wined3d")
+        XCTAssertTrue(src.contains("d3d11=n,b") || src.contains("d3d11,dxgi"),
+                      "WINEDLLOVERRIDES must force d3d11 to native-first so DXMT loads from WINEDLLPATH (lib/dxmt) before the wined3d builtin in lib/wine/x86_64-windows")
+        XCTAssertTrue(src.contains("dxgi=n,b") || src.contains("dxgi,d3d10core"),
+                      "WINEDLLOVERRIDES must force dxgi to native-first so DXMT's dxgi loads (IDXGIAdapter4 + format support)")
+        XCTAssertTrue(src.contains("d3d10core=n,b") || src.contains("d3d10core,"),
+                      "WINEDLLOVERRIDES must force d3d10core to native-first so DXMT covers the full D3D10/11 surface")
     }
 
     // MARK: - Package directory quiescence logic

@@ -1,5 +1,15 @@
 import Foundation
 
+/// Steam's intended logo placement over the hero banner, from PICS appinfo
+/// `library_logo.logo_position`. Pure data — the View layer maps `pinned` to a
+/// SwiftUI alignment. Percentages are 0–100 of the hero box.
+struct LogoPlacement: Hashable, Sendable {
+    /// "BottomLeft", "CenterCenter", "UpperLeft", "BottomCenter", "UpperCenter".
+    let pinned: String
+    let widthPct: Double
+    let heightPct: Double
+}
+
 /// A game in the user's Steam library.
 struct Game: Identifiable, Hashable, Sendable {
     let id: Int
@@ -22,6 +32,20 @@ struct Game: Identifiable, Hashable, Sendable {
     /// Populated alongside libraryCapsuleHash by the background art-hash fetch.
     var heroHash: String? = nil
 
+    // MARK: - Logo placement (Steam's library layout)
+
+    /// Steam's intended logo placement over the hero, from PICS appinfo
+    /// `common.library_assets_full.library_logo.logo_position`. Populated by the
+    /// `-appinfo` resolver. Used ONLY by the game detail hero to reproduce
+    /// Steam's own logo positioning; the Home carousel ignores these.
+    ///
+    /// `logoPinned` is the anchor corner ("BottomLeft", "CenterCenter",
+    /// "UpperLeft", "BottomCenter", "UpperCenter"). `logoWidthPct`/`logoHeightPct`
+    /// are the logo box size as a percentage (0–100) of the hero.
+    var logoPinned: String? = nil
+    var logoWidthPct: Double? = nil
+    var logoHeightPct: Double? = nil
+
     // MARK: - Effective hashes (override registry takes priority)
 
     /// The logo hash to use for CDN URL construction.
@@ -43,6 +67,18 @@ struct Game: Identifiable, Hashable, Sendable {
     /// back to the hash populated by the background fetch.
     var effectiveHeroHash: String? {
         GameArtOverrides.heroHash(for: id) ?? heroHash
+    }
+
+    // MARK: - Effective logo placement (override registry takes priority)
+
+    /// Resolved logo placement for the game-detail hero, preferring a manual
+    /// override, then the appinfo-fetched values. Returns `nil` when no placement
+    /// data is available (caller falls back to the default leading layout).
+    var effectiveLogoPlacement: LogoPlacement? {
+        if let o = GameArtOverrides.logoPlacement(for: id) { return o }
+        guard let pinned = logoPinned, let w = logoWidthPct, let h = logoHeightPct,
+              w > 0, h > 0 else { return nil }
+        return LogoPlacement(pinned: pinned, widthPct: w, heightPct: h)
     }
 
     // MARK: - Computed URLs
@@ -238,7 +274,10 @@ struct Game: Identifiable, Hashable, Sendable {
         windowsOnly: Bool = false,
         libraryCapsuleHash: String? = nil,
         logoHash: String? = nil,
-        heroHash: String? = nil
+        heroHash: String? = nil,
+        logoPinned: String? = nil,
+        logoWidthPct: Double? = nil,
+        logoHeightPct: Double? = nil
     ) {
         self.id                   = id
         self.name                 = name
@@ -251,6 +290,9 @@ struct Game: Identifiable, Hashable, Sendable {
         self.libraryCapsuleHash   = libraryCapsuleHash
         self.logoHash             = logoHash
         self.heroHash             = heroHash
+        self.logoPinned           = logoPinned
+        self.logoWidthPct         = logoWidthPct
+        self.logoHeightPct        = logoHeightPct
     }
 }
 

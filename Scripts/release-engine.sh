@@ -463,6 +463,38 @@ else
     die "clang not found — cannot build meridian-wine-accessory.dylib (required)"
 fi
 
+# ---------- DepotDownloader fork (headless game installer) ----------
+# Native macOS (arm64) binary that installs owned games via Meridian's OAuth
+# refresh_token — no steam.exe. Patched fork of SteamRE/DepotDownloader (GPL-2.0,
+# shipped as a separate executable, not linked). See Scripts/build-depotdownloader.sh
+# + Scripts/depotdownloader/. Resolved at runtime by WineEngine.depotDownloaderURL.
+# The engine-wide `xattr -rd com.apple.quarantine` on download covers it
+# (Pattern 5 — quarantined binaries lose network access on macOS 26).
+yellow "Building DepotDownloader fork (headless installer)..."
+if command -v dotnet >/dev/null 2>&1; then
+    DD_DEST_DIR="${STAGING}/tools/depotdownloader"
+    mkdir -p "${DD_DEST_DIR}"
+    DD_OUT="${DD_DEST_DIR}/DepotDownloader"
+    bash "$(dirname "${BASH_SOURCE[0]}")/build-depotdownloader.sh" "${DD_OUT}" \
+        || die "DepotDownloader fork build failed"
+    info "DepotDownloader: $(stat -f%z "${DD_OUT}") bytes ✓"
+else
+    die "dotnet not found — cannot build DepotDownloader fork (run 'brew install dotnet')"
+fi
+
+# ---------- Steamworks API emulator (gbe_fork) — DRM games without steam.exe ----------
+# DRM games (those shipping steam_api64.dll) have their Valve dll replaced with
+# the open-source gbe_fork emulator at launch so SteamAPI_Init() succeeds
+# locally — no running steam.exe, no auth, no "Who's playing" window. Prebuilt
+# Windows PE DLLs (Wine loads them as the game's import). See
+# Scripts/build-steamemu.sh. Resolved at runtime by WineEngine.steamApi64EmuURL.
+# The engine-wide quarantine strip covers these too (Pattern 5).
+yellow "Staging Steamworks API emulator (gbe_fork)..."
+SE_DEST_DIR="${STAGING}/tools/steamemu"
+bash "$(dirname "${BASH_SOURCE[0]}")/build-steamemu.sh" "${SE_DEST_DIR}" \
+    || die "Steamworks emulator staging failed"
+info "steamemu: $(stat -f%z "${SE_DEST_DIR}/steam_api64.dll") bytes ✓"
+
 # ---------- re-sign wine64 with allow-dyld entitlement ----------
 # CrossOver's stock wine64 has hardened-runtime + library-validation-disabled
 # but lacks `com.apple.security.cs.allow-dyld-environment-variables`, which

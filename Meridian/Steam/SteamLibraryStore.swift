@@ -201,11 +201,56 @@ final class SteamLibraryStore {
                 }
             }
         }
-        // Pass 3 (probeCapsuleHash network probing) was removed. It made hundreds
-        // of HTTP requests per session that never succeeded — the appdetails API
-        // doesn't contain the capsule hash for games on the new CDN, so all probes
-        // returned nil. The local librarycache scan above already covers these games.
-        log.info("[prefetchLibraryCapsuleHashes] complete — localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule hashes")
+        // Pass 3: PICS appinfo via the DepotDownloader fork (`-appinfo`).
+        //
+        // This is the AUTHORITATIVE source for the library LOGO hash, which
+        // neither GetItems (Pass 1) nor — for never-opened games — the local
+        // librarycache (Pass 2) provides. Steam moved library logos to
+        // common.library_assets_full.library_logo, reachable only via the CM
+        // protocol (SteamKit2). The fork resolves them ANONYMOUSLY (the appinfo
+        // `common` section is public) in one batched, no-network-spam call.
+        // Replaces the removed appdetails HTTP-probe pass, which never resolved
+        // anything. Degrades gracefully: if the fork is absent or a game can't
+        // be resolved, that game keeps the legacy CDN fallback.
+        // Query appinfo for any game still missing a logo hash OR a logo
+        // placement — placement (logo_position) ONLY comes from appinfo, so even
+        // games whose logo resolved via Pass 1/2 need this for Steam-accurate
+        // positioning on the detail page. Older titles return an empty logo hash
+        // (bare legacy filename) but a valid position, which the detail hero
+        // applies to their working legacy-CDN logo.
+        let stillMissingLogo = games.indices
+            .filter { games[$0].logoHash == nil || games[$0].logoPinned == nil }
+            .map { games[$0].id }
+        var appInfoLogoCount = 0
+        if !stillMissingLogo.isEmpty {
+            for batch in stillMissingLogo.chunked(into: 200) {
+                let resolved = await SteamAppInfoResolver.resolve(appIDs: batch)
+                guard !resolved.isEmpty else { continue }
+                for (appID, hashes) in resolved {
+                    if let idx = games.firstIndex(where: { $0.id == appID }) {
+                        if let logo = hashes.logo { games[idx].logoHash = logo; appInfoLogoCount += 1 }
+                        if games[idx].libraryCapsuleHash == nil, let c = hashes.capsule { games[idx].libraryCapsuleHash = c }
+                        if games[idx].heroHash == nil, let h = hashes.hero { games[idx].heroHash = h }
+                        if let p = hashes.logoPlacement {
+                            games[idx].logoPinned = p.pinned
+                            games[idx].logoWidthPct = p.widthPct
+                            games[idx].logoHeightPct = p.heightPct
+                        }
+                    }
+                    if let rIdx = recentGames.firstIndex(where: { $0.id == appID }) {
+                        if let logo = hashes.logo { recentGames[rIdx].logoHash = logo }
+                        if recentGames[rIdx].libraryCapsuleHash == nil, let c = hashes.capsule { recentGames[rIdx].libraryCapsuleHash = c }
+                        if recentGames[rIdx].heroHash == nil, let h = hashes.hero { recentGames[rIdx].heroHash = h }
+                        if let p = hashes.logoPlacement {
+                            recentGames[rIdx].logoPinned = p.pinned
+                            recentGames[rIdx].logoWidthPct = p.widthPct
+                            recentGames[rIdx].logoHeightPct = p.heightPct
+                        }
+                    }
+                }
+            }
+        }
+        log.info("[prefetchLibraryCapsuleHashes] complete — localCache resolved \(localLogoCount) logo + \(localCapsuleCount) capsule; appinfo resolved \(appInfoLogoCount) logo")
     }
 
     /// Applies a hash dictionary to both the main games array and recentGames.
@@ -387,7 +432,10 @@ final class SteamLibraryStore {
             windowsOnly: base.windowsOnly,
             libraryCapsuleHash: base.libraryCapsuleHash,
             logoHash: base.logoHash,
-            heroHash: base.heroHash
+            heroHash: base.heroHash,
+            logoPinned: base.logoPinned,
+            logoWidthPct: base.logoWidthPct,
+            logoHeightPct: base.logoHeightPct
         )
     }
 

@@ -77,6 +77,14 @@
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<false/>
 			</dict>
+			<!-- PCGamingWiki Cargo API — per-game tech metadata (engine, Direct3D version, DRM) -->
+			<key>pcgamingwiki.com</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<false/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
 		</dict>
 	</dict>
 	<!-- Custom URL scheme for Steam OpenID callback -->

@@ -83,6 +83,50 @@ final class WineEngine {
     var wine64URL: URL { wineExecutableURL ?? URL(filePath: "/dev/null") }
     var wineserverURL: URL { wineserverExecutableURL ?? URL(filePath: "/dev/null") }
 
+    /// Path to the bundled DepotDownloader fork — a native macOS (arm64) binary
+    /// that installs owned games headlessly via Meridian's OAuth `refresh_token`,
+    /// without `steam.exe`. Staged into the engine tarball at
+    /// `engine/tools/depotdownloader/DepotDownloader` by `release-engine.sh`
+    /// (built by `Scripts/build-depotdownloader.sh`). Returns `nil` when the
+    /// binary is absent or not executable — callers surface a "re-download the
+    /// engine" error rather than crashing.
+    var depotDownloaderURL: URL? {
+        let url = Self.engineDir.appending(path: "tools/depotdownloader/DepotDownloader")
+        return FileManager.default.isExecutableFile(atPath: url.path(percentEncoded: false)) ? url : nil
+    }
+
+    // MARK: - Steamworks API emulator (gbe_fork) — DRM games without steam.exe
+
+    /// Directory holding the bundled open-source Steamworks API emulator
+    /// (gbe_fork). Staged by `Scripts/build-steamemu.sh` /
+    /// `release-engine.sh` at `engine/tools/steamemu/`.
+    ///
+    /// DRM games (those shipping `steam_api64.dll`) have their Valve
+    /// `steam_api(64).dll` replaced with these so `SteamAPI_Init()` succeeds
+    /// locally — no `steam.exe`, no auth, no "Who's playing" window. See
+    /// `WinePrefix.installSteamEmulator`.
+    ///
+    /// `nonisolated` because these are pure static-path + FileManager checks
+    /// (no actor state) — `WinePrefix.installSteamEmulator` runs off the main
+    /// actor (it does multi-MB file copies) and reads them directly.
+    nonisolated var steamEmuDir: URL { Self.engineDir.appending(path: "tools/steamemu") }
+
+    /// The emulator's 64-bit `steam_api64.dll`, or nil if not staged.
+    nonisolated var steamApi64EmuURL: URL? { Self.existingFile(steamEmuDir.appending(path: "steam_api64.dll")) }
+
+    /// The emulator's 32-bit `steam_api.dll`, or nil if not staged.
+    nonisolated var steamApi32EmuURL: URL? { Self.existingFile(steamEmuDir.appending(path: "steam_api.dll")) }
+
+    /// gbe_fork's `generate_interfaces_x64.exe` — run under Wine against the
+    /// ORIGINAL Valve dll to produce `steam_interfaces.txt`. Staged for manual
+    /// / future use; the emulator falls back to built-in interface defaults
+    /// (sufficient for modern games), so the launch path does not invoke it.
+    nonisolated var generateInterfacesX64URL: URL? { Self.existingFile(steamEmuDir.appending(path: "generate_interfaces_x64.exe")) }
+
+    nonisolated private static func existingFile(_ url: URL) -> URL? {
+        FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) ? url : nil
+    }
+
     // MARK: - Settings
 
     private let settings = AppSettings.shared
@@ -371,17 +415,32 @@ final class WineEngine {
             return
         }
 
-        // Copy dylib from bundle → engine if absent (parallels the
-        // dpapi-helper self-heal in `WinePrefix.installDpapiHelperFromBundle`).
+        // Sync dylib from bundle → engine when bundle is newer (or engine
+        // copy is missing). Without the mtime check the engine copy would
+        // never refresh from a Meridian app update — diagnostic logging,
+        // bug fixes, and policy tweaks in the dylib would be silently
+        // ignored. Same self-heal pattern as `installDpapiHelperFromBundle`.
         let dylibDest = Self.engineDir.appending(path: "wine/share/meridian/meridian-wine-accessory.dylib")
-        if !fm.fileExists(atPath: dylibDest.path(percentEncoded: false)),
-           let bundled = Bundle.main.url(forResource: "meridian-wine-accessory", withExtension: "dylib") {
-            do {
-                try fm.createDirectory(at: dylibDest.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fm.copyItem(at: bundled, to: dylibDest)
-                log.info("[ensureDyld] copied bundled meridian-wine-accessory.dylib → engine")
-            } catch {
-                log.warning("[ensureDyld] could not copy accessory dylib: \(error.localizedDescription)")
+        if let bundled = Bundle.main.url(forResource: "meridian-wine-accessory", withExtension: "dylib") {
+            let needsCopy: Bool
+            if !fm.fileExists(atPath: dylibDest.path(percentEncoded: false)) {
+                needsCopy = true
+            } else {
+                let bundledMtime = (try? bundled.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                let engineMtime  = (try? dylibDest.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                needsCopy = (bundledMtime ?? .distantPast) > (engineMtime ?? .distantPast)
+            }
+            if needsCopy {
+                do {
+                    try fm.createDirectory(at: dylibDest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    if fm.fileExists(atPath: dylibDest.path(percentEncoded: false)) {
+                        try fm.removeItem(at: dylibDest)
+                    }
+                    try fm.copyItem(at: bundled, to: dylibDest)
+                    log.info("[ensureDyld] synced meridian-wine-accessory.dylib bundle → engine")
+                } catch {
+                    log.warning("[ensureDyld] could not copy accessory dylib: \(error.localizedDescription)")
+                }
             }
         }
 
@@ -516,13 +575,32 @@ final class WineEngine {
 
                 // DX11 default: DXMT first in WINEDLLPATH, Wine builtins as fallback.
                 // D3D12 games override both WINEDLLPATH and WINEDLLOVERRIDES in
-                // WineSteamManager.launchGameDirectly() based on profile.graphicsAPI == .dx12.
+                // SteamSession.gameEnvironment(for:engine:) based on
+                // profile.graphicsAPI == .dx12.
                 let dxmtLibDir = "\(lib)/dxmt"
                 env["WINEDLLPATH"] = "\(dxmtLibDir):\(lib)/wine"
 
-                // No global WINEDLLOVERRIDES — Wine's default builtin,native load order
-                // correctly picks DXMT from lib/dxmt for DX11 games. D3D12 games set
-                // d3d12=b;dxgi=b in launchGameDirectly to bypass lib/dxmt entirely.
+                // Force Wine to load native PE versions of d3d11/dxgi/d3d10core
+                // BEFORE its own builtin wined3d implementations.
+                //
+                // CRITICAL — without this override, Wine prefers the much
+                // smaller wined3d-based `lib/wine/x86_64-windows/d3d11.dll`
+                // (426 KB) over the full DXMT `lib/dxmt/x86_64-windows/d3d11.dll`
+                // (4.8 MB). The wined3d path then translates D3D11 → Vulkan →
+                // MoltenVK → Metal which has many partial-stub format/feature
+                // gaps (CLI-verified May 20 2026 game log: a Bogos Binted
+                // launch produced 30+ lines of
+                // `err:winediag:wined3d_adapter_create Using the Vulkan
+                //  renderer for d3d10/11 applications` and
+                // `fixme:d3d11:d3d11_device_CheckFormatSupport ... partial-stub!`
+                // before silently failing to render).
+                //
+                // `n,b` order means "try native (PE) first, fall back to
+                // builtin if not found." Wine searches WINEDLLPATH for the
+                // native version; since `lib/dxmt` is first, it finds DXMT's
+                // PE there. Builtin path is preserved as a safety net for
+                // environments where DXMT isn't present.
+                env["WINEDLLOVERRIDES"] = "d3d11=n,b;dxgi=n,b;d3d10core=n,b"
 
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {

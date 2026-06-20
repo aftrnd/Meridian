@@ -94,6 +94,80 @@ final class EnsureCoreServicesTests: XCTestCase {
         )
     }
 
+    // MARK: - Service-config correctness (CLI-verified 2026-06-18)
+
+    /// RpcSs must NOT be registered as an interactive service with a
+    /// non-LocalSystem account. Wine's service controller rejects
+    /// `Type` containing the interactive bit (0x100) when `ObjectName` is not
+    /// LocalSystem with `validate_service_config: ... interactive but has the
+    /// disallowed account name` → the service is skipped → RPC endpoint mapper
+    /// absent → EventLog (RPC-dependent) fails to start (1053). CLI-verified
+    /// from steam.exe stderr on a fresh Meridian prefix. CrossOver's working
+    /// bottle uses LocalSystem + Type 0x20 (share-process, no interactive bit).
+    func testRpcSsIsNotInteractiveWithNetworkService() throws {
+        let src = try readSource("Meridian/Engine/WinePrefix.swift")
+        // Scope strictly to the RpcSs tuple block: from `"RpcSs",` to the
+        // closing `),` that ends its tuple. PlugPlay legitimately uses Type
+        // 0x110 (it runs as LocalSystem, which Wine *does* allow to be
+        // interactive), so a file-wide search would false-positive.
+        guard let rpcStart = src.range(of: "\"RpcSs\",") else {
+            XCTFail("Could not locate RpcSs registration"); return
+        }
+        let after = String(src[rpcStart.upperBound...])
+        // The RpcSs tuple is followed by the EventLog tuple; bound the slice
+        // at the next service marker so inner `),` from value tuples don't
+        // truncate the block prematurely.
+        guard let blockEnd = after.range(of: "\"EventLog\",") else {
+            XCTFail("Could not locate end of RpcSs tuple (EventLog marker)"); return
+        }
+        let rpcBlock = String(after[..<blockEnd.lowerBound])
+
+        XCTAssertFalse(
+            rpcBlock.contains("0x110"),
+            "RpcSs must not be registered with Type 0x110 (interactive | own-process) — Wine rejects the interactive bit for non-LocalSystem accounts (regression)"
+        )
+        XCTAssertFalse(
+            rpcBlock.contains("NetworkService"),
+            "RpcSs must not run as NT AUTHORITY\\NetworkService — combined with the interactive bit Wine rejects it. Use LocalSystem (matches CrossOver)."
+        )
+        XCTAssertTrue(
+            rpcBlock.contains("LocalSystem"),
+            "RpcSs must run as LocalSystem (CrossOver's working configuration)"
+        )
+    }
+
+    /// EventLog is svchost-hosted; svchost needs the group→service mapping
+    /// (`SvcHost\LocalServiceNetworkRestricted = EventLog`) and the service DLL
+    /// (`EventLog\Parameters\ServiceDll = wevtsvc.dll`). The prefix template
+    /// omits both, so `svchost:LoadGroup cannot open key ...Svchost` and
+    /// EventLog never starts. CLI-verified 2026-06-18.
+    func testEnsureCoreServicesWritesSvchostGroupForEventLog() throws {
+        let src = try readSource("Meridian/Engine/WinePrefix.swift")
+        guard let body = ensureCoreServicesBody(src) else {
+            XCTFail("Could not locate ensureCoreServices body"); return
+        }
+        XCTAssertTrue(
+            body.contains("Svchost") && body.contains("LocalServiceNetworkRestricted"),
+            "ensureCoreServices must write the SvcHost group key (LocalServiceNetworkRestricted) so svchost can host EventLog"
+        )
+        XCTAssertTrue(
+            body.contains("wevtsvc.dll") && body.contains("ServiceDll"),
+            "ensureCoreServices must write EventLog\\Parameters\\ServiceDll = wevtsvc.dll so svchost can load the EventLog service DLL"
+        )
+        XCTAssertTrue(
+            body.contains("REG_MULTI_SZ"),
+            "The SvcHost group value must be REG_MULTI_SZ (svchost reads it as a multi-string list of service names)"
+        )
+    }
+
+    /// Helper: returns the textual body of ensureCoreServices, or nil.
+    private func ensureCoreServicesBody(_ src: String) -> String? {
+        guard let funcRange = src.range(of: "func ensureCoreServices(engine: WineEngine) async"),
+              let bodyStart = src.range(of: "{", range: funcRange.upperBound..<src.endIndex)
+        else { return nil }
+        return String(src[bodyStart.lowerBound...])
+    }
+
     // MARK: - BootstrapManager.swift invariants
 
     func testBootstrapAwaitsEnsureCoreServices() throws {

@@ -55,6 +55,18 @@ final class SteamSession {
     private var connectionLogOffset: Int = 0
     private let prefix = WinePrefix.defaultPrefix
 
+    /// Background task that watches `persistentProcess` after it has reached
+    /// `[Logged On,` and relaunches it if Steam exits code=42 (self-update
+    /// restart). Without this, Steam's normal mid-session client-update flow
+    /// terminates wineserver, which kills any running game with it. Set on
+    /// the same actor as `state`; only one is alive at a time.
+    private var healthMonitorTask: Task<Void, Never>?
+
+    /// Sentinel — incremented by `shutdown` so an in-flight health monitor
+    /// task can detect that it has been superseded and exit cleanly without
+    /// fighting the user's explicit shutdown.
+    private var healthGeneration: Int = 0
+
     // MARK: - Dependency injection (set by MeridianApp)
 
     var steamWindow: SteamWindow?
@@ -68,9 +80,19 @@ final class SteamSession {
     /// own on-disk state (ssfn, local.vdf) it succeeds in ~5-10 s.
     /// If not, fails after 12 s → state = .failed → sign-in sheet recovers.
     func start(engine: WineEngine) async {
-        guard case .idle = state else {
-            log.info("[start] already in state \(String(describing: state)) — skip")
+        switch state {
+        case .running:
+            log.info("[start] already running — skip")
             return
+        case .startingSilent:
+            log.info("[start] already starting — skip")
+            return
+        case .idle, .failed:
+            // `.failed` is retryable — a prior silent-auth failure (e.g. a
+            // lazy DRM warm that didn't reach [Logged On,) must be able to
+            // re-attempt cleanly. launchSteamProcess no-ops if a live process
+            // already exists, so this is safe.
+            break
         }
 
         state = .startingSilent
@@ -87,13 +109,303 @@ final class SteamSession {
             if loggedOn {
                 state = .running(pid: pid_t(pid))
                 log.info("[start] silent auth succeeded ✓ pid=\(pid)")
+                // Begin watching the long-running steam.exe so we can transparently
+                // relaunch it when Steam decides to self-update (exit code=42).
+                // Without this, the user's running game dies the next time Valve
+                // pushes a client update mid-session — CLI-confirmed May 20 2026.
+                startHealthMonitor(engine: engine)
             } else {
                 log.warning("[start] silent auth timed out — sign-in sheet will handle re-auth")
+                logSteamFailureDiagnostics(reason: "silent auth did not reach [Logged On,")
                 state = .failed("Steam could not authenticate silently. Please sign in.")
             }
         } catch {
             log.warning("[start] steam.exe start failed: \(error.localizedDescription)")
+            logSteamFailureDiagnostics(reason: "launchSteamProcess threw: \(error.localizedDescription)")
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Lazy DRM-only Steam runtime
+
+    /// Brings the full Steam runtime online for a DRM game launch — and ONLY
+    /// for that.
+    ///
+    /// As of Phase 3 (HANDOFF-2026-06-19) Steam is lazy and DRM-only: the
+    /// bootstrap pipeline no longer installs the Steam client or starts
+    /// steam.exe. The first time a DRM game (`steam_api64.dll`) is launched,
+    /// `Launcher` calls this. It performs the deferred Steam bring-up:
+    ///
+    ///   1. install the Steam stub (`SteamSetup.exe /S`) if absent — silent, small
+    ///   2. download the full client (steamui.dll, ~336 MB) NATIVELY if absent
+    ///   3. inject `local.vdf` from the persisted OAuth refresh_token so
+    ///      `steam.exe -silent` can auto-login
+    ///   4. start `steam.exe -silent` and wait for `[Logged On,`
+    ///
+    /// Idempotent: returns immediately when already `.running`. Recoverable:
+    /// `start()` accepts a prior `.failed` state so a second DRM launch can
+    /// re-attempt. Throws `SessionError.steamNotReady` when Steam cannot reach
+    /// `[Logged On,` so the caller surfaces an actionable error.
+    ///
+    /// DRM-free games and installs never call this — they use the persisted
+    /// refresh_token via DepotDownloader / direct wine64 exec, so a DRM-free-only
+    /// user never downloads the Steam client nor runs steam.exe.
+    func ensureReadyForDRM(
+        engine: WineEngine,
+        onStatus: (@MainActor (String) -> Void)? = nil
+    ) async throws {
+        if isReady { return }
+        log.info("[ensureReadyForDRM] bringing Steam runtime online for DRM launch (state=\(String(describing: state)))")
+
+        // 1. Steam stub — silent install, only if absent.
+        if !prefix.isSteamInstalled {
+            onStatus?("Installing Steam…")
+            log.info("[ensureReadyForDRM] installing Steam stub (SteamSetup.exe /S)")
+            try await prefix.installSteam(engine: engine)
+        }
+        try? prefix.ensureSteamCFG()
+        try? prefix.ensureDefaultLibrary()
+
+        try Task.checkCancellation()
+
+        // 2. Full Steam client (steamui.dll, ~336 MB) — only needed for DRM.
+        try await bootstrapSteamClientIfNeeded(engine: engine, onStatus: onStatus)
+        if prefix.refreshSteamStubFromEngineIfStale() {
+            log.info("[ensureReadyForDRM] steam.exe stub refreshed from engine bundle ✓")
+        }
+
+        try Task.checkCancellation()
+
+        // 3. Inject local.vdf from persisted OAuth credentials so the silent
+        //    launch can auto-login. Best-effort — on-disk ssfn/loginusers may
+        //    already satisfy it.
+        SteamSessionBackup.restoreIfNeeded(prefix: prefix)
+        let settings = AppSettings.shared
+        if settings.hasSteamCredentials {
+            do {
+                try await prefix.writeSteamSessionLocalVdf(
+                    engine: engine,
+                    steamID: settings.steamCredentialSteamID,
+                    accountName: settings.steamCredentialAccountName,
+                    refreshToken: settings.steamCredentialRefreshToken
+                )
+                log.info("[ensureReadyForDRM] local.vdf injected from persisted credentials ✓")
+            } catch {
+                log.warning("[ensureReadyForDRM] local.vdf inject failed: \(error.localizedDescription) — falling back to on-disk state")
+            }
+            // Pre-write the per-user webhelper notification toggles BEFORE Steam
+            // starts so the post-login toast burst is silenced before the first
+            // toast can render. Best-effort — the userdata dir may not exist
+            // until Steam's first -silent launch creates it.
+            try? prefix.writeUserNotificationPreferences(steamID64: settings.steamCredentialSteamID)
+        }
+
+        // 4. Start steam.exe -silent + wait for [Logged On,].
+        onStatus?("Starting Steam…")
+        await start(engine: engine)
+        guard isReady else {
+            // start() already logged steam.exe diagnostics on the failure path.
+            throw SessionError.steamNotReady
+        }
+        log.info("[ensureReadyForDRM] Steam ready for DRM ✓")
+    }
+
+    /// Downloads the full Steam client (steamui.dll) NATIVELY via URLSession.
+    ///
+    /// Moved here from BootstrapManager as part of making Steam DRM-only
+    /// (Phase 3). We do NOT run `steam.exe -silent` to bootstrap: its
+    /// statically-linked 32-bit OpenSSL cannot complete TLS handshakes under
+    /// WoW64 on macOS 26, producing `http error 0` so steamui.dll never
+    /// appears (CLI-reproduced). `SteamClientBootstrap` fetches Valve's CDN
+    /// manifest + packages over native macOS TLS instead.
+    ///
+    /// Re-bootstraps when the client is absent OR the installed `steam.exe` is
+    /// the broken 32-bit build (older prefixes fetched the `steam_client_win32`
+    /// packages whose 32-bit steam.exe reports Windows 8 and fails every
+    /// in-Wine update fetch). FAIL-FAST (fail-fast.mdc): exactly ONE clean
+    /// retry (discard partial cache), then surface the error.
+    private func bootstrapSteamClientIfNeeded(
+        engine: WineEngine,
+        onStatus: (@MainActor (String) -> Void)?
+    ) async throws {
+        let needsClientBootstrap = !prefix.isSteamBootstrapped || !prefix.isSteamExe64Bit
+        guard needsClientBootstrap else {
+            log.info("[bootstrapClient] steamui.dll present and steam.exe is 64-bit — skipping")
+            return
+        }
+        if prefix.isSteamBootstrapped && !prefix.isSteamExe64Bit {
+            log.info("[bootstrapClient] installed steam.exe is 32-bit — re-bootstrapping with win64 client")
+        }
+
+        // Engage suppression before the download in case Steam ever renders UI.
+        steamWindow?.startSuppressing()
+        try? prefix.ensureSteamCFG()
+        prefix.stripBootStrapperInhibit()
+
+        let installDir = prefix.steamInstallDir
+        let progress: @Sendable (Int64, Int64) -> Void = { downloaded, total in
+            Task { @MainActor in
+                let pct = total > 0 ? Int(downloaded * 100 / total) : 0
+                let mb = downloaded / 1_048_576
+                let totalMB = total / 1_048_576
+                onStatus?("Downloading Steam client… \(mb)/\(totalMB) MB (\(pct)%)")
+            }
+        }
+
+        log.info("[bootstrapClient] native download into \(installDir.path(percentEncoded: false))")
+        do {
+            try await SteamClientBootstrap.downloadAndInstall(to: installDir, progress: progress)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // FAIL-FAST: one clean retry — discard partial/corrupt package cache.
+            log.warning("[bootstrapClient] Steam client download failed (\(error.localizedDescription)) — one clean retry")
+            let pkgDir = installDir.appending(path: "package")
+            try? FileManager.default.removeItem(at: pkgDir)
+            try await SteamClientBootstrap.downloadAndInstall(to: installDir, progress: progress)
+        }
+
+        let fm = FileManager.default
+        let dllPath = installDir.appending(path: "steamui.dll").path(percentEncoded: false)
+        let altPath = installDir.appending(path: "SteamUI.dll").path(percentEncoded: false)
+        guard fm.fileExists(atPath: dllPath) || fm.fileExists(atPath: altPath) else {
+            log.error("[bootstrapClient] steamui.dll missing after native bootstrap")
+            throw SteamClientBootstrap.BootstrapError.steamuiMissing
+        }
+        log.info("[bootstrapClient] Steam client bootstrap complete ✓")
+    }
+
+    // MARK: - Self-update health monitor
+
+    /// Watches the persistent steam.exe and relaunches it when Steam
+    /// terminates with `exit=42` — Valve's "self-update completed, please
+    /// restart me" sentinel that fires periodically as Valve ships new
+    /// client builds.
+    ///
+    /// **Why this is necessary:** On Windows, `steam.exe` IS its own
+    /// launcher and re-execs itself in place. Under Wine on macOS each
+    /// process is a separate POSIX process; when steam.exe exits, every
+    /// game process attached to the same wineserver dies with it within
+    /// seconds (wineserver shuts down when no Wine processes are attached
+    /// to it). Without a launcher-side relaunch the game appears to crash
+    /// at random — usually 1–3 minutes after Steam first reaches
+    /// `[Logged On, ` in connection_log.txt.
+    ///
+    /// **Why exit=42 specifically:** Steam uses 42 as its
+    /// "intentional restart" sentinel both during initial client-bootstrap
+    /// (see `bootstrapSteamClientIfNeeded`) and during runtime
+    /// auto-update. CLI-verified May 20 2026 — the log line
+    /// `[steam.exe] exited code=42` correlates 1:1 with wineserver dying
+    /// and the running game ending in `Wine environment stopped before
+    /// the game could start`.
+    ///
+    /// We restart up to `Self.maxRestartAttempts` times in a short window
+    /// to prevent a runaway loop if Steam is genuinely broken (e.g.
+    /// corrupted client files). Each restart re-runs the silent auth path,
+    /// because if Steam updated client files we need to wait for
+    /// `[Logged On,` again before declaring success.
+    private func startHealthMonitor(engine: WineEngine) {
+        healthMonitorTask?.cancel()
+        healthGeneration &+= 1
+        let generation = healthGeneration
+        let process = persistentProcess
+        guard let process else { return }
+
+        healthMonitorTask = Task { [weak self] in
+            await self?.monitorSteamHealth(
+                generation: generation,
+                initialProcess: process,
+                engine: engine
+            )
+        }
+    }
+
+    /// Max consecutive code=42 restarts within `restartWindow` before
+    /// we give up and surface `.failed`. Steam under healthy conditions
+    /// self-updates at most once per session — three within 60 s is a
+    /// genuine failure (corrupt client, network outage, etc.).
+    private static let maxRestartAttempts = 3
+    private static let restartWindow: Duration = .seconds(60)
+
+    private func monitorSteamHealth(
+        generation: Int,
+        initialProcess: Process,
+        engine: WineEngine
+    ) async {
+        var process = initialProcess
+        var recentRestarts: [ContinuousClock.Instant] = []
+
+        while !Task.isCancelled {
+            // Wait for the current steam.exe to exit. `terminationStatus`
+            // is only valid after the process has actually finished, so
+            // we sleep-poll on `isRunning` (the only async-safe way).
+            while process.isRunning && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard generation == healthGeneration else { return }
+            }
+            if Task.isCancelled || generation != healthGeneration { return }
+
+            let code = process.terminationStatus
+            log.info("[healthMonitor] steam.exe exited code=\(code) generation=\(generation)")
+
+            // Non-42 exit during running state = legitimate failure
+            // (Steam crashed, user signed out, etc.). Caller's normal
+            // failure paths take over; we just exit the monitor.
+            guard code == 42 else {
+                log.info("[healthMonitor] non-restart exit — leaving state alone")
+                return
+            }
+
+            // Trim restarts older than the window and bail if we've
+            // exceeded our budget. Each restart is appended below.
+            let now = ContinuousClock.now
+            recentRestarts.removeAll { now - $0 > Self.restartWindow }
+            if recentRestarts.count >= Self.maxRestartAttempts {
+                log.error("[healthMonitor] \(recentRestarts.count) restarts within \(Self.restartWindow) — giving up")
+                state = .failed("Steam keeps restarting unexpectedly. Try quitting and reopening Meridian.")
+                return
+            }
+            recentRestarts.append(now)
+
+            // Relaunch transparently. We DO NOT call `start()` to avoid
+            // double-engaging the SteamWindow suppressor (it's already
+            // engaged) or resetting state. Instead replicate the minimum
+            // needed: launch process + wait for Logged On + register PID.
+            log.info("[healthMonitor] relaunching steam.exe -silent after self-update (attempt \(recentRestarts.count)/\(Self.maxRestartAttempts))")
+            do {
+                try await launchSteamProcess(engine: engine)
+            } catch {
+                log.error("[healthMonitor] relaunch failed: \(error.localizedDescription)")
+                state = .failed("Steam restart failed: \(error.localizedDescription)")
+                return
+            }
+
+            guard generation == healthGeneration else { return }
+            guard let newProcess = persistentProcess else {
+                log.error("[healthMonitor] persistentProcess missing after relaunch")
+                state = .failed("Steam restart failed: no process reference")
+                return
+            }
+            process = newProcess
+
+            let loggedOn = await waitForLoggedOn(
+                engine: engine,
+                timeout: .seconds(120),
+                authTimeout: .seconds(30)
+            )
+            guard generation == healthGeneration else { return }
+
+            if loggedOn {
+                let pid = newProcess.isRunning ? newProcess.processIdentifier : 0
+                state = .running(pid: pid_t(pid))
+                log.info("[healthMonitor] ✓ Steam restored after self-update (pid=\(pid))")
+            } else {
+                log.error("[healthMonitor] Steam did not reach Logged On after self-update")
+                logSteamFailureDiagnostics(reason: "self-update relaunch did not reach [Logged On,")
+                state = .failed("Steam restart didn't complete sign-in. Try quitting and reopening Meridian.")
+                return
+            }
+            // Loop back to wait for the next exit.
         }
     }
 
@@ -106,6 +418,13 @@ final class SteamSession {
     /// running processes. CLI-observed May 19 2026.
     func shutdown(engine: WineEngine) async {
         log.info("[shutdown] stopping steam.exe (state=\(String(describing: state)))")
+        // Bump generation FIRST so the health monitor can detect this is an
+        // intentional shutdown and not race-relaunch the process we're about
+        // to kill. The task itself cancels normally; the generation check is
+        // a belt-and-suspenders in case the cancel propagates lazily.
+        healthGeneration &+= 1
+        healthMonitorTask?.cancel()
+        healthMonitorTask = nil
         steamWindow?.stopSuppressing()
 
         // Send steam.exe -shutdown via a second process instance. Steam's IPC
@@ -148,30 +467,53 @@ final class SteamSession {
 
     // MARK: - Public API: game install
 
-    /// Initiate a game install via Steam IPC. Requires `isReady == true`
-    /// (a persistent `steam.exe -silent` process must be running and authenticated).
+    /// Silently install a game. Requires `isReady == true` (a persistent
+    /// `steam.exe -silent` process must already be authenticated).
     ///
-    /// The install is driven by the SAME mechanism Steam Desktop uses internally:
+    /// ## Why we restart Steam instead of using `steam://install`
     ///
-    ///   1. Pre-seed `appmanifest_<appID>.acf` with `StateFlags=1026` ("scheduled
-    ///      for download") so Steam knows the install location when it receives
-    ///      the IPC command — no install-location picker dialog will ever appear.
-    ///   2. Spawn `wine64 steam.exe steam://install/<appID>`. Wine's PE loader
-    ///      sees that a Steam instance already owns the IPC named pipe and
-    ///      forwards the URL to it instead of cold-starting a second Steam.
-    ///      The forwarder process exits in ~1 second.
-    ///   3. Steam dispatches the URL to its internal download manager, which
-    ///      reads the pre-seeded ACF and starts downloading immediately. No
-    ///      restart, no re-auth, no UI.
+    /// Valve's `steam://install/<appID>` URL handler ALWAYS opens the
+    /// install-location picker dialog. There is no Steam URL that bypasses
+    /// it — Valve assumes users want to choose a disk + library. CLI-
+    /// confirmed user report May 20 2026: every install attempt showed
+    /// the full Steam "Choose where to install" dialog before downloading
+    /// even started.
     ///
-    /// Progress is observed by the caller (`Launcher.pollDownloadProgress`) by
-    /// reading `BytesDownloaded` / `BytesToDownload` from the ACF manifest.
+    /// The ONLY silent-install mechanism Steam supports is the
+    /// **library-scan-at-startup** path: if `steamapps/appmanifest_<id>.acf`
+    /// exists with `StateFlags == 1026` when Steam starts, Steam picks it
+    /// up during its login post-callback library scan and silently downloads
+    /// from the install location encoded in the ACF — no picker, no UI. This
+    /// is the same code path Steam Desktop uses when a user moves their
+    /// Steam library to a new disk and restarts Steam.
     ///
-    /// SteamCMD is NOT used. Meridian's native bootstrap stages `steam.exe` but
-    /// not `steamcmd.exe` (the `steam_cmd_win32` manifest was never wired in),
-    /// so SteamCMD-based installs always failed with "steamcmd.exe not found".
-    /// IPC works against the already-running, already-authenticated Steam — no
-    /// dependency on additional binaries.
+    /// So `installGame` writes a pre-seeded ACF, then restarts Steam:
+    ///
+    ///   1. `writePreseededAppManifest` writes the ACF with `installdir`,
+    ///      `name`, `LastOwner`, and `StateFlags=1026`.
+    ///   2. `shutdown` tears down the running Steam (graceful `-shutdown`
+    ///      IPC + `wineserver -k`).
+    ///   3. `start` launches `steam.exe -silent` and waits for `[Logged On, `.
+    ///      During Steam's startup library scan it discovers the new ACF and
+    ///      silently begins downloading.
+    ///
+    /// Progress is then observed by `Launcher.pollDownloadProgress` reading
+    /// `bytesOnDiskForDownload` + `bytesOnDiskForInstall` directly from the
+    /// filesystem. No Steam UI is rendered at any point.
+    ///
+    /// ## Trade-offs
+    ///
+    /// - Restarting Steam takes 8–15 s. The UI shows "Preparing install…"
+    ///   during that window.
+    /// - Any DRM game currently running through this Steam will die when
+    ///   wineserver tears down. Callers must ensure no game is in `.running`
+    ///   before invoking `installGame`. `Launcher.executePipeline`'s guard
+    ///   already enforces this (early-return when `launchState == .running`,
+    ///   `.installing`, etc.).
+    /// - With `WinePrefix.refreshSteamStubFromEngineIfStale` now repairing
+    ///   only on missing/corrupt (not "different size from bundle"), Steam's
+    ///   own self-update no longer fires on every restart — the restart is
+    ///   quick because Steam verifies its files are current.
     func installGame(
         appID: Int,
         name: String,
@@ -184,9 +526,11 @@ final class SteamSession {
             throw SessionError.steamNotReady
         }
 
-        // 1. Pre-seed the ACF manifest. StateFlags=1026 means "scheduled for
-        //    download" — Steam picks this up on its next library scan or
-        //    immediately when the steam://install IPC arrives.
+        // 1. Pre-seed the ACF manifest. StateFlags=1026 (UpdateRequired
+        //    bit + Validating bit) is the value Steam writes when an ACF
+        //    is queued for download. The installdir field tells Steam
+        //    where to put files; with this set, no picker is needed.
+        onStatus?("Preparing \(name)…")
         log.info("[installGame] writing pre-seeded appmanifest for appID=\(appID) name=\"\(name)\"")
         try prefix.writePreseededAppManifest(
             appID: appID,
@@ -195,15 +539,51 @@ final class SteamSession {
             steamID64: steamID64
         )
 
-        // 2. Send the IPC URL. The new wine64 process detects the running Steam
-        //    and forwards via named pipe; it exits in ~1s. Steam then starts the
-        //    download internally — no observable Steam UI thanks to the
-        //    SteamWindow suppressor + pre-seeded ACF (no picker dialog needed).
+        // 2. Cycle Steam so its login-post-callback library scan picks up
+        //    the new ACF. The shutdown is graceful; start re-runs the
+        //    silent auth + health monitor pipeline.
+        log.info("[installGame] cycling steam.exe so library scan picks up pre-seeded ACF")
         onStatus?("Asking Steam to start the download…")
-        log.info("[installGame] sending steam://install/\(appID) IPC to running Steam")
-        try sendSteamCommand(["steam://install/\(appID)"], engine: engine)
+        await shutdown(engine: engine)
+        try? await Task.sleep(for: .seconds(1))
+        await start(engine: engine)
+
+        guard isReady else {
+            // start() failed to reach Logged On after the restart — the
+            // pre-seeded ACF is still on disk, so the next successful
+            // Steam start (next Meridian launch, or user sign-in retry)
+            // will pick it up and complete the install. Surface as a
+            // user-visible error so they know something happened.
+            throw SessionError.installRestartFailed(name)
+        }
+
         onStatus?("Downloading \(name)…")
-        log.info("[installGame] IPC dispatched — Launcher will poll ACF for progress")
+        log.info("[installGame] ACF pre-seeded + Steam restarted — download starts via library scan")
+    }
+
+    /// Launch a game whose `steam_api64.dll` requires a live Steam IPC
+    /// socket (Steamworks DRM). Dispatched via `steam.exe -applaunch`
+    /// instead of `wine64 game.exe` directly so:
+    ///
+    /// - Steam picks the right exe (UE5 launcher → real game.exe chain
+    ///   is handled internally — no "launching with custom args" dialog
+    ///   that the direct-wine64 path triggered, CLI-confirmed user report
+    ///   May 20 2026 launching Bogos Binted).
+    /// - Steam applies registered launch options, environment, and DRM
+    ///   verification. SteamAPI_Init succeeds first-try, no race.
+    /// - No second Steam process: the new `wine64 steam.exe -applaunch`
+    ///   detects the running Steam's IPC pipe and forwards the command,
+    ///   exiting in ~1 s. Same pattern as `steam://install` forwarding.
+    ///
+    /// Non-DRM games (no `steam_api64.dll`) keep using direct wine64 exec —
+    /// no Steam involvement needed and a faster launch path. See
+    /// `Launcher.launchDirect`.
+    func launchGameViaSteam(appID: Int, engine: WineEngine) throws {
+        guard isReady else {
+            throw SessionError.steamNotReady
+        }
+        log.info("[launchGameViaSteam] dispatching -applaunch \(appID) via IPC")
+        try sendSteamCommand(["-applaunch", "\(appID)"], engine: engine)
     }
 
     /// Cancel an in-progress install.
@@ -282,26 +662,83 @@ final class SteamSession {
                 env["WINEDLLOVERRIDES"] = overrides
             }
         }
-        if let profile = compat.profile(for: appID) {
+        let profile = compat.profile(for: appID)
+        if let profile {
             switch profile.dxmtMode {
             case .disabled:
-                let disableOverride = "d3d11,dxgi=b"
-                if let existing = env["WINEDLLOVERRIDES"], !existing.isEmpty {
-                    env["WINEDLLOVERRIDES"] = existing + ";" + disableOverride
-                } else {
-                    env["WINEDLLOVERRIDES"] = disableOverride
-                }
+                // Per-game opt-out of DXMT. Replace the d3d11/dxgi pair
+                // from the global override with builtin (wined3d) so games
+                // that DXMT mis-renders fall back gracefully. d3d10core is
+                // left as `n,b` because the global override already
+                // includes it and disabling DXMT for one game shouldn't
+                // also nuke d3d10core for it.
+                env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
+                    env["WINEDLLOVERRIDES"],
+                    overriding: ["d3d11", "dxgi"],
+                    with: "b"
+                )
             case .required, .auto:
                 break
             }
-            if profile.graphicsAPI == .dx12,
-               let gptk = engine.gptkPath,
-               let lib = engine.libraryPath {
-                env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
-                env["WINEDLLOVERRIDES"] = "d3d12=b;dxgi=b"
-            }
+        }
+
+        // DX12 → GPTK routing. The effective graphics API is the explicit
+        // profile's (hand-verified override) when set, otherwise the resolved
+        // value from GameStackResolver (PCGamingWiki's tested Direct3D version,
+        // or local engine-default). This means a DX12 game with NO explicit
+        // compat entry — identified by detection/PCGW — still gets the GPTK
+        // (D3D12 → D3DMetal → Metal) path instead of falling through to the
+        // DX11/DXMT global default. The resolver cache is warmed by the
+        // launcher immediately before this is called (`resolve(appID:...)`);
+        // on a cold cache this is nil and behaviour is unchanged (DXMT default).
+        let effectiveAPI: GraphicsAPI = {
+            if let a = profile?.graphicsAPI, a != .unknown { return a }
+            return GameStackResolver.shared.cached(appID: appID)?.graphicsAPI ?? .unknown
+        }()
+        if effectiveAPI == .dx12,
+           let gptk = engine.gptkPath,
+           let lib = engine.libraryPath {
+            env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
+            // Route d3d12 + dxgi through GPTK builtins. Preserve
+            // d3d11/d3d10core overrides from the global DX11 default —
+            // some DX12 games still load d3d11 for legacy components
+            // (e.g. Unity's preprocessor probe) and need DXMT there.
+            env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
+                env["WINEDLLOVERRIDES"],
+                overriding: ["d3d12", "dxgi"],
+                with: "b"
+            )
         }
         return env
+    }
+
+    /// Merges a fresh `key=value` override pair into an existing
+    /// `WINEDLLOVERRIDES` string while preserving every other DLL the
+    /// caller cared about. Wine's format is `dll1[,dll2]=mode[;dll3=…]`,
+    /// where the LAST entry for a given DLL wins on parse — so naive
+    /// concatenation usually works, but builds up duplicates fast and
+    /// makes the env line unreadable in logs.
+    ///
+    /// This helper removes any prior entry that mentioned any of
+    /// `overriding` and re-appends the consolidated `key1,key2=value`.
+    private func mergeWineDllOverrides(
+        _ existing: String?,
+        overriding dlls: [String],
+        with mode: String
+    ) -> String {
+        let dllSet = Set(dlls)
+        var kept: [String] = []
+        let current = existing ?? ""
+        for entry in current.split(separator: ";", omittingEmptySubsequences: true) {
+            let pair = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            guard let lhs = pair.first else { continue }
+            let names = lhs.split(separator: ",").map(String.init)
+            if names.allSatisfy({ !dllSet.contains($0) }) {
+                kept.append(String(entry))
+            }
+        }
+        kept.append("\(dlls.joined(separator: ","))=\(mode)")
+        return kept.joined(separator: ";")
     }
 
     // MARK: - Private: launch steam.exe
@@ -330,10 +767,24 @@ final class SteamSession {
 
         log.info("[launchSteamProcess] wine64 \(args.joined(separator: " "))")
 
+        let env = engine.steamCMDEnvironment(for: prefix)
+        // Diagnostic: confirm the DYLD_INSERT_LIBRARIES dock-suppression payload
+        // is in the env Steam will see. If this is missing or the dylib path
+        // is broken, the Wine subprocess won't get demoted to .accessory and
+        // we'll see a wine64 Dock icon. Pair with the `[meridian-wine-
+        // accessory]` lines that show up in `[steam.exe:stderr]` from the
+        // dylib's own NSLog when it loads successfully.
+        if let dyld = env["DYLD_INSERT_LIBRARIES"] {
+            let exists = FileManager.default.fileExists(atPath: dyld)
+            log.info("[launchSteamProcess] DYLD_INSERT_LIBRARIES=\(dyld) exists=\(exists)")
+        } else {
+            log.warning("[launchSteamProcess] DYLD_INSERT_LIBRARIES not set — wine64 will appear in Dock")
+        }
+
         let process = Process()
         process.executableURL = engine.wine64URL
         process.arguments = args
-        process.environment = engine.steamCMDEnvironment(for: prefix)
+        process.environment = env
         process.standardOutput = FileHandle.nullDevice
 
         let stderrPipe = Pipe()
@@ -395,6 +846,26 @@ final class SteamSession {
                  "HKCU\\Software\\Valve\\Steam",
                  "/v", "WebProcessCmdLine",
                  "/t", "REG_SZ", "/d", "--no-sandbox --disable-gpu", "/f"])
+            // Suppress Steam's post-login "you have new games" toast burst.
+            // After silent auth, Steam scans cloud-known + locally-cached
+            // appmanifests and announces every "installed" game via Windows
+            // toasts that Wine forwards to the macOS Notification Center.
+            // Meridian renders its own native library — Steam's toasts are
+            // never useful and can't be acted on (the user can't see Steam's
+            // UI to dismiss them). Belt-and-suspenders with the `localconfig.vdf`
+            // toggles that `WinePrefix.writeUserNotificationPreferences` writes
+            // post-sign-in — that file controls the webhelper-side toggles,
+            // these registry keys control the native-UI side. Both are needed
+            // because Steam routes different toasts through different layers.
+            reg(["reg", "add",
+                 "HKCU\\Software\\Valve\\Steam",
+                 "/v", "NotifyAvailableGames", "/t", "REG_DWORD", "/d", "0", "/f"])
+            reg(["reg", "add",
+                 "HKCU\\Software\\Valve\\Steam",
+                 "/v", "DesktopNotifications", "/t", "REG_DWORD", "/d", "0", "/f"])
+            reg(["reg", "add",
+                 "HKCU\\Software\\Valve\\Steam",
+                 "/v", "EnableGameOverlay", "/t", "REG_DWORD", "/d", "0", "/f"])
         }.value
     }
 
@@ -492,6 +963,51 @@ final class SteamSession {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
+    /// Dumps the tails of steam.exe's own diagnostic logs into meridian.log so a
+    /// failed start is self-explanatory without attaching Xcode or hand-reading
+    /// the prefix. Called from every failure path in `start()` / the health
+    /// monitor.
+    ///
+    /// `bootstrap_log.txt` records the bootstrapper's verify/update/handoff
+    /// decisions (e.g. `Download failed: http error 0`, `Crypto API failed
+    /// certificate check`, `steam_client_win64.installed` verify result).
+    /// `connection_log.txt` records the CM logon outcome (`[Logged On,`,
+    /// `LogonFailureReceived`, etc.). Together they pinpoint whether the failure
+    /// was client-bootstrap (no steamclient handoff) or auth (CM rejection).
+    private func logSteamFailureDiagnostics(reason: String) {
+        let steamDir = prefix.steamInstallDir
+        let logsDir = steamDir.appending(path: "logs")
+        let sources: [(label: String, path: String)] = [
+            ("bootstrap_log.txt", logsDir.appending(path: "bootstrap_log.txt").path(percentEncoded: false)),
+            ("connection_log.txt", logsDir.appending(path: "connection_log.txt").path(percentEncoded: false)),
+        ]
+
+        log.error("╔══ STEAM START FAILED: \(reason)")
+        for (label, path) in sources {
+            guard FileManager.default.fileExists(atPath: path) else {
+                log.error("║ [\(label)] (absent — steam.exe wrote no \(label))")
+                continue
+            }
+            let full = readLogTail(path: path, from: 0)
+            let tail = Self.lastLines(of: full, count: 30)
+            if tail.isEmpty {
+                log.error("║ [\(label)] (empty)")
+                continue
+            }
+            log.error("║ ── \(label) (last 30 lines) ──")
+            for line in tail.components(separatedBy: .newlines) where !line.isEmpty {
+                log.error("║   \(line)")
+            }
+        }
+        log.error("╚══════════════════════════════════════════════════")
+    }
+
+    private static func lastLines(of text: String, count: Int) -> String {
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        guard lines.count > count else { return lines.joined(separator: "\n") }
+        return lines.suffix(count).joined(separator: "\n")
+    }
+
     private func killWebhelper() {
         pkill(["-9", "-f", "steamwebhelper"])
     }
@@ -514,11 +1030,14 @@ final class SteamSession {
 
 enum SessionError: LocalizedError {
     case steamNotReady
+    case installRestartFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .steamNotReady:
             return "Steam is not ready. Please sign in first."
+        case .installRestartFailed(let name):
+            return "Couldn't restart Steam to begin downloading \(name). The install is queued — try again in a moment."
         }
     }
 }

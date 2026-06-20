@@ -1,0 +1,830 @@
+diff --git a/DepotDownloader/ContentDownloader.cs b/DepotDownloader/ContentDownloader.cs
+index a59a69f..f8b723e 100644
+--- a/DepotDownloader/ContentDownloader.cs
++++ b/DepotDownloader/ContentDownloader.cs
+@@ -29,6 +29,11 @@ namespace DepotDownloader
+ 
+         public static DownloadConfig Config = new();
+ 
++        // Meridian: set true when a pre-supplied refresh token is rejected by
++        // Valve's CM, so Program can exit 3 (REFRESH_TOKEN_INVALID) instead of
++        // a generic failure.
++        public static bool RefreshTokenRejected;
++
+         private static Steam3Session steam3;
+         private static CDNClientPool cdnPool;
+ 
+@@ -179,6 +184,108 @@ namespace DepotDownloader
+             return section_kv;
+         }
+ 
++        // Meridian: dump library art HASHES from PICS appinfo for the given apps.
++        //
++        // Steam's public IStoreBrowseService/GetItems API does NOT return the
++        // library LOGO for any game (only capsule/hero/header/icon), and the
++        // legacy /steam/apps/{id}/logo.png path 404s for newer titles. The logo
++        // lives ONLY in PICS appinfo at common.library_assets_full.library_logo.
++        // The `common` section is available to an ANONYMOUS logon, so this needs
++        // no license — Meridian calls it anonymously (or with the user's token).
++        //
++        // Emits one NDJSON `appinfo` line per app:
++        //   {"type":"appinfo","appid":N,"logo":"<hash>","capsule":"<hash>","hero":"<hash>"}
++        // where <hash> is the 40-hex content directory (the segment before the
++        // filename, e.g. "4037b4ea.../logo.png" → "4037b4ea..."). Empty when the
++        // app does not publish that asset.
++        public static async Task DumpAppInfoAsync(uint[] appIds)
++        {
++            // Extracts the leading content-hash directory from an appinfo asset
++            // value like "4037b4ea74455653c6c369d098fbb26dd54c988b/logo_2x.png".
++            static string HashOf(KeyValue node)
++            {
++                // New-CDN values are "<40-hex>/<filename>"; the leading directory
++                // is the content hash. OLDER titles store a BARE filename
++                // ("logo.png") served from the legacy /steam/apps/{id}/ path with
++                // NO content hash — for those return "" so the Swift side keeps
++                // its working legacy-CDN fallback instead of building a broken
++                // new-CDN URL from the filename. (The logo_position still applies
++                // to whichever logo source is used.)
++                var v = node?.Value;
++                if (string.IsNullOrEmpty(v)) return "";
++                var slash = v.IndexOf('/');
++                if (slash <= 0) return "";
++                var head = v.Substring(0, slash);
++                bool looksLikeHash = head.Length == 40 &&
++                    head.All(c => (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
++                return looksLikeHash ? head : "";
++            }
++
++            // library_assets_full.<asset>.image.english (fall back to image2x,
++            // then any first child language if english is absent).
++            static string AssetHash(KeyValue full, string assetName)
++            {
++                if (full == KeyValue.Invalid || full == null) return "";
++                var asset = full[assetName];
++                if (asset == KeyValue.Invalid) return "";
++                foreach (var imgKey in new[] { "image", "image2x" })
++                {
++                    var img = asset[imgKey];
++                    if (img == KeyValue.Invalid) continue;
++                    var en = img["english"];
++                    if (en != KeyValue.Invalid && !string.IsNullOrEmpty(en.Value)) return HashOf(en);
++                    var first = img.Children.FirstOrDefault();
++                    if (first != null && !string.IsNullOrEmpty(first.Value)) return HashOf(first);
++                }
++                return "";
++            }
++
++            foreach (var appId in appIds)
++            {
++                try
++                {
++                    await steam3.RequestAppInfo(appId).ConfigureAwait(false);
++                }
++                catch (Exception ex)
++                {
++                    Console.Error.WriteLine($"appinfo request failed for {appId}: {ex.Message}");
++                    MeridianJson.AppInfo(appId, "", "", "", "", 0, 0);
++                    continue;
++                }
++
++                var common = GetSteam3AppSection(appId, EAppInfoSection.Common);
++                var full = common?["library_assets_full"] ?? KeyValue.Invalid;
++
++                var logo = AssetHash(full, "library_logo");
++                var capsule = AssetHash(full, "library_capsule");
++                var hero = AssetHash(full, "library_hero");
++
++                // Steam's intended logo placement on the hero:
++                // library_assets_full.library_logo.logo_position = { pinned_position,
++                // width_pct, height_pct }. Reproduces Steam's own library layout.
++                static double Pct(KeyValue node)
++                {
++                    var v = node?.Value;
++                    return double.TryParse(v, System.Globalization.NumberStyles.Float,
++                        System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0.0;
++                }
++                var pinned = "";
++                double widthPct = 0, heightPct = 0;
++                if (full != KeyValue.Invalid && full != null)
++                {
++                    var pos = full["library_logo"]["logo_position"];
++                    if (pos != KeyValue.Invalid)
++                    {
++                        pinned = pos["pinned_position"].Value ?? "";
++                        widthPct = Pct(pos["width_pct"]);
++                        heightPct = Pct(pos["height_pct"]);
++                    }
++                }
++
++                MeridianJson.AppInfo(appId, logo, capsule, hero, pinned, widthPct, heightPct);
++            }
++        }
++
+         static uint GetSteam3AppBuildNumber(uint appId, string branch)
+         {
+             if (appId == INVALID_APP_ID)
+@@ -590,7 +697,12 @@ namespace DepotDownloader
+ 
+             try
+             {
++                if (Config.Json) MeridianJson.Phase("downloading");
+                 await DownloadSteam3Async(infos).ConfigureAwait(false);
++                // Meridian: terminal `done` event so the Swift install UI can
++                // settle to 100% and finalise. Byte count is the uncompressed
++                // total the download counters accumulated.
++                if (Config.Json) MeridianJson.Done(0);
+             }
+             catch (OperationCanceledException)
+             {
+@@ -1369,6 +1481,15 @@ namespace DepotDownloader
+                 downloadCounter.totalBytesUncompressed += chunk.UncompressedLength;
+ 
+                 Ansi.Progress(downloadCounter.totalBytesUncompressed, downloadCounter.completeDownloadSize);
++
++                // Meridian: live NDJSON progress for the Swift install UI.
++                if (Config.Json)
++                {
++                    var done = (long)downloadCounter.totalBytesUncompressed;
++                    var total = (long)downloadCounter.completeDownloadSize;
++                    var pct = total > 0 ? (done / (double)total) * 100.0 : 0.0;
++                    MeridianJson.Progress(done, total, pct);
++                }
+             }
+ 
+             if (remainingChunks == 0)
+diff --git a/DepotDownloader/DownloadConfig.cs b/DepotDownloader/DownloadConfig.cs
+index 144853b..ee59d1f 100644
+--- a/DepotDownloader/DownloadConfig.cs
++++ b/DepotDownloader/DownloadConfig.cs
+@@ -32,5 +32,11 @@ namespace DepotDownloader
+ 
+         public bool UseQrCode { get; set; }
+         public bool SkipAppConfirmation { get; set; }
++
++        // Meridian: machine-readable NDJSON progress on stdout.
++        public bool Json { get; set; }
++
++        // Meridian: pre-supplied JWT refresh token for token-only logon.
++        public string RefreshToken { get; set; }
+     }
+ }
+diff --git a/DepotDownloader/MeridianJson.cs b/DepotDownloader/MeridianJson.cs
+new file mode 100644
+index 0000000..a1646ba
+--- /dev/null
++++ b/DepotDownloader/MeridianJson.cs
+@@ -0,0 +1,91 @@
++// This file is subject to the terms and conditions defined
++// in file 'LICENSE', which is part of this source code package.
++
++// Meridian: machine-readable NDJSON event emitter on stdout. One compact JSON
++// object per line, consumed by Meridian's Swift side (DepotDownloaderInstall.swift
++// for installs; SteamAppInfoResolver for -appinfo). Kept dependency-free
++// (manual escaping, no System.Text.Json ceremony) so a single-file publish stays
++// tiny and the output is byte-stable.
++using System;
++
++namespace DepotDownloader
++{
++    internal static class MeridianJson
++    {
++        private static readonly object Gate = new();
++
++        private static string Escape(string s)
++        {
++            if (string.IsNullOrEmpty(s)) return "";
++            var sb = new System.Text.StringBuilder(s.Length + 8);
++            foreach (var c in s)
++            {
++                switch (c)
++                {
++                    case '"': sb.Append("\\\""); break;
++                    case '\\': sb.Append("\\\\"); break;
++                    case '\n': sb.Append("\\n"); break;
++                    case '\r': sb.Append("\\r"); break;
++                    case '\t': sb.Append("\\t"); break;
++                    default:
++                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
++                        else sb.Append(c);
++                        break;
++                }
++            }
++            return sb.ToString();
++        }
++
++        private static void Emit(string line)
++        {
++            lock (Gate)
++            {
++                Console.Out.WriteLine(line);
++                Console.Out.Flush();
++            }
++        }
++
++        /// {"type":"phase","phase":"<p>","detail":"<d>"}
++        public static void Phase(string phase, string detail = null)
++        {
++            Emit($"{{\"type\":\"phase\",\"phase\":\"{Escape(phase)}\",\"detail\":\"{Escape(detail ?? "")}\"}}");
++        }
++
++        /// {"type":"progress","bytesDone":N,"bytesTotal":N,"pct":D}
++        public static void Progress(long bytesDone, long bytesTotal, double pct)
++        {
++            Emit($"{{\"type\":\"progress\",\"bytesDone\":{bytesDone},\"bytesTotal\":{bytesTotal},\"pct\":{pct.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}");
++        }
++
++        /// {"type":"done","bytesDownloaded":N}
++        public static void Done(long bytesDownloaded)
++        {
++            Emit($"{{\"type\":\"done\",\"bytesDownloaded\":{bytesDownloaded}}}");
++        }
++
++        /// {"type":"error","message":"<m>"}
++        public static void Error(string message)
++        {
++            Emit($"{{\"type\":\"error\",\"message\":\"{Escape(message)}\"}}");
++        }
++
++        /// {"type":"appinfo","appid":N,"logo":"<hash>","capsule":"<hash>","hero":"<hash>",
++        ///  "logoPinned":"<BottomLeft|CenterCenter|…>","logoWidthPct":D,"logoHeightPct":D}
++        /// Empty string / 0 for any asset or position field the app does not publish.
++        /// logoWidthPct/logoHeightPct are Steam's intended logo box size as a
++        /// percentage of the hero; logoPinned is the anchor corner. Together they
++        /// reproduce Steam's own library logo placement.
++        public static void AppInfo(uint appid, string logo, string capsule, string hero,
++                                   string logoPinned, double logoWidthPct, double logoHeightPct)
++        {
++            var ci = System.Globalization.CultureInfo.InvariantCulture;
++            Emit($"{{\"type\":\"appinfo\",\"appid\":{appid}," +
++                 $"\"logo\":\"{Escape(logo ?? "")}\"," +
++                 $"\"capsule\":\"{Escape(capsule ?? "")}\"," +
++                 $"\"hero\":\"{Escape(hero ?? "")}\"," +
++                 $"\"logoPinned\":\"{Escape(logoPinned ?? "")}\"," +
++                 $"\"logoWidthPct\":{logoWidthPct.ToString(ci)}," +
++                 $"\"logoHeightPct\":{logoHeightPct.ToString(ci)}}}");
++        }
++    }
++}
+diff --git a/DepotDownloader/Program.cs b/DepotDownloader/Program.cs
+index 26b7f16..35db5de 100644
+--- a/DepotDownloader/Program.cs
++++ b/DepotDownloader/Program.cs
+@@ -19,6 +19,10 @@ namespace DepotDownloader
+     {
+         private static bool[] consumedArgs;
+ 
++        // Meridian: must stay rooted for the process lifetime — if the registration is
++        // garbage-collected the handler is removed and SIGTERM reverts to the default kill (143).
++        private static IDisposable sigtermRegistration;
++
+         static async Task<int> Main(string[] args)
+         {
+             if (args.Length == 0)
+@@ -36,6 +40,38 @@ namespace DepotDownloader
+ 
+             Ansi.Init();
+ 
++            // Meridian: graceful SIGINT / SIGTERM handling — exit deterministically with 130.
++            // We intentionally do NOT run the in-process Steam disconnect here: it pumps callbacks
++            // and would unblock the main thread, racing it to set a different exit code. State
++            // integrity is already guaranteed by DepotConfigStore — a depot's manifest id is held
++            // at INVALID on disk until the depot fully completes, so an interrupted run resumes via
++            // verify-all and re-fetches any partially-written chunks. The OS reclaims the socket.
++            var stopping = 0;
++            void HandleStop()
++            {
++                if (System.Threading.Interlocked.Exchange(ref stopping, 1) != 0)
++                    return;
++
++                MeridianJson.Phase("error", "cancelled");
++                Console.Out.Flush();
++                Environment.Exit(130);
++            }
++
++            Console.CancelKeyPress += (_, e) =>
++            {
++                e.Cancel = true; // prevent the runtime's abrupt kill; we exit gracefully
++                HandleStop();
++            };
++
++            if (!OperatingSystem.IsWindows())
++            {
++                sigtermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
++                {
++                    ctx.Cancel = true;
++                    HandleStop();
++                });
++            }
++
+             DebugLog.Enabled = false;
+ 
+             AccountSettingsStore.LoadFromFile("account.config");
+@@ -65,23 +101,31 @@ namespace DepotDownloader
+             }
+ 
+             var username = GetParameter<string>(args, "-username") ?? GetParameter<string>(args, "-user");
+-            var password = GetParameter<string>(args, "-password") ?? GetParameter<string>(args, "-pass");
+-            ContentDownloader.Config.RememberPassword = HasParameter(args, "-remember-password");
+-            ContentDownloader.Config.UseQrCode = HasParameter(args, "-qr");
+-            ContentDownloader.Config.SkipAppConfirmation = HasParameter(args, "-no-mobile");
+ 
+-            if (username == null)
++            // Meridian: machine-readable JSON progress on stdout.
++            ContentDownloader.Config.Json = HasParameter(args, "-json");
++
++            // Meridian: this fork is REFRESH-TOKEN-ONLY. All interactive credential auth has
++            // been removed — no password prompt, no BeginAuthSessionViaCredentials, no Steam
++            // Guard console flow, no QR. That interactive path (ConsoleAuthenticator + the
++            // "STEAM GUARD! Use the Steam Mobile App..." poll) was the source of the auth loop,
++            // and Meridian never uses it. The only authenticated path is SteamUser.LogOn with a
++            // pre-supplied JWT refresh token (Username + AccessToken, ShouldRememberPassword=true).
++            // Anonymous downloads (no -username, no -refreshtoken) still work.
++            var refreshToken = GetParameter<string>(args, "-refreshtoken");
++
++            if (username != null || refreshToken != null)
+             {
+-                if (ContentDownloader.Config.RememberPassword && !ContentDownloader.Config.UseQrCode)
++                if (username == null || refreshToken == null)
+                 {
+-                    Console.WriteLine("Error: -remember-password can not be used without -username or -qr.");
++                    Console.Error.WriteLine("Meridian fork requires -username and -refreshtoken; interactive auth is disabled");
+                     return 1;
+                 }
+-            }
+-            else if (ContentDownloader.Config.UseQrCode)
+-            {
+-                Console.WriteLine("Error: -qr can not be used with -username.");
+-                return 1;
++
++                ContentDownloader.Config.RefreshToken = refreshToken;
++                // RememberPassword must be true for SteamKit2 to treat a LogOn rejection as an
++                // access-token (expired/revoked) failure rather than a password failure.
++                ContentDownloader.Config.RememberPassword = true;
+             }
+ 
+             ContentDownloader.Config.DownloadManifestOnly = HasParameter(args, "-manifest-only");
+@@ -159,6 +203,51 @@ namespace DepotDownloader
+ 
+             #endregion
+ 
++            // Meridian: -appinfo <id,id,...> — dump library art hashes (logo/
++            // capsule/hero) from PICS appinfo as NDJSON, then exit. Does not
++            // require -app. Works anonymously (the `common` section is public),
++            // so a refresh token is optional here.
++            var appInfoIds = GetParameter<string>(args, "-appinfo");
++            if (appInfoIds != null)
++            {
++                PrintUnconsumedArgs(args);
++
++                var ids = appInfoIds
++                    .Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries)
++                    .Select(s => uint.TryParse(s.Trim(), out var v) ? v : 0u)
++                    .Where(v => v != 0u)
++                    .Distinct()
++                    .ToArray();
++
++                if (ids.Length == 0)
++                {
++                    Console.Error.WriteLine("Error: -appinfo requires at least one app id");
++                    return 1;
++                }
++
++                if (InitializeSteam(username))
++                {
++                    try
++                    {
++                        await ContentDownloader.DumpAppInfoAsync(ids).ConfigureAwait(false);
++                    }
++                    catch (Exception e)
++                    {
++                        Console.Error.WriteLine("appinfo failed: {0}", e.Message);
++                        return 1;
++                    }
++                    finally
++                    {
++                        ContentDownloader.ShutdownSteam3();
++                    }
++                    return 0;
++                }
++                else
++                {
++                    return InitializeFailedExitCode();
++                }
++            }
++
+             var appId = GetParameter(args, "-app", ContentDownloader.INVALID_APP_ID);
+             if (appId == ContentDownloader.INVALID_APP_ID)
+             {
+@@ -174,7 +263,7 @@ namespace DepotDownloader
+ 
+                 PrintUnconsumedArgs(args);
+ 
+-                if (InitializeSteam(username, password))
++                if (InitializeSteam(username))
+                 {
+                     try
+                     {
+@@ -199,8 +288,7 @@ namespace DepotDownloader
+                 }
+                 else
+                 {
+-                    Console.WriteLine("Error: InitializeSteam failed");
+-                    return 1;
++                    return InitializeFailedExitCode();
+                 }
+ 
+                 #endregion
+@@ -211,7 +299,7 @@ namespace DepotDownloader
+ 
+                 PrintUnconsumedArgs(args);
+ 
+-                if (InitializeSteam(username, password))
++                if (InitializeSteam(username))
+                 {
+                     try
+                     {
+@@ -236,8 +324,7 @@ namespace DepotDownloader
+                 }
+                 else
+                 {
+-                    Console.WriteLine("Error: InitializeSteam failed");
+-                    return 1;
++                    return InitializeFailedExitCode();
+                 }
+ 
+                 #endregion
+@@ -309,7 +396,7 @@ namespace DepotDownloader
+ 
+                 PrintUnconsumedArgs(args);
+ 
+-                if (InitializeSteam(username, password))
++                if (InitializeSteam(username))
+                 {
+                     try
+                     {
+@@ -334,8 +421,7 @@ namespace DepotDownloader
+                 }
+                 else
+                 {
+-                    Console.WriteLine("Error: InitializeSteam failed");
+-                    return 1;
++                    return InitializeFailedExitCode();
+                 }
+ 
+                 #endregion
+@@ -344,55 +430,32 @@ namespace DepotDownloader
+             return 0;
+         }
+ 
+-        static bool InitializeSteam(string username, string password)
++        // Meridian: distinguish a rejected/expired refresh token (so the caller knows to
++        // re-authenticate) from a generic init failure.
++        static int InitializeFailedExitCode()
+         {
+-            if (!ContentDownloader.Config.UseQrCode)
++            if (ContentDownloader.RefreshTokenRejected)
+             {
+-                if (username != null && password == null && (!ContentDownloader.Config.RememberPassword || !AccountSettingsStore.Instance.LoginTokens.ContainsKey(username)))
+-                {
+-                    if (AccountSettingsStore.Instance.LoginTokens.ContainsKey(username))
+-                    {
+-                        Console.WriteLine($"Account \"{username}\" has stored credentials. Did you forget to specify -remember-password?");
+-                    }
+-
+-                    do
+-                    {
+-                        Console.Write("Enter account password for \"{0}\": ", username);
+-                        if (Console.IsInputRedirected)
+-                        {
+-                            password = Console.ReadLine();
+-                        }
+-                        else
+-                        {
+-                            // Avoid console echoing of password
+-                            password = Util.ReadPassword();
+-                        }
+-
+-                        Console.WriteLine();
+-                    } while (string.Empty == password);
+-                }
+-                else if (username == null)
+-                {
+-                    Console.WriteLine("No username given. Using anonymous account with dedicated server subscription.");
+-                }
++                Console.Error.WriteLine("REFRESH_TOKEN_INVALID");
++                MeridianJson.Error("REFRESH_TOKEN_INVALID");
++                return 3;
+             }
+ 
+-            if (!string.IsNullOrEmpty(password))
+-            {
+-                const int MAX_PASSWORD_SIZE = 64;
+-
+-                if (password.Length > MAX_PASSWORD_SIZE)
+-                {
+-                    Console.Error.WriteLine($"Warning: Password is longer than {MAX_PASSWORD_SIZE} characters, which is not supported by Steam.");
+-                }
++            Console.WriteLine("Error: InitializeSteam failed");
++            return 1;
++        }
+ 
+-                if (!password.All(char.IsAscii))
+-                {
+-                    Console.Error.WriteLine("Warning: Password contains non-ASCII characters, which is not supported by Steam.");
+-                }
++        static bool InitializeSteam(string username)
++        {
++            // Meridian: refresh-token-only. Either a non-interactive token logon (Username +
++            // AccessToken, set up via Config.RefreshToken) or an anonymous session. There is no
++            // password and no interactive prompt of any kind.
++            if (username == null)
++            {
++                Console.WriteLine("No username given. Using anonymous account with dedicated server subscription.");
+             }
+ 
+-            return ContentDownloader.InitializeSteam3(username, password);
++            return ContentDownloader.InitializeSteam3(username, null);
+         }
+ 
+         static int IndexOfParam(string[] args, string param)
+diff --git a/DepotDownloader/Steam3Session.cs b/DepotDownloader/Steam3Session.cs
+index bff4f3c..9e036ab 100644
+--- a/DepotDownloader/Steam3Session.cs
++++ b/DepotDownloader/Steam3Session.cs
+@@ -8,7 +8,6 @@ using System.Collections.ObjectModel;
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
+-using QRCoder;
+ using SteamKit2;
+ using SteamKit2.Authentication;
+ using SteamKit2.CDN;
+@@ -51,7 +50,6 @@ namespace DepotDownloader
+         bool bIsConnectionRecovery;
+         int connectionBackoff;
+         int seq; // more hack fixes
+-        AuthSession authSession;
+         readonly CancellationTokenSource abortedToken = new();
+ 
+         // input
+@@ -83,6 +81,7 @@ namespace DepotDownloader
+             this.callbacks.Subscribe<SteamUser.LoggedOnCallback>(LogOnCallback);
+             this.callbacks.Subscribe<SteamApps.LicenseListCallback>(LicenseListCallback);
+ 
++            MeridianJson.Phase("connecting");
+             Console.Write("Connecting to Steam3...");
+             Connect();
+         }
+@@ -379,7 +378,6 @@ namespace DepotDownloader
+             bAborted = false;
+             bConnecting = true;
+             connectionBackoff = 0;
+-            authSession = null;
+ 
+             ResetConnectionFlags();
+             this.steamClient.Connect();
+@@ -434,120 +432,35 @@ namespace DepotDownloader
+             }
+             else
+             {
+-                if (logonDetails.Username != null)
+-                {
+-                    Console.WriteLine("Logging '{0}' into Steam3...", logonDetails.Username);
+-                }
++                // Meridian: refresh-token-only. The interactive credential/QR/Steam-Guard auth
++                // (BeginAuthSessionViaCredentialsAsync + ConsoleAuthenticator polling) has been
++                // removed — it was the source of the "STEAM GUARD! Use the Steam Mobile App..."
++                // loop and Meridian never uses it. logonDetails already carries Username +
++                // AccessToken (the pre-supplied JWT refresh token), so we log on directly.
++                Console.WriteLine("Logging '{0}' into Steam3 with refresh token...", logonDetails.Username);
+ 
+-                if (authSession is null)
++                try
+                 {
+-                    if (logonDetails.Username != null && logonDetails.Password != null && logonDetails.AccessToken is null)
+-                    {
+-                        try
+-                        {
+-                            _ = AccountSettingsStore.Instance.GuardData.TryGetValue(logonDetails.Username, out var guarddata);
+-                            authSession = await steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+-                            {
+-                                DeviceFriendlyName = nameof(DepotDownloader),
+-                                Username = logonDetails.Username,
+-                                Password = logonDetails.Password,
+-                                IsPersistentSession = ContentDownloader.Config.RememberPassword,
+-                                GuardData = guarddata,
+-                                Authenticator = new ConsoleAuthenticator(),
+-                            });
+-                        }
+-                        catch (TaskCanceledException)
+-                        {
+-                            return;
+-                        }
+-                        catch (Exception ex)
+-                        {
+-                            Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
+-                            Abort(false);
+-                            return;
+-                        }
+-                    }
+-                    else if (logonDetails.AccessToken is null && ContentDownloader.Config.UseQrCode)
+-                    {
+-                        Console.WriteLine("Logging in with QR code...");
+-
+-                        try
+-                        {
+-                            var session = await steamClient.Authentication.BeginAuthSessionViaQRAsync(new AuthSessionDetails
+-                            {
+-                                DeviceFriendlyName = nameof(DepotDownloader),
+-                                IsPersistentSession = ContentDownloader.Config.RememberPassword,
+-                            });
+-
+-                            authSession = session;
+-
+-                            // Steam will periodically refresh the challenge url, so we need a new QR code.
+-                            session.ChallengeURLChanged = () =>
+-                            {
+-                                Console.WriteLine();
+-                                Console.WriteLine("The QR code has changed:");
+-
+-                                DisplayQrCode(session.ChallengeURL);
+-                            };
+-
+-                            // Draw initial QR code immediately
+-                            DisplayQrCode(session.ChallengeURL);
+-                        }
+-                        catch (TaskCanceledException)
+-                        {
+-                            return;
+-                        }
+-                        catch (Exception ex)
+-                        {
+-                            Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
+-                            Abort(false);
+-                            return;
+-                        }
+-                    }
++                    steamUser.LogOn(logonDetails);
+                 }
+-
+-                if (authSession != null)
++                catch (Exception ex)
+                 {
+-                    try
+-                    {
+-                        var result = await authSession.PollingWaitForResultAsync();
+-
+-                        logonDetails.Username = result.AccountName;
+-                        logonDetails.Password = null;
+-                        logonDetails.AccessToken = result.RefreshToken;
+-
+-                        if (result.NewGuardData != null)
+-                        {
+-                            AccountSettingsStore.Instance.GuardData[result.AccountName] = result.NewGuardData;
+-
+-                            if (ContentDownloader.Config.UseQrCode)
+-                            {
+-                                Console.WriteLine($"Success! Next time you can login with -username {result.AccountName} -remember-password instead of -qr.");
+-                            }
+-                        }
+-                        else
+-                        {
+-                            AccountSettingsStore.Instance.GuardData.Remove(result.AccountName);
+-                        }
+-
+-                        AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
+-                        AccountSettingsStore.Save();
+-                    }
+-                    catch (TaskCanceledException)
++                    // Meridian: SteamKit2 throws synchronously here if AccessToken is not a
++                    // well-formed JWT. In refresh-token mode treat that as an invalid token so
++                    // the caller is told to re-auth instead of hanging in WaitForCredentials.
++                    if (ContentDownloader.Config.RefreshToken != null)
+                     {
+-                        return;
++                        Console.Error.WriteLine("Refresh token rejected: " + ex.Message);
++                        ContentDownloader.RefreshTokenRejected = true;
+                     }
+-                    catch (Exception ex)
++                    else
+                     {
+-                        Console.Error.WriteLine("Failed to authenticate with Steam: " + ex.Message);
+-                        Abort(false);
+-                        return;
++                        Console.Error.WriteLine("Failed to log on to Steam: " + ex.Message);
+                     }
+ 
+-                    authSession = null;
++                    bExpectingDisconnectRemote = true;
++                    Abort(false);
+                 }
+-
+-                steamUser.LogOn(logonDetails);
+             }
+         }
+ 
+@@ -593,55 +506,36 @@ namespace DepotDownloader
+ 
+         private void LogOnCallback(SteamUser.LoggedOnCallback loggedOn)
+         {
+-            var isSteamGuard = loggedOn.Result == EResult.AccountLogonDenied;
+-            var is2FA = loggedOn.Result == EResult.AccountLoginDeniedNeedTwoFactor;
+-            var isAccessToken = ContentDownloader.Config.RememberPassword && logonDetails.AccessToken != null &&
+-                loggedOn.Result is EResult.InvalidPassword
++            // Meridian: refresh-token-only. There is no interactive Steam Guard / 2FA / email-code
++            // entry and no retry loop. Steam does not issue a guard challenge for a token logon,
++            // so any of these rejection results on an authenticated (AccessToken) session means
++            // the supplied refresh token is invalid / expired / revoked — fail fast with
++            // REFRESH_TOKEN_INVALID rather than prompting for input that will never come.
++            var isTokenRejected = logonDetails.AccessToken != null &&
++                loggedOn.Result is EResult.AccountLogonDenied
++                or EResult.AccountLoginDeniedNeedTwoFactor
++                or EResult.InvalidPassword
+                 or EResult.InvalidSignature
+                 or EResult.AccessDenied
+                 or EResult.Expired
+                 or EResult.Revoked;
+ 
+-            if (isSteamGuard || is2FA || isAccessToken)
++            if (isTokenRejected)
+             {
+-                bExpectingDisconnectRemote = true;
+-                Abort(false);
++                Console.WriteLine($"Access token was rejected ({loggedOn.Result}).");
+ 
+-                if (!isAccessToken)
+-                {
+-                    Console.WriteLine("This account is protected by Steam Guard.");
+-                }
+-
+-                if (is2FA)
+-                {
+-                    do
+-                    {
+-                        Console.Write("Please enter your 2 factor auth code from your authenticator app: ");
+-                        logonDetails.TwoFactorCode = Console.ReadLine();
+-                    } while (string.Empty == logonDetails.TwoFactorCode);
+-                }
+-                else if (isAccessToken)
+-                {
+-                    AccountSettingsStore.Instance.LoginTokens.Remove(logonDetails.Username);
+-                    AccountSettingsStore.Save();
++                AccountSettingsStore.Instance.LoginTokens.Remove(logonDetails.Username);
++                AccountSettingsStore.Save();
+ 
+-                    // TODO: Handle gracefully by falling back to password prompt?
+-                    Console.WriteLine($"Access token was rejected ({loggedOn.Result}).");
+-                    Abort(false);
+-                    return;
+-                }
+-                else
++                // Signal the caller (via exit code 3 + "REFRESH_TOKEN_INVALID") that the
++                // pre-supplied refresh token is no longer valid and re-auth is needed.
++                if (ContentDownloader.Config.RefreshToken != null)
+                 {
+-                    do
+-                    {
+-                        Console.Write("Please enter the authentication code sent to your email address: ");
+-                        logonDetails.AuthCode = Console.ReadLine();
+-                    } while (string.Empty == logonDetails.AuthCode);
++                    ContentDownloader.RefreshTokenRejected = true;
+                 }
+ 
+-                Console.Write("Retrying Steam3 connection...");
+-                Connect();
+-
++                bExpectingDisconnectRemote = true;
++                Abort(false);
+                 return;
+             }
+ 
+@@ -671,6 +565,7 @@ namespace DepotDownloader
+             }
+ 
+             Console.WriteLine(" Done!");
++            MeridianJson.Phase("loggedon");
+ 
+             this.seq++;
+             IsLoggedOn = true;
+@@ -703,21 +598,5 @@ namespace DepotDownloader
+                 }
+             }
+         }
+-
+-        private static void DisplayQrCode(string challengeUrl)
+-        {
+-            // Encode the link as a QR code
+-            using var qrGenerator = new QRCodeGenerator();
+-            var qrCodeData = qrGenerator.CreateQrCode(challengeUrl, QRCodeGenerator.ECCLevel.L);
+-            using var qrCode = new AsciiQRCode(qrCodeData);
+-            var qrCodeAsAsciiArt = qrCode.GetLineByLineGraphic(1, drawQuietZones: true);
+-
+-            Console.WriteLine("Use the Steam Mobile App to sign in with this QR code:");
+-
+-            foreach (var line in qrCodeAsAsciiArt)
+-            {
+-                Console.WriteLine(line);
+-            }
+-        }
+     }
+ }

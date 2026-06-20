@@ -48,7 +48,22 @@ struct ContentView: View {
                     .onAppear {
                         guard !hasCheckedSetup else { return }
                         hasCheckedSetup = true
-                        if !steamAuth.isAuthenticated || !session.isReady || steamAuth.needsAPIKey {
+                        // The sign-in sheet is for genuine missing state: no
+                        // identity, or no Web API key. It is NOT gated on
+                        // `session.isReady` (steam.exe silent auto-login).
+                        //
+                        // Steam is now DRM-only: installs run headlessly via
+                        // DepotDownloader and DRM-free games launch directly,
+                        // both using the persisted OAuth refresh_token — which
+                        // works even when Wine's steam.exe silent auto-login
+                        // does not (Pattern 6). Forcing re-auth here meant a
+                        // returning user was asked to sign in on every launch
+                        // despite having a perfectly valid session. DRM-game
+                        // launches gate on Steam readiness at launch time with
+                        // a clear message; if the refresh_token is genuinely
+                        // expired, the install/launch path surfaces that and
+                        // routes the user back here to re-auth.
+                        if !steamAuth.isAuthenticated || steamAuth.needsAPIKey {
                             showSetupSheet = true
                         }
                     }
@@ -77,10 +92,12 @@ struct ContentView: View {
         .onChange(of: steamAuth.isAuthenticated) { _, authenticated in
             if !authenticated { showSetupSheet = true }
         }
-        .onChange(of: session.isReady) { _, ready in
-            // When Steam session fails silently (e.g. expired ssfn), show the sign-in sheet.
-            if !ready && steamAuth.isAuthenticated && !showSetupSheet { showSetupSheet = true }
-        }
+        // NOTE: deliberately NOT re-showing the sheet when `session.isReady`
+        // flips false. steam.exe silent auto-login failing (Pattern 6) is no
+        // longer a re-auth trigger — the app stays usable (headless installs +
+        // direct launch) on the persisted refresh_token. Re-auth is surfaced
+        // by the install/launch path only when an operation actually needs a
+        // token that turns out to be expired (fail-fast at the point of use).
     }
 
     @ViewBuilder

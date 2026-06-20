@@ -22,10 +22,17 @@ struct GameArtOverride {
     /// Used by the hero banner in the Home carousel and game detail view.
     let heroHash: String?
 
-    init(logoHash: String? = nil, capsuleHash: String? = nil, heroHash: String? = nil) {
-        self.logoHash    = logoHash
-        self.capsuleHash = capsuleHash
-        self.heroHash    = heroHash
+    /// Steam's logo placement on the hero (from appinfo `logo_position`). Drives
+    /// the game-detail hero's Steam-accurate logo positioning. Optional — when
+    /// nil the appinfo-fetched placement (if any) is used.
+    let logoPlacement: LogoPlacement?
+
+    init(logoHash: String? = nil, capsuleHash: String? = nil, heroHash: String? = nil,
+         logoPlacement: LogoPlacement? = nil) {
+        self.logoHash      = logoHash
+        self.capsuleHash   = capsuleHash
+        self.heroHash      = heroHash
+        self.logoPlacement = logoPlacement
     }
 }
 
@@ -79,6 +86,27 @@ enum GameArtOverrides {
             heroHash:    "81ccebfda24722ce39d61462a406e186b166b06e"
         ),
 
+        // Bogos Binted (3588490) — logo confirmed via Steam appinfo
+        // (common.library_assets_full.library_logo.image.english), CLI-verified
+        // 2026-06-19. Only the LOGO is overridden: GetItems already resolves the
+        // capsule (0827d5a4) + hero (b1f7f916) but NEVER returns the logo for any
+        // game, and the legacy /steam/apps/3588490/logo.png 404s (new-CDN-only
+        // title). logo URL verified 200:
+        //   https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3588490/4037b4ea74455653c6c369d098fbb26dd54c988b/logo_2x.png
+        3588490: GameArtOverride(
+            logoHash: "4037b4ea74455653c6c369d098fbb26dd54c988b",
+            logoPlacement: LogoPlacement(pinned: "BottomLeft", widthPct: 50.794144220416385, heightPct: 50)
+        ),
+
+        // Pratfall (4244510) — logo confirmed via Steam appinfo, CLI-verified
+        // 2026-06-19. Same situation: GetItems gives capsule (950ae75b) + hero
+        // (ff53ff26) but no logo; legacy path 404s. logo URL verified 200:
+        //   https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/4244510/6b0b4b03d09d8d0c8e5369e1623d116f6b23d6a1/logo_2x.png
+        4244510: GameArtOverride(
+            logoHash: "6b0b4b03d09d8d0c8e5369e1623d116f6b23d6a1",
+            logoPlacement: LogoPlacement(pinned: "CenterCenter", widthPct: 100, heightPct: 100)
+        ),
+
     ]
 
     // MARK: - Lookups
@@ -93,5 +121,9 @@ enum GameArtOverrides {
 
     static func heroHash(for appID: Int) -> String? {
         registry[appID]?.heroHash
+    }
+
+    static func logoPlacement(for appID: Int) -> LogoPlacement? {
+        registry[appID]?.logoPlacement
     }
 }

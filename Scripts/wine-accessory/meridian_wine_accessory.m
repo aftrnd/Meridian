@@ -47,6 +47,8 @@
 
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
+#import <os/log.h>
+#import <unistd.h>
 
 /*
  * Category that swizzles `-[NSApplication setActivationPolicy:]` to force
@@ -82,16 +84,50 @@
 
 @end
 
+/// Single os_log handle for the dylib. Subsystem matches `MeridianLog`'s
+/// so the dylib's lines appear alongside the Swift app's in `log stream`
+/// and Console.app filters. Stream:
+///
+///     log stream --predicate 'subsystem == "com.meridian.app"
+///                              AND category == "WineAccessoryDylib"'
+static os_log_t accessory_log(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        log = os_log_create("com.meridian.app", "WineAccessoryDylib");
+    });
+    return log;
+}
+
 __attribute__((constructor))
 static void meridian_wine_accessory_init(void) {
+    // Diagnostic: confirm the dylib actually loaded into a Wine subprocess.
+    // If the Dock icon ever reappears despite this dylib being on disk,
+    // these lines tell us whether it was injected. Use both `os_log` (for
+    // log stream/Console.app filtering) and `NSLog` (so it lands in the
+    // Wine-process stderr that Meridian captures into meridian.log via
+    // `[steam.exe:stderr]`).
+    pid_t pid = getpid();
+    pid_t ppid = getppid();
+    os_log_info(accessory_log(),
+        "[meridian-wine-accessory] loaded into pid=%{public}d ppid=%{public}d",
+        pid, ppid);
+    NSLog(@"[meridian-wine-accessory] dylib loaded pid=%d ppid=%d",
+          pid, ppid);
+
     // Trigger NSApp initialisation + apply accessory policy immediately.
     // After swizzling, even a call with `.regular` will end up as `.accessory`
     // via the swapped implementation. The explicit call here is belt-and-
     // suspenders for cases where winemac.drv reads the policy back before
     // setting it.
     dispatch_block_t apply = ^{
-        [[NSApplication sharedApplication]
-            setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        NSApplication *app = [NSApplication sharedApplication];
+        BOOL ok = [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        os_log_info(accessory_log(),
+            "[meridian-wine-accessory] setActivationPolicy(.accessory) = %{public}s pid=%{public}d",
+            ok ? "YES" : "NO", pid);
+        NSLog(@"[meridian-wine-accessory] setActivationPolicy(.accessory) = %@ pid=%d",
+              ok ? @"YES" : @"NO", pid);
     };
     if ([NSThread isMainThread]) {
         apply();
@@ -107,7 +143,10 @@ static void meridian_wine_accessory_init(void) {
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification * _Nonnull note) {
-        [[NSApplication sharedApplication]
+        BOOL ok = [[NSApplication sharedApplication]
             setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        os_log_info(accessory_log(),
+            "[meridian-wine-accessory] re-assert .accessory after launch = %{public}s",
+            ok ? "YES" : "NO");
     }];
 }

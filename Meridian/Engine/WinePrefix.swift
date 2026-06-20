@@ -127,6 +127,38 @@ struct WinePrefix: Sendable {
         return FileManager.default.fileExists(atPath: dllPath)
     }
 
+    /// Whether the installed `steam.exe` is the 64-bit (PE32+ / x86-64) build.
+    ///
+    /// CLI-verified 2026-06-18: the 32-bit bootstrapper stub (PE32, Machine
+    /// 0x014c) reports Windows 8 (6.2.9200), requests the `steam_client_legacy_win64`
+    /// manifest, and fails every in-Wine client-update fetch with `http error 0`
+    /// — so `steam.exe -silent` can never reach `[Logged On,`. The 64-bit build
+    /// (PE32+, Machine 0x8664) reports Windows 10, requests `steam_client_win64`,
+    /// and downloads/authenticates correctly. A prefix created by an older
+    /// Meridian that fetched the `steam_client_win32` packages has the broken
+    /// 32-bit steam.exe even though `steamui.dll` exists, so `isSteamBootstrapped`
+    /// alone is insufficient to decide the client is healthy. Returns `false`
+    /// when steam.exe is absent or not readable as a 64-bit PE.
+    var isSteamExe64Bit: Bool {
+        let exeURL = steamExePath
+        guard let handle = try? FileHandle(forReadingFrom: exeURL) else { return false }
+        defer { try? handle.close() }
+        // DOS header: e_lfanew (DWORD, LE) at offset 0x3C points to the PE header.
+        guard let dosHeader = try? handle.read(upToCount: 0x40), dosHeader.count >= 0x40 else { return false }
+        let peOffset = dosHeader.withUnsafeBytes { raw -> UInt32 in
+            raw.loadUnaligned(fromByteOffset: 0x3C, as: UInt32.self).littleEndian
+        }
+        // PE signature "PE\0\0" (4 bytes) then IMAGE_FILE_HEADER.Machine (WORD) at +4.
+        try? handle.seek(toOffset: UInt64(peOffset))
+        guard let peHeader = try? handle.read(upToCount: 6), peHeader.count == 6 else { return false }
+        let sig = peHeader.prefix(4)
+        guard sig.elementsEqual([0x50, 0x45, 0x00, 0x00]) else { return false }  // "PE\0\0"
+        let machine = peHeader.withUnsafeBytes { raw -> UInt16 in
+            raw.loadUnaligned(fromByteOffset: 4, as: UInt16.self).littleEndian
+        }
+        return machine == 0x8664  // IMAGE_FILE_MACHINE_AMD64
+    }
+
     /// Returns `true` when the Wine prefix's Steam install has an authenticated user
     /// with `MostRecent "1"` recorded in `config/loginusers.vdf`.
     ///
@@ -427,29 +459,45 @@ struct WinePrefix: Sendable {
                 ]
             ),
             (
+                // Values copied verbatim from a working CrossOver Steam bottle
+                // (CLI-verified 2026-06-18). The previous config registered
+                // RpcSs as INTERACTIVE (Type 0x110) with ObjectName
+                // "NT AUTHORITY\NetworkService" — Wine's service controller
+                // rejects that combination ("interactive but has the disallowed
+                // account name") so RpcSs was never created, the RPC endpoint
+                // mapper was absent, and EventLog (RPC-dependent) failed to
+                // start (1053). CrossOver runs RpcSs as LocalSystem, Type 0x20
+                // (SERVICE_WIN32_SHARE_PROCESS, no interactive bit), demand-start.
                 "RpcSs",
                 #"HKLM\System\CurrentControlSet\Services\RpcSs"#,
                 [
-                    ("Description",  "REG_SZ",        "Provides the endpoint mapper and other miscellaneous RPC services."),
+                    ("Description",  "REG_SZ",        "RPC service"),
                     ("DisplayName",  "REG_SZ",        "Remote Procedure Call (RPC)"),
                     ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\rpcss.exe"#),
-                    ("ObjectName",   "REG_SZ",        #"NT AUTHORITY\NetworkService"#),
-                    ("Start",        "REG_DWORD",     "2"),       // SERVICE_AUTO_START
-                    ("Type",         "REG_DWORD",     "0x110"),   // SERVICE_WIN32_OWN_PROCESS | SERVICE_INTERACTIVE_PROCESS
+                    ("ObjectName",   "REG_SZ",        "LocalSystem"),
+                    ("Start",        "REG_DWORD",     "3"),       // SERVICE_DEMAND_START
+                    ("Type",         "REG_DWORD",     "0x20"),    // SERVICE_WIN32_SHARE_PROCESS (no interactive bit)
                     ("ErrorControl", "REG_DWORD",     "1"),
-                    ("Group",        "REG_SZ",        "COM Infrastructure"),
                 ]
             ),
             (
+                // Values copied verbatim from a working CrossOver Steam bottle.
+                // EventLog is an svchost-hosted service (Type 0x20, LocalSystem,
+                // group "LocalServiceNetworkRestricted"). For svchost to host it,
+                // TWO extra registry artefacts are required (added after this
+                // loop): the SvcHost group key mapping the group → "EventLog",
+                // and EventLog\Parameters\ServiceDll → wevtsvc.dll. Without the
+                // group key Wine logs `svchost:LoadGroup cannot open key ...Svchost`
+                // and EventLog never starts.
                 "EventLog",
                 #"HKLM\System\CurrentControlSet\Services\EventLog"#,
                 [
-                    ("Description",  "REG_SZ",        "Manages event logging."),
+                    ("Description",  "REG_SZ",        "Event Log"),
                     ("DisplayName",  "REG_SZ",        "Event Log"),
                     ("ImagePath",    "REG_EXPAND_SZ", #"C:\windows\system32\svchost.exe -k LocalServiceNetworkRestricted"#),
-                    ("ObjectName",   "REG_SZ",        #"NT AUTHORITY\LocalService"#),
-                    ("Start",        "REG_DWORD",     "2"),
-                    ("Type",         "REG_DWORD",     "0x10"),    // SERVICE_WIN32_OWN_PROCESS
+                    ("ObjectName",   "REG_SZ",        "LocalSystem"),
+                    ("Start",        "REG_DWORD",     "2"),       // SERVICE_AUTO_START
+                    ("Type",         "REG_DWORD",     "0x20"),    // SERVICE_WIN32_SHARE_PROCESS
                     ("ErrorControl", "REG_DWORD",     "1"),
                 ]
             ),
@@ -469,16 +517,19 @@ struct WinePrefix: Sendable {
             ),
         ]
 
-        // Cheap fast-path: if all four services are already present in
-        // system.reg under ControlSet001 (where wineserver actually stores
-        // them after symlink resolution), skip the work entirely.
+        // Cheap fast-path: if all four services AND the EventLog svchost
+        // group artefacts are already present in system.reg under ControlSet001
+        // (where wineserver actually stores them after symlink resolution),
+        // skip the work entirely. EventLog\Parameters is the sentinel for the
+        // svchost-group artefacts written after the service loop below.
         let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
         if let current = try? String(contentsOfFile: regPath, encoding: .utf8) {
             let allPresent = services.allSatisfy { svc in
                 current.contains(#"[System\\ControlSet001\\Services\\"# + svc.name + "]")
             }
-            if allPresent {
-                log.debug("[ensureCoreServices] all 4 services already present — skipping")
+            let svcHostArtefacts = current.contains(#"[System\\ControlSet001\\Services\\EventLog\\Parameters]"#)
+            if allPresent && svcHostArtefacts {
+                log.debug("[ensureCoreServices] all services + svchost group already present — skipping")
                 return
             }
         }
@@ -497,7 +548,31 @@ struct WinePrefix: Sendable {
                 }
             }
         }
-        log.info("[ensureCoreServices] core service registration complete ✓ (nsiproxy + RpcSs + EventLog + PlugPlay)")
+
+        // EventLog is svchost-hosted; svchost needs the group→service mapping
+        // and the service DLL. wine.inf normally writes these, but the prefix
+        // template ships without them (the release-engine wineboot was killed
+        // before completing). Without them svchost logs `LoadGroup cannot open
+        // key ...Svchost` and EventLog fails to start (1053). Values verbatim
+        // from a working CrossOver Steam bottle (CLI-verified 2026-06-18).
+        let extraKeys: [(key: String, valname: String, valtype: String, val: String)] = [
+            (#"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Svchost"#,
+             "LocalServiceNetworkRestricted", "REG_MULTI_SZ", "EventLog"),
+            (#"HKLM\System\CurrentControlSet\Services\EventLog\Parameters"#,
+             "ServiceDll", "REG_EXPAND_SZ", #"C:\windows\system32\wevtsvc.dll"#),
+        ]
+        for entry in extraKeys {
+            let args = ["reg", "add", entry.key, "/v", entry.valname, "/t", entry.valtype, "/d", entry.val, "/f"]
+            do {
+                let process = try await engine.run(args: args, prefix: self)
+                if process.terminationStatus != 0 {
+                    log.warning("[ensureCoreServices] reg add svchost artefact \(entry.valname) failed exit=\(process.terminationStatus)")
+                }
+            } catch {
+                log.warning("[ensureCoreServices] reg add svchost artefact \(entry.valname) threw: \(error.localizedDescription)")
+            }
+        }
+        log.info("[ensureCoreServices] core service registration complete ✓ (nsiproxy + RpcSs + EventLog + PlugPlay + svchost group)")
     }
 
     /// Refreshes system DLL symlinks in an existing prefix after a Wine engine upgrade.
@@ -612,12 +687,37 @@ struct WinePrefix: Sendable {
         WineEngine.engineDir.appending(path: "wine/share/meridian/steam.exe.stub")
     }
 
-    /// If the engine ships a newer `steam.exe` stub than whatever
-    /// `SteamSetup.exe` installed, overwrite the prefix's copy. Idempotent —
-    /// no-op when sizes match or when the engine doesn't ship a bundled stub
-    /// (legacy engines without this asset).
+    /// Restores `steam.exe` from the engine's bundled stub ONLY when the
+    /// prefix's copy is missing or corrupted (zero bytes). Never overwrites
+    /// a healthy stub.
     ///
-    /// Returns `true` when the stub was actually replaced.
+    /// **Why size-based "refresh" is wrong.** Steam self-updates its own
+    /// `steam.exe` as Valve ships client releases. The engine's bundled
+    /// stub is frozen at the version Meridian was packaged with — Valve
+    /// typically ships several updates a month, so the bundled stub
+    /// drifts from current within days. CLI-verified May 20 2026:
+    /// `bootstrap_log.txt` showed Steam comparing `steam.exe is 5767832
+    /// bytes, expected 5771928` (our bundled vs current), forcing a
+    /// self-update download → exit code=42 → wineserver tear-down →
+    /// every running game dies. The previous "if sizes differ, copy
+    /// bundle over" policy rolled Steam back on every Meridian launch,
+    /// guaranteeing this loop.
+    ///
+    /// **Why this matters.** Meridian cannot set `BootStrapperInhibitAll`
+    /// to suppress Steam's update check — the Mar 12 2026+ stub
+    /// silent-exits when that flag is set without handing off to
+    /// `steamclient64.dll` (see `ensureSteamCFG` doc-comment). So the
+    /// ONLY way to avoid the self-update loop is to let the prefix's
+    /// steam.exe stay at whatever version Valve last shipped, which is
+    /// guaranteed-current because Steam keeps it current.
+    ///
+    /// **When to repair.** A genuinely missing or zero-byte stub means
+    /// the prefix is broken — usually from a forced quit during a Steam
+    /// update where files were swapped but the rename failed. The
+    /// bundled stub is a known-good seed for that recovery path; Steam
+    /// will then self-update from the seed to current.
+    ///
+    /// Returns `true` when the stub was actually replaced. Idempotent.
     @discardableResult
     func refreshSteamStubFromEngineIfStale() -> Bool {
         let fm = FileManager.default
@@ -631,22 +731,22 @@ struct WinePrefix: Sendable {
             return false
         }
 
-        let bundledSize = (try? fm.attributesOfItem(atPath: bundledPath))?[.size] as? Int ?? 0
         let ourSize = (try? fm.attributesOfItem(atPath: ourStubPath))?[.size] as? Int ?? 0
-
-        guard bundledSize != ourSize else {
-            log.debug("[refreshSteamStub] stub sizes identical (\(bundledSize) bytes) — already up to date")
+        let prefixHealthy = ourSize > 0 && fm.fileExists(atPath: ourStubPath)
+        guard !prefixHealthy else {
+            log.debug("[refreshSteamStub] prefix steam.exe healthy (\(ourSize) bytes) — leaving Steam's own copy alone (Steam self-updates this)")
             return false
         }
 
-        log.info("[refreshSteamStub] stale stub detected (prefix=\(ourSize) bytes, engine=\(bundledSize) bytes) — overwriting with bundled stub")
+        let bundledSize = (try? fm.attributesOfItem(atPath: bundledPath))?[.size] as? Int ?? 0
+        log.warning("[refreshSteamStub] prefix steam.exe missing/corrupted (\(ourSize) bytes) — seeding from engine bundle (\(bundledSize) bytes); Steam will self-update from this seed")
 
         do {
             if fm.fileExists(atPath: ourStubPath) {
                 try fm.removeItem(atPath: ourStubPath)
             }
             try fm.copyItem(at: bundled, to: ourStub)
-            log.info("[refreshSteamStub] steam.exe stub updated from engine bundle ✓")
+            log.info("[refreshSteamStub] steam.exe recovery seed written")
             return true
         } catch {
             log.error("[refreshSteamStub] copy failed: \(error.localizedDescription)")
@@ -1305,6 +1405,62 @@ struct WinePrefix: Sendable {
         log.info("[writePreseededAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" → \(dest.path(percentEncoded: false))")
     }
 
+    /// Writes an appmanifest marking a game as **fully installed** (`StateFlags=4`).
+    ///
+    /// Used after a headless DepotDownloader install completes: DepotDownloader
+    /// downloads depot files directly into `steamapps/common/<installDir>/` but
+    /// writes no ACF, so Meridian writes one itself. The rest of the app keys
+    /// off this manifest — `isGameFullyInstalled` (StateFlags=="4"),
+    /// `gameInstallDir` (installdir field), `gameRequiresSteamAPI`, uninstall,
+    /// and launch path resolution all read it.
+    ///
+    /// `StateFlags=4` (StateFullyInstalled) tells Steam — if it ever scans this
+    /// prefix — that the game is current and complete, so it will NOT queue a
+    /// re-download. `sizeOnDisk` is informational (readers only check StateFlags
+    /// and installdir); pass the downloaded byte count when known, else 0.
+    func writeInstalledAppManifest(
+        appID: Int,
+        name: String,
+        installDir: String,
+        steamID64: String,
+        sizeOnDisk: Int64 = 0,
+        buildID: Int = 0
+    ) throws {
+        let fm = FileManager.default
+        let steamappsDir = steamInstallDir.appending(path: "steamapps")
+        try fm.createDirectory(at: steamappsDir, withIntermediateDirectories: true)
+
+        let now = Int(Date().timeIntervalSince1970)
+        let vdf = """
+        "AppState"
+        {
+        \t"appid"\t\t"\(appID)"
+        \t"universe"\t\t"1"
+        \t"name"\t\t"\(name.replacingOccurrences(of: "\"", with: "\\\""))"
+        \t"StateFlags"\t\t"4"
+        \t"installdir"\t\t"\(installDir.replacingOccurrences(of: "\"", with: "\\\""))"
+        \t"LastUpdated"\t\t"\(now)"
+        \t"SizeOnDisk"\t\t"\(sizeOnDisk)"
+        \t"StagingSize"\t\t"0"
+        \t"buildid"\t\t"\(buildID)"
+        \t"LastOwner"\t\t"\(steamID64)"
+        \t"DownloadType"\t\t"0"
+        \t"UpdateResult"\t\t"0"
+        \t"BytesToDownload"\t\t"\(sizeOnDisk)"
+        \t"BytesDownloaded"\t\t"\(sizeOnDisk)"
+        \t"BytesToStage"\t\t"\(sizeOnDisk)"
+        \t"BytesStaged"\t\t"\(sizeOnDisk)"
+        \t"TargetBuildID"\t\t"\(buildID)"
+        \t"AutoUpdateBehavior"\t\t"0"
+        \t"AllowOtherDownloadsWhileRunning"\t\t"0"
+        \t"ScheduledAutoUpdate"\t\t"0"
+        }
+        """
+        let dest = steamappsDir.appending(path: "appmanifest_\(appID).acf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writeInstalledAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" StateFlags=4 → \(dest.path(percentEncoded: false))")
+    }
+
     /// Flips every `appmanifest_*.acf` whose `StateFlags == "4"` (fully installed)
     /// to `StateFlags == "1026"` (UpdateRequired | Validating) across ALL Steam
     /// library folders. Returns the number of manifests rewritten.
@@ -1688,6 +1844,154 @@ struct WinePrefix: Sendable {
         return false
     }
 
+    // MARK: - Steamworks API shim (gbe_fork) — DRM games without steam.exe
+
+    /// Replaces the game's Valve `steam_api(64).dll` with the open-source
+    /// gbe_fork emulator so `SteamAPI_Init()` succeeds locally — no running
+    /// `steam.exe`, no Steam auth, no "Who's playing" window. This is Meridian's
+    /// DRM-game launch path (Phase 4): the user's ownership is already proven
+    /// (the game was downloaded by DepotDownloader with the user's OAuth token),
+    /// so the emulator simply answers the Steamworks API in-process using the
+    /// user's steamID + the appID.
+    ///
+    /// For EVERY `steam_api64.dll` / `steam_api.dll` under the game directory
+    /// (games place them at the root, in `bin/`, or in
+    /// `GameName_Data/Plugins/x86_64/` for Unity):
+    ///   1. back up the original Valve dll → `<dll>.valve` (once — idempotent)
+    ///   2. create a `steam_settings/` folder beside the dll (gbe_fork uses
+    ///      built-in interface-version defaults — no steam_interfaces.txt
+    ///      generation at launch; the tool is staged for manual use if a
+    ///      specific older game ever needs an exact interface map)
+    ///   3. copy the matching emu dll (x64/x86) over the original name
+    ///   4. write `steam_appid.txt` + `configs.user.ini` (account name +
+    ///      steamID) into that `steam_settings/` folder
+    ///
+    /// Idempotent: re-runs refresh the emu dll (covers engine upgrades) and
+    /// rewrite the config; the `.valve` backup is created only once so the
+    /// ORIGINAL is never clobbered.
+    func installSteamEmulator(
+        appID: Int,
+        steamID: String,
+        accountName: String,
+        engine: WineEngine
+    ) async throws {
+        guard let emu64 = engine.steamApi64EmuURL else {
+            throw PrefixError.steamEmulatorMissing
+        }
+        let emu32 = engine.steamApi32EmuURL  // optional — some games are 64-bit only
+
+        guard let installDirName = gameInstallDir(appID: appID) else {
+            throw PrefixError.gameDirNotFound(appID: appID)
+        }
+        let fm = FileManager.default
+        var gameDir: URL?
+        for library in steamLibraryFolders {
+            let d = library.appending(path: "steamapps/common/\(installDirName)")
+            if fm.fileExists(atPath: d.path(percentEncoded: false)) { gameDir = d; break }
+        }
+        guard let gameDir else { throw PrefixError.gameDirNotFound(appID: appID) }
+
+        // Collect every steam_api dll (relative paths) under the game dir.
+        var dllRelPaths: [String] = []
+        if let en = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) {
+            while let f = en.nextObject() as? String {
+                let lower = (f as NSString).lastPathComponent.lowercased()
+                if lower == "steam_api64.dll" || lower == "steam_api.dll" {
+                    dllRelPaths.append(f)
+                }
+            }
+        }
+        guard !dllRelPaths.isEmpty else { throw PrefixError.noSteamApiDLL(appID: appID) }
+
+        for rel in dllRelPaths {
+            let dllURL = gameDir.appending(path: rel)
+            let dir = dllURL.deletingLastPathComponent()
+            let isX64 = dllURL.lastPathComponent.lowercased() == "steam_api64.dll"
+            guard let emuSrc = isX64 ? emu64 : emu32 else {
+                log.warning("[installSteamEmulator] no \(isX64 ? "x64" : "x86") emu dll staged — skipping \(rel)")
+                continue
+            }
+
+            let backup = dir.appending(path: dllURL.lastPathComponent + ".valve")
+            let backupPath = backup.path(percentEncoded: false)
+            let dllPath = dllURL.path(percentEncoded: false)
+
+            // 1. Back up the ORIGINAL Valve dll exactly once. If the backup
+            //    already exists, the on-disk dll is our emu from a prior run.
+            if !fm.fileExists(atPath: backupPath) {
+                do {
+                    try fm.copyItem(at: dllURL, to: backup)
+                    log.info("[installSteamEmulator] backed up original → \(backup.lastPathComponent)")
+                } catch {
+                    log.warning("[installSteamEmulator] could not back up \(rel): \(error.localizedDescription)")
+                }
+            }
+
+            // 2. steam_settings/ folder beside the dll. gbe_fork falls back to
+            //    its built-in interface-version defaults (sufficient for modern
+            //    games), so we do NOT generate steam_interfaces.txt at launch —
+            //    that would require a Wine invocation here with hang risk. The
+            //    `generate_interfaces` tool is staged in the engine for manual
+            //    use if a specific older game ever needs an exact interface map.
+            let settingsDir = dir.appending(path: "steam_settings")
+            try? fm.createDirectory(at: settingsDir, withIntermediateDirectories: true)
+
+            // 3. Copy the emu dll over the original name.
+            try? fm.removeItem(at: dllURL)
+            do {
+                try fm.copyItem(at: emuSrc, to: dllURL)
+                log.info("[installSteamEmulator] installed emu \(dllURL.lastPathComponent) at \(dir.lastPathComponent)/")
+            } catch {
+                // Restore the backup so we don't leave the game without any dll.
+                if fm.fileExists(atPath: backupPath), !fm.fileExists(atPath: dllPath) {
+                    try? fm.copyItem(at: backup, to: dllURL)
+                }
+                throw error
+            }
+
+            // 4. steam_settings config beside the dll.
+            try? "\(appID)".write(
+                to: settingsDir.appending(path: "steam_appid.txt"),
+                atomically: true, encoding: .utf8
+            )
+            let safeName = accountName.isEmpty ? "Meridian" : accountName
+            let userIni = """
+            [user::general]
+            account_name=\(safeName)
+            account_steamid=\(steamID)
+            language=english
+            ip_country=US
+            """
+            try? userIni.write(
+                to: settingsDir.appending(path: "configs.user.ini"),
+                atomically: true, encoding: .utf8
+            )
+        }
+        log.info("[installSteamEmulator] ✓ appID=\(appID) shimmed \(dllRelPaths.count) dll(s) — launches without steam.exe")
+    }
+
+    /// Reverts `installSteamEmulator`: restores every `<dll>.valve` backup over
+    /// the emu dll and removes the `steam_settings/` we wrote. Used if a game
+    /// needs the real Steam client (e.g. SteamStub exe-encryption) as a fallback.
+    func removeSteamEmulator(appID: Int) {
+        guard let installDirName = gameInstallDir(appID: appID) else { return }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            guard let en = fm.enumerator(atPath: gameDir.path(percentEncoded: false)) else { continue }
+            while let f = en.nextObject() as? String {
+                guard f.lowercased().hasSuffix("steam_api64.dll.valve")
+                    || f.lowercased().hasSuffix("steam_api.dll.valve") else { continue }
+                let backup = gameDir.appending(path: f)
+                let original = backup.deletingPathExtension()  // strip .valve
+                try? fm.removeItem(at: original)
+                try? fm.copyItem(at: backup, to: original)
+                log.info("[removeSteamEmulator] restored \(original.lastPathComponent)")
+            }
+            return
+        }
+    }
+
     /// Writes `steam_appid.txt` into the game's install directory and, if
     /// `steam_api64.dll` is in a subdirectory (e.g. Unity's
     /// `GameName_Data/Plugins/x86_64/`), also into that subdirectory.
@@ -1753,7 +2057,19 @@ struct WinePrefix: Sendable {
     /// Increment when the set of HKLM Steam or WoW64 crypto registry keys changes.
     /// steam.exe writes these on first run; the native bootstrap bypasses steam.exe,
     /// so we must write them explicitly before steamcmd.exe (32-bit WoW64) starts.
-    static let steamInstallPathRegistrationVersion = 3
+    ///
+    /// 3 → 4 (Jun 19 2026): forces a one-time re-run against every EXISTING
+    /// prefix. The WoW64 crypto provider types (Pattern 11) were being skipped
+    /// on prefixes created via the fresh-create bootstrap path (`!prefix.exists`),
+    /// which — unlike the engine-reset path — did NOT reset the versioned
+    /// registry counters. A prefix recreated after a manual `bottles/` wipe (or
+    /// the Phase-2/3 refactor) therefore inherited `version == 3` and never got
+    /// the keys, re-breaking HL2's 32-bit `filesystem_stdio.dll`
+    /// `CryptAcquireContextA` (page fault at the freed-DLL offset 0x1DDE0).
+    /// Bumping to 4 re-applies the keys to the live prefix without a wipe;
+    /// `BootstrapManager.resetVersionedRegistryCounters()` (now called on BOTH
+    /// create and reset) prevents the skip from recurring.
+    static let steamInstallPathRegistrationVersion = 4
 
     // MARK: - Windows Version Registration
 
@@ -1915,6 +2231,89 @@ struct WinePrefix: Sendable {
         }
 
         log.info("[writeSteamInstallPathRegistryKeys] Steam install path + WoW64 crypto registry keys written ✓")
+    }
+
+    // MARK: - 32-bit (WoW64) COM class registration
+
+    /// Increment when the WoW64 COM class list below changes.
+    ///
+    /// History:
+    ///   1 — registers MMDeviceEnumerator (audio), DirectInput8, and the WBEM
+    ///       locator in the 32-bit `Software\Classes\Wow6432Node\CLSID` view.
+    static let wow64ComRegistrationVersion = 1
+
+    /// Mirrors the COM class registrations that wine.inf writes to the 64-bit
+    /// `HKLM\Software\Classes\CLSID` hive into the 32-bit WoW64 view
+    /// (`Software\Classes\Wow6432Node\CLSID`), which the prefix template ships
+    /// EMPTY.
+    ///
+    /// **Root cause (CLI-verified 2026-06-19):** the prefix template's 64-bit
+    /// CLSID hive has 1935 classes registered; the 32-bit Wow6432Node CLSID
+    /// view has ZERO. `release-engine.sh`'s `wineboot --init` was killed before
+    /// its 32-bit wine.inf registration pass ran (Pattern 7 — the same killed
+    /// wineboot that left the core services and WoW64 crypto provider types
+    /// missing). A 32-bit (WoW64) process resolving a class through `HKCR\CLSID`
+    /// is redirected to `Software\Classes\Wow6432Node\CLSID`; finding it empty,
+    /// `CoCreateInstance` returns `REGDB_E_CLASSNOTREG` (0x80040154).
+    ///
+    /// Observed in Half-Life 2 (32-bit, appID 220): `dsound`'s
+    /// `get_mmdevenum` calls `CoCreateInstance(CLSID_MMDeviceEnumerator)` →
+    /// `class {bcde0395-...} not registered` → the audio device enumerator is
+    /// never created → **no sound**. `DirectInput8` ({25e609e4-...}) and the
+    /// WBEM locator ({4590f811-...}) fail identically (controller input / WMI).
+    /// 64-bit games are unaffected because they read the populated 64-bit view.
+    ///
+    /// CLI-verified 2026-06-19: a 32-bit test calling
+    /// `CoCreateInstance(CLSID_MMDeviceEnumerator)` under WoW64 returned
+    /// `0x80040154` before this registration and `S_OK` (valid pointer) after.
+    ///
+    /// Values mirror the working 64-bit entries verbatim (InprocServer32 to the
+    /// system32 DLL — WoW64 file redirection re-routes 32-bit loads to the
+    /// 32-bit DLL — and `ThreadingModel=Both`). This is the same surgical,
+    /// fact-verified approach as `writeSteamInstallPathRegistryKeys` (WoW64
+    /// crypto, Pattern 11) and `ensureCoreServices` (Pattern 7): register
+    /// exactly what 32-bit games need rather than re-running the hung wineboot.
+    /// Idempotent — `reg add /f` overwrites.
+    func registerWoW64ComClasses(engine: WineEngine) async {
+        // (CLSID, friendly name, InprocServer32 DLL path). All ThreadingModel=Both.
+        let classes: [(clsid: String, name: String, dll: String)] = [
+            // MMDeviceEnumerator — core audio device enumerator. dsound, WASAPI,
+            // and XAudio2 all CoCreateInstance this to open any audio device.
+            // Missing → no sound in every 32-bit game.
+            ("{BCDE0395-E52F-467C-8E3D-C4579291692E}", "MMDeviceEnumerator class",
+             #"C:\windows\system32\mmdevapi.dll"#),
+            // DirectInput8 — keyboard / mouse / gamepad input for 32-bit games.
+            ("{25E609E4-B259-11CF-BFC7-444553540000}", "DirectInput8 Object",
+             #"C:\windows\system32\dinput8.dll"#),
+            // WBEM locator — WMI; some 32-bit games query it at startup.
+            ("{4590F811-1D3A-11D0-891F-00AA004B2E24}", "WBEM Locator",
+             #"C:\windows\system32\wbem\wbemprox.dll"#),
+        ]
+
+        // Fast-path: if every CLSID already exists in the 32-bit view, skip.
+        let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
+        if let current = try? String(contentsOfFile: regPath, encoding: .utf8) {
+            let allPresent = classes.allSatisfy { cls in
+                current.contains(#"[Software\\Classes\\Wow6432Node\\CLSID\\"# + cls.clsid + "]")
+            }
+            if allPresent {
+                log.debug("[registerWoW64ComClasses] all 32-bit COM classes already present — skipping")
+                return
+            }
+        }
+
+        log.info("[registerWoW64ComClasses] registering \(classes.count) 32-bit (WoW64) COM classes (audio/input/WMI)")
+        for cls in classes {
+            let base = #"HKLM\Software\Classes\Wow6432Node\CLSID\"# + cls.clsid
+            let inproc = base + #"\InprocServer32"#
+            // Default value = friendly name on the CLSID key.
+            _ = try? await engine.run(args: ["reg", "add", base, "/ve", "/t", "REG_SZ", "/d", cls.name, "/f"], prefix: self)
+            // Default value = DLL path on the InprocServer32 subkey.
+            _ = try? await engine.run(args: ["reg", "add", inproc, "/ve", "/t", "REG_SZ", "/d", cls.dll, "/f"], prefix: self)
+            // ThreadingModel = Both.
+            _ = try? await engine.run(args: ["reg", "add", inproc, "/v", "ThreadingModel", "/t", "REG_SZ", "/d", "Both", "/f"], prefix: self)
+        }
+        log.info("[registerWoW64ComClasses] 32-bit COM class registration complete ✓")
     }
 
     /// Registers WinRT ActivatableClassId entries that Wine's wineboot does not
@@ -2129,6 +2528,9 @@ struct WinePrefix: Sendable {
         case updateFailed(exitCode: Int32)
         case steamDownloadFailed(statusCode: Int)
         case steamInstallFailed(exitCode: Int32)
+        case steamEmulatorMissing
+        case gameDirNotFound(appID: Int)
+        case noSteamApiDLL(appID: Int)
 
         var errorDescription: String? {
             switch self {
@@ -2140,6 +2542,12 @@ struct WinePrefix: Sendable {
                 return "Failed to download SteamSetup.exe (HTTP \(code))."
             case .steamInstallFailed(let code):
                 return "Failed to install Steam (installer exit \(code))."
+            case .steamEmulatorMissing:
+                return "The Steamworks compatibility component is missing from the engine. Re-download the engine from Settings."
+            case .gameDirNotFound(let id):
+                return "Could not find the install directory for appID \(id)."
+            case .noSteamApiDLL(let id):
+                return "appID \(id) has no steam_api dll to shim (it may not be a DRM game)."
             }
         }
     }
