@@ -467,7 +467,40 @@ struct WinePrefix: Sendable {
     /// Idempotent — `wine64 reg add /f` overwrites without error if the
     /// section exists. Total cost: ~3-5 wineserver round-trips per service,
     /// ~10-15 s on a cold prefix, near-zero once wineserver is warm.
+    /// True when `system.reg` already contains the four core service sections
+    /// plus the svchost hosting config EventLog needs. Pure text probe — no
+    /// Wine process spawned. Case-insensitive because wine.inf and the
+    /// reg-add self-heal disagree on casing (`EventLog` vs `Eventlog`).
+    private func coreServicesAlreadyRegistered() -> Bool {
+        let regPath = path.appending(path: "system.reg").path(percentEncoded: false)
+        guard let raw = try? String(contentsOfFile: regPath, encoding: .utf8) else { return false }
+        let reg = raw.lowercased()
+        let required = [
+            #"services\\nsiproxy"#,
+            #"services\\rpcss"#,
+            #"services\\eventlog"#,
+            #"services\\plugplay"#,
+            "localservicenetworkrestricted", // svchost group hosting EventLog
+            "wevtsvc",                       // EventLog ServiceDll
+        ]
+        return required.allSatisfy { reg.contains($0) }
+    }
+
     func ensureCoreServices(engine: WineEngine) async {
+        // Fast path (Pattern 24): the v3.1.0-engine prefix template ships the
+        // COMPLETE wine.inf service registration (Wine 11.10's wineboot
+        // finishes once share/wine/winmd is staged), so on healthy prefixes
+        // there is nothing left to register. Each `wine64 reg add` round-trip
+        // spawns a Wine process (~1-3 s), and this self-heal used to run
+        // unconditionally on EVERY launch — 10-15 s of splash time. Read
+        // system.reg (plain text) and skip when the services are already
+        // there; the reg-add path below remains as the self-heal for old or
+        // broken prefixes.
+        if coreServicesAlreadyRegistered() {
+            log.info("[ensureCoreServices] all core services present in system.reg — skipping (template-complete prefix)")
+            return
+        }
+
         // Each tuple: (HKLM key path, [(value name, type, value as string)])
         // Values match what `wine.inf` [<Svc>Service] sections install on a
         // working CX Preview bottle. Order: nsiproxy first so that even if a

@@ -168,6 +168,33 @@ final class EnsureCoreServicesTests: XCTestCase {
         return String(src[bodyStart.lowerBound...])
     }
 
+    // MARK: - Fast path (Pattern 24 — template-complete prefixes)
+
+    /// The v3.1.0-engine template ships the complete wine.inf service
+    /// registration, so ensureCoreServices must skip its 10-15 s of
+    /// `wine64 reg add` round-trips when system.reg already has the services.
+    /// Without this gate every launch paid the reg-add cost on the splash
+    /// (user-reported Jul 2 2026 as a slow "Checking for engine updates…").
+    func testEnsureCoreServicesSkipsWhenTemplateComplete() throws {
+        let src = try readSource("Meridian/Engine/WinePrefix.swift")
+        XCTAssertTrue(
+            src.contains("func coreServicesAlreadyRegistered()"),
+            "ensureCoreServices must have a text-probe fast path (no Wine process) for template-complete prefixes"
+        )
+        XCTAssertTrue(
+            src.contains("if coreServicesAlreadyRegistered()"),
+            "ensureCoreServices must consult the fast path before spawning wine64 reg add"
+        )
+        // The probe must be a pure file read on system.reg, not a Wine query.
+        if let fn = src.range(of: "func coreServicesAlreadyRegistered()") {
+            let body = String(src[fn.lowerBound...].prefix(1200))
+            XCTAssertTrue(body.contains("system.reg"),
+                          "The fast-path probe must read system.reg directly")
+            XCTAssertFalse(body.contains("engine.run"),
+                           "The fast-path probe must not spawn a Wine process")
+        }
+    }
+
     // MARK: - BootstrapManager.swift invariants
 
     func testBootstrapAwaitsEnsureCoreServices() throws {

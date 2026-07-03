@@ -291,7 +291,11 @@ final class BootstrapManager {
 
         guard !Task.isCancelled else { return }
 
-        // 2c. Ensure core Wine services.
+        // 2c. Ensure core Wine services. Fast no-op on template-complete
+        // prefixes (Pattern 24); the message only matters on the self-heal
+        // path — without it the splash keeps showing the previous step's
+        // "Checking for engine updates…" while wine64 reg add runs.
+        statusMessage = "Verifying Wine environment…"
         await prefix.ensureCoreServices(engine: engine)
 
         // 3. One-time prefix REGISTRY setup. These are GENERAL prefix
