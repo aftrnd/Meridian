@@ -176,23 +176,19 @@ final class SteamSession {
 
         try Task.checkCancellation()
 
-        // 3. Inject local.vdf from persisted OAuth credentials so the silent
-        //    launch can auto-login. Best-effort — on-disk ssfn/loginusers may
-        //    already satisfy it.
+        // 3. Restore Steam's OWN previously-written session (snapshot taken
+        //    after a successful login) so `-silent` can auto-login.
+        //
+        //    NOTE: we deliberately do NOT inject the Meridian OAuth token via
+        //    `writeSteamSessionLocalVdf` here. Valve's CM rejects injected
+        //    tokens at logon (device-binding wall, Pattern 6 — reconfirmed
+        //    Jul 2 2026), and repeated rejected logons feed the anti-abuse
+        //    lockout (Pattern 23). Only a session Steam wrote itself (via the
+        //    one-time interactive sign-in, `signInInteractively`) is accepted
+        //    for silent auto-login.
         SteamSessionBackup.restoreIfNeeded(prefix: prefix)
         let settings = AppSettings.shared
         if settings.hasSteamCredentials {
-            do {
-                try await prefix.writeSteamSessionLocalVdf(
-                    engine: engine,
-                    steamID: settings.steamCredentialSteamID,
-                    accountName: settings.steamCredentialAccountName,
-                    refreshToken: settings.steamCredentialRefreshToken
-                )
-                log.info("[ensureReadyForDRM] local.vdf injected from persisted credentials ✓")
-            } catch {
-                log.warning("[ensureReadyForDRM] local.vdf inject failed: \(error.localizedDescription) — falling back to on-disk state")
-            }
             // Pre-write the per-user webhelper notification toggles BEFORE Steam
             // starts so the post-login toast burst is silenced before the first
             // toast can render. Best-effort — the userdata dir may not exist
@@ -208,6 +204,131 @@ final class SteamSession {
             throw SessionError.steamNotReady
         }
         log.info("[ensureReadyForDRM] Steam ready for DRM ✓")
+    }
+
+    // MARK: - Interactive one-time Steam sign-in (Online mode)
+
+    /// Brings up Steam's OWN sign-in window (`steam.exe` WITHOUT `-silent`)
+    /// and waits for the user to complete login. One-time per prefix: after a
+    /// successful interactive login Steam persists its own session
+    /// (`loginusers.vdf` with `RememberPassword=1` + `local.vdf`), so every
+    /// subsequent Online launch auto-authenticates via the silent path.
+    ///
+    /// Why interactive: token injection into the bottle is rejected by Valve's
+    /// CM at logon (device-binding wall, Pattern 6), and repeated rejected
+    /// logons feed the anti-abuse lockout (Pattern 23). A session established
+    /// through Steam's own login UI is device-consistent and accepted —
+    /// user-verified Jul 2 2026 on our engine once the prefix had the complete
+    /// wine.inf registration (Pattern 24 / v3.1.0-engine).
+    ///
+    /// Window policy: suppression is paused while the sign-in window is up
+    /// (it must render and receive input — the ONE sanctioned Steam window
+    /// besides EULA/purchase dialogs), and re-engaged the moment
+    /// `[Logged On,` appears so Steam's post-login main window never paints.
+    func signInInteractively(
+        engine: WineEngine,
+        timeout: Duration = .seconds(300),
+        onStatus: (@MainActor (String) -> Void)? = nil
+    ) async throws {
+        if isReady { return }
+        log.info("[signInInteractively] starting interactive Steam sign-in (state=\(String(describing: state)))")
+
+        // Same deferred bring-up as ensureReadyForDRM steps 1-2.
+        if !prefix.isSteamInstalled {
+            onStatus?("Installing Steam…")
+            try await prefix.installSteam(engine: engine)
+        }
+        try? prefix.ensureSteamCFG()
+        try? prefix.ensureDefaultLibrary()
+        try Task.checkCancellation()
+        try await bootstrapSteamClientIfNeeded(engine: engine, onStatus: onStatus)
+        _ = prefix.refreshSteamStubFromEngineIfStale()
+        try Task.checkCancellation()
+
+        // Own a clean process tree — a half-started silent attempt would race
+        // the interactive instance on the same prefix.
+        await shutdown(engine: engine)
+
+        state = .startingSilent
+        // Pause suppression so the sign-in window can render and take input.
+        steamWindow?.pauseForGame()
+
+        onStatus?("Opening Steam sign-in…")
+        do {
+            try await launchSteamProcess(engine: engine, interactive: true)
+        } catch {
+            steamWindow?.startSuppressing()
+            state = .failed(error.localizedDescription)
+            throw error
+        }
+
+        onStatus?("Waiting for you to sign in to Steam…")
+        let loggedOn = await waitForInteractiveLogon(timeout: timeout)
+
+        // Re-engage suppression FIRST so Steam's post-login main window is
+        // hidden before it paints.
+        steamWindow?.startSuppressing()
+        if let p = persistentProcess, p.isRunning {
+            steamWindow?.registerPID(pid_t(p.processIdentifier))
+        }
+
+        guard loggedOn else {
+            logSteamFailureDiagnostics(reason: "interactive sign-in did not reach [Logged On,")
+            state = .failed("Steam sign-in was not completed.")
+            await shutdown(engine: engine)
+            throw SessionError.steamNotReady
+        }
+
+        let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
+        state = .running(pid: pid_t(pid))
+        startHealthMonitor(engine: engine)
+
+        // Snapshot Steam's own freshly-written session so it survives prefix
+        // resets. Steam flushes local.vdf shortly after logon (Pattern 12).
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            SteamSessionBackup.snapshot(prefix: self.prefix)
+        }
+        log.info("[signInInteractively] ✓ signed in — Steam persisted its own session")
+    }
+
+    /// Interactive variant of `waitForLoggedOn`: the user is typing
+    /// credentials / scanning a QR, so there is no post-Connected auth
+    /// deadline and the login page's webhelper polling is expected traffic.
+    /// Fails fast only when steam.exe itself exits (user closed the window,
+    /// or a crash) — the timeout is a last-resort safety net for an abandoned
+    /// sign-in window.
+    private func waitForInteractiveLogon(timeout: Duration) async -> Bool {
+        let connLogPath = prefix.steamInstallDir
+            .appending(path: "logs/connection_log.txt")
+            .path(percentEncoded: false)
+        let started = ContinuousClock.now
+
+        while ContinuousClock.now - started < timeout {
+            if Task.isCancelled { return false }
+
+            if let p = persistentProcess, !p.isRunning {
+                let code = p.terminationStatus
+                if code == 42 {
+                    log.info("[interactiveLogon] code=42 self-update restart, continuing…")
+                    persistentProcess = nil
+                } else {
+                    log.error("[interactiveLogon] steam.exe exited code=\(code) — window closed or crashed before sign-in")
+                    return false
+                }
+            }
+
+            let content = readLogTail(path: connLogPath, from: connectionLogOffset)
+            if content.contains("[Logged On, ") {
+                log.info("[interactiveLogon] ✓ Logged On")
+                return true
+            }
+
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+
+        log.warning("[interactiveLogon] timeout after \(timeout) — sign-in window abandoned")
+        return false
     }
 
     /// Downloads the full Steam client (steamui.dll) NATIVELY via URLSession.
@@ -793,7 +914,7 @@ final class SteamSession {
 
     // MARK: - Private: launch steam.exe
 
-    private func launchSteamProcess(engine: WineEngine) async throws {
+    private func launchSteamProcess(engine: WineEngine, interactive: Bool = false) async throws {
         guard persistentProcess == nil || !(persistentProcess?.isRunning ?? false) else {
             log.info("[launchSteamProcess] already running — skipping")
             return
@@ -810,10 +931,13 @@ final class SteamSession {
         connectionLogOffset = connectionLogFileSize()
 
         let steamExePath = prefix.steamExePath.path(percentEncoded: false)
-        // ALWAYS -silent. Auth comes from the DPAPI-injected local.vdf (written
-        // by WinePrefix.writeSteamSessionLocalVdf at sign-in time + on every
-        // BootstrapManager cold start from persisted credentials).
-        let args = [steamExePath, "-silent", "-nofriendsui"]
+        // Default: -silent — auth comes from Steam's own persisted session
+        // (restored by SteamSessionBackup / written by a prior interactive
+        // sign-in). Interactive: NO -silent, so Steam renders its own sign-in
+        // window for the one-time Online-mode login (`signInInteractively`).
+        let args = interactive
+            ? [steamExePath, "-nofriendsui"]
+            : [steamExePath, "-silent", "-nofriendsui"]
 
         log.info("[launchSteamProcess] wine64 \(args.joined(separator: " "))")
 
@@ -843,10 +967,15 @@ final class SteamSession {
         try process.run()
         persistentProcess = process
         let pid = process.processIdentifier
-        log.info("[launchSteamProcess] pid=\(pid)")
+        log.info("[launchSteamProcess] pid=\(pid) interactive=\(interactive)")
 
-        // Register PID with window suppressor immediately for instant hide.
-        steamWindow?.registerPID(pid_t(pid))
+        // Register PID with window suppressor immediately for instant hide —
+        // EXCEPT for the interactive sign-in launch, whose window must render.
+        // `signInInteractively` registers the PID itself once `[Logged On,`
+        // is reached.
+        if !interactive {
+            steamWindow?.registerPID(pid_t(pid))
+        }
 
         // Store paths for TerminationCleanup so wineserver -k works at quit.
         TerminationCleanup.context = TerminationCleanup.Context(

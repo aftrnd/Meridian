@@ -49,6 +49,59 @@ final class Launcher {
         }
     }
 
+    // MARK: - Steam prompts (user consent before any Steam window can appear)
+
+    /// A user-consent prompt raised by the launch pipeline. The UI
+    /// (GameDetailView) renders it as an alert; the user's choice re-enters
+    /// the pipeline via `confirmSteamPrompt` / `dismissSteamPrompt`.
+    enum SteamPrompt: Equatable {
+        /// The game's exe is SteamStub-encrypted (`.bind` PE section) — the
+        /// gbe_fork shim cannot decrypt it, so Offline mode cannot run it.
+        /// Offer switching the game to Online (real Steam client).
+        case steamRequired(Game)
+        /// Online mode needs a ONE-TIME interactive Steam sign-in (no
+        /// Steam-written session exists on this prefix yet). Explain that a
+        /// Steam window will open once before actually opening it.
+        case signInRequired(Game)
+
+        var game: Game {
+            switch self {
+            case .steamRequired(let g), .signInRequired(let g): return g
+            }
+        }
+    }
+
+    private(set) var steamPrompt: SteamPrompt?
+
+    /// One-shot approval for the interactive sign-in, set when the user
+    /// confirms a prompt. Consumed (reset) by the next `launchOnline` run so
+    /// a later cold launch re-prompts instead of silently opening Steam.
+    private var approvedInteractiveSignInAppID: Int?
+
+    /// User confirmed the pending prompt: switch SteamStub games to Online
+    /// mode, mark the interactive sign-in as approved, and re-enter the
+    /// launch pipeline.
+    func confirmSteamPrompt(
+        engine: WineEngine,
+        session: SteamSession,
+        steamAuth: SteamAuthService? = nil,
+        library: SteamLibraryStore? = nil
+    ) {
+        guard let prompt = steamPrompt else { return }
+        steamPrompt = nil
+        let game = prompt.game
+        if case .steamRequired = prompt {
+            AppSettings.shared.setLaunchMode(.online, appID: game.id)
+            appendLog("Switched \(game.name) to Online mode (SteamStub DRM requires the Steam client)")
+        }
+        approvedInteractiveSignInAppID = game.id
+        launch(game: game, engine: engine, session: session, steamAuth: steamAuth, library: library)
+    }
+
+    func dismissSteamPrompt() {
+        steamPrompt = nil
+    }
+
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
     private(set) var downloadProgress: Double?
@@ -248,6 +301,20 @@ final class Launcher {
         // game was downloaded by DepotDownloader with the user's OAuth token).
         // DRM-free games skip this entirely.
         let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)
+
+        // SteamStub exe encryption cannot be satisfied by the shim — the exe
+        // itself is encrypted and only a running, signed-in Steam client can
+        // decrypt it. Don't attempt a shim launch that would fail opaquely;
+        // ask the user to switch this game to Online mode instead.
+        if needsDRM, prefix.gameHasSteamStubDRM(appID: game.id) {
+            log.info("[pipeline] appID=\(game.id) is SteamStub-encrypted — prompting for Online mode")
+            appendLog("\(game.name) uses SteamStub DRM — the Steam client is required to run it")
+            steamPrompt = .steamRequired(game)
+            launchState = .idle
+            currentActivity = nil
+            return
+        }
+
         if needsDRM {
             launchState = .launching(appID: game.id)
             currentActivity = "Preparing \(game.name)…"
@@ -402,13 +469,52 @@ final class Launcher {
     /// which also avoids the "launching with custom args" dialog for UE
     /// launcher chains (Pattern 20).
     private func launchOnline(game: Game, engine: WineEngine, session: SteamSession) async {
+        // First-time Online on this prefix: no Steam-written session exists,
+        // so a ONE-TIME interactive sign-in (a real Steam window) is needed.
+        // Never open a Steam window without asking first — raise the consent
+        // prompt and bail; `confirmSteamPrompt` re-enters with approval.
+        let hasSession = prefix.hasSteamLoginSession()
+        let approved = approvedInteractiveSignInAppID == game.id
+        approvedInteractiveSignInAppID = nil // one-shot
+        if !hasSession && !approved {
+            log.info("[launchOnline] no Steam session on disk — prompting for one-time sign-in")
+            steamPrompt = .signInRequired(game)
+            launchState = .idle
+            currentActivity = nil
+            return
+        }
+
         launchState = .launching(appID: game.id)
         currentActivity = "Connecting to Steam…"
         appendLog("Online mode: bringing Steam online for \(game.name)")
 
         do {
-            try await session.ensureReadyForDRM(engine: engine) { [weak self] status in
-                self?.currentActivity = status
+            if !hasSession {
+                // User approved the one-time interactive sign-in. Steam's own
+                // login window renders; Steam persists its own session, so
+                // every later Online launch takes the silent path below.
+                try await session.signInInteractively(engine: engine) { [weak self] status in
+                    self?.currentActivity = status
+                }
+            } else {
+                do {
+                    try await session.ensureReadyForDRM(engine: engine) { [weak self] status in
+                        self?.currentActivity = status
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // The on-disk session went stale (Valve rejected it or the
+                    // silent auth timed out). Retry DIFFERENTLY (fail-fast
+                    // rule): fall back to the interactive sign-in so the user
+                    // can re-establish a session Steam itself persists.
+                    log.warning("[launchOnline] silent auth failed (\(error.localizedDescription)) — falling back to interactive sign-in")
+                    appendLog("Steam session expired — opening Steam sign-in")
+                    currentActivity = "Steam sign-in required…"
+                    try await session.signInInteractively(engine: engine) { [weak self] status in
+                        self?.currentActivity = status
+                    }
+                }
             }
         } catch is CancellationError {
             // Tear Steam down so a cancelled bring-up doesn't leave steam.exe /
@@ -418,15 +524,14 @@ final class Launcher {
             currentActivity = nil
             return
         } catch {
-            // Silent steam.exe auto-login did not reach [Logged On,]. steam.exe
-            // is still alive and WILL render its own sign-in QR window (which the
-            // suppressor does not hide — it's Steam's login UI, not chrome). Tear
-            // the whole Steam runtime down before surfacing the error so no Steam
-            // UI is ever left on screen (development-standards: Steam UI is never
-            // shown). Offline mode remains the working default.
+            // Neither silent auto-login nor the interactive sign-in reached
+            // [Logged On,]. Tear the whole Steam runtime down before surfacing
+            // the error so no Steam UI is ever left on screen
+            // (development-standards: Steam UI is never shown). Offline mode
+            // remains the working default.
             await session.shutdown(engine: engine)
             steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("Steam couldn't sign in to launch \(game.name) online. Switch this game to Offline mode to play now. (Online mode needs Steam to complete its own sign-in, which didn't finish this time.)", error: error)
+            fail("Steam couldn't sign in to launch \(game.name) online. Switch this game to Offline mode to play now. (Online mode needs a completed Steam sign-in.)", error: error)
             return
         }
 

@@ -1874,6 +1874,28 @@ struct WinePrefix: Sendable {
         return false
     }
 
+    /// True when the game's main executable is wrapped with SteamStub DRM
+    /// (exe encryption — a `.bind` PE section). SteamStub games cannot run
+    /// under the gbe_fork API shim: the exe itself is encrypted and only a
+    /// running, signed-in Steam client can decrypt it. `Launcher` uses this
+    /// to route the user to Online mode instead of attempting a shim launch
+    /// that would fail opaquely.
+    func gameHasSteamStubDRM(appID: Int) -> Bool {
+        guard let installDirName = gameInstallDir(appID: appID) else { return false }
+        let fm = FileManager.default
+        for library in steamLibraryFolders {
+            let gameDir = library.appending(path: "steamapps/common/\(installDirName)")
+            let gameDirPath = gameDir.path(percentEncoded: false)
+            guard fm.fileExists(atPath: gameDirPath) else { continue }
+            let top = (try? fm.contentsOfDirectory(atPath: gameDirPath)) ?? []
+            guard let exeName = GameStackDetector.mainExecutable(in: top) else { return false }
+            let stub = GameStackDetector.hasSteamStub(exe: gameDir.appending(path: exeName))
+            log.debug("[gameHasSteamStubDRM] appID=\(appID) exe=\(exeName) → \(stub)")
+            return stub
+        }
+        return false
+    }
+
     // MARK: - Steamworks API shim (gbe_fork) — DRM games without steam.exe
 
     /// Replaces the game's Valve `steam_api(64).dll` with the open-source

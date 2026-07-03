@@ -257,6 +257,53 @@ struct GameDetailView: View {
         } message: {
             Text("This removes this game's local manifest and downloaded files only. It does not reset the Wine engine, Steam, or other installed games.")
         }
+        // Consent prompts raised by the launch pipeline before any Steam
+        // window can appear (SteamStub DRM → Online switch; first-time Online
+        // → one-time interactive Steam sign-in).
+        .alert(
+            steamPromptTitle,
+            isPresented: Binding(
+                get: { launcher.steamPrompt != nil },
+                set: { if !$0 { launcher.dismissSteamPrompt() } }
+            ),
+            presenting: launcher.steamPrompt
+        ) { prompt in
+            Button(steamPromptConfirmLabel(for: prompt)) {
+                launcher.confirmSteamPrompt(
+                    engine: engine, session: session,
+                    steamAuth: steamAuth, library: library
+                )
+            }
+            Button("Cancel", role: .cancel) { launcher.dismissSteamPrompt() }
+        } message: { prompt in
+            Text(steamPromptMessage(for: prompt))
+        }
+    }
+
+    // MARK: - Steam prompt copy
+
+    private var steamPromptTitle: String {
+        switch launcher.steamPrompt {
+        case .steamRequired:  return "Steam Required"
+        case .signInRequired: return "One-Time Steam Sign-In"
+        case nil:             return ""
+        }
+    }
+
+    private func steamPromptConfirmLabel(for prompt: Launcher.SteamPrompt) -> String {
+        switch prompt {
+        case .steamRequired:  return "Play via Steam"
+        case .signInRequired: return "Open Steam Sign-In"
+        }
+    }
+
+    private func steamPromptMessage(for prompt: Launcher.SteamPrompt) -> String {
+        switch prompt {
+        case .steamRequired(let game):
+            return "\(game.name) uses Steam DRM that can only run through the Steam client, so it can't use Meridian's seamless Offline mode. Switch it to Online mode? If you haven't signed in to Steam on this Mac yet, Steam will open once so you can sign in — after that, launches are automatic."
+        case .signInRequired(let game):
+            return "Playing \(game.name) online needs a one-time Steam sign-in. Steam will open so you can sign in; Meridian handles everything after that — future Online launches are automatic and no Steam windows will appear."
+        }
     }
 
     // MARK: - Hero Banner

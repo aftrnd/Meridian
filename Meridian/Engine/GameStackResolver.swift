@@ -135,6 +135,47 @@ enum GameStackDetector {
         return exes.first(where: { !$0.lowercased().contains("unity") }) ?? exes.first
     }
 
+    // MARK: SteamStub DRM (exe encryption)
+
+    /// Detects the SteamStub DRM wrapper by the `.bind` PE section it injects
+    /// into the game's executable. SteamStub encrypts the exe's real entry
+    /// point; only a running, signed-in Steam client can decrypt it at launch.
+    /// The gbe_fork API shim can satisfy `SteamAPI_Init()` but can NOT decrypt
+    /// a SteamStub exe — these games genuinely require Online mode.
+    ///
+    /// PE walk: MZ → e_lfanew(0x3C) → "PE\0\0" → COFF header (NumberOfSections
+    /// at +6, SizeOfOptionalHeader at +20) → section table (40-byte entries,
+    /// first 8 bytes = name). Returns true when any section is named ".bind".
+    ///
+    /// MIRROR CONTRACT: mirrored in GameInstallTests.hasSteamStub.
+    static func hasSteamStub(exe: URL) -> Bool {
+        guard let fh = try? FileHandle(forReadingFrom: exe) else { return false }
+        defer { try? fh.close() }
+
+        guard let dosData = try? fh.read(upToCount: 0x40), dosData.count >= 0x40 else { return false }
+        let dos = [UInt8](dosData)
+        guard dos[0] == 0x4D, dos[1] == 0x5A else { return false } // "MZ"
+        let eLfanew = Int(dos[0x3C]) | Int(dos[0x3D]) << 8 | Int(dos[0x3E]) << 16 | Int(dos[0x3F]) << 24
+        guard eLfanew > 0, eLfanew < 4_000_000 else { return false }
+
+        try? fh.seek(toOffset: UInt64(eLfanew))
+        guard let coffData = try? fh.read(upToCount: 24), coffData.count >= 24 else { return false }
+        let coff = [UInt8](coffData)
+        guard coff[0] == 0x50, coff[1] == 0x45, coff[2] == 0, coff[3] == 0 else { return false } // "PE\0\0"
+        let numberOfSections     = Int(coff[6])  | Int(coff[7])  << 8
+        let sizeOfOptionalHeader = Int(coff[20]) | Int(coff[21]) << 8
+
+        try? fh.seek(toOffset: UInt64(eLfanew + 24 + sizeOfOptionalHeader))
+        let tableSize = min(numberOfSections, 96) * 40
+        guard tableSize > 0, let table = try? fh.read(upToCount: tableSize), table.count >= 40 else { return false }
+        let bytes = [UInt8](table)
+        let bind: [UInt8] = [0x2E, 0x62, 0x69, 0x6E, 0x64] // ".bind"
+        for i in stride(from: 0, to: bytes.count - 39, by: 40) {
+            if Array(bytes[i..<(i + 5)]) == bind, bytes[i + 5] == 0 { return true }
+        }
+        return false
+    }
+
     // MARK: PE bitness
 
     /// Reads the COFF Machine field from a Windows PE executable and maps it to
