@@ -134,7 +134,8 @@ final class BootstrapManager {
         log.info("║ steam bootstrapped=\(prefix.isSteamBootstrapped)")
         log.info("╚══════════════════════════════════════════════════")
 
-        // 1. Detect engine — auto-download if absent.
+        // 1. Detect engine — auto-download if absent, auto-UPDATE if a newer
+        //    engine release is published.
         transition(to: .detectingEngine, message: "Detecting Wine engine…")
         if !engine.isReady {
             transition(to: .downloadingEngine, message: "Downloading Wine engine…")
@@ -158,8 +159,54 @@ final class BootstrapManager {
                 else { detail = "Engine could not be verified after download." }
                 fail(detail); return
             }
+        } else {
+            // 1a. Engine auto-update. Engine-only releases (vX.Y.Z-engine) never
+            // bump the app version, so without this check users stay on an old
+            // engine until they manually visit Settings → Updates. Running the
+            // update HERE is race-free: it happens before any Wine process is
+            // started this session (orphan cleanup above), so replacing the
+            // engine directory cannot delete a live wine64 — the hazard
+            // EngineDownloader's same-tag short-circuit exists for. When the
+            // installed tag already matches GitHub's latest, download() is a
+            // ~single-API-call no-op.
+            //
+            // Fail-OPEN: any check/download failure keeps the installed engine
+            // and the launch proceeds — an offline user must never be blocked
+            // by a GitHub fetch.
+            transition(to: .detectingEngine, message: "Checking for engine updates…")
+            engineDownloader.download {}
+            updateLoop: while true {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled else { return }
+                let current = engineDownloader.state
+                switch current {
+                case .complete:
+                    break updateLoop
+                case .failed(let msg):
+                    log.warning("[bootstrap] engine update check failed — continuing with installed engine: \(msg)")
+                    break updateLoop
+                case .downloading, .extracting:
+                    if phase != .downloadingEngine {
+                        transition(to: .downloadingEngine, message: "Updating Wine engine…")
+                    }
+                    engineDownloadState = current
+                default:
+                    continue
+                }
+            }
+            // Re-detect unconditionally: on success the version/paths must
+            // reflect the freshly-extracted engine; on a mid-extraction
+            // failure the engine dir may be gone and the cached isReady would
+            // lie — detect() surfaces that as a real failure instead.
+            engine.detect()
+            guard engine.isReady else {
+                let detail: String
+                if case .error(let msg) = engine.state { detail = msg }
+                else { detail = "Engine could not be verified after update." }
+                fail(detail); return
+            }
         }
-        log.info("[bootstrap] engine OK — \(engine.backendName)")
+        log.info("[bootstrap] engine OK — \(engine.backendName) \(engine.engineVersion ?? "unknown")")
 
         TerminationCleanup.context = TerminationCleanup.Context(
             wineserverPath: engine.wineserverURL.path(percentEncoded: false),

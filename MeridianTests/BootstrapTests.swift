@@ -20,6 +20,34 @@ final class BootstrapTests: XCTestCase {
         try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
     }
 
+    // MARK: - Engine auto-update on launch
+
+    /// Engine-only releases (vX.Y.Z-engine) never bump the app version, so the
+    /// old "auto-refresh engine on app version change" hook never fired for
+    /// them — users stayed on a stale engine until they manually visited
+    /// Settings → Updates (observed Jul 2 2026: v3.1.0-engine published, app
+    /// still reported v3.0.6). BootstrapManager must run the engine updater on
+    /// EVERY launch, in the engine-ready branch, BEFORE any Wine process
+    /// starts (race-free window), and must fail-open on check failure so an
+    /// offline user is never blocked.
+    func testBootstrap_autoUpdatesEngineOnLaunch() throws {
+        let src = try readSource("Meridian/App/BootstrapManager.swift")
+
+        XCTAssertTrue(src.contains("Checking for engine updates…"),
+                      "The engine-ready branch must run an update check on every launch")
+        XCTAssertTrue(src.contains("Updating Wine engine…"),
+                      "A newer published engine must be downloaded during bootstrap")
+        XCTAssertTrue(src.contains("engine update check failed — continuing with installed engine"),
+                      "Update-check failures must fail-open (keep installed engine, continue launch)")
+
+        // The auto-update must live in the `else` of `if !engine.isReady` —
+        // i.e. it runs when an engine IS installed. Two download() call sites
+        // therefore exist in the pipeline (absent-engine + update paths).
+        let downloadCalls = src.components(separatedBy: "engineDownloader.download {}").count - 1
+        XCTAssertGreaterThanOrEqual(downloadCalls, 2,
+                      "Both the absent-engine and installed-engine (auto-update) paths must invoke the engine downloader")
+    }
+
     // MARK: - Phase enum mirror (BootstrapManager.Phase)
 
     /// Mirror of BootstrapManager.Phase
