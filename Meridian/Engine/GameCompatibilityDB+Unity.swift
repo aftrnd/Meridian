@@ -72,11 +72,11 @@ extension GameCompatibilityDB {
         .unity(
             appID: 4069520,
             name: "Super Battle Golf",
-            status: .untested,
+            status: .verified,
             graphicsAPI: .dx11,
             dxmtMode: .auto,
             launchArgs: ["-force-d3d11"],
-            verifiedWith: nil,
+            verifiedWith: "v3.1.0-engine",
             notes: """
             Unity DX12 game. Root cause of crash (0xc06d007e / E_DELAYLOAD_MOD_NOT_FOUND): \
             WineEngine.environment(for:) was globally setting WINEDLLOVERRIDES=d3d12,d3d12core=n \
@@ -85,7 +85,10 @@ extension GameCompatibilityDB {
             Unity probes D3D12 even with -force-d3d11, hitting the broken VKD3D-proton path. \
             Engine-wide fix (April 2026): removed the VKD3D-proton override from \
             WineEngine.environment(for:). -force-d3d11 routes through DXMT->Metal. \
-            No per-game WINEDLLOVERRIDES needed. Untested post-fix — verify and update status.
+            No per-game WINEDLLOVERRIDES needed. User-verified Jul 3 2026 on v3.1.0-engine: \
+            Offline (gbe_fork shim) "perfect", AND Online (real steam.exe -applaunch, \
+            game-mode window suppression) launched with no visible Steam UI — the first \
+            game to pass the full Online seamlessness contract (Pattern 25).
             """
         ),
 
