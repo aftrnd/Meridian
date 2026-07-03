@@ -1481,20 +1481,82 @@ struct WinePrefix: Sendable {
     /// prefix — that the game is current and complete, so it will NOT queue a
     /// re-download. `sizeOnDisk` is informational (readers only check StateFlags
     /// and installdir); pass the downloaded byte count when known, else 0.
+    ///
+    /// `buildID` + `depots` matter for Online mode: Steam's login library scan
+    /// compares the ACF's `buildid` and `InstalledDepots` manifest ids against
+    /// PICS. With `buildid=0` / no depots (the pre-Jul-2026 behaviour) Steam
+    /// flips StateFlags 4→6 (update pending) and `-applaunch` silently queues a
+    /// validation instead of launching (user-verified Jul 2 2026, Super Battle
+    /// Golf). Depots with `sharedApp` set are written to `SharedDepots`
+    /// (depotfromapp-proxied, e.g. Steamworks Common Redistributables) —
+    /// mirroring the exact ACF layout Steam itself writes.
     func writeInstalledAppManifest(
         appID: Int,
         name: String,
         installDir: String,
         steamID64: String,
         sizeOnDisk: Int64 = 0,
-        buildID: Int = 0
+        buildID: Int = 0,
+        depots: [DepotDownloaderInstall.InstalledDepot] = []
     ) throws {
         let fm = FileManager.default
         let steamappsDir = steamInstallDir.appending(path: "steamapps")
         try fm.createDirectory(at: steamappsDir, withIntermediateDirectories: true)
 
         let now = Int(Date().timeIntervalSince1970)
-        let vdf = """
+        let vdf = Self.installedAppManifestVDF(
+            appID: appID,
+            name: name,
+            installDir: installDir,
+            steamID64: steamID64,
+            sizeOnDisk: sizeOnDisk,
+            buildID: buildID,
+            depots: depots,
+            lastUpdated: now
+        )
+        let dest = steamappsDir.appending(path: "appmanifest_\(appID).acf")
+        try vdf.write(to: dest, atomically: true, encoding: .utf8)
+        log.info("[writeInstalledAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" StateFlags=4 buildid=\(buildID) depots=\(depots.count) → \(dest.path(percentEncoded: false))")
+    }
+
+    /// Pure VDF builder for the fully-installed appmanifest. Extracted as a
+    /// static helper so the test mirror can stay byte-for-byte equivalent.
+    ///
+    /// MIRROR CONTRACT: mirrored in DepotDownloaderInstallTests.installedAppManifestVDFFull.
+    static func installedAppManifestVDF(
+        appID: Int,
+        name: String,
+        installDir: String,
+        steamID64: String,
+        sizeOnDisk: Int64,
+        buildID: Int,
+        depots: [DepotDownloaderInstall.InstalledDepot],
+        lastUpdated: Int
+    ) -> String {
+        let owned = depots.filter { $0.sharedApp == nil }
+        let shared = depots.filter { $0.sharedApp != nil }
+
+        var installedDepotsBlock = ""
+        if !owned.isEmpty {
+            installedDepotsBlock = "\n\t\"InstalledDepots\"\n\t{\n"
+            for d in owned {
+                installedDepotsBlock += "\t\t\"\(d.depotID)\"\n\t\t{\n"
+                installedDepotsBlock += "\t\t\t\"manifest\"\t\t\"\(d.manifestID)\"\n"
+                installedDepotsBlock += "\t\t\t\"size\"\t\t\"\(d.size)\"\n"
+                installedDepotsBlock += "\t\t}\n"
+            }
+            installedDepotsBlock += "\t}"
+        }
+        var sharedDepotsBlock = ""
+        if !shared.isEmpty {
+            sharedDepotsBlock = "\n\t\"SharedDepots\"\n\t{\n"
+            for d in shared {
+                sharedDepotsBlock += "\t\t\"\(d.depotID)\"\t\t\"\(d.sharedApp ?? 0)\"\n"
+            }
+            sharedDepotsBlock += "\t}"
+        }
+
+        return """
         "AppState"
         {
         \t"appid"\t\t"\(appID)"
@@ -1502,7 +1564,7 @@ struct WinePrefix: Sendable {
         \t"name"\t\t"\(name.replacingOccurrences(of: "\"", with: "\\\""))"
         \t"StateFlags"\t\t"4"
         \t"installdir"\t\t"\(installDir.replacingOccurrences(of: "\"", with: "\\\""))"
-        \t"LastUpdated"\t\t"\(now)"
+        \t"LastUpdated"\t\t"\(lastUpdated)"
         \t"SizeOnDisk"\t\t"\(sizeOnDisk)"
         \t"StagingSize"\t\t"0"
         \t"buildid"\t\t"\(buildID)"
@@ -1516,12 +1578,9 @@ struct WinePrefix: Sendable {
         \t"TargetBuildID"\t\t"\(buildID)"
         \t"AutoUpdateBehavior"\t\t"0"
         \t"AllowOtherDownloadsWhileRunning"\t\t"0"
-        \t"ScheduledAutoUpdate"\t\t"0"
+        \t"ScheduledAutoUpdate"\t\t"0"\(installedDepotsBlock)\(sharedDepotsBlock)
         }
         """
-        let dest = steamappsDir.appending(path: "appmanifest_\(appID).acf")
-        try vdf.write(to: dest, atomically: true, encoding: .utf8)
-        log.info("[writeInstalledAppManifest] appID=\(appID) name=\"\(name)\" installdir=\"\(installDir)\" StateFlags=4 → \(dest.path(percentEncoded: false))")
     }
 
     /// Flips every `appmanifest_*.acf` whose `StateFlags == "4"` (fully installed)

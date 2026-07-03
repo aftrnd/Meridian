@@ -25,10 +25,17 @@ final class DepotDownloaderInstallTests: XCTestCase {
 
     // MARK: - Mirror of DepotDownloaderInstall.Event / parse
 
+    struct InstalledDepot: Equatable {
+        let depotID: UInt32
+        let manifestID: String
+        let size: Int64
+        let sharedApp: UInt32?
+    }
+
     enum Event: Equatable {
         case phase(phase: String, detail: String)
         case progress(bytesDone: Int64, bytesTotal: Int64, pct: Double)
-        case done(bytesDownloaded: Int64)
+        case done(bytesDownloaded: Int64, buildID: Int, depots: [InstalledDepot])
         case error(message: String)
     }
 
@@ -63,7 +70,28 @@ final class DepotDownloaderInstallTests: XCTestCase {
                              bytesTotal: intValue(obj["bytesTotal"]),
                              pct: doubleValue(obj["pct"]))
         case "done":
-            return .done(bytesDownloaded: intValue(obj["bytesDownloaded"]))
+            var depots: [InstalledDepot] = []
+            if let arr = obj["depots"] as? [[String: Any]] {
+                for d in arr {
+                    let depotID = UInt32(clamping: intValue(d["depot"]))
+                    guard depotID != 0 else { continue }
+                    let manifest = (d["manifest"] as? String)
+                        ?? (intValue(d["manifest"]) != 0 ? String(intValue(d["manifest"])) : "")
+                    guard !manifest.isEmpty else { continue }
+                    let shared = intValue(d["sharedApp"])
+                    depots.append(InstalledDepot(
+                        depotID: depotID,
+                        manifestID: manifest,
+                        size: intValue(d["size"]),
+                        sharedApp: shared != 0 ? UInt32(clamping: shared) : nil
+                    ))
+                }
+            }
+            return .done(
+                bytesDownloaded: intValue(obj["bytesDownloaded"]),
+                buildID: Int(intValue(obj["buildid"])),
+                depots: depots
+            )
         case "error":
             return .error(message: (obj["message"] as? String) ?? "unknown error")
         default:
@@ -86,8 +114,35 @@ final class DepotDownloaderInstallTests: XCTestCase {
     }
 
     func testParse_done() {
+        // Older fork binaries emit no buildid/depots → 0/[] (no regression).
         XCTAssertEqual(parse(#"{"type":"done","bytesDownloaded":34000000}"#),
-                       .done(bytesDownloaded: 34_000_000))
+                       .done(bytesDownloaded: 34_000_000, buildID: 0, depots: []))
+    }
+
+    /// The fork's `done` event carries the installed buildid + depot manifests
+    /// so Launcher can write an ACF Steam's library scan agrees is CURRENT.
+    /// Values from the real Super Battle Golf install (Jul 2 2026): buildid
+    /// 22804232, own depot 4069521, Steamworks redist 228989 shared from
+    /// app 228980. Manifest ids are strings — they exceed Double precision.
+    func testParse_doneWithBuildIDAndDepots() {
+        let line = #"{"type":"done","bytesDownloaded":0,"buildid":22804232,"depots":[{"depot":4069521,"manifest":"1731867607556253764","size":1818015642},{"depot":228989,"manifest":"3514306556860204959","size":2639,"sharedApp":228980}]}"#
+        XCTAssertEqual(parse(line), .done(
+            bytesDownloaded: 0,
+            buildID: 22_804_232,
+            depots: [
+                InstalledDepot(depotID: 4_069_521, manifestID: "1731867607556253764",
+                               size: 1_818_015_642, sharedApp: nil),
+                InstalledDepot(depotID: 228_989, manifestID: "3514306556860204959",
+                               size: 2_639, sharedApp: 228_980),
+            ]
+        ))
+        // Precision guard: the manifest id must round-trip EXACTLY (a Double
+        // parse would corrupt 1731867607556253764 → 1731867607556253696).
+        if case .done(_, _, let depots)? = parse(line) {
+            XCTAssertEqual(depots.first?.manifestID, "1731867607556253764")
+        } else {
+            XCTFail("done event must parse")
+        }
     }
 
     func testParse_error() {
@@ -371,5 +426,83 @@ final class DepotDownloaderInstallTests: XCTestCase {
         XCTAssertTrue(vdf.contains("\"StateFlags\"\t\t\"4\""))
         // installdir must be present (what gameInstallDir reads).
         XCTAssertTrue(vdf.contains("\"installdir\"\t\t\"Animal Well\""))
+    }
+
+    // MARK: - Installed-manifest buildid + depots (Bug B, HANDOFF-2026-07-02-v4)
+
+    /// Mirror of WinePrefix.installedAppManifestVDF (depot blocks only —
+    /// asserts the structural pieces Steam's library scan compares).
+    /// MIRROR CONTRACT: must match WinePrefix.installedAppManifestVDF.
+    private func installedAppManifestVDFFull(
+        buildID: Int, depots: [InstalledDepot]
+    ) -> (installedBlock: String, sharedBlock: String) {
+        let owned = depots.filter { $0.sharedApp == nil }
+        let shared = depots.filter { $0.sharedApp != nil }
+
+        var installedDepotsBlock = ""
+        if !owned.isEmpty {
+            installedDepotsBlock = "\n\t\"InstalledDepots\"\n\t{\n"
+            for d in owned {
+                installedDepotsBlock += "\t\t\"\(d.depotID)\"\n\t\t{\n"
+                installedDepotsBlock += "\t\t\t\"manifest\"\t\t\"\(d.manifestID)\"\n"
+                installedDepotsBlock += "\t\t\t\"size\"\t\t\"\(d.size)\"\n"
+                installedDepotsBlock += "\t\t}\n"
+            }
+            installedDepotsBlock += "\t}"
+        }
+        var sharedDepotsBlock = ""
+        if !shared.isEmpty {
+            sharedDepotsBlock = "\n\t\"SharedDepots\"\n\t{\n"
+            for d in shared {
+                sharedDepotsBlock += "\t\t\"\(d.depotID)\"\t\t\"\(d.sharedApp ?? 0)\"\n"
+            }
+            sharedDepotsBlock += "\t}"
+        }
+        return (installedDepotsBlock, sharedDepotsBlock)
+    }
+
+    /// A DepotDownloader install must produce an ACF Steam agrees is CURRENT:
+    /// real buildid + InstalledDepots (own depots) + SharedDepots (proxied).
+    /// With buildid=0 / no depots, Steam flips StateFlags 4→6 and `-applaunch`
+    /// silently queues a validation instead of launching (user-verified
+    /// Jul 2 2026, Super Battle Golf Online).
+    func testInstalledManifest_writesDepotBlocksSteamAgreesWith() {
+        let depots = [
+            InstalledDepot(depotID: 4_069_521, manifestID: "1731867607556253764",
+                           size: 1_818_015_642, sharedApp: nil),
+            InstalledDepot(depotID: 228_989, manifestID: "3514306556860204959",
+                           size: 2_639, sharedApp: 228_980),
+        ]
+        let (installed, shared) = installedAppManifestVDFFull(buildID: 22_804_232, depots: depots)
+        XCTAssertTrue(installed.contains("\"InstalledDepots\""))
+        XCTAssertTrue(installed.contains("\"4069521\""))
+        XCTAssertTrue(installed.contains("\"manifest\"\t\t\"1731867607556253764\""))
+        // The shared (depotfromapp) depot must NOT land in InstalledDepots…
+        XCTAssertFalse(installed.contains("228989"))
+        // …but in SharedDepots, mapped to its owning app.
+        XCTAssertTrue(shared.contains("\"SharedDepots\""))
+        XCTAssertTrue(shared.contains("\"228989\"\t\t\"228980\""))
+    }
+
+    /// Source invariants: the writer accepts buildid + depots and the Launcher
+    /// passes the fork's `done` values through.
+    func testInstalledManifest_wiredWithBuildIDAndDepots() throws {
+        let prefixSrc = try readSource("Meridian/Engine/WinePrefix.swift")
+        XCTAssertTrue(prefixSrc.contains("depots: [DepotDownloaderInstall.InstalledDepot]"),
+                      "writeInstalledAppManifest must accept the installed depot list")
+        XCTAssertTrue(prefixSrc.contains("InstalledDepots") && prefixSrc.contains("SharedDepots"),
+                      "the manifest VDF must include InstalledDepots + SharedDepots blocks")
+
+        let launcherSrc = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcherSrc.contains("buildID: result.buildID"),
+                      "installHeadless must pass the fork-reported buildid into the ACF")
+        XCTAssertTrue(launcherSrc.contains("depots: result.depots"),
+                      "installHeadless must pass the fork-reported depots into the ACF")
+
+        let forkPatch = try readSource("Scripts/depotdownloader/meridian-task1.patch")
+        XCTAssertTrue(forkPatch.contains("GetSteam3AppBuildNumber(appId, branch)"),
+                      "the fork's done event must carry the installed branch buildid")
+        XCTAssertTrue(forkPatch.contains("DepotManifestSizes"),
+                      "the fork must record per-depot manifest sizes for the ACF")
     }
 }

@@ -114,6 +114,23 @@ final class GameProcess {
         }
     }
 
+    /// Stops monitoring WITHOUT killing any processes. Used when a launch is
+    /// cancelled/stopped while Steam owns the process tree (Online mode) —
+    /// killing wineserver there would take the persistent Steam session down
+    /// with it. Also stops the monitor's `onLog` callbacks, which otherwise
+    /// keep overwriting the UI's activity text with "Waiting for game to
+    /// start…" after the user already cancelled (Bug D,
+    /// HANDOFF-2026-07-02-v4).
+    func cancelMonitoring() {
+        guard monitorTask != nil || monitorPhase != .idle else { return }
+        log.info("[cancelMonitoring] appID=\(appID) — monitor stopped, processes left alone")
+        monitorTask?.cancel()
+        monitorTask = nil
+        onLog = nil
+        monitorPhase = .idle
+        launchedPID = 0
+    }
+
     /// Stops the game by killing the Wine server for the prefix.
     func stopGame(engine: WineEngine, prefix: WinePrefix) async {
         let currentAppID = self.appID

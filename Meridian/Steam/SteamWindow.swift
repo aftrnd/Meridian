@@ -96,6 +96,23 @@ final class SteamWindow {
     private var pollingTimer: Timer?
     private var suppressionActive = false
 
+    /// Game-mode suppression (Online launches): suppression stays ACTIVE but
+    /// only windows belonging to Steam-owned Wine processes (steam.exe,
+    /// steamwebhelper) are hidden — the game's own Wine process is left alone
+    /// so its window appears naturally. This replaces the old blanket
+    /// `pauseForGame()` during `-applaunch`, which disabled ALL suppression
+    /// and let Steam's full post-login UI stay on screen (Bug A,
+    /// HANDOFF-2026-07-02-v4).
+    private var gameMode = false
+    private var steamOwnedPIDs: Set<pid_t> = []
+    private var pollTick = 0
+
+    /// Command-line substrings identifying Steam-owned Wine processes. These
+    /// survive Wine's argv[0] rewrite (the Windows path still contains the
+    /// process name — engine-research-findings.mdc Pattern 2).
+    /// MIRROR CONTRACT: mirrored in OnlineFlowTests.steamProcessPatterns.
+    static let steamProcessPatterns = ["steam.exe", "steamwebhelper"]
+
     init() {
         isPermissionGranted = AXIsProcessTrusted()
     }
@@ -125,23 +142,51 @@ final class SteamWindow {
         }
         suppressionActive = true
         isSuppressing = true
+        gameMode = false
         engageLayers()
         log.info("[SteamWindow] suppression started")
     }
 
+    /// Enter game-mode suppression for an Online (`-applaunch`) launch:
+    /// Steam-owned windows (steam.exe, steamwebhelper) keep getting hidden —
+    /// including Steam's main window left over from an interactive sign-in —
+    /// while every other Wine process (the game Steam is about to spawn) is
+    /// exempt so its window appears naturally. Actionable dialogs (EULA /
+    /// purchase) still surface via the `policy(forTitle:)` allowlist.
+    func enterGameMode() {
+        guard isPermissionGranted else {
+            log.warning("[SteamWindow] no AX permission — game mode inactive")
+            return
+        }
+        suppressionActive = true
+        isSuppressing = true
+        gameMode = true
+        refreshSteamOwnedPIDs()
+        engageLayers()
+        log.info("[SteamWindow] game mode — suppressing Steam windows only")
+    }
+
     /// Register a newly-launched Wine PID immediately.
-    /// Called by SteamSession right after starting steam.exe.
+    /// Called by SteamSession right after starting steam.exe (and for the
+    /// short-lived `-applaunch` IPC forwarders). All call sites are Steam-side
+    /// processes, so the PID also joins the game-mode Steam-owned set without
+    /// waiting for the next pgrep refresh.
     func registerPID(_ pid: pid_t) {
         guard isPermissionGranted, suppressionActive else { return }
+        steamOwnedPIDs.insert(pid)
         installObserver(for: pid)
         hideWindows(for: pid)
         log.info("[SteamWindow] registered pid=\(pid)")
     }
 
-    /// Pause suppression while the game window is visible.
+    /// Pause suppression while the game window is visible. Only appropriate
+    /// when Steam has NO windows that could surface (e.g. the interactive
+    /// sign-in window, which must render and take input). Online game
+    /// launches use `enterGameMode()` instead so Steam chrome stays hidden.
     func pauseForGame() {
         suppressionActive = false
         isSuppressing = false
+        gameMode = false
         actionableDialogTitle = nil
         log.info("[SteamWindow] paused — game window will appear")
     }
@@ -151,6 +196,7 @@ final class SteamWindow {
         guard isPermissionGranted else { return }
         suppressionActive = true
         isSuppressing = true
+        gameMode = false
         if steamPID > 0 {
             if entries[steamPID] == nil { installObserver(for: steamPID) }
             hideWindows(for: steamPID)
@@ -163,6 +209,7 @@ final class SteamWindow {
     func stopSuppressing() {
         suppressionActive = false
         isSuppressing = false
+        gameMode = false
         actionableDialogTitle = nil
         stopPollingTimer()
         for pid in entries.keys { removeObserver(for: pid) }
@@ -192,6 +239,7 @@ final class SteamWindow {
 
     private func pollingTick() {
         guard suppressionActive else { return }
+        pollTick &+= 1
 
         // Remove observers for dead processes.
         for pid in entries.keys {
@@ -201,6 +249,14 @@ final class SteamWindow {
         // Discover new Wine PIDs and install observers.
         for pid in currentWinePIDs() {
             if entries[pid] == nil { installObserver(for: pid) }
+        }
+
+        // In game mode, refresh the Steam-owned PID set about once per second
+        // (steam.exe/steamwebhelper PIDs are long-lived — including after a
+        // code=42 self-update re-exec, which the pgrep refresh picks up even
+        // though the new PID was never registered by SteamSession).
+        if gameMode, pollTick % 4 == 0 {
+            refreshSteamOwnedPIDs()
         }
 
         // Hide any visible windows.
@@ -258,6 +314,9 @@ final class SteamWindow {
 
     private func hideWindows(for pid: pid_t) {
         guard suppressionActive else { return }
+        // Game mode: only Steam-owned processes get their windows hidden; the
+        // game's own Wine process is exempt so its window appears naturally.
+        if gameMode, !steamOwnedPIDs.contains(pid) { return }
         let app = AXUIElementCreateApplication(pid)
         var windowsRef: AnyObject?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
@@ -296,6 +355,30 @@ final class SteamWindow {
     }
 
     // MARK: - Private: process detection
+
+    /// Synchronously refreshes the set of Steam-owned Wine PIDs via pgrep.
+    /// Cheap (two pgrep spawns, ~10 ms) and rate-limited by the caller to
+    /// about once per second in game mode.
+    private func refreshSteamOwnedPIDs() {
+        var pids: Set<pid_t> = []
+        for pattern in Self.steamProcessPatterns {
+            let t = Process()
+            t.executableURL = URL(filePath: "/usr/bin/pgrep")
+            t.arguments = ["-f", pattern]
+            let pipe = Pipe()
+            t.standardOutput = pipe
+            t.standardError = FileHandle.nullDevice
+            try? t.run()
+            t.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            for line in out.split(separator: "\n") {
+                if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) {
+                    pids.insert(pid)
+                }
+            }
+        }
+        steamOwnedPIDs = pids
+    }
 
     private func currentWinePIDs() -> [pid_t] {
         NSRunningApplication.runningApplications(withBundleIdentifier: "")

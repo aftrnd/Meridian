@@ -23,13 +23,35 @@ enum DepotDownloaderInstall {
 
     // MARK: - NDJSON events
 
+    /// One installed depot as reported by the fork's terminal `done` event.
+    /// `manifestID` stays a String — Steam manifest ids are 64-bit values that
+    /// exceed Double precision, so the fork serialises them as JSON strings.
+    /// `sharedApp` is non-nil for depotfromapp-proxied depots (e.g. Steamworks
+    /// Common Redistributables 228989 → app 228980); those belong in the ACF's
+    /// `SharedDepots` block, not `InstalledDepots`.
+    struct InstalledDepot: Equatable, Sendable {
+        let depotID: UInt32
+        let manifestID: String
+        let size: Int64
+        let sharedApp: UInt32?
+    }
+
+    /// Outcome of a completed install: bytes + the Steam-side identity of what
+    /// was installed (branch buildid + per-depot manifests) so the caller can
+    /// write an ACF that Steam's own library scan agrees is CURRENT.
+    struct InstallResult: Equatable, Sendable {
+        let bytesDownloaded: Int64
+        let buildID: Int
+        let depots: [InstalledDepot]
+    }
+
     /// One parsed line of the fork's `-json` stdout stream. Human-readable `%`
     /// progress lines (which do NOT start with `{`) parse to `nil` and are
     /// ignored by the caller.
     enum Event: Equatable {
         case phase(phase: String, detail: String)
         case progress(bytesDone: Int64, bytesTotal: Int64, pct: Double)
-        case done(bytesDownloaded: Int64)
+        case done(bytesDownloaded: Int64, buildID: Int, depots: [InstalledDepot])
         case error(message: String)
     }
 
@@ -57,7 +79,30 @@ enum DepotDownloaderInstall {
             let pct = doubleValue(obj["pct"])
             return .progress(bytesDone: done, bytesTotal: total, pct: pct)
         case "done":
-            return .done(bytesDownloaded: intValue(obj["bytesDownloaded"]))
+            // buildid/depots absent on older fork binaries → 0/[] (the caller
+            // then writes the same buildid=0 ACF as before — no regression).
+            var depots: [InstalledDepot] = []
+            if let arr = obj["depots"] as? [[String: Any]] {
+                for d in arr {
+                    let depotID = UInt32(clamping: intValue(d["depot"]))
+                    guard depotID != 0 else { continue }
+                    let manifest = (d["manifest"] as? String)
+                        ?? (intValue(d["manifest"]) != 0 ? String(intValue(d["manifest"])) : "")
+                    guard !manifest.isEmpty else { continue }
+                    let shared = intValue(d["sharedApp"])
+                    depots.append(InstalledDepot(
+                        depotID: depotID,
+                        manifestID: manifest,
+                        size: intValue(d["size"]),
+                        sharedApp: shared != 0 ? UInt32(clamping: shared) : nil
+                    ))
+                }
+            }
+            return .done(
+                bytesDownloaded: intValue(obj["bytesDownloaded"]),
+                buildID: Int(intValue(obj["buildid"])),
+                depots: depots
+            )
         case "error":
             return .error(message: (obj["message"] as? String) ?? "unknown error")
         default:
@@ -112,7 +157,8 @@ enum DepotDownloaderInstall {
     /// - Throws: `CancellationError` if the task is cancelled (the fork is sent
     ///   SIGTERM and exits 130, leaving a resume-safe `.DepotDownloader/` state);
     ///   `DDError.refreshTokenInvalid` on exit 3; `DDError.failed` otherwise.
-    /// - Returns: total bytes downloaded (from the `done` event, 0 if absent).
+    /// - Returns: install result (bytes + buildid + installed depot manifests
+    ///   from the `done` event; zeros/empty if the event was absent).
     @discardableResult
     static func run(
         binary: URL,
@@ -122,7 +168,7 @@ enum DepotDownloaderInstall {
         refreshToken: String,
         onPhase: @MainActor @escaping (_ phase: String, _ detail: String) -> Void,
         onProgress: @MainActor @escaping (_ bytesDone: Int64, _ bytesTotal: Int64, _ pct: Double) -> Void
-    ) async throws -> Int64 {
+    ) async throws -> InstallResult {
 
         let fm = FileManager.default
         try fm.createDirectory(at: installDir, withIntermediateDirectories: true)
@@ -167,6 +213,8 @@ enum DepotDownloaderInstall {
         }
 
         var doneBytes: Int64 = 0
+        var doneBuildID: Int = 0
+        var doneDepots: [InstalledDepot] = []
         var jsonError: String?
 
         do {
@@ -197,9 +245,11 @@ enum DepotDownloaderInstall {
                     await onPhase(phase, detail)
                 case .progress(let d, let t, let p):
                     await onProgress(d, t, p)
-                case .done(let b):
+                case .done(let b, let build, let depots):
                     doneBytes = b
-                    log.info("[run] done bytesDownloaded=\(b)")
+                    doneBuildID = build
+                    doneDepots = depots
+                    log.info("[run] done bytesDownloaded=\(b) buildid=\(build) depots=\(depots.map { "\($0.depotID):\($0.manifestID)\($0.sharedApp.map { " (shared app \($0))" } ?? "")" }.joined(separator: ", "))")
                 case .error(let m):
                     jsonError = m
                     log.error("[run] fork reported error: \(m)")
@@ -226,8 +276,8 @@ enum DepotDownloaderInstall {
 
         switch code {
         case 0:
-            log.info("[run] ✓ install complete appID=\(appID) bytes=\(doneBytes)")
-            return doneBytes
+            log.info("[run] ✓ install complete appID=\(appID) bytes=\(doneBytes) buildid=\(doneBuildID)")
+            return InstallResult(bytesDownloaded: doneBytes, buildID: doneBuildID, depots: doneDepots)
         case 3:
             log.error("[run] REFRESH_TOKEN_INVALID appID=\(appID)")
             throw DDError.refreshTokenInvalid

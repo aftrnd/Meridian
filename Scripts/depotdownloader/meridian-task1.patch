@@ -1,8 +1,8 @@
 diff --git a/DepotDownloader/ContentDownloader.cs b/DepotDownloader/ContentDownloader.cs
-index a59a69f..f8b723e 100644
+index a59a69f..c48f1d7 100644
 --- a/DepotDownloader/ContentDownloader.cs
 +++ b/DepotDownloader/ContentDownloader.cs
-@@ -29,6 +29,11 @@ namespace DepotDownloader
+@@ -29,6 +29,17 @@ namespace DepotDownloader
  
          public static DownloadConfig Config = new();
  
@@ -11,10 +11,16 @@ index a59a69f..f8b723e 100644
 +        // a generic failure.
 +        public static bool RefreshTokenRejected;
 +
++        // Meridian: total (uncompressed) file size per depot from its manifest,
++        // captured in ProcessDepotManifestAndFiles. Consumed by the terminal
++        // `done` NDJSON event so the Swift side can write an appmanifest ACF
++        // whose InstalledDepots sizes match what Steam itself would record.
++        public static readonly Dictionary<uint, long> DepotManifestSizes = [];
++
          private static Steam3Session steam3;
          private static CDNClientPool cdnPool;
  
-@@ -179,6 +184,108 @@ namespace DepotDownloader
+@@ -179,6 +190,108 @@ namespace DepotDownloader
              return section_kv;
          }
  
@@ -123,20 +129,60 @@ index a59a69f..f8b723e 100644
          static uint GetSteam3AppBuildNumber(uint appId, string branch)
          {
              if (appId == INVALID_APP_ID)
-@@ -590,7 +697,12 @@ namespace DepotDownloader
+@@ -590,7 +703,39 @@ namespace DepotDownloader
  
              try
              {
 +                if (Config.Json) MeridianJson.Phase("downloading");
                  await DownloadSteam3Async(infos).ConfigureAwait(false);
 +                // Meridian: terminal `done` event so the Swift install UI can
-+                // settle to 100% and finalise. Byte count is the uncompressed
-+                // total the download counters accumulated.
-+                if (Config.Json) MeridianJson.Done(0);
++                // settle to 100% and finalise. Also carries the installed
++                // buildid + per-depot manifest ids/sizes so the Swift side can
++                // write an ACF that Steam's own library scan agrees is CURRENT.
++                // Without these (buildid=0, no InstalledDepots) Steam flips the
++                // ACF to update-pending and `-applaunch` silently queues a
++                // validation instead of launching — user-verified Jul 2 2026
++                // (Super Battle Golf, Online mode).
++                if (Config.Json)
++                {
++                    var acfBuild = GetSteam3AppBuildNumber(appId, branch);
++                    var sb = new System.Text.StringBuilder("[");
++                    for (var i = 0; i < infos.Count; i++)
++                    {
++                        var d = infos[i];
++                        if (i > 0) sb.Append(',');
++                        DepotManifestSizes.TryGetValue(d.DepotId, out var dsize);
++                        // manifest id as a STRING: ulong manifest ids exceed
++                        // 2^53 and would lose precision in float-based JSON
++                        // consumers.
++                        sb.Append($"{{\"depot\":{d.DepotId},\"manifest\":\"{d.ManifestId}\",\"size\":{dsize}");
++                        // Depots proxied from another app (depotfromapp, e.g.
++                        // Steamworks Common Redistributables 228989→228980)
++                        // belong in the ACF's SharedDepots block, not
++                        // InstalledDepots.
++                        if (d.AppId != appId) sb.Append($",\"sharedApp\":{d.AppId}");
++                        sb.Append('}');
++                    }
++                    sb.Append(']');
++                    MeridianJson.Done(0, acfBuild, sb.ToString());
++                }
              }
              catch (OperationCanceledException)
              {
-@@ -1369,6 +1481,15 @@ namespace DepotDownloader
+@@ -941,6 +1086,12 @@ namespace DepotDownloader
+                 }
+             });
+ 
++            // Meridian: record the depot's FULL manifest size (all files, not
++            // just the delta needing download) for the post-install ACF.
++            DepotManifestSizes[depot.DepotId] = newManifest.Files
++                .Where(f => !f.Flags.HasFlag(EDepotFileFlag.Directory))
++                .Sum(f => (long)f.TotalSize);
++
+             return new DepotFilesData
+             {
+                 depotDownloadInfo = depot,
+@@ -1369,6 +1520,15 @@ namespace DepotDownloader
                  downloadCounter.totalBytesUncompressed += chunk.UncompressedLength;
  
                  Ansi.Progress(downloadCounter.totalBytesUncompressed, downloadCounter.completeDownloadSize);
@@ -170,10 +216,10 @@ index 144853b..ee59d1f 100644
  }
 diff --git a/DepotDownloader/MeridianJson.cs b/DepotDownloader/MeridianJson.cs
 new file mode 100644
-index 0000000..a1646ba
+index 0000000..60cec9d
 --- /dev/null
 +++ b/DepotDownloader/MeridianJson.cs
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,97 @@
 +// This file is subject to the terms and conditions defined
 +// in file 'LICENSE', which is part of this source code package.
 +
@@ -233,10 +279,16 @@ index 0000000..a1646ba
 +            Emit($"{{\"type\":\"progress\",\"bytesDone\":{bytesDone},\"bytesTotal\":{bytesTotal},\"pct\":{pct.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}");
 +        }
 +
-+        /// {"type":"done","bytesDownloaded":N}
-+        public static void Done(long bytesDownloaded)
++        /// {"type":"done","bytesDownloaded":N,"buildid":B,"depots":[
++        ///   {"depot":N,"manifest":"M","size":N[,"sharedApp":N]},…]}
++        /// buildid is the installed branch build; depots carries each installed
++        /// depot's manifest id (string — ulong exceeds double precision) + full
++        /// manifest size, with sharedApp set for depotfromapp-proxied depots.
++        /// depotsJson is a pre-serialised JSON array (built by the caller).
++        public static void Done(long bytesDownloaded, uint buildid = 0, string depotsJson = null)
 +        {
-+            Emit($"{{\"type\":\"done\",\"bytesDownloaded\":{bytesDownloaded}}}");
++            var depots = string.IsNullOrEmpty(depotsJson) ? "[]" : depotsJson;
++            Emit($"{{\"type\":\"done\",\"bytesDownloaded\":{bytesDownloaded},\"buildid\":{buildid},\"depots\":{depots}}}");
 +        }
 +
 +        /// {"type":"error","message":"<m>"}

@@ -53,6 +53,12 @@ final class SteamSession {
 
     private var persistentProcess: Process?
     private var connectionLogOffset: Int = 0
+    /// Session-start offset into webhelper_js.txt, captured alongside
+    /// `connectionLogOffset`. The webhelper fast-fail heuristic must only
+    /// count THIS session's "connect attempt failed" lines — reading from
+    /// offset 0 counted stale failures from previous Steam runs (Bug E,
+    /// HANDOFF-2026-07-02-v4).
+    private var webhelperLogOffset: Int = 0
     private let prefix = WinePrefix.defaultPrefix
 
     /// Background task that watches `persistentProcess` after it has reached
@@ -273,6 +279,13 @@ final class SteamSession {
         }
 
         guard loggedOn else {
+            if Task.isCancelled {
+                // Stop button during the sign-in wait — this is a cancel, not
+                // an auth failure. The caller's cancellation path tears the
+                // sign-in window down; don't overwrite state with .failed.
+                state = .idle
+                throw CancellationError()
+            }
             logSteamFailureDiagnostics(reason: "interactive sign-in did not reach [Logged On,")
             state = .failed("Steam sign-in was not completed.")
             await shutdown(engine: engine)
@@ -280,6 +293,15 @@ final class SteamSession {
         }
 
         let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
+        if pid == 0 {
+            // steam.exe self-updated (code=42) mid-sign-in and re-exec'd with
+            // a PID we don't own. Window suppression still covers it (the
+            // polling discovery + game-mode pgrep find the new PID), but the
+            // code=42 health monitor cannot watch a process we have no handle
+            // for — a mid-game Steam self-update will not be auto-restarted
+            // this session.
+            log.warning("[signInInteractively] steam.exe re-exec'd during sign-in (code=42) — pid unknown, health monitor inactive")
+        }
         state = .running(pid: pid_t(pid))
         startHealthMonitor(engine: engine)
 
@@ -929,6 +951,9 @@ final class SteamSession {
         prefix.clearCrashMarker()
 
         connectionLogOffset = connectionLogFileSize()
+        webhelperLogOffset = fileSize(of: prefix.steamInstallDir
+            .appending(path: "logs/webhelper_js.txt")
+            .path(percentEncoded: false))
 
         let steamExePath = prefix.steamExePath.path(percentEncoded: false)
         // Default: -silent — auth comes from Steam's own persisted session
@@ -1050,9 +1075,39 @@ final class SteamSession {
 
     // MARK: - Private: wait for auth outcome
 
+    /// True when connection_log content shows Steam actively performing a
+    /// CREDENTIALED logon: it has set a non-zero SteamID on the CM interface
+    /// and/or issued LogOn. This is the signal (fail-fast rule: observable
+    /// signals over wall-clock deadlines) that Steam holds a persisted session
+    /// and is authenticating — the short post-Connected deadline must then
+    /// yield to the overall timeout, because a cold post-update start can take
+    /// 20-40 s to reach `[Logged On,` (observed Jul 2 2026: silent auth was
+    /// declared dead at 12 s while `SetSteamID [U:1:86752607]` had appeared at
+    /// 3 s and the logon completed fine moments later — Bug E).
+    ///
+    /// MIRROR CONTRACT: mirrored in OnlineFlowTests.hasCredentialedLogonActivity.
+    static func hasCredentialedLogonActivity(_ content: String) -> Bool {
+        if content.contains("Logging on [U:1:") { return true }
+        if content.contains("LogOn() called") { return true }
+        // SetSteamID with a NON-ZERO id — "[U:1:0]" appears during anonymous
+        // connect and must not count.
+        var search = content[...]
+        while let r = search.range(of: "SetSteamID( [U:1:") {
+            let after = search[r.upperBound...]
+            if let first = after.first, first != "0" { return true }
+            search = after
+        }
+        return false
+    }
+
     /// Wait for `[Logged On, ]` in connection_log.txt.
     /// Returns true on success, false on timeout (state remains unchanged — caller sets it).
     /// Fast-fails immediately on explicit rejection from Valve CM.
+    ///
+    /// `authTimeout` bounds the "Connected but Steam has NOT started a
+    /// credentialed logon" window (fresh user, no session on disk — fail fast
+    /// to the sign-in sheet). Once credentialed logon activity is observed,
+    /// only the overall `timeout` and the explicit rejection markers apply.
     private func waitForLoggedOn(engine: WineEngine, timeout: Duration, authTimeout: Duration) async -> Bool {
         let connLogPath = prefix.steamInstallDir
             .appending(path: "logs/connection_log.txt")
@@ -1060,10 +1115,11 @@ final class SteamSession {
 
         let started = ContinuousClock.now
         var connectedAt: ContinuousClock.Instant?
+        var logonActivitySeen = false
         var poll = 0
 
         while ContinuousClock.now - started < timeout {
-            try? Task.checkCancellation()
+            if Task.isCancelled { return false }
             poll += 1
 
             // If tracked process exited non-42, fail immediately.
@@ -1095,43 +1151,60 @@ final class SteamSession {
                 return false
             }
 
+            if !logonActivitySeen, Self.hasCredentialedLogonActivity(content) {
+                logonActivitySeen = true
+                log.info("[waitForLoggedOn] credentialed logon in progress — extending deadline to overall timeout")
+            }
+
             if connectedAt == nil, content.contains("Connectivity test: result=Connected") {
                 connectedAt = ContinuousClock.now
-                log.info("[waitForLoggedOn] Connected — waiting up to \(authTimeout) for Logged On")
+                log.info("[waitForLoggedOn] Connected — waiting up to \(authTimeout) for logon activity")
             }
 
-            if let ca = connectedAt, ContinuousClock.now - ca > authTimeout {
-                log.warning("[waitForLoggedOn] auth timeout after Connected")
+            // The short deadline only applies while Steam shows NO sign of a
+            // credentialed logon (fresh user / no session). Once logon
+            // activity is observed, Valve's explicit rejection markers and the
+            // overall timeout own failure detection.
+            if !logonActivitySeen, let ca = connectedAt, ContinuousClock.now - ca > authTimeout {
+                log.warning("[waitForLoggedOn] no credentialed logon activity within \(authTimeout) of Connected — no session on disk")
                 killWebhelper()
                 return false
             }
 
-            // Webhelper connect failures = auth rejected.
-            let webhelperPath = prefix.steamInstallDir
-                .appending(path: "logs/webhelper_js.txt")
-                .path(percentEncoded: false)
-            let webContent = readLogTail(path: webhelperPath, from: 0)
-            let failures = webContent.components(separatedBy: "connect attempt failed").count - 1
-            if failures >= 2 {
-                log.error("[waitForLoggedOn] webhelper connect failed ×\(failures) — rejecting")
-                killWebhelper()
-                return false
+            // Webhelper connect failures = silent auth wedged (hidden
+            // "Who's playing" prompt). Only meaningful BEFORE a credentialed
+            // logon starts, and only for THIS session's log tail — reading
+            // from offset 0 counted stale failures from previous runs.
+            if !logonActivitySeen {
+                let webhelperPath = prefix.steamInstallDir
+                    .appending(path: "logs/webhelper_js.txt")
+                    .path(percentEncoded: false)
+                let webContent = readLogTail(path: webhelperPath, from: webhelperLogOffset)
+                let failures = webContent.components(separatedBy: "connect attempt failed").count - 1
+                if failures >= 2 {
+                    log.error("[waitForLoggedOn] webhelper connect failed ×\(failures) this session — rejecting")
+                    killWebhelper()
+                    return false
+                }
             }
 
             try? await Task.sleep(for: .milliseconds(500))
         }
 
-        log.warning("[waitForLoggedOn] overall timeout after \(timeout)")
+        log.warning("[waitForLoggedOn] overall timeout after \(timeout) (logonActivitySeen=\(logonActivitySeen))")
         return false
     }
 
     // MARK: - Private: helpers
 
     private func connectionLogFileSize() -> Int {
-        let path = prefix.steamInstallDir
+        fileSize(of: prefix.steamInstallDir
             .appending(path: "logs/connection_log.txt")
-            .path(percentEncoded: false)
-        return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+            .path(percentEncoded: false))
+    }
+
+    private func fileSize(of path: String) -> Int {
+        ((try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int) ?? 0
     }
 
     private func readLogTail(path: String, from offset: Int) -> String {

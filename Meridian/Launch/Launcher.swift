@@ -171,6 +171,10 @@ final class Launcher {
     func cancelLaunch() {
         launchTask?.cancel()
         activeSession?.cancelInstall()
+        // Stop the process monitor too — its onLog callback would otherwise
+        // keep overwriting currentActivity with "Waiting for game to start…"
+        // long after the user cancelled (Bug D, HANDOFF-2026-07-02-v4).
+        gameProcess.cancelMonitoring()
         closeActiveGameLog(reason: "user cancelled launch", exitCode: nil)
         launchState = .idle
         currentActivity = nil
@@ -185,15 +189,50 @@ final class Launcher {
     private weak var activeSession: SteamSession?
 
     func stopGame(engine: WineEngine) {
-        guard case .running(let appID) = launchState else { return }
-        launchState = .stopping(appID: appID)
-        currentActivity = "Stopping game…"
-        Task { [weak self] in
-            guard let self else { return }
-            await gameProcess.stopGame(engine: engine, prefix: prefix)
-            closeActiveGameLog(reason: "user requested stop", exitCode: nil)
-            launchState = .idle
-            currentActivity = nil
+        switch launchState {
+        case .running(let appID):
+            launchState = .stopping(appID: appID)
+            currentActivity = "Stopping game…"
+            Task { [weak self] in
+                guard let self else { return }
+                await gameProcess.stopGame(engine: engine, prefix: prefix)
+                closeActiveGameLog(reason: "user requested stop", exitCode: nil)
+                launchState = .idle
+                currentActivity = nil
+            }
+
+        case .launching(let appID):
+            // Stop during a launch in flight (previously a silent no-op —
+            // Bug D, HANDOFF-2026-07-02-v4). Cancel the pipeline task first
+            // so its wait loops exit, then tear down what the launch started.
+            launchTask?.cancel()
+            launchState = .stopping(appID: appID)
+            currentActivity = "Stopping…"
+            let online = AppSettings.shared.launchMode(appID: appID) == .online
+            Task { [weak self] in
+                guard let self else { return }
+                if online {
+                    // Steam owns the process tree; killing wineserver would
+                    // take the persistent Steam session down with it. Stop
+                    // tracking, keep Steam alive in the background (if it is
+                    // mid-validation, letting it finish helps the next Play).
+                    gameProcess.cancelMonitoring()
+                    steamWindow?.resumeAfterGame(steamPID: 0)
+                } else {
+                    // Offline: the game process may already be spawned via
+                    // wine64 — kill the prefix's wineserver (no Steam running
+                    // in Offline mode, so this only stops the game).
+                    await gameProcess.stopGame(engine: engine, prefix: prefix)
+                    steamWindow?.resumeAfterGame(steamPID: 0)
+                }
+                closeActiveGameLog(reason: "user stopped launch in flight", exitCode: nil)
+                launchState = .idle
+                currentActivity = nil
+                activeAppID = nil
+            }
+
+        default:
+            return
         }
     }
 
@@ -430,6 +469,7 @@ final class Launcher {
             return
         case .startup:
             // Cancelled during startup polling — task cancellation path.
+            gameProcess.cancelMonitoring()
             steamWindow?.resumeAfterGame(steamPID: 0)
             closeActiveGameLog(reason: "launch cancelled by user during startup", exitCode: nil)
             launchState = .idle
@@ -504,6 +544,7 @@ final class Launcher {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    if Task.isCancelled { throw CancellationError() }
                     // The on-disk session went stale (Valve rejected it or the
                     // silent auth timed out). Retry DIFFERENTLY (fail-fast
                     // rule): fall back to the interactive sign-in so the user
@@ -524,6 +565,16 @@ final class Launcher {
             currentActivity = nil
             return
         } catch {
+            if Task.isCancelled {
+                // Stop button mid-bring-up surfaced as a non-cancellation
+                // error (e.g. steamNotReady from an interrupted logon wait).
+                // Treat it as a cancel: tear the sign-in window down and
+                // return to idle — never .failed (Bug D).
+                await session.shutdown(engine: engine)
+                launchState = .idle
+                currentActivity = nil
+                return
+            }
             // Neither silent auto-login nor the interactive sign-in reached
             // [Logged On,]. Tear the whole Steam runtime down before surfacing
             // the error so no Steam UI is ever left on screen
@@ -537,9 +588,14 @@ final class Launcher {
 
         currentActivity = "Launching \(game.name) through Steam…"
         appendLog("Dispatching -applaunch \(game.id)")
-        // Let the game window appear (suppressor keeps hiding Steam chrome but
-        // A2's allowlist surfaces any EULA/purchase dialog Steam raises).
-        steamWindow?.pauseForGame()
+        // Game-mode suppression: Steam chrome (steam.exe / steamwebhelper
+        // windows, including the main window left over from an interactive
+        // sign-in) keeps getting hidden, while the game's own Wine process is
+        // exempt so its window appears naturally. The allowlist still surfaces
+        // any EULA/purchase dialog Steam raises. The previous blanket
+        // suppression pause here disabled ALL hiding and let Steam's full
+        // post-login UI stay on screen (Bug A, HANDOFF-2026-07-02-v4).
+        steamWindow?.enterGameMode()
         do {
             try session.launchGameViaSteam(appID: game.id, engine: engine)
         } catch {
@@ -563,9 +619,26 @@ final class Launcher {
         )
 
         appendLog("Waiting for game to start")
+        // Steam-side failure/progress signal (fail-fast rule): if Steam
+        // decided the app needs an update/validation instead of launching, the
+        // ACF's StateFlags leaves "4". Report THAT instead of a mislabeled
+        // "waiting for game to start" — Steam launches the game itself once
+        // the validation completes (observed Jul 2 2026: validation of a
+        // DepotDownloader install took ~80 s, then the game launched).
+        var lastReportedValidating = false
         while gameProcess.monitorPhase == .startup {
             try? await Task.sleep(for: .milliseconds(500))
             if Task.isCancelled { break }
+            if let acfState = prefix.gameDownloadProgress(appID: game.id) {
+                let validating = acfState.stateFlags != "4"
+                if validating != lastReportedValidating {
+                    lastReportedValidating = validating
+                    if validating {
+                        currentActivity = "Steam is validating \(game.name) before launch…"
+                        appendLog("Steam queued a validation/update for \(game.name) (StateFlags=\(acfState.stateFlags))")
+                    }
+                }
+            }
         }
 
         switch gameProcess.monitorPhase {
@@ -576,11 +649,23 @@ final class Launcher {
             currentActivity = nil
             processesConfirmed = true
             appendLog("Game running (Online mode)")
-        case .timedOut, .exited, .idle, .failed:
+        case .timedOut:
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            if lastReportedValidating {
+                fail("Steam is still validating \(game.name). Wait a moment and press Play again — the download/validation continues in the background.")
+            } else {
+                fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+            }
+            return
+        case .exited, .idle, .failed:
             steamWindow?.resumeAfterGame(steamPID: 0)
             fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
             return
         case .startup:
+            // Cancelled (Stop button / cancelLaunch). Teardown is owned by
+            // stopGame/cancelLaunch; make sure the monitor is stopped and
+            // suppression restored even if they raced us.
+            gameProcess.cancelMonitoring()
             steamWindow?.resumeAfterGame(steamPID: 0)
             launchState = .idle
             currentActivity = nil
@@ -637,7 +722,7 @@ final class Launcher {
         var lastBytes: Int64 = 0
         var lastSampleAt = ContinuousClock.now
 
-        let downloaded = try await DepotDownloaderInstall.run(
+        let result = try await DepotDownloaderInstall.run(
             binary: binary,
             appID: game.id,
             installDir: installDir,
@@ -690,20 +775,33 @@ final class Launcher {
 
         // DepotDownloader writes no ACF — write a StateFlags=4 manifest so the
         // launch path, uninstall, and installed-state checks all read the game
-        // as installed.
+        // as installed. buildid + InstalledDepots come from the fork's `done`
+        // event so Steam's own library scan (Online mode) agrees the install
+        // is CURRENT — without them Steam flips the ACF to update-pending and
+        // `-applaunch` queues a validation instead of launching (Bug B,
+        // HANDOFF-2026-07-02-v4).
+        //
+        // SizeOnDisk = sum of the own-app depots' full manifest sizes (matches
+        // what Steam itself records; shared depots are excluded there too).
+        // Falls back to the raw downloaded byte count on older fork binaries.
+        let ownedSize = result.depots
+            .filter { $0.sharedApp == nil }
+            .reduce(Int64(0)) { $0 + $1.size }
         try prefix.writeInstalledAppManifest(
             appID: game.id,
             name: game.name,
             installDir: installDirName,
             steamID64: steamID,
-            sizeOnDisk: downloaded
+            sizeOnDisk: ownedSize > 0 ? ownedSize : result.bytesDownloaded,
+            buildID: result.buildID,
+            depots: result.depots
         )
 
         downloadProgress = 1.0
         downloadRateBps = 0
         currentActivity = "\(game.name) installed"
-        appendLog("\(game.name) install complete (\(downloaded / (1024 * 1024)) MB)")
-        log.info("[installHeadless] ✓ appID=\(game.id) bytes=\(downloaded)")
+        appendLog("\(game.name) install complete (\(result.bytesDownloaded / (1024 * 1024)) MB)")
+        log.info("[installHeadless] ✓ appID=\(game.id) bytes=\(result.bytesDownloaded) buildid=\(result.buildID)")
     }
 
     // MARK: - Private: launch via wine64
