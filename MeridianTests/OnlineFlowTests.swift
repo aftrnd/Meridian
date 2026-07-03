@@ -157,4 +157,147 @@ final class OnlineFlowTests: XCTestCase {
         XCTAssertFalse(src.contains("readLogTail(path: webhelperPath, from: 0)"),
                        "reading webhelper_js.txt from offset 0 counts stale failures from previous Steam runs (Bug E)")
     }
+
+    // MARK: - localconfig.vdf merge (EULA re-prompt regression, Jul 3 2026)
+
+    /// Mirror of WinePrefix.notificationSuppressionBlocks + mergeNotificationPreferences.
+    /// MIRROR CONTRACT: must match WinePrefix.mergeNotificationPreferences.
+    private static let notificationSuppressionBlocks: [(name: String, block: String)] = [
+        ("Notifications", """
+        \t"Notifications"
+        \t{
+        \t\t"DownloadCompleted"\t\t"0"
+        \t\t"ShowDesktopToast"\t\t"0"
+        \t\t"ShowInGameToast"\t\t"0"
+        \t\t"EnableCustomSounds"\t\t"0"
+        \t}
+        """),
+        ("Sounds", """
+        \t"Sounds"
+        \t{
+        \t\t"PlaySoundDownload"\t\t"0"
+        \t\t"PlaySoundDownloadComplete"\t\t"0"
+        \t\t"EnableStandardSounds"\t\t"0"
+        \t\t"EnableCustomSounds"\t\t"0"
+        \t}
+        """),
+    ]
+
+    private func mergeNotificationPreferences(into existing: String) -> String {
+        let minimal = "\"UserLocalConfigStore\"\n{\n"
+            + Self.notificationSuppressionBlocks.map(\.block).joined(separator: "\n")
+            + "\n}\n"
+        guard existing.contains("\"UserLocalConfigStore\"") else { return minimal }
+
+        var lines = existing.components(separatedBy: "\n")
+
+        for (name, block) in Self.notificationSuppressionBlocks {
+            let blockLines = block.components(separatedBy: "\n")
+
+            var depth = 0
+            var blockStart: Int?
+            var blockEnd: Int?
+            var i = 0
+            while i < lines.count {
+                let trimmed = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+                if blockStart == nil, depth == 1, trimmed == "\"\(name)\"" {
+                    blockStart = i
+                }
+                if trimmed.hasPrefix("{") { depth += 1 }
+                if trimmed.hasPrefix("}") {
+                    depth -= 1
+                    if let start = blockStart, blockEnd == nil, depth == 1, i > start {
+                        blockEnd = i
+                        break
+                    }
+                }
+                i += 1
+            }
+
+            if let start = blockStart, let end = blockEnd {
+                lines.replaceSubrange(start...(end), with: blockLines)
+            } else if let rootBrace = lines.firstIndex(where: {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines) == "{"
+            }) {
+                lines.insert(contentsOf: blockLines, at: rootBrace + 1)
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A realistic localconfig.vdf slice — Steam's own layout with the EULA
+    /// acceptance record (`<id>_eula_0`) that the old wholesale-replace write
+    /// wiped on every launch, making Steam re-present the game's EULA every
+    /// Online session (user-reported Jul 3 2026, Super Battle Golf).
+    private let steamLocalConfig = """
+    "UserLocalConfigStore"
+    {
+    \t"Notifications"
+    \t{
+    \t\t"DownloadCompleted"\t\t"1"
+    \t}
+    \t"Software"
+    \t{
+    \t\t"Valve"
+    \t\t{
+    \t\t\t"Steam"
+    \t\t\t{
+    \t\t\t\t"Apps"
+    \t\t\t\t{
+    \t\t\t\t\t"4069520"
+    \t\t\t\t\t{
+    \t\t\t\t\t\t"LastPlayed"\t\t"1783048158"
+    \t\t\t\t\t\t"Playtime"\t\t"3421"
+    \t\t\t\t\t\t"4069520_eula_0"\t\t"3"
+    \t\t\t\t\t}
+    \t\t\t\t}
+    \t\t\t}
+    \t\t}
+    \t}
+    \t"Offline"
+    \t{
+    \t\t"Ticket"\t\t"08dffaae2915ff3a476a"
+    \t}
+    }
+    """
+
+    func testMergeNotificationPrefs_preservesEULAAcceptance() {
+        let merged = mergeNotificationPreferences(into: steamLocalConfig)
+        // The critical state must survive:
+        XCTAssertTrue(merged.contains("\"4069520_eula_0\"\t\t\"3\""),
+                      "EULA acceptance must be preserved — wiping it re-prompts the EULA every launch")
+        XCTAssertTrue(merged.contains("\"Playtime\"\t\t\"3421\""))
+        XCTAssertTrue(merged.contains("\"Offline\""))
+        XCTAssertTrue(merged.contains("\"Ticket\"\t\t\"08dffaae2915ff3a476a\""))
+        // Our suppression values must be applied (existing block replaced):
+        XCTAssertTrue(merged.contains("\"DownloadCompleted\"\t\t\"0\""))
+        XCTAssertFalse(merged.contains("\"DownloadCompleted\"\t\t\"1\""))
+        // Sounds block (absent in input) must be inserted:
+        XCTAssertTrue(merged.contains("\"PlaySoundDownload\"\t\t\"0\""))
+        // Structure must stay balanced:
+        XCTAssertEqual(merged.filter { $0 == "{" }.count, merged.filter { $0 == "}" }.count)
+    }
+
+    func testMergeNotificationPrefs_emptyFileYieldsMinimal() {
+        let merged = mergeNotificationPreferences(into: "")
+        XCTAssertTrue(merged.contains("\"UserLocalConfigStore\""))
+        XCTAssertTrue(merged.contains("\"ShowDesktopToast\"\t\t\"0\""))
+        XCTAssertTrue(merged.contains("\"EnableStandardSounds\"\t\t\"0\""))
+        XCTAssertEqual(merged.filter { $0 == "{" }.count, merged.filter { $0 == "}" }.count)
+    }
+
+    func testWriteUserNotificationPrefs_mergesInsteadOfReplacing() throws {
+        let src = try readSource("Meridian/Engine/WinePrefix.swift")
+        XCTAssertTrue(src.contains("static func mergeNotificationPreferences(into"),
+                      "WinePrefix must expose the pure merge helper")
+        guard let fn = src.range(of: "func writeUserNotificationPreferences(") else {
+            return XCTFail("writeUserNotificationPreferences must exist")
+        }
+        let after = src[fn.lowerBound...]
+        let body = String(after.prefix(3000))
+        XCTAssertTrue(body.contains("mergeNotificationPreferences(into:"),
+                      "writeUserNotificationPreferences must MERGE into the existing localconfig.vdf — replacing it wipes EULA acceptance (and other local-only state) every launch")
+        XCTAssertTrue(body.contains("String(contentsOfFile: cfgPath"),
+                      "the existing localconfig.vdf must be read before writing")
+    }
 }

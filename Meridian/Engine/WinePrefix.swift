@@ -1138,9 +1138,8 @@ struct WinePrefix: Sendable {
         let fm = FileManager.default
         try fm.createDirectory(at: userDir, withIntermediateDirectories: true)
 
-        // Minimal VDF overriding the notification + sound toggles. Steam merges
-        // this with any existing file at launch. Keys confirmed in Steam's
-        // HTML5 UI source (`steamui/chunk~*.js`) as the settings backing:
+        // Keys confirmed in Steam's HTML5 UI source (`steamui/chunk~*.js`) as
+        // the settings backing:
         //
         //   • `UserLocalConfigStore > Notifications > DownloadCompleted`
         //     — Settings → Interface → "Desktop notifications" → "Download complete"
@@ -1149,9 +1148,29 @@ struct WinePrefix: Sendable {
         //   • `EnableCustomSounds = 0` turns off Steam's entire sound pack, a
         //     defence-in-depth belt-and-suspenders against Valve renaming the
         //     specific key above.
-        let vdf = """
-        "UserLocalConfigStore"
-        {
+        //
+        // CRITICAL: MERGE into the existing file, never replace it wholesale.
+        // localconfig.vdf is Steam's per-user LOCAL state store — it also holds
+        // game EULA acceptance records (`Apps > <id> > <id>_eula_N`), playtime
+        // caches, cloud sync state, and offline tickets. Replacing the file
+        // wiped the EULA acceptance on every launch, so Steam re-presented the
+        // game's EULA dialog on every Online session (user-reported Jul 3
+        // 2026, Super Battle Golf). Most other fields silently resynced from
+        // Steam Cloud, which masked the clobber until an EULA game exposed it.
+        let existing = (try? String(contentsOfFile: cfgPath, encoding: .utf8)) ?? ""
+        let vdf = Self.mergeNotificationPreferences(into: existing)
+
+        // Atomic write so Steam never reads a partial file if it happens to be
+        // scanning userdata while we write (rare — Steam reads localconfig only
+        // at post-login hydration).
+        try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
+        log.info("[writeUserNotificationPrefs] merged into \(cfgPath) (accountID=\(accountID), existing=\(existing.count) bytes)")
+    }
+
+    /// The Notifications / Sounds suppression blocks, as depth-1 children of
+    /// `UserLocalConfigStore`. Used by `mergeNotificationPreferences`.
+    private static let notificationSuppressionBlocks: [(name: String, block: String)] = [
+        ("Notifications", """
         \t"Notifications"
         \t{
         \t\t"DownloadCompleted"\t\t"0"
@@ -1159,6 +1178,8 @@ struct WinePrefix: Sendable {
         \t\t"ShowInGameToast"\t\t"0"
         \t\t"EnableCustomSounds"\t\t"0"
         \t}
+        """),
+        ("Sounds", """
         \t"Sounds"
         \t{
         \t\t"PlaySoundDownload"\t\t"0"
@@ -1166,14 +1187,61 @@ struct WinePrefix: Sendable {
         \t\t"EnableStandardSounds"\t\t"0"
         \t\t"EnableCustomSounds"\t\t"0"
         \t}
-        }
-        """
+        """),
+    ]
 
-        // Atomic write so Steam never reads a partial file if it happens to be
-        // scanning userdata while we write (rare — Steam reads localconfig only
-        // at post-login hydration).
-        try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
-        log.info("[writeUserNotificationPrefs] wrote \(cfgPath) (accountID=\(accountID))")
+    /// Returns `existing` (a `localconfig.vdf` in Steam's canonical line-based
+    /// VDF form: one key/brace per line) with the depth-1 `Notifications` and
+    /// `Sounds` blocks replaced by Meridian's suppression values — every other
+    /// byte of the user's state (EULA acceptances, playtime caches, cloud sync
+    /// state, offline tickets) is preserved verbatim. When `existing` is empty
+    /// or has no `UserLocalConfigStore` root, returns a minimal file containing
+    /// only the suppression blocks.
+    ///
+    /// MIRROR CONTRACT: mirrored in OnlineFlowTests.mergeNotificationPreferences.
+    static func mergeNotificationPreferences(into existing: String) -> String {
+        let minimal = "\"UserLocalConfigStore\"\n{\n"
+            + notificationSuppressionBlocks.map(\.block).joined(separator: "\n")
+            + "\n}\n"
+        guard existing.contains("\"UserLocalConfigStore\"") else { return minimal }
+
+        var lines = existing.components(separatedBy: "\n")
+
+        for (name, block) in notificationSuppressionBlocks {
+            let blockLines = block.components(separatedBy: "\n")
+
+            // Locate the depth-1 block `"<name>"` (a direct child of the
+            // UserLocalConfigStore root) by brace-tracking. Depth counts the
+            // number of open braces; the root's children live at depth 1.
+            var depth = 0
+            var blockStart: Int?   // index of the `"<name>"` line
+            var blockEnd: Int?     // index of its closing `}` line
+            var i = 0
+            while i < lines.count {
+                let trimmed = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
+                if blockStart == nil, depth == 1, trimmed == "\"\(name)\"" {
+                    blockStart = i
+                }
+                if trimmed.hasPrefix("{") { depth += 1 }
+                if trimmed.hasPrefix("}") {
+                    depth -= 1
+                    if let start = blockStart, blockEnd == nil, depth == 1, i > start {
+                        blockEnd = i
+                        break
+                    }
+                }
+                i += 1
+            }
+
+            if let start = blockStart, let end = blockEnd {
+                lines.replaceSubrange(start...(end), with: blockLines)
+            } else if let rootBrace = lines.firstIndex(where: {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines) == "{"
+            }) {
+                lines.insert(contentsOf: blockLines, at: rootBrace + 1)
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// Writes `steam.cfg` in the Steam install directory to disable the CEF sandbox.
