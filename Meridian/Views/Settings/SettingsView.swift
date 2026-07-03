@@ -172,6 +172,15 @@ private struct EngineSettingsTab: View {
                     .font(.caption)
             }
 
+            Section("Performance") {
+                Toggle("Use msync (recommended)", isOn: Binding(
+                    get: { settings.msyncEnabled },
+                    set: { settings.msyncEnabled = $0 }
+                ))
+                Text("Native Mach-semaphore synchronization. Lower CPU overhead than the legacy path on Apple Silicon — leave on unless a specific game misbehaves. Restart any running game after changing.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Display") {
                 Toggle("Metal Performance HUD", isOn: Binding(
                     get: { settings.metalHUD },

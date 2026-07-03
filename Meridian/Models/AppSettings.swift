@@ -20,6 +20,24 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "metalHUD") }
     }
 
+    /// Enable msync (Mach-semaphore NT-sync) for all Wine processes.
+    ///
+    /// CX Wine ships marzent's msync patch. `WINEMSYNC=1` replaces the
+    /// eventfd-emulation esync path with native Mach semaphores, cutting CPU
+    /// sync overhead substantially on Apple Silicon (marzent's own FFXIV
+    /// bench: 219 fps msync+ulock vs 145 fps esync vs 93 fps server-side).
+    /// CrossOver applies it bottle-wide; Meridian sets it on BOTH the game
+    /// (`environment(for:)`) and admin/steam.exe (`steamCMDEnvironment(for:)`)
+    /// paths so every wineserver in the prefix is started with the SAME msync
+    /// setting — the msync client aborts (`exit(1)`) if it attaches to a
+    /// wineserver started without it. Default ON; master kill-switch if a
+    /// broad regression ever appears. Per-game opt-out via
+    /// `GameProfile.extraEnv["WINEMSYNC"] = "0"`.
+    var msyncEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "msyncEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "msyncEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "msyncEnabled") }
+    }
+
     /// Force Wine virtual desktop at a fixed resolution instead of windowed mode.
     var useVirtualDesktop: Bool {
         get { UserDefaults.standard.bool(forKey: "useVirtualDesktop") }
@@ -60,6 +78,46 @@ final class AppSettings: @unchecked Sendable {
         var ids = installedAppIDs
         ids.remove(appID)
         installedAppIDs = ids
+    }
+
+    // MARK: - Launch Mode (Offline gbe_fork vs Online steam.exe)
+
+    /// How a game is launched:
+    /// - `.offline`: gbe_fork Steamworks shim + direct `wine64` exec. No
+    ///   `steam.exe`, no auth needed at launch. Cloud saves, in-game
+    ///   multiplayer, and real Steam DRM verification are NOT available — the
+    ///   game talks to a local emulator, not Valve. Fast, fully seamless.
+    ///   This is the default (proven, reliable).
+    /// - `.online`: brings the real Steam client online in the background
+    ///   (`steam.exe -silent`, authenticated from the QR/OAuth session) and
+    ///   launches via `-applaunch`. Enables cloud saves, online multiplayer,
+    ///   EULAs, and genuine DRM. Requires a signed-in Steam session.
+    enum LaunchMode: String {
+        case offline
+        case online
+    }
+
+    /// App IDs the user has explicitly switched to Online mode. Everything not
+    /// in this set defaults to Offline (the reliable gbe_fork path). We store
+    /// only the opt-ins so the default stays Offline even as the set of games
+    /// grows, and so a cleared/blank set == "all offline".
+    private var onlineModeAppIDs: Set<Int> {
+        get { Set(UserDefaults.standard.array(forKey: "onlineModeAppIDs") as? [Int] ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "onlineModeAppIDs") }
+    }
+
+    /// The effective launch mode for a game. Defaults to `.offline`.
+    func launchMode(appID: Int) -> LaunchMode {
+        onlineModeAppIDs.contains(appID) ? .online : .offline
+    }
+
+    func setLaunchMode(_ mode: LaunchMode, appID: Int) {
+        var ids = onlineModeAppIDs
+        switch mode {
+        case .online:  ids.insert(appID)
+        case .offline: ids.remove(appID)
+        }
+        onlineModeAppIDs = ids
     }
 
     // MARK: - Hidden Games

@@ -15,16 +15,37 @@
 #   - x86_64-w64-mingw32-gcc: brew install mingw-w64  (for custom coremessaging.dll)
 #
 # What it does:
-#   1. Copies Wine binary + DLLs from CrossOver Preview (CX Wine 11.4)
+#   1. Copies Wine binary + DLLs from CrossOver Preview (CX Wine 11.10, CX 27)
 #   2. Stages DXMT from CrossOver Preview into lib/dxmt/ (DirectX 11/10 → Metal)
 #   3. Stages DXVK from CrossOver Preview (DirectX → Vulkan fallback)
 #   4. Stages GPTK from CrossOver Preview (D3D12 → D3DMetal → Metal — ACTIVE with CX Wine)
-#   5. Stages lib64 dylibs from CrossOver Preview (MoltenVK, GStreamer, etc.)
+#      CX 27 ships D3DMetal 4.0b1 at lib/apple_gptk (moved from lib64/apple_gptk).
+#      Optional: set GPTK4_ROOT=<dir with D3DMetal.framework + libd3dshared.dylib>
+#      to override with a different Apple GPTK 4 build (ABI-gated on GFXTOSInterface).
+#   5. Stages support dylibs from CX lib/x86_64 (MoltenVK, GStreamer, GnuTLS)
+#      into wine/lib64/ (Meridian's stable location — see LAYOUT NOTE below)
 #   6. Builds a pre-initialized prefix template via wineboot --init
-#   7. Validates binaries, NLS data, syswow64, and prefix template
+#      (Wine 11.10's wineboot COMPLETES wine.inf registration on macOS — the
+#      11.4 rundll32 runaway recursion is gone. The template now ships the full
+#      ~30-service registration incl. Winsock2/Dnscache, which is REQUIRED for
+#      steamwebhelper (CEF/Chromium) networking — see HANDOFF-2026-07-02-v3.)
+#   7. Validates binaries, NLS data, syswow64, prefix template, and Winsock registration
 #   8. Creates a .tar.gz archive and uploads to aftrnd/meridian
 #
-# Wine source: CrossOver Preview (CX Wine 11.4 with full CodeWeavers patches)
+# LAYOUT NOTE (CX 27 / Wine 11.10 — CLI-verified 2026-07-02):
+#   CrossOver 27 dropped lib64/: dylibs moved to lib/x86_64/, GPTK moved to
+#   lib/apple_gptk/. Wine 11.10 .so modules have rpath
+#   @loader_path/../../../lib/x86_64 (was .../lib64), and cxcompatdb.so
+#   hard-codes $CX_ROOT/lib/apple_gptk/wine (was lib64/apple_gptk/wine).
+#   Meridian keeps its historical on-disk layout (wine/lib64/ real dir,
+#   wine/lib/gptk/ real dir) so no app code changes, and bridges the new
+#   expectations with two symlinks:
+#     wine/lib/x86_64     -> ../lib64    (satisfies Wine 11.10 rpath)
+#     wine/lib/apple_gptk -> gptk        (satisfies cxcompatdb 11.10 CX_GRAPHICS_BACKEND path)
+#   The old wine/lib64/apple_gptk -> ../lib/gptk symlink is kept for
+#   compatibility with WineEngine.ensureAppleGptkSymlink and older docs.
+#
+# Wine source: CrossOver Preview (CX Wine with full CodeWeavers patches)
 #   WHY CX Wine (not Gcenx wine-devel):
 #   1. TLS: secur32.so uses GnuTLS exclusively for Schannel/TLS (NOT Security.framework).
 #      lib64 MUST be on DYLD_FALLBACK_LIBRARY_PATH at runtime so secur32.so can dlopen
@@ -71,8 +92,10 @@ gh auth status >/dev/null 2>&1   || die "gh CLI not authenticated. Run: gh auth 
 [ -d "${CX_ROOT}" ] || die "CrossOver Preview not found at /Applications/CrossOver Preview.app"
 [ -f "${CX_ROOT}/CrossOver-Hosted Application/wineloader" ] || die "CX wineloader not found"
 [ -f "${CX_ROOT}/CrossOver-Hosted Application/wineserver" ] || die "CX wineserver not found"
-[ -d "${CX_ROOT}/lib/wine" ]  || die "CX lib/wine/ not found"
-[ -d "${CX_ROOT}/lib/dxmt" ]  || die "CX lib/dxmt/ not found"
+[ -d "${CX_ROOT}/lib/wine" ]       || die "CX lib/wine/ not found"
+[ -d "${CX_ROOT}/lib/dxmt" ]       || die "CX lib/dxmt/ not found"
+[ -d "${CX_ROOT}/lib/x86_64" ]     || die "CX lib/x86_64/ not found (CX 27 dylib dir — older CX layouts unsupported)"
+[ -d "${CX_ROOT}/lib/apple_gptk" ] || die "CX lib/apple_gptk/ not found (CX 27 GPTK dir — older CX layouts unsupported)"
 
 WINE_VERSION=$("${CX_ROOT}/CrossOver-Hosted Application/wineloader" --version 2>/dev/null || echo "unknown")
 info "CrossOver Preview Wine: ${WINE_VERSION}"
@@ -130,11 +153,20 @@ UNIX_COUNT=$(find "${STAGING}/wine/lib/wine/x86_64-unix" -name "*.so" 2>/dev/nul
 WIN32_COUNT=$(find "${STAGING}/wine/lib/wine/i386-windows" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
 info "Wine DLLs: ${WIN64_COUNT} x86_64-windows, ${UNIX_COUNT} x86_64-unix, ${WIN32_COUNT} i386-windows"
 
-# Wine data files (NLS, fonts, wine.inf) — from CX share/wine/
+# Wine data files (NLS, fonts, winmd, wine.inf) — from CX share/wine/
+#
+# winmd is LOAD-BEARING (CLI-verified 2026-07-02): wine.inf's DefaultInstall
+# has `CopyFiles=…,WinmdFiles` referencing share/wine/winmd/*.winmd. When the
+# winmd dir is missing from the engine, `rundll32 setupapi,InstallHinfSection`
+# hits a runaway recursion in ntdll.so on macOS and NEVER completes — the
+# wine.inf service registration (Winsock2, Dnscache, NDIS, …) is never
+# written, which is the Pattern 7 killed-wineboot template gap that broke
+# steamwebhelper networking. With winmd staged, wineboot --init completes in
+# ~17 s and registers the full ~22-service set.
 yellow "Staging Wine data files..."
 if [ -d "${CX_ROOT}/share/wine" ]; then
     mkdir -p "${STAGING}/wine/share/wine"
-    for datadir in nls fonts; do
+    for datadir in nls fonts winmd; do
         if [ -d "${CX_ROOT}/share/wine/${datadir}" ]; then
             cp -R "${CX_ROOT}/share/wine/${datadir}" "${STAGING}/wine/share/wine/"
             info "Copied share/wine/${datadir}"
@@ -202,7 +234,8 @@ fi
 # With CX Wine: gptkPath is set → GPTK env vars injected for game launches → D3D12 works.
 # d3d12.so (in gptk/wine/x86_64-unix/) is a symlink to libd3dshared.dylib.
 yellow "Staging Apple GPTK (D3D12 → D3DMetal → Metal, ACTIVE with CX Wine)..."
-GPTK_SOURCE="${CX_ROOT}/lib64/apple_gptk"
+# CX 27 moved GPTK from lib64/apple_gptk to lib/apple_gptk (see LAYOUT NOTE).
+GPTK_SOURCE="${CX_ROOT}/lib/apple_gptk"
 GPTK_DEST="${STAGING}/wine/lib/gptk"
 
 if [ -d "${GPTK_SOURCE}" ]; then
@@ -226,17 +259,86 @@ else
     yellow "Warning: apple_gptk not found in CX Preview — D3D12 will not work"
 fi
 
-# ---------- lib64 dylibs from CX Preview ----------
-# Wine's .so modules have rpath @loader_path/../../../lib64 which resolves to
-# wine/lib64/ at runtime. All supporting dylibs must be there.
+# ---------- GPTK 4 / D3DMetal 4 override (optional, ABI-gated) ----------
+#
+# Apple's GPTK 4 (WWDC26, macOS 27) ships D3DMetal 4: a DX12 → Metal 4
+# translation layer with two-phase shader compilation (kills first-run
+# stutter), MTLStorageModeShared unified-memory allocation (no readback
+# round-trips), and nvngx-on-metalfx (DLSS → MetalFX upscaling + Metal 4
+# frame interpolation). D3DMetal is redistributable for non-commercial use —
+# same terms as the CX-sourced copy Meridian ships today.
+#
+# Set GPTK4_ROOT to the directory that contains D3DMetal.framework +
+# libd3dshared.dylib (e.g. a mounted "Game Porting Toolkit 4.dmg"'s
+# lib/external, or an extracted copy). When set, we OVERRIDE the CX-sourced
+# D3DMetal — but ONLY after an ABI GATE confirms GPTK 4's libd3dshared.dylib
+# still exports `GFXTOSInterface`, the coordinator symbol our d3d12.so adapter
+# + CX Wine's __wine_unix_call bridge depend on (see engine-research-findings
+# Pattern: "GPTK Opcode 0 dual-purpose buffer protocol"). If the gate FAILS
+# (Apple changed the interface), we KEEP CX's D3DMetal and print a clear note,
+# so the shipped engine always has a WORKING D3D12 path — never a broken one.
+# The full runtime gate (a real D3D12 title reaching D3D12CreateDevice=S_OK)
+# still must be run in-app before promoting a GPTK4 engine to users.
+if [ -n "${GPTK4_ROOT:-}" ]; then
+    yellow "GPTK4_ROOT set — attempting D3DMetal 4 override (ABI-gated)..."
+    G4_FRAMEWORK="${GPTK4_ROOT}/D3DMetal.framework"
+    G4_SHARED="${GPTK4_ROOT}/libd3dshared.dylib"
+    if [ ! -d "${G4_FRAMEWORK}" ] || [ ! -f "${G4_SHARED}" ]; then
+        yellow "  GPTK4_ROOT missing D3DMetal.framework or libd3dshared.dylib — KEEPING CX D3DMetal"
+    elif ! nm -gU "${G4_SHARED}" 2>/dev/null | grep -q "GFXTOSInterface"; then
+        # ABI GATE FAILED: never ship a D3DMetal that our bridge can't drive.
+        yellow "  ABI GATE FAILED: GPTK 4 libd3dshared.dylib does NOT export GFXTOSInterface."
+        yellow "  Apple may have changed the coordinator interface — KEEPING CX D3DMetal."
+        yellow "  Wait for the CrossOver Preview that integrates D3DMetal 4; this script"
+        yellow "  then picks it up automatically via the CX harvest above."
+    else
+        # ABI GATE PASSED: swap in GPTK 4's D3DMetal.
+        rm -rf "${GPTK_DEST}/external/D3DMetal.framework"
+        cp -R "${G4_FRAMEWORK}" "${GPTK_DEST}/external/D3DMetal.framework"
+        cp "${G4_SHARED}" "${GPTK_DEST}/external/libd3dshared.dylib"
+        chmod 0755 "${GPTK_DEST}/external/libd3dshared.dylib"
+        # Optional nvngx-on-metalfx DLSS→MetalFX shim (Phase B3). Staged only if
+        # present in GPTK4_ROOT; consumed per-game via GameProfile.enableDLSSBridge.
+        if [ -f "${GPTK4_ROOT}/nvngx.dll" ]; then
+            cp "${GPTK4_ROOT}/nvngx.dll" "${GPTK_DEST}/wine/x86_64-windows/nvngx.dll"
+            info "  nvngx-on-metalfx DLSS→MetalFX shim staged (nvngx.dll) ✓"
+        fi
+        green "  D3DMetal 4 override applied (ABI gate passed: GFXTOSInterface present) ✓"
+    fi
+fi
+
+# Record the D3DMetal version actually staged (CX's or GPTK 4's) so the engine
+# manifest + Meridian's diagnostics can report which D3DMetal a bottle runs.
+D3DMETAL_PLIST="${GPTK_DEST}/external/D3DMetal.framework/Resources/Info.plist"
+if [ -f "${D3DMETAL_PLIST}" ]; then
+    D3DMETAL_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "${D3DMETAL_PLIST}" 2>/dev/null || echo "unknown")
+else
+    D3DMETAL_VERSION="unknown"
+fi
+echo "${D3DMETAL_VERSION}" > "${STAGING}/wine/meridian-d3dmetal-version.txt"
+info "D3DMetal version: ${D3DMETAL_VERSION}"
+
+# Record the DXMT version staged (refreshed from whatever CX Preview ships).
+# DXMT has no version file; derive from the winemetal.so if it embeds one,
+# else record the CX Preview app version as provenance.
+DXMT_VERSION=$(strings "${STAGING}/wine/lib/dxmt/x86_64-windows/d3d11.dll" 2>/dev/null | grep -oE "DXMT [0-9]+\.[0-9]+(\.[0-9]+)?" | head -1 || true)
+[ -n "${DXMT_VERSION}" ] || DXMT_VERSION="CX Preview (${WINE_VERSION})"
+echo "${DXMT_VERSION}" > "${STAGING}/wine/meridian-dxmt-version.txt"
+info "DXMT version: ${DXMT_VERSION}"
+
+# ---------- support dylibs from CX Preview (lib/x86_64 → wine/lib64) ----------
+# CX 27 keeps dylibs in lib/x86_64/. Meridian stages them into wine/lib64/
+# (the stable location WineEngine.lib64Path + GST_PLUGIN_SYSTEM_PATH_1_0 expect)
+# and bridges Wine 11.10's rpath (@loader_path/../../../lib/x86_64) with a
+# wine/lib/x86_64 -> ../lib64 symlink created below.
 # lib64 IS on DYLD_FALLBACK_LIBRARY_PATH at runtime (steamCMDEnvironment and environment(for:)
 # both include it). secur32.so needs to dlopen libgnutls.30.dylib for Wine TLS.
 # libgnutls also needs @loader_path rpath to find @rpath/libgmp.10.dylib (fixed below).
-yellow "Staging lib64 dylibs (from CX Preview)..."
+yellow "Staging support dylibs (CX lib/x86_64 → wine/lib64)..."
 mkdir -p "${STAGING}/wine/lib64"
 python3 -c "
 import os
-src_dir = '${CX_ROOT}/lib64'
+src_dir = '${CX_ROOT}/lib/x86_64'
 dst_dir = '${STAGING}/wine/lib64'
 count = 0
 for f in os.listdir(src_dir):
@@ -260,6 +362,16 @@ if os.path.isdir(gst_src):
 print(f'  lib64: {count} files staged')
 " || die "lib64 dylibs staging failed"
 
+# Wine 11.10's .so modules (ntdll.so, secur32.so, winegstreamer.so, …) carry
+# rpath @loader_path/../../../lib/x86_64 — which from wine/lib/wine/x86_64-unix/
+# resolves to wine/lib/x86_64. Bridge it to the real dylib dir with a relative
+# symlink so @rpath deps (libgst*, libMoltenVK, …) resolve without relying on
+# DYLD_FALLBACK_LIBRARY_PATH.
+ln -sfn "../lib64" "${STAGING}/wine/lib/x86_64"
+[ -f "${STAGING}/wine/lib/x86_64/libMoltenVK.dylib" ] \
+    || die "wine/lib/x86_64 -> ../lib64 symlink does not resolve (libMoltenVK.dylib missing)"
+info "  wine/lib/x86_64 -> ../lib64 symlink created (Wine 11.10 rpath bridge) ✓"
+
 # Fix libgnutls rpath so its @rpath/libgmp.10.dylib dependency resolves.
 # CX Preview's libgnutls.30.dylib has ZERO LC_RPATH entries. secur32.so dlopen's
 # it (found via DYLD_FALLBACK_LIBRARY_PATH), but libgnutls then needs libgmp.10.dylib
@@ -275,22 +387,24 @@ else
     yellow "  Warning: libgnutls.30.dylib not found in lib64 — Wine TLS will not work"
 fi
 
-# ---------- apple_gptk symlink for CX_GRAPHICS_BACKEND=d3dmetal ----------
-# CX Wine's cxcompatdb.so hard-codes the GPTK location as
-# $CX_ROOT/lib64/apple_gptk/wine/x86_64-windows (CrossOver's native layout).
-# Meridian stages GPTK at wine/lib/gptk, so create a relative symlink
-# wine/lib64/apple_gptk -> ../lib/gptk. With CX_ROOT=wine/ set at launch, this
-# makes CX_GRAPHICS_BACKEND=d3dmetal route D3D11/DXGI/D3D12 through Apple GPTK
-# (D3DMetal). REQUIRED for Media Foundation video cutscenes (Unity VideoPlayer):
-# DXMT cannot service the MF video processor's D3D11 texture path, so videos
-# render black under DXMT. D3DMetal (the same backend CrossOver 26 uses) does.
+# ---------- apple_gptk symlinks for CX_GRAPHICS_BACKEND=d3dmetal ----------
+# CX Wine's cxcompatdb.so hard-codes the GPTK location relative to $CX_ROOT:
+#   Wine 11.10 (CX 27):  $CX_ROOT/lib/apple_gptk/wine/x86_64-windows
+#   Wine 11.4  (CX 26):  $CX_ROOT/lib64/apple_gptk/wine/x86_64-windows
+# Meridian stages GPTK at wine/lib/gptk, so create BOTH relative symlinks.
+# With CX_ROOT=wine/ set at launch, this makes CX_GRAPHICS_BACKEND=d3dmetal
+# route D3D11/DXGI/D3D12 through Apple GPTK (D3DMetal). REQUIRED for Media
+# Foundation video cutscenes (Unity VideoPlayer): DXMT cannot service the MF
+# video processor's D3D11 texture path, so videos render black under DXMT.
 # CLI + user-verified June 19 2026 on "No, I'm not a Human".
-# WineEngine.ensureAppleGptkSymlink() also creates this at runtime for engines
+# WineEngine.ensureAppleGptkSymlink() also creates these at runtime for engines
 # downloaded before this was added.
 if [ -d "${STAGING}/wine/lib/gptk" ] && [ -d "${STAGING}/wine/lib64" ]; then
     ln -sfn "../lib/gptk" "${STAGING}/wine/lib64/apple_gptk"
-    if [ -f "${STAGING}/wine/lib64/apple_gptk/wine/x86_64-windows/d3d11.dll" ]; then
-        info "  lib64/apple_gptk -> ../lib/gptk symlink created (d3dmetal D3D11 path) ✓"
+    ln -sfn "gptk" "${STAGING}/wine/lib/apple_gptk"
+    if [ -f "${STAGING}/wine/lib64/apple_gptk/wine/x86_64-windows/d3d11.dll" ] \
+       && [ -f "${STAGING}/wine/lib/apple_gptk/wine/x86_64-windows/d3d11.dll" ]; then
+        info "  lib64/apple_gptk -> ../lib/gptk + lib/apple_gptk -> gptk symlinks created (d3dmetal path) ✓"
     else
         die "apple_gptk symlink does not resolve to GPTK d3d11.dll"
     fi
@@ -316,47 +430,41 @@ PREFIX_STAGING="${STAGING}/prefix-template"
 rm -rf "${PREFIX_TEMPLATE}"
 mkdir -p "${PREFIX_TEMPLATE}"
 
-info "Running wineboot --init (this may take 1-3 minutes)..."
-# Run wineboot --init in background with a 180s timeout.
-# lib64 is included in DYLD here (build-time only) so wineserver can find MoltenVK/GStreamer.
-# lib64 included in DYLD — same as app runtime. Needed for GnuTLS (secur32.so TLS).
+info "Running wineboot --init (Wine 11.10 completes in seconds)..."
+# Run wineboot --init in background with a 300s last-resort timeout.
+# lib64 is included in DYLD here (build-time only) so wineserver can find
+# MoltenVK/GStreamer/GnuTLS (secur32.so TLS).
 #
-# KNOWN LIMITATION (CLI-confirmed April 25 2026): on macOS hosts,
-# `rundll32 setupapi InstallHinfSection DefaultInstall 128 wine.inf` (the
-# step that registers Wine services from wine.inf) hits a runaway recursion
-# in ntdll.so and never returns within 180s. `sample` showed 568 frames
-# stacked at the same address. The 180 s timeout below kills it; the
-# resulting `system.reg` ships with only 2 services (MountMgr,
-# Tcpip\Parameters) instead of the 12+ a Linux-host wineboot would
-# register — RpcSs, EventLog, PlugPlay, nsiproxy etc. are all absent.
+# HISTORY: Wine 11.4's `rundll32 setupapi InstallHinfSection` hit a runaway
+# recursion in ntdll.so on macOS hosts and never completed — the old 180 s
+# kill-timeout shipped a template with only 2 registered services. That gap
+# broke steamwebhelper (CEF/Chromium) networking: Chromium needs the
+# Winsock2 Protocol_Catalog9 + Dnscache/Tcpip6/NDIS registration that only
+# a COMPLETED wine.inf install writes (`connect failed: 10065` in cef_log,
+# root-caused in HANDOFF-2026-07-02-v3). Wine 11.10's wineboot completes
+# wine.inf registration in ~6 s on macOS (CLI-verified 2026-07-02), so the
+# timeout below is a genuine last-resort safety net — and the Winsock
+# validation after this block makes an incomplete template a HARD FAILURE
+# instead of a silently-broken ship.
 #
-# WHY THE TARBALL IS STILL SAFE: the runtime self-heal
-# `WinePrefix.ensureCoreServices(engine:)` (called from BootstrapManager
-# before Steam install) registers nsiproxy + RpcSs + EventLog + PlugPlay
-# via `wine64 reg add` on every fresh prefix. That is the only set Steam
-# actually depends on for Pattern-7-free startup. Do NOT add an
-# app-level fallback that registers more services without first
-# confirming a real-world need — `wine.inf`'s full set is documented
-# in engine-research-findings.mdc.
-#
-# Future option: replace this block with a Linux Docker stage that
-# runs wineboot natively, exports `system.reg`, and copies it into the
-# tarball — eliminates the recursion entirely and yields a fully
-# pre-initialised prefix. Tracked but not blocking.
+# mscoree,mshtml are disabled for the template build so wineboot never
+# prompts for (or tries to install) Wine Mono / Gecko — we don't ship them.
 WINEPREFIX="${PREFIX_TEMPLATE}" \
 DYLD_FALLBACK_LIBRARY_PATH="${STAGING}/wine/lib:${STAGING}/wine/lib/wine/x86_64-unix:${STAGING}/wine/lib64" \
 WINEDLLPATH="${STAGING}/wine/lib/wine" \
 WINELOADER="${STAGING}/wine/bin/wine64" \
 WINESERVER="${STAGING}/wine/bin/wineserver" \
+CX_ROOT="${STAGING}/wine" \
+WINEDLLOVERRIDES="mscoree,mshtml=" \
     "${STAGING}/wine/bin/wine64" wineboot --init &
 WINEBOOT_PID=$!
-for i in $(seq 1 36); do
+for i in $(seq 1 60); do
     sleep 5
     if ! kill -0 ${WINEBOOT_PID} 2>/dev/null; then
         break
     fi
-    if [ ${i} -eq 36 ]; then
-        yellow "wineboot --init timeout (180s) — prefix appears complete, killing..."
+    if [ ${i} -eq 60 ]; then
+        yellow "wineboot --init timeout (300s) — killing (template validation below will decide pass/fail)..."
         kill -9 ${WINEBOOT_PID} 2>/dev/null || true
         pkill -9 -f "wineboot.exe" 2>/dev/null || true
     fi
@@ -377,6 +485,20 @@ sleep 1
 TEMPLATE_DLL_COUNT=$(find "${PREFIX_TEMPLATE}/drive_c/windows/system32" -name "*.dll" 2>/dev/null | wc -l | tr -d ' ')
 [ "${TEMPLATE_DLL_COUNT}" -gt 100 ] || die "prefix template has too few DLLs (${TEMPLATE_DLL_COUNT}) — wineboot --init incomplete"
 info "Prefix template: ${TEMPLATE_DLL_COUNT} DLLs in system32"
+
+# LOAD-BEARING validation (HANDOFF-2026-07-02-v3): the template MUST contain
+# the full wine.inf service registration. steamwebhelper's Chromium network
+# stack requires the Winsock2 protocol catalog + DNS/network services — a
+# template without them ships `connect failed: 10065` (WSAEHOSTUNREACH) to
+# every user and Steam sign-in can never complete. A working wineboot
+# registers ~30 services; the broken 11.4 one registered 2.
+WINSOCK_COUNT=$(grep -c 'Winsock2' "${PREFIX_TEMPLATE}/system.reg" || true)
+DNSCACHE_COUNT=$(grep -c 'Dnscache' "${PREFIX_TEMPLATE}/system.reg" || true)
+SERVICE_COUNT=$(grep -cE '^\[System\\\\(CurrentControlSet|ControlSet001)\\\\Services\\\\[^\\]+\]' "${PREFIX_TEMPLATE}/system.reg" || true)
+info "Prefix template: ${SERVICE_COUNT} service sections, Winsock2=${WINSOCK_COUNT}, Dnscache=${DNSCACHE_COUNT}"
+[ "${WINSOCK_COUNT}" -gt 0 ]  || die "prefix template missing Winsock2 registration — wineboot did not complete wine.inf install (webhelper networking would be broken)"
+[ "${DNSCACHE_COUNT}" -gt 0 ] || die "prefix template missing Dnscache registration — wineboot did not complete wine.inf install"
+[ "${SERVICE_COUNT}" -ge 15 ] || die "prefix template has only ${SERVICE_COUNT} registered services (expected ~30) — wine.inf install incomplete"
 
 mkdir -p "${PREFIX_TEMPLATE}/drive_c/windows/syswow64"
 info "Prefix template: syswow64/ guaranteed ✓"
@@ -577,6 +699,13 @@ info "NLS files verified ✓"
 [ -f "${STAGING}/wine/share/wine/wine.inf" ] || die "wine.inf missing"
 info "wine.inf verified ✓"
 
+# winmd must ship with the engine: wine.inf references WinmdFiles, and a
+# missing winmd dir sends setupapi's InstallHinfSection into runaway
+# recursion on macOS (wineboot never completes on user machines either —
+# e.g. the wineboot --update run after an engine change).
+[ -f "${STAGING}/wine/share/wine/winmd/windows.system.winmd" ] || die "share/wine/winmd/ missing — wineboot InstallHinfSection will hang (runaway recursion)"
+info "winmd verified ✓"
+
 [ -f "${STAGING}/prefix-template/system.reg" ] || die "prefix-template/system.reg missing"
 [ -d "${STAGING}/prefix-template/drive_c/windows/syswow64" ] || die "prefix-template syswow64/ missing"
 info "prefix-template verified ✓"
@@ -639,9 +768,9 @@ yellow "Uploading release ${TAG} to ${REPO}..."
 NOTES="Wine engine runtime for Meridian.
 
 **Wine:** ${STAGED_VERSION} (CrossOver Preview CX Wine — Security.framework TLS, GPTK active)
-**DXMT:** CrossOver Preview builtin — DirectX 11/10 → Metal
+**DXMT:** ${DXMT_VERSION:-CrossOver Preview builtin} — DirectX 11/10 → Metal
 **DXVK:** CrossOver Preview — DirectX → Vulkan fallback
-**GPTK:** Apple Game Porting Toolkit ACTIVE (CX Wine has ntdll.__wine_unix_call)
+**GPTK / D3DMetal:** ${D3DMETAL_VERSION:-unknown} — D3D12 → D3DMetal → Metal (ACTIVE; CX Wine has ntdll.__wine_unix_call)
 **MoltenVK:** CX lib64/libMoltenVK.dylib
 **Architecture:** arm64 / x86_64 (Rosetta 2)
 **Archive size:** ${ARCHIVE_SIZE}

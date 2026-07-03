@@ -67,6 +67,9 @@ enum GameLogFile {
         "DYLD_FALLBACK_FRAMEWORK_PATH",
         "DYLD_INSERT_LIBRARIES",
         "CX_APPLEGPTK_LIBD3DSHARED_PATH",
+        "CX_GRAPHICS_BACKEND",
+        "CX_ROOT",
+        "WINEMSYNC",
         "MTL_HUD_ENABLED",
         "ROSETTA_ADVERTISE_AVX",
         "DOTNET_EnableWriteXorExecute",
@@ -405,7 +408,13 @@ struct GameStackReport {
         let overrides = parseOverrides(overridesStr)
 
         let renderer: Renderer
-        if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
+        if environment["CX_GRAPHICS_BACKEND"] == "d3dmetal" {
+            // preferD3DMetal path: CX Wine's cxcompatdb prepends GPTK's
+            // D3DMetal builtins; WINEDLLOVERRIDES is intentionally cleared, so
+            // this MUST be checked before the override-based branches or the
+            // renderer mis-reports as .unknown (the pre-B4 bug).
+            renderer = .gptk
+        } else if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
             renderer = .gptk
         } else if dllPath.contains("/dxvk") {
             renderer = .dxvk

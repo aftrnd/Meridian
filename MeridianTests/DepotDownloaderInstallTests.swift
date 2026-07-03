@@ -214,9 +214,19 @@ final class DepotDownloaderInstallTests: XCTestCase {
         // The steam.exe -applaunch launch path must no longer be used in the Launcher.
         XCTAssertFalse(src.contains("launchViaSteam"),
                        "Launcher must not use the steam.exe -applaunch path for DRM games (replaced by the shim)")
-        // The old lazy-steam warm must be gone from the launch path.
-        XCTAssertFalse(src.contains("session.ensureReadyForDRM"),
-                       "Launcher must not lazy-warm steam.exe for DRM launches (replaced by the shim)")
+        // The old lazy-steam warm must be gone from the DEFAULT (Offline)
+        // launch path. `launchOnline` (explicit per-game Online opt-in,
+        // HANDOFF-2026-07-02-v2) legitimately brings steam.exe up via
+        // `ensureReadyForDRM` — so scope the ban to everything BEFORE
+        // launchOnline's definition (executePipeline + the offline pipeline).
+        if let onlineRange = src.range(of: "private func launchOnline") {
+            let offlinePath = String(src[src.startIndex..<onlineRange.lowerBound])
+            XCTAssertFalse(offlinePath.contains("session.ensureReadyForDRM"),
+                           "The default (Offline) launch path must not lazy-warm steam.exe (replaced by the shim); only launchOnline may call ensureReadyForDRM")
+        } else {
+            XCTAssertFalse(src.contains("session.ensureReadyForDRM"),
+                           "Launcher must not lazy-warm steam.exe for DRM launches (replaced by the shim)")
+        }
     }
 
     /// SteamSession still EXPOSES the steam.exe DRM bring-up
@@ -321,9 +331,21 @@ final class DepotDownloaderInstallTests: XCTestCase {
         // The session.isReady→false re-show handler must be gone.
         XCTAssertFalse(src.contains("if !ready && steamAuth.isAuthenticated && !showSetupSheet"),
                        "session.isReady flipping false must NOT re-show the sign-in sheet")
-        // Sign-out must still re-show the sheet.
-        XCTAssertTrue(src.contains("if !authenticated { showSetupSheet = true }"),
+        // Sign-out must still re-show the sheet (now in the else-branch of the
+        // isAuthenticated onChange handler).
+        XCTAssertTrue(src.contains("showSetupSheet = true"),
                       "signing out must still re-present the sign-in sheet")
+        // Sign-IN must refresh the library: mainContent's one-shot .task runs
+        // before authentication completes (steamID empty → refresh skipped),
+        // so without this a user whose API key was already stored lands on an
+        // empty library (observed July 2 2026 after the QR sign-in test).
+        if let onChangeRange = src.range(of: ".onChange(of: steamAuth.isAuthenticated)") {
+            let handler = String(src[onChangeRange.lowerBound...].prefix(700))
+            XCTAssertTrue(handler.contains("library.refresh"),
+                          "the isAuthenticated onChange handler must refresh the library on sign-in")
+        } else {
+            XCTFail("ContentView must observe steamAuth.isAuthenticated")
+        }
     }
 
     // MARK: - Installed-manifest round-trip (mirror)

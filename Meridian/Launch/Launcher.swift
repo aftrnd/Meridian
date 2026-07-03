@@ -201,6 +201,16 @@ final class Launcher {
                 currentActivity = nil
                 downloadProgress = nil
                 return
+            } catch let dd as DepotDownloaderInstall.DDError where dd == .refreshTokenInvalid {
+                // Exit 3 — Valve rejected the refresh token as genuinely dead
+                // (not the anti-abuse AccessDenied case, which never reaches an
+                // install because the token still "works" for the library).
+                // Route the user back to re-auth. SteamAuthService observes this
+                // and surfaces the sign-in sheet (API key + password preserved).
+                log.warning("[pipeline] refresh token invalid on install — prompting re-auth")
+                NotificationCenter.default.post(name: .meridianSteamSessionExpired, object: nil)
+                fail("Your Steam session has expired. Please sign in again to install \(game.name).", error: dd)
+                return
             } catch {
                 fail("Could not install \(game.name): \(error.localizedDescription)", error: error)
                 return
@@ -215,6 +225,16 @@ final class Launcher {
         guard launchAfterInstall else {
             launchState = .idle
             currentActivity = nil
+            return
+        }
+
+        // Online mode: bring the real Steam client online (authenticated from
+        // the QR/OAuth session) and launch via `-applaunch`. This is the path
+        // that enables cloud saves, in-game multiplayer, EULAs, and genuine
+        // Steam DRM — the game talks to Valve, not a local emulator. Opt-in
+        // per game (AppSettings.launchMode); default is Offline (gbe_fork).
+        if AppSettings.shared.launchMode(appID: game.id) == .online {
+            await launchOnline(game: game, engine: engine, session: session)
             return
         }
 
@@ -237,6 +257,7 @@ final class Launcher {
                     appID: game.id,
                     steamID: steamID,
                     accountName: AppSettings.shared.steamCredentialAccountName,
+                    personaName: steamAuth?.displayName ?? "",
                     engine: engine
                 )
             } catch is CancellationError {
@@ -364,6 +385,113 @@ final class Launcher {
         activeAppID = nil
         appendLog("Game exited")
         log.info("[pipeline] game exited appID=\(game.id)")
+    }
+
+    // MARK: - Private: Online-mode launch (real Steam, -applaunch)
+
+    /// Launches a game in Online mode: brings the real Steam client online in
+    /// the background (authenticated from the QR/OAuth session), then dispatches
+    /// `steam.exe -applaunch <appID>` via IPC. Steam owns the launch — cloud
+    /// saves sync, online multiplayer works, EULAs are handled by Steam itself,
+    /// and DRM verification is genuine. No Steam window is shown; the suppressor
+    /// hides everything except user-actionable dialogs (EULA/purchase — A2).
+    ///
+    /// Unlike Offline mode we do NOT install the gbe_fork shim (that would make
+    /// the game talk to a local emulator instead of Valve) and we do NOT
+    /// `launchDirect` — Steam picks the exe and applies launch options itself,
+    /// which also avoids the "launching with custom args" dialog for UE
+    /// launcher chains (Pattern 20).
+    private func launchOnline(game: Game, engine: WineEngine, session: SteamSession) async {
+        launchState = .launching(appID: game.id)
+        currentActivity = "Connecting to Steam…"
+        appendLog("Online mode: bringing Steam online for \(game.name)")
+
+        do {
+            try await session.ensureReadyForDRM(engine: engine) { [weak self] status in
+                self?.currentActivity = status
+            }
+        } catch is CancellationError {
+            // Tear Steam down so a cancelled bring-up doesn't leave steam.exe /
+            // steamwebhelper running with a visible sign-in window.
+            await session.shutdown(engine: engine)
+            launchState = .idle
+            currentActivity = nil
+            return
+        } catch {
+            // Silent steam.exe auto-login did not reach [Logged On,]. steam.exe
+            // is still alive and WILL render its own sign-in QR window (which the
+            // suppressor does not hide — it's Steam's login UI, not chrome). Tear
+            // the whole Steam runtime down before surfacing the error so no Steam
+            // UI is ever left on screen (development-standards: Steam UI is never
+            // shown). Offline mode remains the working default.
+            await session.shutdown(engine: engine)
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            fail("Steam couldn't sign in to launch \(game.name) online. Switch this game to Offline mode to play now. (Online mode needs Steam to complete its own sign-in, which didn't finish this time.)", error: error)
+            return
+        }
+
+        currentActivity = "Launching \(game.name) through Steam…"
+        appendLog("Dispatching -applaunch \(game.id)")
+        // Let the game window appear (suppressor keeps hiding Steam chrome but
+        // A2's allowlist surfaces any EULA/purchase dialog Steam raises).
+        steamWindow?.pauseForGame()
+        do {
+            try session.launchGameViaSteam(appID: game.id, engine: engine)
+        } catch {
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            fail("Could not launch \(game.name) through Steam: \(error.localizedDescription)", error: error)
+            return
+        }
+
+        // Steam owns the process tree in Online mode. Monitor via the game's
+        // install dir so we still detect the running game + its exit, but the
+        // game's stdout/stderr is owned by Steam (Pattern 20) — the engine log
+        // under the install dir remains the authoritative diagnostic source.
+        let gamePattern = prefix.gameInstallDir(appID: game.id)
+        gameProcess.startMonitoring(
+            appID: game.id,
+            launchedPID: 0,
+            engine: engine,
+            prefix: prefix,
+            gamePattern: gamePattern,
+            onLog: { [weak self] msg in self?.currentActivity = msg }
+        )
+
+        appendLog("Waiting for game to start")
+        while gameProcess.monitorPhase == .startup {
+            try? await Task.sleep(for: .milliseconds(500))
+            if Task.isCancelled { break }
+        }
+
+        switch gameProcess.monitorPhase {
+        case .running:
+            AppSettings.shared.recordLaunch(appID: game.id)
+            runningSince = Date()
+            launchState = .running(appID: game.id)
+            currentActivity = nil
+            processesConfirmed = true
+            appendLog("Game running (Online mode)")
+        case .timedOut, .exited, .idle, .failed:
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+            return
+        case .startup:
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            launchState = .idle
+            currentActivity = nil
+            return
+        }
+
+        while gameProcess.monitorPhase == .running {
+            try? await Task.sleep(for: .milliseconds(500))
+            if Task.isCancelled { break }
+        }
+        steamWindow?.resumeAfterGame(steamPID: 0)
+        launchState = .idle
+        currentActivity = nil
+        runningSince = nil
+        activeAppID = nil
+        appendLog("Game exited")
     }
 
     // MARK: - Private: headless install (DepotDownloader)

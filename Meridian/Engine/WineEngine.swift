@@ -45,6 +45,16 @@ final class WineEngine {
     /// Read from `wine/meridian-engine-version.txt` written by `release-engine.sh`.
     private(set) var engineVersion: String?
 
+    /// The staged D3DMetal version (e.g. GPTK 4's "4.x" or the CX-sourced
+    /// D3DMetal 3.x), read from `wine/meridian-d3dmetal-version.txt` written by
+    /// `release-engine.sh`. nil for engines built before B2 (no version file).
+    /// Surfaced in diagnostics so "which D3DMetal is this bottle running?" is
+    /// answerable without inspecting the framework Info.plist by hand.
+    private(set) var d3dMetalVersion: String?
+
+    /// The staged DXMT version, read from `wine/meridian-dxmt-version.txt`.
+    private(set) var dxmtVersion: String?
+
     // MARK: - Detected Paths
 
     /// Path to the Wine executable (wine64).
@@ -267,6 +277,8 @@ final class WineEngine {
 
         backendName   = "Meridian"
         engineVersion = readEngineVersion()
+        d3dMetalVersion = Self.readVersionFile("wine/meridian-d3dmetal-version.txt")
+        dxmtVersion     = Self.readVersionFile("wine/meridian-dxmt-version.txt")
         state         = .ready
 
         let dxmtMode: String = {
@@ -281,6 +293,7 @@ final class WineEngine {
         log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
         log.info("[detect]   d3d12=\(self.d3d12Path ?? "none")")
         log.info("[detect]   gptk=\(self.gptkPath ?? "none") cxABI=\(hasCXWineABI)")
+        log.info("[detect]   d3dmetal=\(self.d3dMetalVersion ?? "unknown") dxmt=\(self.dxmtVersion ?? "unknown")")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
         log.info("[detect] backend=\(backendName) ✓")
 
@@ -298,6 +311,16 @@ final class WineEngine {
     /// Reads the engine release tag from the version file written by `release-engine.sh`.
     private func readEngineVersion() -> String? {
         Self.installedEngineTagOnDisk()
+    }
+
+    /// Reads a single-line version file under the engine dir (e.g.
+    /// `wine/meridian-d3dmetal-version.txt`). Returns nil when absent/blank —
+    /// engines built before the file existed simply report "unknown".
+    private static func readVersionFile(_ relativePath: String) -> String? {
+        let url = Self.engineDir.appending(path: relativePath)
+        return try? String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
     }
 
     /// Reads the installed engine tag (e.g. `v3.0.6-engine`) directly from disk
@@ -381,6 +404,13 @@ final class WineEngine {
             // through. Games use environment(for:) which does not set this.
             "WINEDLLOVERRIDES":          "mmdevapi=d",
         ]
+        // msync MUST be set identically on EVERY Wine process attaching to the
+        // shared wineserver. The msync client `exit(1)`s if it attaches to a
+        // wineserver that was started without it (and vice-versa). Since admin
+        // processes (wineboot, steam.exe) start the wineserver that game
+        // processes later attach to, both env builders must agree. Kept in sync
+        // with `environment(for:)`. See AppSettings.msyncEnabled.
+        if settings.msyncEnabled { env["WINEMSYNC"] = "1" }
         if let accessoryPath = Self.accessoryDylibPath() {
             env["DYLD_INSERT_LIBRARIES"] = accessoryPath
         }
@@ -433,27 +463,35 @@ final class WineEngine {
     /// video cutscenes correctly (D3D11 routed through D3DMetal instead of DXMT).
     static func ensureAppleGptkSymlink() {
         let fm = FileManager.default
-        let lib64 = Self.engineDir.appending(path: "wine/lib64")
-        guard fm.fileExists(atPath: lib64.path(percentEncoded: false)) else { return }
         let gptk = Self.engineDir.appending(path: "wine/lib/gptk")
         guard fm.fileExists(atPath: gptk.path(percentEncoded: false)) else { return }
 
-        let link = lib64.appending(path: "apple_gptk")
-        let linkPath = link.path(percentEncoded: false)
-        // Already a symlink resolving to the gptk dir? Nothing to do.
-        if let dest = try? fm.destinationOfSymbolicLink(atPath: linkPath), dest == "../lib/gptk" {
-            return
+        // cxcompatdb.so's hard-coded GPTK location moved between CX Wine
+        // versions: 11.4 (CX 26) resolves $CX_ROOT/lib64/apple_gptk, 11.10
+        // (CX 27) resolves $CX_ROOT/lib/apple_gptk. Ship-safe: maintain both.
+        func ensureLink(at link: URL, target: String) {
+            let linkPath = link.path(percentEncoded: false)
+            // Already a symlink resolving to the gptk dir? Nothing to do.
+            if let dest = try? fm.destinationOfSymbolicLink(atPath: linkPath), dest == target {
+                return
+            }
+            // Remove any stale entry (wrong target, or a real dir) before re-linking.
+            if fm.fileExists(atPath: linkPath) || (try? fm.destinationOfSymbolicLink(atPath: linkPath)) != nil {
+                try? fm.removeItem(atPath: linkPath)
+            }
+            do {
+                try fm.createSymbolicLink(atPath: linkPath, withDestinationPath: target)
+                log.info("[ensureAppleGptk] created \(link.lastPathComponent) -> \(target)")
+            } catch {
+                log.warning("[ensureAppleGptk] failed to create symlink: \(error.localizedDescription)")
+            }
         }
-        // Remove any stale entry (wrong target, or a real dir) before re-linking.
-        if fm.fileExists(atPath: linkPath) || (try? fm.destinationOfSymbolicLink(atPath: linkPath)) != nil {
-            try? fm.removeItem(atPath: linkPath)
+
+        let lib64 = Self.engineDir.appending(path: "wine/lib64")
+        if fm.fileExists(atPath: lib64.path(percentEncoded: false)) {
+            ensureLink(at: lib64.appending(path: "apple_gptk"), target: "../lib/gptk")
         }
-        do {
-            try fm.createSymbolicLink(atPath: linkPath, withDestinationPath: "../lib/gptk")
-            log.info("[ensureAppleGptk] created lib64/apple_gptk -> ../lib/gptk")
-        } catch {
-            log.warning("[ensureAppleGptk] failed to create symlink: \(error.localizedDescription)")
-        }
+        ensureLink(at: Self.engineDir.appending(path: "wine/lib/apple_gptk"), target: "gptk")
     }
 
     static func ensureDyldInjection() {
@@ -600,6 +638,15 @@ final class WineEngine {
             "ROSETTA_ADVERTISE_AVX":         "1",
             "DOTNET_EnableWriteXorExecute":  "0",
         ]
+
+        // msync (Mach-semaphore NT-sync) — native macOS sync, substantially
+        // lower CPU overhead than esync's eventfd emulation on Apple Silicon.
+        // MUST match the admin/steam.exe path (steamCMDEnvironment) so the
+        // shared wineserver is consistent — the msync client aborts if it
+        // attaches to a wineserver started with a different msync setting.
+        // Per-game opt-out lands later in SteamSession.gameEnvironment via
+        // GameProfile.extraEnv (a profile can set WINEMSYNC=0). Default ON.
+        if settings.msyncEnabled { env["WINEMSYNC"] = "1" }
 
         if let wineExe = wineExecutableURL {
             env["WINELOADER"] = wineExe.path(percentEncoded: false)

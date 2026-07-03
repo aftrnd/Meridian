@@ -46,6 +46,10 @@ struct MeridianApp: App {
                     steamWindow.refreshPermission()
                 }
                 .task {
+                    // Begin MetricKit frame-rate/GPU telemetry (B4). App-level
+                    // aggregate; logged for overall-performance diagnostics.
+                    GamePerformanceMonitor.shared.start()
+
                     updateChecker.installedEngineTag = engine.engineVersion
                     updateChecker.checkIfStale()
 

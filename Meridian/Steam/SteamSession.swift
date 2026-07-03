@@ -739,6 +739,26 @@ final class SteamSession {
                 env.removeValue(forKey: "WINEDLLPATH")
             }
         }
+
+        // DLSS → MetalFX bridge (GPTK 4 `nvngx-on-metalfx`). When a DLSS title
+        // opts in and the engine's GPTK ships the shim (nvngx.dll staged by
+        // release-engine.sh with GPTK4_ROOT), force Wine to load the native
+        // nvngx PE so the game's DLSS calls route to MetalFX Temporal + Metal 4
+        // frame interpolation instead of failing on absent NVIDIA hardware.
+        // No effect if the shim isn't present (WINEDLLPATH won't resolve it).
+        if profile?.enableDLSSBridge == true, let gptk = engine.gptkPath {
+            let nvngx = "\(gptk)/wine/x86_64-windows/nvngx.dll"
+            if FileManager.default.fileExists(atPath: nvngx) {
+                env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
+                    env["WINEDLLOVERRIDES"],
+                    overriding: ["nvngx", "nvngx_dlss"],
+                    with: "n"
+                )
+                log.info("[gameEnvironment] DLSS→MetalFX bridge enabled for appID=\(appID)")
+            } else {
+                log.warning("[gameEnvironment] enableDLSSBridge set but nvngx.dll not in engine — ship a GPTK 4 engine (GPTK4_ROOT)")
+            }
+        }
         return env
     }
 

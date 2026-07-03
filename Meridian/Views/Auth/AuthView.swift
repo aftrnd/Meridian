@@ -1,4 +1,28 @@
 import SwiftUI
+import CoreImage.CIFilterBuiltins
+
+// MARK: - QR rendering
+
+/// Renders a `challenge_url` string as a crisp QR `Image` using CoreImage.
+/// Local generation (no network round-trip to a QR web service) keeps the
+/// challenge URL private and works offline. Nearest-neighbour scaling keeps
+/// the modules sharp at display size.
+enum QRCodeRenderer {
+    static func image(from string: String, scale: CGFloat = 8) -> Image? {
+        // Create the filter + context locally each call — CIFilter / CIContext
+        // are not Sendable, so they can't be shared static state under strict
+        // concurrency. QR rendering is infrequent (once per sign-in), so the
+        // per-call allocation cost is irrelevant.
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(string.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = CIContext()
+        guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return Image(decorative: cg, scale: 1, orientation: .up)
+    }
+}
 
 // MARK: - Setup Sheet
 
@@ -173,6 +197,12 @@ private struct SteamLoginStepContent: View {
     @State private var isSigningIn = false
     @State private var errorMessage: String?
 
+    /// QR is the primary, seamless path (scan + approve — no typing, no Steam
+    /// window). Password is the fallback for users who prefer it or whose
+    /// account can't use QR. Starts in QR mode.
+    private enum Mode { case qr, password }
+    @State private var mode: Mode = .qr
+
     private var canSignIn: Bool {
         !username.trimmingCharacters(in: .whitespaces).isEmpty
             && !password.isEmpty
@@ -198,18 +228,24 @@ private struct SteamLoginStepContent: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Sign in to Steam")
                     .font(.title2).fontWeight(.bold)
-                Text("Meridian authenticates directly with Steam's servers. Your password is encrypted with Valve's public key in transit, then saved to Keychain for seamless re-authentication.")
+                Text(mode == .qr
+                     ? "Scan the code with the Steam Mobile app and tap Approve. No password, no Steam window — Meridian stays seamless."
+                     : "Meridian authenticates directly with Steam's servers. Your password is encrypted with Valve's public key in transit, then saved to Keychain.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Adaptive content
-            if !isSigningIn {
-                credentialFields
-            } else if awaitingTypedCode {
-                guardCodeFields
+            if mode == .qr {
+                qrContent
             } else {
-                signingInView
+                // Password mode — adaptive content.
+                if !isSigningIn {
+                    credentialFields
+                } else if awaitingTypedCode {
+                    guardCodeFields
+                } else {
+                    signingInView
+                }
             }
 
             if let error = errorMessage ?? credentialAuth.errorMessage {
@@ -219,15 +255,101 @@ private struct SteamLoginStepContent: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack {
-                Button("Skip for now") {
+            controlRow
+        }
+        .padding(28)
+        .frame(width: 460)
+        .onAppear {
+            let savedUsername = AppSettings.shared.steamCredentialAccountName
+            if !savedUsername.isEmpty { username = savedUsername }
+            if let saved = steamAuth.loadSteamPassword(), !saved.isEmpty { password = saved }
+            // Kick off the QR session immediately so the code is ready to scan
+            // the moment the step appears.
+            if mode == .qr { beginQRSignIn() }
+        }
+        .onDisappear {
+            credentialAuth.cancel()
+        }
+    }
+
+    // MARK: - QR content
+
+    @ViewBuilder
+    private var qrContent: some View {
+        HStack(alignment: .top, spacing: 20) {
+            qrCodePanel
+            VStack(alignment: .leading, spacing: 14) {
+                qrStep(1, "Open the Steam Mobile app on your phone")
+                qrStep(2, "Tap the QR scanner (top-left menu → scan)")
+                qrStep(3, credentialAuth.qrScanned ? "Tap Approve to finish" : "Scan this code, then tap Approve")
+
+                if credentialAuth.qrScanned {
+                    Label("Scanned — approve on your phone", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var qrCodePanel: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(.white)
+                .frame(width: 180, height: 180)
+            if let url = credentialAuth.qrChallengeURL, let img = QRCodeRenderer.image(from: url) {
+                img.resizable().interpolation(.none)
+                    .frame(width: 160, height: 160)
+            } else {
+                ProgressView()
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator, lineWidth: 0.5))
+    }
+
+    private func qrStep(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(n)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(.tint))
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - Control row
+
+    @ViewBuilder
+    private var controlRow: some View {
+        HStack {
+            Button("Skip for now") {
+                credentialAuth.cancel()
+                isSigningIn = false
+                onSkip()
+            }
+            .keyboardShortcut(.cancelAction)
+
+            Spacer()
+
+            if mode == .qr {
+                Button("Use password instead") {
+                    credentialAuth.cancel()
+                    mode = .password
+                }
+                .buttonStyle(.link)
+            } else {
+                Button("Use QR code") {
                     credentialAuth.cancel()
                     isSigningIn = false
-                    onSkip()
+                    mode = .qr
+                    beginQRSignIn()
                 }
-                .keyboardShortcut(.cancelAction)
-
-                Spacer()
+                .buttonStyle(.link)
 
                 if !isSigningIn {
                     Button("Sign In") { beginSignIn() }
@@ -248,16 +370,6 @@ private struct SteamLoginStepContent: View {
                     }
                 }
             }
-        }
-        .padding(28)
-        .frame(width: 460)
-        .onAppear {
-            let savedUsername = AppSettings.shared.steamCredentialAccountName
-            if !savedUsername.isEmpty { username = savedUsername }
-            if let saved = steamAuth.loadSteamPassword(), !saved.isEmpty { password = saved }
-        }
-        .onDisappear {
-            credentialAuth.cancel()
         }
     }
 
@@ -328,6 +440,14 @@ private struct SteamLoginStepContent: View {
         }
     }
 
+    /// Starts (or restarts) the QR sign-in session and wires the same
+    /// post-auth handler the password flow uses. Idempotent — the underlying
+    /// `authenticateWithQR` no-ops if a task is already running.
+    private func beginQRSignIn() {
+        errorMessage = nil
+        credentialAuth.authenticateWithQR(onAuthenticated: makeOnAuthenticated())
+    }
+
     private func beginSignIn() {
         errorMessage = nil
         isSigningIn = true
@@ -338,11 +458,21 @@ private struct SteamLoginStepContent: View {
 
         let usr = username.trimmingCharacters(in: .whitespaces).lowercased()
         let pwd = password
+
+        credentialAuth.authenticate(username: usr, password: pwd, onAuthenticated: makeOnAuthenticated())
+    }
+
+    /// The shared post-authentication handler used by BOTH the QR and password
+    /// flows. Both yield the same `(steamID, accountName, refreshToken)` triple
+    /// (QR guarantees `persistence: 1`; password uses `platform_type=1` for the
+    /// same), so the downstream persistence + notification-prefs + advance is
+    /// identical. Does NOT start steam.exe (Phase A: Steam is lazy — see the
+    /// step 5 comment below and HANDOFF-2026-06-20).
+    private func makeOnAuthenticated() -> @MainActor (String, String, String) async -> Void {
         let eng = engine
         let auth = steamAuth
         let advance = onSignedIn
-
-        credentialAuth.authenticate(username: usr, password: pwd) { steamID, accountName, refreshToken in
+        return { steamID, accountName, refreshToken in
             // 1. Persist tokens to UserDefaults — used by BootstrapManager to
             //    re-inject local.vdf on every subsequent cold start.
             let settings = AppSettings.shared
@@ -401,11 +531,15 @@ private struct SteamLoginStepContent: View {
             //    so prefix-reset survival works on next cold start.
             SteamSessionBackup.snapshot(prefix: WinePrefix.defaultPrefix)
 
-            // 5. Kill any prior steam.exe (orphan or previous unauth attempt)
-            //    and start a clean steam.exe -silent. Steam reads local.vdf
-            //    and auto-logs in.
-            await session.shutdown(engine: eng)
-            await session.start(engine: eng)
+            // 5. Do NOT start steam.exe here. Starting steam.exe -silent at
+            //    sign-in popped the Steam login/UI window AND poisoned the
+            //    freshly-minted refresh token (CLI-verified Jun 20 2026,
+            //    HANDOFF-2026-06-20). Steam is now lazy: it starts only for
+            //    an Online-mode game launch (Phase A3), and the framed QR
+            //    onboarding (Phase A1) is the one place Steam authenticates
+            //    itself. Installs run headlessly via DepotDownloader on the
+            //    persisted refresh_token, and DRM-free launches go direct —
+            //    neither needs a running steam.exe.
 
             // 6. Update SteamAuthService → triggers SetupSheet advance.
             auth.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)

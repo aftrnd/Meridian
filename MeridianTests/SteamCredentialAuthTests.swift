@@ -353,9 +353,16 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertTrue(authView.contains("SteamSessionBackup.snapshot"),
                       "Sign-in must snapshot local.vdf to AppSupport so prefix resets / engine upgrades survive without re-auth.")
 
-        // Steam must be started with -silent (never -login).
-        XCTAssertTrue(authView.contains("session.start("),
-                      "Sign-in must launch steam.exe -silent via session.start(); -login is forbidden because it yields persistence: 0.")
+        // Sign-in must NOT start steam.exe. CLI-verified Jun 20 2026
+        // (HANDOFF-2026-06-20): `session.start` at sign-in popped the Steam
+        // login/UI window AND poisoned the freshly-minted refresh token. Steam
+        // is lazy — it starts only for an Online-mode game launch (Phase A3)
+        // and for framed QR onboarding (Phase A1). Installs (DepotDownloader)
+        // and DRM-free launches never need a running steam.exe.
+        XCTAssertFalse(authView.contains("session.start("),
+                       "Sign-in MUST NOT call session.start( — it poisons the fresh refresh token and pops the Steam window (HANDOFF-2026-06-20).")
+        XCTAssertFalse(authView.contains("session.shutdown("),
+                       "Sign-in MUST NOT call session.shutdown( — Steam isn't started at sign-in anymore, so there's nothing to shut down.")
 
         // The sign-in flow must NEVER use steam.exe -login (the path that produces
         // persistence: 0). SteamSession.signIn was the wrapper for that path and is
@@ -425,6 +432,76 @@ final class SteamCredentialAuthTests: XCTestCase {
         }
     }
 
+    // MARK: - QR sign-in (Phase A1)
+    //
+    // QR is the primary seamless path: BeginAuthSessionViaQR → render
+    // challenge_url as a QR → PollAuthSessionStatus → persistence:1 refresh
+    // token. The steamID is not in the QR begin-response; it's recovered from
+    // the refresh token JWT's `sub` claim.
+
+    /// Mirror of SteamCredentialAuth.steamID(fromJWT:) — pure base64url + JSON.
+    private func steamID(fromJWT jwt: String) -> String? {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sub = json["sub"] as? String, !sub.isEmpty
+        else { return nil }
+        return sub
+    }
+
+    func testJWTSubExtraction_recoversSteamID() {
+        // Build a minimal JWT: header.payload.sig with sub = a steamID64.
+        let header = Data(#"{"typ":"JWT","alg":"EdDSA"}"#.utf8).base64URLEncoded()
+        let payload = Data(#"{"iss":"steam","sub":"76561198047018335","aud":["client"]}"#.utf8).base64URLEncoded()
+        let jwt = "\(header).\(payload).signature"
+        XCTAssertEqual(steamID(fromJWT: jwt), "76561198047018335",
+                       "steamID must be recovered from the JWT sub claim (QR flow has no steamID otherwise).")
+    }
+
+    func testJWTSubExtraction_returnsNilForMalformed() {
+        XCTAssertNil(steamID(fromJWT: "not-a-jwt"))
+        XCTAssertNil(steamID(fromJWT: "onlyonepart"))
+        XCTAssertNil(steamID(fromJWT: "a.b"), "A payload with no valid base64 JSON must yield nil.")
+    }
+
+    func testQRSignIn_isWiredIntoAuthView() throws {
+        let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
+        let auth = try readSource("Meridian/Steam/SteamCredentialAuth.swift")
+
+        // SteamCredentialAuth must expose the QR entry point + challenge surface.
+        XCTAssertTrue(auth.contains("func authenticateWithQR("),
+                      "SteamCredentialAuth must expose authenticateWithQR — the seamless primary sign-in path.")
+        XCTAssertTrue(auth.contains("BeginAuthSessionViaQR"),
+                      "QR flow must call BeginAuthSessionViaQR.")
+        XCTAssertTrue(auth.contains("qrChallengeURL"),
+                      "SteamCredentialAuth must publish qrChallengeURL for the UI to render.")
+        XCTAssertTrue(auth.contains("steamID(fromJWT:"),
+                      "QR flow must recover steamID from the refresh token JWT sub claim.")
+
+        // AuthView must render the QR and default to it.
+        XCTAssertTrue(authView.contains("authenticateWithQR"),
+                      "AuthView must drive the QR sign-in path.")
+        XCTAssertTrue(authView.contains("QRCodeRenderer"),
+                      "AuthView must render the challenge_url as a QR image.")
+
+        // QR platform_type must be SteamClient (1) so it yields persistence:1
+        // (the same requirement as the password path). Anchor on the endpoint
+        // URL — doc comments mention "BeginAuthSessionViaQR" long before the
+        // actual request-building code.
+        if let qrRange = auth.range(of: "BeginAuthSessionViaQR/v1/") {
+            let after = String(auth[qrRange.lowerBound...].prefix(800))
+            XCTAssertTrue(after.contains("platform_type"),
+                          "QR begin-session must send platform_type=1 (SteamClient) for a persistence:1 token.")
+        } else {
+            XCTFail("SteamCredentialAuth must call the BeginAuthSessionViaQR/v1/ endpoint")
+        }
+    }
+
     private var repoRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -433,5 +510,15 @@ final class SteamCredentialAuthTests: XCTestCase {
 
     private func readSource(_ relativePath: String) throws -> String {
         try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
+    }
+}
+
+private extension Data {
+    /// base64url without padding — the JWT segment encoding.
+    func base64URLEncoded() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

@@ -42,6 +42,17 @@ final class SteamCredentialAuth {
     private(set) var step: AuthStep = .idle
     private(set) var errorMessage: String?
 
+    /// The `challenge_url` returned by `BeginAuthSessionViaQR`, rendered as a
+    /// QR code natively (CoreImage) inside Meridian's onboarding sheet. Set
+    /// while a QR sign-in is in flight; nil otherwise. Scanning + approving in
+    /// the Steam Mobile app completes the same `PollAuthSessionStatus` loop the
+    /// password flow uses — no typed username/password/2FA, no Steam window.
+    private(set) var qrChallengeURL: String?
+
+    /// True once Valve reports the QR has been scanned but not yet approved
+    /// (`had_remote_interaction`). Lets the UI nudge "now tap Approve".
+    private(set) var qrScanned: Bool = false
+
     /// When `deviceConfirmation` is the primary path but a typed-code option is also
     /// available, this is set to the fallback type so the UI can offer "use a code instead".
     /// The user calls `submitFallbackCode(_:)` while polling is already running —
@@ -97,6 +108,44 @@ final class SteamCredentialAuth {
         }
     }
 
+    /// Begins a QR sign-in flow — the seamless, no-typing path.
+    ///
+    /// Calls `BeginAuthSessionViaQR`, publishes `qrChallengeURL` (which the UI
+    /// renders as a QR image via CoreImage), and polls `PollAuthSessionStatus`.
+    /// The user scans the QR with the Steam Mobile app and taps Approve; the
+    /// poll loop then returns a `persistence: 1` refresh token — identical to
+    /// the password flow's output, so every downstream consumer (DepotDownloader,
+    /// local.vdf, Online-mode steam.exe) is unchanged.
+    ///
+    /// This is the CrossOver-equivalent auth: Steam authenticates the session
+    /// through its own trusted QR channel; Meridian never types credentials
+    /// into `steam.exe` and never shows a Steam window. `persistence: 1` is
+    /// guaranteed for QR logins (email-Guard accounts cannot use QR at all).
+    func authenticateWithQR(
+        onAuthenticated: @escaping @MainActor (String, String, String) async -> Void = { _, _, _ in }
+    ) {
+        guard authTask == nil else { return }
+        step = .authenticating
+        errorMessage = nil
+        qrChallengeURL = nil
+        qrScanned = false
+
+        authTask = Task { @MainActor [weak self] in
+            do {
+                try await self?.runQRFlow(onAuthenticated: onAuthenticated)
+                self?.step = .done
+            } catch is CancellationError {
+                log.info("[auth] QR authentication cancelled")
+                self?.step = .idle
+            } catch {
+                self?.errorMessage = error.localizedDescription
+                self?.step = .idle
+            }
+            self?.authTask = nil
+            self?.qrChallengeURL = nil
+        }
+    }
+
     /// Submit the Steam Guard code entered by the user.
     /// Only valid while `step == .awaitingGuardCode` for a code-entry type.
     func submitGuardCode(_ code: String) {
@@ -140,10 +189,106 @@ final class SteamCredentialAuth {
         fallbackCodeType = nil
         pendingClientID = ""
         pendingSteamID = ""
+        qrChallengeURL = nil
+        qrScanned = false
     }
 
     func reset() {
         cancel()
+    }
+
+    // MARK: - Refresh-token renewal (Pattern 23)
+
+    /// Outcome of a `GenerateAccessTokenForApp` refresh-token exchange.
+    ///
+    /// The authoritative signal is the `x-eresult` HTTP header (CLI-verified
+    /// Pattern 23), NOT the (frequently empty) JSON body.
+    enum RenewalOutcome: Equatable {
+        /// Valve rotated the refresh token — persist the new one.
+        case renewed(String)
+        /// Token still valid; no rotation needed.
+        case valid
+        /// Token is genuinely dead (revoked / password change / aged out) —
+        /// route the user to re-auth.
+        case invalid
+        /// `x-eresult: 15` (EResult.AccessDenied). Valve's anti-abuse system
+        /// is denying this account's client-token exchange server-side. NOT a
+        /// dead token and NOT code-fixable — keep the token and do NOT force
+        /// re-auth (re-minting only feeds the lockout, Pattern 23).
+        case accessDenied
+        /// Transient network / 5xx error — keep the token and retry next launch.
+        case networkError
+    }
+
+    /// Validates (and, if Valve rotates it, renews) the stored OAuth refresh
+    /// token against `IAuthenticationService/GenerateAccessTokenForApp`.
+    ///
+    /// `nonisolated static` so it can be awaited from any context (startup
+    /// `restoreSession`, install-time re-check) without hopping to the main
+    /// actor. Pure HTTPS; no Wine, no prefix access.
+    ///
+    /// Classification (Pattern 23, CLI-verified Jun 20 2026):
+    /// - HTTP 5xx / transport error → `.networkError` (token preserved).
+    /// - body has a rotated `refresh_token` → `.renewed`.
+    /// - body has an `access_token` (no rotation) → `.valid`.
+    /// - empty body + `x-eresult: 15` → `.accessDenied` (account anti-abuse; keep token).
+    /// - empty body + any other eresult → `.invalid` (dead → re-auth).
+    nonisolated static func renewRefreshToken(
+        steamID: String,
+        refreshToken: String
+    ) async -> RenewalOutcome {
+        guard !steamID.isEmpty, !refreshToken.isEmpty else { return .invalid }
+
+        let url = URL(string: "https://api.steampowered.com/IAuthenticationService/GenerateAccessTokenForApp/v1/")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        request.httpBody = formEncodeStatic([
+            "steamid":       steamID,
+            "refresh_token": refreshToken,
+            // renewal_type=1 permits Valve to rotate the token in the response.
+            "renewal_type":  "1",
+        ]).data(using: .utf8)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return .networkError }
+
+            // 5xx = transient server-side issue; never treat as a dead token.
+            if (500...599).contains(http.statusCode) { return .networkError }
+
+            let eresult = http.value(forHTTPHeaderField: "x-eresult").flatMap { Int($0) }
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let resp = json?["response"] as? [String: Any]
+
+            if let rotated = resp?["refresh_token"] as? String, !rotated.isEmpty {
+                return .renewed(rotated)
+            }
+            if let access = resp?["access_token"] as? String, !access.isEmpty {
+                return .valid
+            }
+            // Empty response body — the eresult header decides.
+            if eresult == 15 { return .accessDenied }
+            return .invalid
+        } catch {
+            return .networkError
+        }
+    }
+
+    /// `nonisolated` form encoder for use by `renewRefreshToken`.
+    /// Same strict percent-encoding contract as the instance `formEncode`.
+    nonisolated private static func formEncodeStatic(_ params: [String: String]) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return params
+            .sorted { $0.key < $1.key }
+            .map { k, v in
+                let ek = k.addingPercentEncoding(withAllowedCharacters: allowed) ?? k
+                let ev = v.addingPercentEncoding(withAllowedCharacters: allowed) ?? v
+                return "\(ek)=\(ev)"
+            }
+            .joined(separator: "&")
     }
 
     // MARK: - Auth flow
@@ -222,6 +367,110 @@ final class SteamCredentialAuth {
         //    store for later, etc.). This is a pure-auth method; no Wine operations.
         await onAuthenticated(session.steamID, tokens.accountName, tokens.refreshToken)
         log.info("[auth] authentication complete ✓ steamID=\(session.steamID)")
+    }
+
+    // MARK: - QR flow
+
+    private func runQRFlow(
+        onAuthenticated: @escaping @MainActor (String, String, String) async -> Void
+    ) async throws {
+        log.info("[auth] beginning QR auth session")
+        let session = try await beginQRSession()
+        log.info("[auth] QR session started | client_id=\(session.clientID)")
+
+        // Publish the challenge URL so the UI renders the QR. `pollForTokens`
+        // adopts any rotated challenge URL Steam returns mid-session and keeps
+        // `qrChallengeURL` current, so a scan of a rotated code still works.
+        qrChallengeURL = session.challengeURL
+        step = .polling
+
+        let tokens = try await pollForTokens(
+            clientID: session.clientID,
+            requestID: session.requestID,
+            interval: session.interval,
+            isQR: true
+        )
+        log.info("[auth] QR tokens received for account=\(tokens.accountName)")
+
+        // QR's BeginAuthSessionViaQR does not return a steamID (it's not known
+        // until a device approves). Recover it from the refresh token's `sub`
+        // claim — the JWT subject IS the 64-bit steamID.
+        let steamID = Self.steamID(fromJWT: tokens.refreshToken) ?? session.steamID
+        guard !steamID.isEmpty else {
+            throw AuthError.unexpectedResponse("QR auth succeeded but steamID could not be derived from the token")
+        }
+
+        await onAuthenticated(steamID, tokens.accountName, tokens.refreshToken)
+        log.info("[auth] QR authentication complete ✓ steamID=\(steamID)")
+    }
+
+    private struct QRSession {
+        let clientID: String
+        let requestID: String
+        let challengeURL: String
+        let interval: Double
+        /// steamID is not known until the poll completes for QR logins.
+        let steamID: String
+    }
+
+    private func beginQRSession() async throws -> QRSession {
+        let url = URL(string: "https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaQR/v1/")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = formEncode([
+            "device_friendly_name": "Meridian on Mac",
+            // platform_type 1 = SteamClient → persistence:1 refresh token
+            // (matches the password flow; required so the token is usable for
+            // client logon, DepotDownloader, and local.vdf auto-login).
+            "platform_type":        "1",
+            "website_id":           "Client",
+        ]).data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = response as? HTTPURLResponse
+        guard http?.statusCode == 200 else {
+            throw AuthError.networkError("BeginAuthSessionViaQR failed: HTTP \(http?.statusCode ?? -1)")
+        }
+
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let resp = json?["response"] as? [String: Any]
+        guard
+            let clientID     = resp?["client_id"]     as? String, !clientID.isEmpty,
+            let requestID    = resp?["request_id"]    as? String, !requestID.isEmpty,
+            let challengeURL = resp?["challenge_url"] as? String, !challengeURL.isEmpty
+        else {
+            throw AuthError.unexpectedResponse("BeginAuthSessionViaQR response missing required fields")
+        }
+
+        let interval = resp?["interval"] as? Double ?? 5.0
+        return QRSession(
+            clientID: clientID,
+            requestID: requestID,
+            challengeURL: challengeURL,
+            interval: interval,
+            steamID: (resp?["steamid"] as? String) ?? ""
+        )
+    }
+
+    /// Extracts the 64-bit steamID from a Steam JWT's `sub` claim.
+    ///
+    /// Steam refresh/access tokens are JWTs whose subject (`sub`) is the
+    /// account's steamID64. The QR flow doesn't otherwise surface the steamID,
+    /// so we decode the (unverified — we only read a public claim) payload.
+    nonisolated static func steamID(fromJWT jwt: String) -> String? {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        // Re-pad to a multiple of 4 for base64 decoding.
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sub = json["sub"] as? String, !sub.isEmpty
+        else { return nil }
+        return sub
     }
 
     // MARK: - API: GetPasswordRSAPublicKey
@@ -377,7 +626,8 @@ final class SteamCredentialAuth {
     private func pollForTokens(
         clientID: String,
         requestID: String,
-        interval: Double
+        interval: Double,
+        isQR: Bool = false
     ) async throws -> SessionTokens {
         let url = URL(string: "https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/")!
         let pollInterval = max(interval, 2.0)
@@ -430,6 +680,19 @@ final class SteamCredentialAuth {
             } else if let newClientIDStr = resp["new_client_id"] as? String, !newClientIDStr.isEmpty {
                 log.debug("[auth] poll attempt \(attempt): client_id rotated (string) \(currentClientID) → \(newClientIDStr)")
                 currentClientID = newClientIDStr
+            }
+
+            if isQR {
+                // Steam rotates the QR challenge every ~30 s. Re-render the new
+                // one so a slow scan still works.
+                if let newChallenge = resp["new_challenge_url"] as? String, !newChallenge.isEmpty {
+                    qrChallengeURL = newChallenge
+                }
+                // Once the phone has scanned (but not yet approved), nudge the UI.
+                if (resp["had_remote_interaction"] as? Bool) == true, !qrScanned {
+                    qrScanned = true
+                    log.info("[auth] QR scanned — awaiting approval on device")
+                }
             }
 
             if let eresult = resp["eresult"] as? Int, eresult != 1 {

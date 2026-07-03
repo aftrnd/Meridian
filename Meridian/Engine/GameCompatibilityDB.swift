@@ -25,8 +25,10 @@ import Observation
 /// ## Architecture
 /// Game entries live in per-engine extension files:
 /// - `GameCompatibilityDB+Unity.swift`   → all Unity games
+/// - `GameCompatibilityDB+Unreal.swift`  → all Unreal Engine games
+/// - `GameCompatibilityDB+Source.swift`  → all Source engine games
 /// - `GameCompatibilityDB+Custom.swift`  → custom/proprietary engine games
-/// - Future: `+Unreal.swift`, `+Godot.swift`, etc.
+/// - Future: `+Godot.swift`, etc.
 ///
 /// Factory methods on `GameProfile` encode engine-specific defaults. Changing
 /// a factory (e.g. `.unity()`) updates every game of that engine type at once.
@@ -40,7 +42,7 @@ final class GameCompatibilityDB {
     /// Merges all per-engine extension arrays into a single list.
     /// Add new engine categories here as a single additional term.
     private static var allProfiles: [GameProfile] {
-        unityProfiles + sourceEngineProfiles + customEngineProfiles
+        unityProfiles + unrealProfiles + sourceEngineProfiles + customEngineProfiles
     }
 
     /// All known game profiles, keyed by appID for O(1) lookup at launch time.
@@ -79,6 +81,44 @@ final class GameCompatibilityDB {
 
     /// Total number of game profiles in the database.
     var count: Int { profiles.count }
+
+    /// A single numeric score for ranking a game by how well it runs, so the UI
+    /// can sort "best-running first" from real data rather than a coarse badge.
+    ///
+    /// Combines the effective compat status (verified > playable > launches >
+    /// broken) with any measured average FPS recorded in `CompatVerdictStore`
+    /// (developer Metal-HUD reading, Pattern B4). Higher is better. Games with a
+    /// measured FPS outrank same-status games without one; status dominates so a
+    /// smooth-but-broken game never outranks a verified one. nil status data
+    /// falls back to `.untested`.
+    func performanceScore(for appID: Int) -> Double {
+        let status = effectiveStatus(for: appID)
+        let statusWeight: Double
+        switch status {
+        case .verified: statusWeight = 400
+        case .playable: statusWeight = 300
+        case .launches: statusWeight = 200
+        case .untested: statusWeight = 100
+        case .broken:   statusWeight = 0
+        }
+        // Measured FPS contributes within a status band (clamped so a huge FPS
+        // can't jump bands). 0–99 fps → 0–99 points.
+        let fps = CompatVerdictStore.shared.verdict(for: appID)?.fps ?? 0
+        return statusWeight + min(fps, 99)
+    }
+
+    /// Returns the given app IDs sorted best-running-first by `performanceScore`.
+    /// Stable on ties. Used to surface a data-driven "runs great on your Mac"
+    /// ordering in the library.
+    func rankedByPerformance(_ appIDs: [Int]) -> [Int] {
+        appIDs.enumerated()
+            .sorted { lhs, rhs in
+                let sl = performanceScore(for: lhs.element)
+                let sr = performanceScore(for: rhs.element)
+                return sl == sr ? lhs.offset < rhs.offset : sl > sr
+            }
+            .map(\.element)
+    }
 
     /// The compatibility status to display for a game, in priority order:
     /// 1. A developer verdict recorded in this build (DEBUG verdict overlay)
@@ -129,6 +169,12 @@ final class CompatVerdictStore {
         var note: String
         var engineTag: String
         var date: Date
+        /// Optional measured average frame rate for this game on this engine,
+        /// so the compat DB can rank titles by real performance rather than a
+        /// coarse status alone. Populated from a developer's Metal-HUD reading
+        /// or a MetricKit aggregate (see GamePerformanceMonitor). nil when not
+        /// measured. Optional so older JSON (no `fps` key) decodes unchanged.
+        var fps: Double?
     }
 
     private(set) var verdicts: [Int: Verdict] = [:]
@@ -143,8 +189,24 @@ final class CompatVerdictStore {
     func verdict(for appID: Int) -> Verdict? { verdicts[appID] }
 
     /// Records (or replaces) the verdict for a game and persists immediately.
-    func setVerdict(_ status: CompatStatus, note: String = "", engineTag: String, for appID: Int) {
-        verdicts[appID] = Verdict(status: status.rawValue, note: note, engineTag: engineTag, date: .now)
+    /// Preserves any previously-measured `fps` unless a new value is supplied.
+    func setVerdict(_ status: CompatStatus, note: String = "", engineTag: String, fps: Double? = nil, for appID: Int) {
+        let keepFPS = fps ?? verdicts[appID]?.fps
+        verdicts[appID] = Verdict(status: status.rawValue, note: note, engineTag: engineTag, date: .now, fps: keepFPS)
+        save()
+    }
+
+    /// Attaches (or updates) a measured average frame rate to a game's verdict,
+    /// creating an `.untested` verdict shell if none exists. Lets performance
+    /// data accrue independently of a manual status tap.
+    func recordFPS(_ fps: Double, engineTag: String, for appID: Int) {
+        if var existing = verdicts[appID] {
+            existing.fps = fps
+            existing.date = .now
+            verdicts[appID] = existing
+        } else {
+            verdicts[appID] = Verdict(status: CompatStatus.untested.rawValue, note: "", engineTag: engineTag, date: .now, fps: fps)
+        }
         save()
     }
 

@@ -36,6 +36,56 @@ final class SteamWindow {
     private(set) var isPermissionGranted: Bool
     private(set) var isSuppressing: Bool = false
 
+    /// The title of a user-actionable Steam dialog currently being surfaced
+    /// (EULA acceptance, subscriber agreement, purchase/family-sharing
+    /// confirmation). nil when no such dialog is on screen. Observed by the UI
+    /// to show a "Steam needs your confirmation" banner while the real dialog
+    /// is brought on-screen (rather than hidden). Reset when the window closes.
+    private(set) var actionableDialogTitle: String?
+
+    // MARK: - Window classification (A2 allowlist)
+
+    /// How a Steam-rendered window should be handled.
+    enum WindowPolicy: Equatable {
+        /// Hide it (off-screen + minimize) — Meridian owns this UX.
+        case suppress
+        /// Surface it — the user MUST interact (EULA / agreement / purchase /
+        /// family-sharing confirmation). These are rare, legitimate, and can't
+        /// be actioned any other way without showing Steam's own dialog.
+        case surface
+    }
+
+    /// Titles that indicate a dialog the user must act on. Matched
+    /// case-insensitively as substrings. Ordered before the blanket suppress
+    /// so e.g. "Steam Subscriber Agreement" surfaces even though it contains
+    /// "steam". Kept deliberately narrow — anything not on this list is hidden.
+    ///
+    /// MIRROR CONTRACT: mirrored in WindowClassificationTests.actionableTitlePatterns.
+    static let actionableTitlePatterns: [String] = [
+        "end user license", "eula",
+        "subscriber agreement", "license agreement", "agreement",
+        "terms of service",
+        "purchase", "checkout", "confirm your purchase",
+        "family sharing", "family view", "parental",
+        "enter your", "authorize",
+    ]
+
+    /// Classifies a window title into a handling policy. Actionable dialogs
+    /// (EULA / agreement / purchase / family) are surfaced; everything else —
+    /// Steam chrome, install/download/notification windows, unknown titles — is
+    /// suppressed. A nil/empty title is always suppressed (Steam's transient
+    /// chrome windows often have no title before they paint).
+    ///
+    /// MIRROR CONTRACT: mirrored in WindowClassificationTests.classifyPolicy.
+    static func policy(forTitle title: String?) -> WindowPolicy {
+        guard let title, !title.isEmpty else { return .suppress }
+        let lower = title.lowercased()
+        for pattern in actionableTitlePatterns where lower.contains(pattern) {
+            return .surface
+        }
+        return .suppress
+    }
+
     private struct Entry {
         let observer: AXObserver
         let source: CFRunLoopSource
@@ -92,6 +142,7 @@ final class SteamWindow {
     func pauseForGame() {
         suppressionActive = false
         isSuppressing = false
+        actionableDialogTitle = nil
         log.info("[SteamWindow] paused — game window will appear")
     }
 
@@ -112,6 +163,7 @@ final class SteamWindow {
     func stopSuppressing() {
         suppressionActive = false
         isSuppressing = false
+        actionableDialogTitle = nil
         stopPollingTimer()
         for pid in entries.keys { removeObserver(for: pid) }
         entries.removeAll()
@@ -211,7 +263,22 @@ final class SteamWindow {
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
               let windows = windowsRef as? [AXUIElement] else { return }
 
+        var surfacedTitle: String?
         for window in windows {
+            // Read the title so EULA / agreement / purchase dialogs are
+            // surfaced (the user MUST act on them) instead of hidden. Anything
+            // not on the narrow actionable allowlist is suppressed.
+            var titleRef: AnyObject?
+            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+            let title = titleRef as? String
+
+            if Self.policy(forTitle: title) == .surface {
+                // Bring it back on-screen (un-minimize) so the user can act.
+                AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, false as CFTypeRef)
+                surfacedTitle = title
+                continue
+            }
+
             // Move off-screen immediately (no animation, instant).
             var pos = CGPoint(x: -32000, y: -32000)
             if let posValue = AXValueCreate(.cgPoint, &pos) {
@@ -219,6 +286,12 @@ final class SteamWindow {
             }
             // Minimize for belt-and-suspenders.
             AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, true as CFTypeRef)
+        }
+
+        // Publish/clear the actionable-dialog banner state. Only updates when
+        // it actually changes to avoid churning @Observable subscribers.
+        if actionableDialogTitle != surfacedTitle {
+            actionableDialogTitle = surfacedTitle
         }
     }
 

@@ -1214,7 +1214,11 @@ final class GameInstallTests: XCTestCase {
     private func resolveRenderer(env: [String: String]) -> String {
         let dllPath = env["WINEDLLPATH"] ?? ""
         let overrides = parseOverridesMirror(env["WINEDLLOVERRIDES"] ?? "")
-        if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
+        if env["CX_GRAPHICS_BACKEND"] == "d3dmetal" {
+            // preferD3DMetal: cxcompatdb prepends GPTK D3DMetal builtins;
+            // WINEDLLOVERRIDES is cleared. Must be checked FIRST (B4 fix).
+            return "gptk"
+        } else if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
             return "gptk"
         } else if dllPath.contains("/dxvk") {
             return "dxvk"
@@ -1266,6 +1270,48 @@ final class GameInstallTests: XCTestCase {
     func testStackReport_inferUnknownWhenNoD3DOverride() {
         let env = ["WINEDLLPATH": "/engine/wine/lib/wine"]
         XCTAssertEqual(resolveRenderer(env: env), "unknown")
+    }
+
+    func testStackReport_inferGPTKForPreferD3DMetalEnv() {
+        // The preferD3DMetal env from SteamSession.gameEnvironment: no
+        // WINEDLLOVERRIDES, CX_GRAPHICS_BACKEND=d3dmetal, WINEDLLPATH=gptk/wine.
+        // Before B4 this mis-reported as "unknown" (no d3d12=b override).
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/gptk/wine:/engine/wine/lib/wine",
+            "CX_GRAPHICS_BACKEND": "d3dmetal",
+            "CX_ROOT": "/engine/wine",
+        ]
+        XCTAssertEqual(resolveRenderer(env: env), "gptk",
+                       "preferD3DMetal (CX_GRAPHICS_BACKEND=d3dmetal) must report the GPTK/D3DMetal renderer, not unknown.")
+    }
+
+    func testStackReport_productionChecksGraphicsBackendFirst() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(contentsOf: root.appending(path: "Meridian/Utilities/GameLogFile.swift"), encoding: .utf8)
+        XCTAssertTrue(src.contains(#"environment["CX_GRAPHICS_BACKEND"] == "d3dmetal""#),
+                      "GameStackReport.resolve must detect the D3DMetal backend so preferD3DMetal games don't report unknown.")
+        XCTAssertTrue(src.contains("CX_GRAPHICS_BACKEND") && src.contains("relevantEnvKeys"),
+                      "CX_GRAPHICS_BACKEND must be in the per-game log header's relevantEnvKeys.")
+    }
+
+    func testEngine_surfacesD3DMetalAndDxmtVersions() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(contentsOf: root.appending(path: "Meridian/Engine/WineEngine.swift"), encoding: .utf8)
+        XCTAssertTrue(src.contains("var d3dMetalVersion"),
+                      "WineEngine must surface d3dMetalVersion from meridian-d3dmetal-version.txt.")
+        XCTAssertTrue(src.contains("var dxmtVersion"),
+                      "WineEngine must surface dxmtVersion from meridian-dxmt-version.txt.")
+        XCTAssertTrue(src.contains("meridian-d3dmetal-version.txt"),
+                      "WineEngine must read the D3DMetal version file written by release-engine.sh.")
+    }
+
+    func testCompatVerdict_carriesMeasuredFPS() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(contentsOf: root.appending(path: "Meridian/Engine/GameCompatibilityDB.swift"), encoding: .utf8)
+        XCTAssertTrue(src.contains("var fps: Double?"),
+                      "CompatVerdictStore.Verdict must carry an optional measured fps for data-driven ranking.")
+        XCTAssertTrue(src.contains("func recordFPS("),
+                      "CompatVerdictStore must expose recordFPS to attach a measured frame rate.")
     }
 
     /// Wiring guard: GameStackReport, engine-log collection, and the enriched

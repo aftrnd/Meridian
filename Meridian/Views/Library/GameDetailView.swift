@@ -162,6 +162,24 @@ struct GameDetailView: View {
                 .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
 
                 Menu {
+                    // Launch mode: Offline (gbe_fork, seamless, no cloud/MP) vs
+                    // Online (real Steam in background — cloud saves, multiplayer,
+                    // EULAs, genuine DRM). Offline is the default; Online is an
+                    // opt-in per game. Picker persists via AppSettings.
+                    Menu {
+                        Picker("Launch Mode", selection: launchModeBinding) {
+                            Label("Offline (seamless)", systemImage: "bolt.fill")
+                                .tag(AppSettings.LaunchMode.offline)
+                            Label("Online (cloud saves, multiplayer)", systemImage: "cloud.fill")
+                                .tag(AppSettings.LaunchMode.online)
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        Label("Launch Mode", systemImage: "network")
+                    }
+
+                    Divider()
+
                     Button {
                         openWindow(id: "launch-log")
                     } label: {
@@ -968,6 +986,15 @@ struct GameDetailView: View {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    /// Binding for the per-game launch mode picker. Reads/writes the persisted
+    /// Offline/Online opt-in in AppSettings (default Offline).
+    private var launchModeBinding: Binding<AppSettings.LaunchMode> {
+        Binding(
+            get: { AppSettings.shared.launchMode(appID: currentGame.id) },
+            set: { AppSettings.shared.setLaunchMode($0, appID: currentGame.id) }
+        )
     }
 
     /// Whether the raw per-game Wine log exists for this game (i.e. it has

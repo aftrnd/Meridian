@@ -20,6 +20,7 @@ struct ContentView: View {
     @Environment(Launcher.self) private var launcher
     @Environment(BootstrapManager.self) private var bootstrap
     @Environment(CategoryStore.self) private var categoryStore
+    @Environment(SteamWindow.self) private var steamWindow
     @Environment(\.openSettings) private var openSettings
     @State private var selectedGame: Game?
     @State private var columnVisibility = NavigationSplitViewVisibility.all
@@ -42,6 +43,14 @@ struct ContentView: View {
                 SplashView()
             } else {
                 mainContent
+                    .overlay(alignment: .top) {
+                        if let title = steamWindow.actionableDialogTitle {
+                            SteamConfirmationBanner(title: title)
+                                .padding(.top, 10)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: steamWindow.actionableDialogTitle)
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
@@ -89,8 +98,18 @@ struct ContentView: View {
         // check on mainContent only fires once at bootstrap. Without this,
         // signing out in Settings leaves the app with no way to sign back in
         // until a full restart.
+        //
+        // On sign-IN, refresh the library: mainContent's one-shot .task fired
+        // before authentication completed (empty steamID → refresh skipped),
+        // and the API-key step's own refresh only runs when that step is
+        // actually shown. A user signing in with a key already stored would
+        // otherwise land on an empty library until the next app restart.
         .onChange(of: steamAuth.isAuthenticated) { _, authenticated in
-            if !authenticated { showSetupSheet = true }
+            if authenticated {
+                Task { await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey) }
+            } else {
+                showSetupSheet = true
+            }
         }
         // NOTE: deliberately NOT re-showing the sheet when `session.isReady`
         // flips false. steam.exe silent auto-login failing (Pattern 6) is no
@@ -169,6 +188,11 @@ struct ContentView: View {
 extension Notification.Name {
     static let meridianBootstrapReady = Notification.Name("meridianBootstrapReady")
     static let meridianOpenSettings   = Notification.Name("meridianOpenSettings")
+    /// Posted when an OAuth refresh token is found to be genuinely dead
+    /// (DepotDownloader exit 3 at install time). SteamAuthService observes
+    /// this and calls `markSessionExpired()`, which flips `isAuthenticated`
+    /// false → the sign-in sheet re-appears (API key + password preserved).
+    static let meridianSteamSessionExpired = Notification.Name("meridianSteamSessionExpired")
 }
 
 // MARK: - Sidebar
@@ -404,6 +428,38 @@ private struct CategoriesSidebarSection: View {
     }
 }
 
+// MARK: - Steam Confirmation Banner
+
+/// Shown when the window suppressor surfaces a user-actionable Steam dialog
+/// (EULA acceptance, subscriber agreement, purchase / family-sharing
+/// confirmation) that Meridian cannot action on the user's behalf. The real
+/// Steam dialog is brought on-screen; this banner explains why a Steam window
+/// just appeared so the seamless illusion isn't jarring.
+private struct SteamConfirmationBanner: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "hand.raised.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Steam needs your confirmation")
+                    .font(.callout.weight(.semibold))
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .modifier(GlassRoundedBackground(cornerRadius: 10))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .frame(maxWidth: 420)
+    }
+}
+
 // MARK: - Engine Status Pill
 
 private struct EngineStatusPill: View {
@@ -527,5 +583,6 @@ struct GlassRoundedBackground: ViewModifier {
         .environment(Launcher())
         .environment(BootstrapManager())
         .environment(CategoryStore())
+        .environment(SteamWindow())
         .environment(AppUpdateChecker())
 }

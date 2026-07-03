@@ -134,6 +134,83 @@ final class WindowClassificationTests: XCTestCase {
         XCTAssertEqual(classifyTitle("Steam Client"), .suppressible)
     }
 
+    // MARK: - A2: actionable-dialog allowlist (surface vs suppress)
+    //
+    // MIRROR CONTRACT: mirrors SteamWindow.actionableTitlePatterns +
+    // SteamWindow.policy(forTitle:). EULA / agreement / purchase / family
+    // dialogs are SURFACED (user must act); everything else is SUPPRESSED.
+
+    enum WindowPolicy: Equatable { case suppress, surface }
+
+    /// Mirror of SteamWindow.actionableTitlePatterns.
+    private let actionableTitlePatterns: [String] = [
+        "end user license", "eula",
+        "subscriber agreement", "license agreement", "agreement",
+        "terms of service",
+        "purchase", "checkout", "confirm your purchase",
+        "family sharing", "family view", "parental",
+        "enter your", "authorize",
+    ]
+
+    /// Mirror of SteamWindow.policy(forTitle:).
+    private func policy(forTitle title: String?) -> WindowPolicy {
+        guard let title, !title.isEmpty else { return .suppress }
+        let lower = title.lowercased()
+        for pattern in actionableTitlePatterns where lower.contains(pattern) {
+            return .surface
+        }
+        return .suppress
+    }
+
+    func testEULAWindowsAreSurfaced() {
+        XCTAssertEqual(policy(forTitle: "End User License Agreement"), .surface)
+        XCTAssertEqual(policy(forTitle: "EULA"), .surface)
+        XCTAssertEqual(policy(forTitle: "Steam Subscriber Agreement"), .surface,
+                       "The subscriber agreement contains 'steam' but must SURFACE, not suppress — the user must accept it.")
+        XCTAssertEqual(policy(forTitle: "License Agreement"), .surface)
+        XCTAssertEqual(policy(forTitle: "Terms of Service"), .surface)
+    }
+
+    func testPurchaseAndFamilyDialogsAreSurfaced() {
+        XCTAssertEqual(policy(forTitle: "Confirm Your Purchase"), .surface)
+        XCTAssertEqual(policy(forTitle: "Checkout"), .surface)
+        XCTAssertEqual(policy(forTitle: "Steam Family Sharing"), .surface)
+        XCTAssertEqual(policy(forTitle: "Family View"), .surface)
+    }
+
+    func testChromeAndInstallWindowsAreSuppressed() {
+        XCTAssertEqual(policy(forTitle: "Steam"), .suppress)
+        XCTAssertEqual(policy(forTitle: "Friends & Chat"), .suppress)
+        XCTAssertEqual(policy(forTitle: "Install - Counter-Strike 2"), .suppress)
+        XCTAssertEqual(policy(forTitle: "Downloading update..."), .suppress)
+        XCTAssertEqual(policy(forTitle: "Who's playing on this PC?"), .suppress)
+    }
+
+    func testNilOrEmptyTitleIsSuppressed() {
+        XCTAssertEqual(policy(forTitle: nil), .suppress,
+                       "Transient untitled Steam chrome must be suppressed by default.")
+        XCTAssertEqual(policy(forTitle: ""), .suppress)
+    }
+
+    func testSteamWindowExposesPolicyAllowlist() throws {
+        let src = try steamWindowSource()
+        XCTAssertTrue(src.contains("static func policy(forTitle"),
+                      "SteamWindow must expose policy(forTitle:) for the actionable-dialog allowlist.")
+        XCTAssertTrue(src.contains("actionableTitlePatterns"),
+                      "SteamWindow must declare actionableTitlePatterns.")
+        XCTAssertTrue(src.contains("actionableDialogTitle"),
+                      "SteamWindow must publish actionableDialogTitle so the UI can show the confirmation banner.")
+        XCTAssertTrue(src.contains("case surface"),
+                      "SteamWindow.WindowPolicy must have a .surface case for user-actionable dialogs.")
+        // hideWindows must consult the policy (not blindly hide everything).
+        guard let fn = src.range(of: "func hideWindows(for pid:") else {
+            return XCTFail("SteamWindow must have hideWindows(for:)")
+        }
+        let body = src[fn.lowerBound...]
+        XCTAssertTrue(body.contains("Self.policy(forTitle:"),
+                      "hideWindows must consult policy(forTitle:) so EULA/agreement/purchase dialogs are surfaced.")
+    }
+
     // MARK: - Suppression aggressiveness guards
 
     func testSuppressorUsesFastPollingInterval() throws {

@@ -82,6 +82,22 @@ final class SteamAuthService: NSObject {
     override init() {
         super.init()
         restoreSession()
+
+        // Route install/launch-time token-expiry back to re-auth. The
+        // install path posts this when DepotDownloader reports exit 3
+        // (REFRESH_TOKEN_INVALID) — a genuinely dead token, distinct from
+        // the anti-abuse AccessDenied case which is handled silently in
+        // `renewSessionIfNeeded`.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionExpiredNotification),
+            name: .meridianSteamSessionExpired,
+            object: nil
+        )
+    }
+
+    @objc private func handleSessionExpiredNotification() {
+        Task { @MainActor in self.markSessionExpired() }
     }
 
     // MARK: - Public API
@@ -149,6 +165,18 @@ final class SteamAuthService: NSObject {
             log.info("[restoreSession] no saved session")
             return
         }
+        // A Keychain identity WITHOUT a stored refresh token is a broken
+        // half-session (Keychain survived but UserDefaults were reset, or a
+        // partial sign-out). Installs and DRM launches require the token, so
+        // restoring this as "authenticated" produces an app that looks signed
+        // in but can't do anything token-gated. Fail fast: route to the
+        // sign-in sheet instead (API key + password are preserved).
+        guard !AppSettings.shared.steamCredentialRefreshToken.isEmpty else {
+            log.warning("[restoreSession] steamID present but no refresh token — stale half-session, prompting sign-in")
+            markSessionExpired()
+            return
+        }
+
         log.info("[restoreSession] restored steamID=\(savedID)")
         steamID = savedID
         isAuthenticated = true
@@ -165,6 +193,87 @@ final class SteamAuthService: NSObject {
         Task {
             await refreshProfile(steamID: savedID)
         }
+
+        // Proactively renew the OAuth refresh token on every cold start so it
+        // never silently ages out mid-session (Pattern 23 / handoff v6). Pure
+        // HTTPS; runs off the main actor.
+        Task { await renewSessionIfNeeded() }
+    }
+
+    /// Validates (and rotates, if Valve returns a new one) the stored OAuth
+    /// refresh token. Called at startup from `restoreSession`.
+    ///
+    /// - `.renewed`      → persist the rotated token.
+    /// - `.valid`        → nothing to do.
+    /// - `.networkError` → keep the token, retry next launch (offline-safe).
+    /// - `.accessDenied` → KEEP the token, do NOT force re-auth. Valve's
+    ///   anti-abuse lockout (EResult 15) rejects the *exchange* while the
+    ///   library + installed games keep working; re-minting only feeds the
+    ///   lockout (Pattern 23). Staying signed in is the harm-reduction path.
+    /// - `.invalid`      → KEEP the token, do NOT force re-auth from this
+    ///   startup probe. `GenerateAccessTokenForApp` returns an empty
+    ///   `{"response":{}}` body (no access_token, no rotation) with a FLAPPING
+    ///   eresult (15 vs 63 on back-to-back calls) for some accounts, even for a
+    ///   freshly-minted, structurally-valid token (CLI-verified July 2 2026 on
+    ///   a token QR-minted minutes earlier). An empty body is Valve declining
+    ///   to mint a new access token, NOT proof the refresh token is dead —
+    ///   so treating it as dead here logs the user out on every launch despite
+    ///   a perfectly good session. The AUTHORITATIVE dead-token signal is a
+    ///   token-gated operation actually failing: DepotDownloader exit 3
+    ///   (`.refreshTokenInvalid`) → `.meridianSteamSessionExpired` →
+    ///   `markSessionExpired()` (observed in `init`). The startup probe is
+    ///   advisory only: it rotates the token when Valve offers a new one and
+    ///   otherwise leaves the session intact. Matches the ContentView gate
+    ///   comment ("if the refresh_token is genuinely expired, the
+    ///   install/launch path surfaces that").
+    func renewSessionIfNeeded() async {
+        let settings = AppSettings.shared
+        let sid   = settings.steamCredentialSteamID
+        let token = settings.steamCredentialRefreshToken
+        guard !sid.isEmpty, !token.isEmpty else {
+            log.debug("[renewSession] no stored token — skipping")
+            return
+        }
+
+        let outcome = await SteamCredentialAuth.renewRefreshToken(steamID: sid, refreshToken: token)
+        switch outcome {
+        case .renewed(let newToken):
+            settings.steamCredentialRefreshToken = newToken
+            log.info("[renewSession] persisted rotated refresh token ✓")
+        case .valid:
+            log.info("[renewSession] stored token still valid ✓")
+        case .networkError:
+            log.info("[renewSession] transient network error — keeping token, will retry next launch")
+        case .accessDenied:
+            // EResult 15. Keep the token; do NOT sign out. Re-minting feeds the
+            // anti-abuse lockout and 2FAs the user every launch (Pattern 23).
+            log.warning("[renewSession] AccessDenied (EResult 15) — keeping token, staying signed in (anti-abuse; not code-fixable)")
+        case .invalid:
+            // Empty/ambiguous exchange response — NOT proof the token is dead.
+            // Keep the session; the install/launch path (DepotDownloader exit 3)
+            // is the authoritative dead-token signal and will route to re-auth
+            // if the token actually fails in use. Signing out here logged users
+            // out on every launch with a perfectly valid token (July 2 2026).
+            log.info("[renewSession] renewal exchange returned no token — keeping session (point-of-use will detect a genuinely dead token)")
+        }
+    }
+
+    /// Drops the authenticated state (→ sign-in sheet) and clears the dead
+    /// refresh token + live `local.vdf`, but PRESERVES the Web API key and
+    /// saved password (unlike `signOut()`) so the library keeps working and
+    /// re-auth is one tap. Used when a token is genuinely dead (Pattern 23).
+    func markSessionExpired() {
+        log.warning("[markSessionExpired] clearing dead session — preserving API key + password for one-tap re-auth")
+        isAuthenticated = false
+        steamID = ""
+        displayName = ""
+        avatarURL = nil
+        deleteSecret(key: KeychainKey.steamID)
+        AppSettings.shared.steamCredentialRefreshToken = ""
+        // Drop the live local.vdf so Steam doesn't try to auto-login with the
+        // now-orphaned token. Backups / API key / password remain intact.
+        let liveLocalVdf = WinePrefix.defaultPrefix.localAppDataSteamDir.appending(path: "local.vdf")
+        try? FileManager.default.removeItem(at: liveLocalVdf)
     }
 
     // MARK: - Keychain helpers

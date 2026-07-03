@@ -1020,6 +1020,17 @@ final class WinePrefixTests: XCTestCase {
         let localVdfURL = localAppDataSteamDir.appending(path: "local.vdf")
         let savedLocalVdf: Data? = try? Data(contentsOf: localVdfURL)
 
+        // MIRROR CONTRACT: Preserve steamapps/ (installed games + ACFs) via a
+        // same-volume move-aside — mirrors WinePrefix.resetToEngineTemplate.
+        let steamappsURL = steamInstallDir.appending(path: "steamapps")
+        let steamappsHold = prefix.deletingLastPathComponent()
+            .appending(path: "steamapps-preserve-\(UUID().uuidString)")
+        var steamappsMoved = false
+        if fm.fileExists(atPath: steamappsURL.path(percentEncoded: false)) {
+            try? fm.moveItem(at: steamappsURL, to: steamappsHold)
+            steamappsMoved = fm.fileExists(atPath: steamappsHold.path(percentEncoded: false))
+        }
+
         // Remove old prefix, copy new template
         try fm.removeItem(at: prefix)
         try fm.copyItem(at: templateDir, to: prefix)
@@ -1070,6 +1081,12 @@ final class WinePrefixTests: XCTestCase {
         if let data = savedLocalVdf, !data.isEmpty {
             try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
             try? data.write(to: localVdfURL)
+        }
+
+        // MIRROR CONTRACT: Restore steamapps/ — mirrors WinePrefix.resetToEngineTemplate.
+        if steamappsMoved {
+            try? fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
+            try? fm.moveItem(at: steamappsHold, to: steamappsURL)
         }
 
         let dosdevContents = (try? fm.contentsOfDirectory(atPath: dosdev.path(percentEncoded: false))) ?? []
@@ -1869,6 +1886,48 @@ final class WinePrefixTests: XCTestCase {
         let restoredContent = try String(contentsOfFile: restoredLocalVdfPath, encoding: .utf8)
         XCTAssertEqual(restoredContent, originalToken,
                        "Restored local.vdf must contain the original token")
+    }
+
+    /// Installed games (steamapps/) must survive an engine-version prefix reset.
+    /// Without the move-aside/restore, every engine bump (e.g. v3.0.6 → v3.1.0)
+    /// wiped all installed games and forced full re-downloads.
+    func testResetToEngineTemplate_preservesSteamapps() throws {
+        let fm = FileManager.default
+        let (tmplDir, i386Dir) = try makeEngineTemplate()
+
+        // Build a prefix with an installed game + ACF manifest under steamapps/.
+        let prefix = tempDir.appending(path: "prefix_steamapps")
+        let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
+        let gameDir = steamDir.appending(path: "steamapps/common/Fake Game")
+        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        try "".write(to: prefix.appending(path: "system.reg"), atomically: true, encoding: .utf8)
+        try "game-bytes".write(to: gameDir.appending(path: "game.exe"), atomically: true, encoding: .utf8)
+        try "acf-content".write(
+            to: steamDir.appending(path: "steamapps/appmanifest_12345.acf"),
+            atomically: true, encoding: .utf8
+        )
+
+        _ = try simulateResetToEngineTemplate(
+            prefix: prefix,
+            templateDir: tmplDir,
+            steamInstallDir: steamDir,
+            engineI386Dir: i386Dir
+        )
+
+        XCTAssertTrue(
+            fm.fileExists(atPath: gameDir.appending(path: "game.exe").path(percentEncoded: false)),
+            "Installed game files must be preserved across resetToEngineTemplate"
+        )
+        let acf = try String(
+            contentsOfFile: steamDir.appending(path: "steamapps/appmanifest_12345.acf").path(percentEncoded: false),
+            encoding: .utf8
+        )
+        XCTAssertEqual(acf, "acf-content", "ACF manifests must be preserved across resetToEngineTemplate")
+        // The temporary hold directory must not be left behind.
+        let parent = prefix.deletingLastPathComponent()
+        let leftovers = (try? fm.contentsOfDirectory(atPath: parent.path(percentEncoded: false)))?
+            .filter { $0.hasPrefix("steamapps-preserve-") } ?? []
+        XCTAssertTrue(leftovers.isEmpty, "steamapps-preserve hold dir must be moved back, not orphaned")
     }
 
     func testSteamSessionBackup_clearRemovesFile() throws {

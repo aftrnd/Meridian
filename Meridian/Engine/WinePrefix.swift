@@ -330,6 +330,25 @@ struct WinePrefix: Sendable {
         log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)" +
             (savedLocalVdf != nil ? " + local.vdf" : ""))
 
+        // Preserve installed games across the reset. steamapps/ (game files +
+        // appmanifest ACFs) is multi-GB, so move it aside with a same-volume
+        // rename (instant, no copy) and move it back after the template copy.
+        // Without this, every engine version bump wipes the user's installed
+        // games and forces full re-downloads.
+        let steamappsURL = steamInstallDir.appending(path: "steamapps")
+        let steamappsHold = path.deletingLastPathComponent()
+            .appending(path: "steamapps-preserve-\(UUID().uuidString)")
+        var steamappsMoved = false
+        if fm.fileExists(atPath: steamappsURL.path(percentEncoded: false)) {
+            do {
+                try fm.moveItem(at: steamappsURL, to: steamappsHold)
+                steamappsMoved = true
+                log.info("[resetToTemplate] moved steamapps/ aside to preserve installed games")
+            } catch {
+                log.warning("[resetToTemplate] could not move steamapps/ aside — installed games will be lost: \(error.localizedDescription)")
+            }
+        }
+
         // Remove the existing prefix and copy the new template
         log.info("[resetToTemplate] removing existing prefix")
         try fm.removeItem(at: path)
@@ -387,6 +406,17 @@ struct WinePrefix: Sendable {
             try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
             try? data.write(to: localVdfURL)
             log.info("[resetToTemplate] restored local.vdf (\(data.count) bytes)")
+        }
+
+        // Restore steamapps/ (installed games + ACF manifests).
+        if steamappsMoved {
+            do {
+                try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
+                try fm.moveItem(at: steamappsHold, to: steamappsURL)
+                log.info("[resetToTemplate] restored steamapps/ (installed games preserved)")
+            } catch {
+                log.error("[resetToTemplate] failed to restore steamapps/ from \(steamappsHold.lastPathComponent): \(error.localizedDescription)")
+            }
         }
 
         log.info("[resetToTemplate] restored \(savedConfigs.count) Steam config file(s)")
@@ -1873,6 +1903,7 @@ struct WinePrefix: Sendable {
         appID: Int,
         steamID: String,
         accountName: String,
+        personaName: String = "",
         engine: WineEngine
     ) async throws {
         guard let emu64 = engine.steamApi64EmuURL else {
@@ -1954,7 +1985,16 @@ struct WinePrefix: Sendable {
                 to: settingsDir.appending(path: "steam_appid.txt"),
                 atomically: true, encoding: .utf8
             )
-            let safeName = accountName.isEmpty ? "Meridian" : accountName
+            // gbe_fork displays `account_name` as the in-game player name.
+            // Prefer the Steam PROFILE/persona name (e.g. "Tra La La") so the
+            // in-game identity matches what the user sees everywhere else;
+            // fall back to the Steam login name, then a generic default. The
+            // stable identity is `account_steamid` (the real 64-bit ID),
+            // independent of the cosmetic display name.
+            let displayName = personaName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let loginName = accountName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let safeName = !displayName.isEmpty ? displayName
+                         : (!loginName.isEmpty ? loginName : "Meridian")
             let userIni = """
             [user::general]
             account_name=\(safeName)

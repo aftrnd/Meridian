@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		22514C5D01E68E0515FA9EAA /* GameCompatibilityDB+Unity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */; };
-		D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */; };
 		31BBDC1F93444D77B811A589 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE9307949871471AB0E85285 /* BootstrapManager.swift */; };
 		893C6023DF3C41F9A6624B1D /* CategoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46B315635523C0CF2D44F9BA /* CategoryStore.swift */; };
 		8B0812FC6BBB07573ED3A149 /* GameProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4965BA889D288764428E3E5 /* GameProfile.swift */; };
@@ -20,20 +19,12 @@
 		B001000C /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001000D /* AppDelegate.swift */; };
 		B001000E /* SteamAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001000F /* SteamAuthService.swift */; };
 		B0010010 /* SteamAPIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010011 /* SteamAPIService.swift */; };
-		B00G0001 /* SteamSessionBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00G0002 /* SteamSessionBackup.swift */; };
-		B00F0001 /* SteamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0002 /* SteamSession.swift */; };
-		B00H0001 /* SteamCredentialAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00H0002 /* SteamCredentialAuth.swift */; };
-		B00F0003 /* SteamWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0004 /* SteamWindow.swift */; };
-		B00F0005 /* Launcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0006 /* Launcher.swift */; };
-		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B0010012 /* SteamLibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010013 /* SteamLibraryStore.swift */; };
-		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
 		B0010014 /* Game.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010015 /* Game.swift */; };
 		B0010016 /* PlayerSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010017 /* PlayerSummary.swift */; };
 		B0010024 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010025 /* ContentView.swift */; };
 		B0010026 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010027 /* LibraryView.swift */; };
 		B0010028 /* GameGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010029 /* GameGridView.swift */; };
-		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
@@ -42,29 +33,41 @@
 		B0010036 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0010037 /* Assets.xcassets */; };
 		B0010036A /* GameAchievement.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010036B /* GameAchievement.swift */; };
 		B00A0001 /* GameArtOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00A0002 /* GameArtOverrides.swift */; };
+		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
+		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
+		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B00E0001 /* WineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0002 /* WineEngine.swift */; };
 		B00E0003 /* WinePrefix.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0004 /* WinePrefix.swift */; };
 		B00E0007 /* GameProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0008 /* GameProcess.swift */; };
 		B00E0009 /* EngineSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E000A /* EngineSetupView.swift */; };
 		B00E0020 /* CachedAsyncImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0021 /* CachedAsyncImage.swift */; };
 		B00E0030 /* EngineDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0031 /* EngineDownloader.swift */; };
-		B00E00F1 /* SteamClientBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00F2 /* SteamClientBootstrap.swift */; };
 		B00E0040 /* TerminationCleanup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0041 /* TerminationCleanup.swift */; };
 		B00E0050 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0051 /* SearchView.swift */; };
 		B00E0060 /* SteamWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0061 /* SteamWebView.swift */; };
 		B00E0070 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0071 /* HomeView.swift */; };
 		B00E00B0 /* AppUpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00B1 /* AppUpdateChecker.swift */; };
 		B00E00C0 /* HeroArtViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00C1 /* HeroArtViews.swift */; };
+		B00E00F1 /* SteamClientBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00F2 /* SteamClientBootstrap.swift */; };
+		B00F0001 /* SteamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0002 /* SteamSession.swift */; };
+		B00F0003 /* SteamWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0004 /* SteamWindow.swift */; };
+		B00F0005 /* Launcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0006 /* Launcher.swift */; };
+		B00G0001 /* SteamSessionBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00G0002 /* SteamSessionBackup.swift */; };
+		B00H0001 /* SteamCredentialAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00H0002 /* SteamCredentialAuth.swift */; };
 		B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */; };
 		D1D8B7DD549091BB2876CCA0 /* MeridianLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE30B92B1C3871B6B2870750 /* MeridianLog.swift */; };
+		D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */; };
 		DF364F39F87A4CEA949C0F22 /* MeridianNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */; };
 		E20520A6AF6648F0BC6B1C00 /* GameLogFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20520A6AF6648F0BC6B1C01 /* GameLogFile.swift */; };
+		A7C4E1F200000001 /* GamePerformanceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7C4E1F200000002 /* GamePerformanceMonitor.swift */; };
+		A7C4E1F200000003 /* GameCompatibilityDB+Unreal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7C4E1F200000004 /* GameCompatibilityDB+Unreal.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Unity.swift"; sourceTree = "<group>"; };
-		3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Custom.swift"; sourceTree = "<group>"; };
 		2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Source.swift"; sourceTree = "<group>"; };
+		341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Unity.swift"; sourceTree = "<group>"; };
+		37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianNotifications.swift; sourceTree = "<group>"; };
+		3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Custom.swift"; sourceTree = "<group>"; };
 		46B315635523C0CF2D44F9BA /* CategoryStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CategoryStore.swift; sourceTree = "<group>"; };
 		4F62085FF69F4F208309DA56 /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
 		A66F49292F6617F1005601F4 /* app-icon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "app-icon.icon"; sourceTree = "<group>"; };
@@ -74,20 +77,12 @@
 		B001000D /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		B001000F /* SteamAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAuthService.swift; sourceTree = "<group>"; };
 		B0010011 /* SteamAPIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAPIService.swift; sourceTree = "<group>"; };
-		B00G0002 /* SteamSessionBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSessionBackup.swift; sourceTree = "<group>"; };
-		B00F0002 /* SteamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSession.swift; sourceTree = "<group>"; };
-		B00H0002 /* SteamCredentialAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCredentialAuth.swift; sourceTree = "<group>"; };
-		B00F0004 /* SteamWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWindow.swift; sourceTree = "<group>"; };
-		B00F0006 /* Launcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Launcher.swift; sourceTree = "<group>"; };
-		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B0010013 /* SteamLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLibraryStore.swift; sourceTree = "<group>"; };
-		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
 		B0010015 /* Game.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Game.swift; sourceTree = "<group>"; };
 		B0010017 /* PlayerSummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerSummary.swift; sourceTree = "<group>"; };
 		B0010025 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		B0010027 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		B0010029 /* GameGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameGridView.swift; sourceTree = "<group>"; };
-		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
@@ -100,23 +95,32 @@
 		B001003B /* Meridian.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Meridian.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B001003C /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Package.swift; path = ../Package.swift; sourceTree = "<group>"; };
 		B00A0002 /* GameArtOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameArtOverrides.swift; sourceTree = "<group>"; };
+		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
+		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
+		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B00E0002 /* WineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineEngine.swift; sourceTree = "<group>"; };
 		B00E0004 /* WinePrefix.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WinePrefix.swift; sourceTree = "<group>"; };
 		B00E0008 /* GameProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameProcess.swift; sourceTree = "<group>"; };
 		B00E000A /* EngineSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineSetupView.swift; sourceTree = "<group>"; };
 		B00E0021 /* CachedAsyncImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CachedAsyncImage.swift; sourceTree = "<group>"; };
 		B00E0031 /* EngineDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineDownloader.swift; sourceTree = "<group>"; };
-		B00E00F2 /* SteamClientBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamClientBootstrap.swift; sourceTree = "<group>"; };
 		B00E0041 /* TerminationCleanup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminationCleanup.swift; sourceTree = "<group>"; };
 		B00E0051 /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
 		B00E0061 /* SteamWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWebView.swift; sourceTree = "<group>"; };
 		B00E0071 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		B00E00B1 /* AppUpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdateChecker.swift; sourceTree = "<group>"; };
 		B00E00C1 /* HeroArtViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeroArtViews.swift; sourceTree = "<group>"; };
+		B00E00F2 /* SteamClientBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamClientBootstrap.swift; sourceTree = "<group>"; };
+		B00F0002 /* SteamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSession.swift; sourceTree = "<group>"; };
+		B00F0004 /* SteamWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWindow.swift; sourceTree = "<group>"; };
+		B00F0006 /* Launcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Launcher.swift; sourceTree = "<group>"; };
+		B00G0002 /* SteamSessionBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSessionBackup.swift; sourceTree = "<group>"; };
+		B00H0002 /* SteamCredentialAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCredentialAuth.swift; sourceTree = "<group>"; };
 		D4965BA889D288764428E3E5 /* GameProfile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GameProfile.swift; sourceTree = "<group>"; };
-		EE30B92B1C3871B6B2870750 /* MeridianLog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianLog.swift; sourceTree = "<group>"; };
-		37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianNotifications.swift; sourceTree = "<group>"; };
 		E20520A6AF6648F0BC6B1C01 /* GameLogFile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GameLogFile.swift; sourceTree = "<group>"; };
+		A7C4E1F200000002 /* GamePerformanceMonitor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GamePerformanceMonitor.swift; sourceTree = "<group>"; };
+		A7C4E1F200000004 /* GameCompatibilityDB+Unreal.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Unreal.swift"; sourceTree = "<group>"; };
+		EE30B92B1C3871B6B2870750 /* MeridianLog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianLog.swift; sourceTree = "<group>"; };
 		EE9307949871471AB0E85285 /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -213,14 +217,6 @@
 			path = Views;
 			sourceTree = "<group>";
 		};
-		B00D0003 /* Downloads */ = {
-			isa = PBXGroup;
-			children = (
-				B00D0002 /* DownloadsToolbarButton.swift */,
-			);
-			path = Downloads;
-			sourceTree = "<group>";
-		};
 		B0010048 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
@@ -275,6 +271,14 @@
 			path = Auth;
 			sourceTree = "<group>";
 		};
+		B00D0003 /* Downloads */ = {
+			isa = PBXGroup;
+			children = (
+				B00D0002 /* DownloadsToolbarButton.swift */,
+			);
+			path = Downloads;
+			sourceTree = "<group>";
+		};
 		B00E0010 /* Engine */ = {
 			isa = PBXGroup;
 			children = (
@@ -291,6 +295,7 @@
 				341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */,
 				3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */,
 				2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */,
+				A7C4E1F200000004 /* GameCompatibilityDB+Unreal.swift */,
 			);
 			path = Engine;
 			sourceTree = "<group>";
@@ -309,8 +314,8 @@
 				EE30B92B1C3871B6B2870750 /* MeridianLog.swift */,
 				37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */,
 				E20520A6AF6648F0BC6B1C01 /* GameLogFile.swift */,
+				A7C4E1F200000002 /* GamePerformanceMonitor.swift */,
 			);
-			name = Utilities;
 			path = Utilities;
 			sourceTree = "<group>";
 		};
@@ -344,7 +349,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1600;
-				LastUpgradeCheck = 2630;
+				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					B0010060 = {
 						CreatedOnToolsVersion = 16.0;
@@ -437,8 +442,8 @@
 				B001000C /* AppDelegate.swift in Sources */,
 				B001000E /* SteamAuthService.swift in Sources */,
 				B0010010 /* SteamAPIService.swift in Sources */,
-		B0010012 /* SteamLibraryStore.swift in Sources */,
-		B00AI001 /* SteamAppInfoResolver.swift in Sources */,
+				B0010012 /* SteamLibraryStore.swift in Sources */,
+				B00AI001 /* SteamAppInfoResolver.swift in Sources */,
 				B0010014 /* Game.swift in Sources */,
 				B0010016 /* PlayerSummary.swift in Sources */,
 				B00E0001 /* WineEngine.swift in Sources */,
@@ -483,6 +488,8 @@
 				22514C5D01E68E0515FA9EAA /* GameCompatibilityDB+Unity.swift in Sources */,
 				B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */,
 				D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */,
+				A7C4E1F200000001 /* GamePerformanceMonitor.swift in Sources */,
+				A7C4E1F200000003 /* GameCompatibilityDB+Unreal.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
