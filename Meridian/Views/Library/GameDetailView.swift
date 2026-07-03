@@ -51,6 +51,19 @@ struct GameDetailView: View {
     /// detection + PCGamingWiki + any explicit compat profile). Populated by
     /// `resolveStack()` when the game is installed; drives the compat popover.
     @State private var resolvedStack: ResolvedGameStack? = nil
+    /// UI mirror of the persisted per-game launch mode. AppSettings is not
+    /// Observable (UserDefaults-backed), so the split Play button reads this
+    /// state; `launchModeBinding.set` and the SteamStub probe keep it synced.
+    @State private var launchModeUI: AppSettings.LaunchMode = .offline
+    /// True when the installed exe is SteamStub-encrypted (`.bind` PE
+    /// section): the gbe_fork shim can't decrypt it, so Offline mode is
+    /// impossible. The mode menu disables Offline and the probe persists
+    /// Online — reflecting the constraint up-front instead of prompting
+    /// after the fact (HANDOFF-2026-07-03-v6 Goal 1).
+    @State private var steamStubRequiresOnline = false
+    /// The chevron segment's launch-mode popover (the "teardrop" window —
+    /// same presentation as the Meridian Verified badge popover).
+    @State private var showLaunchModePopover = false
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
@@ -83,57 +96,13 @@ struct GameDetailView: View {
                     )
 
                     // ── Info + Achievements (two-column) ──────────────────────
-                    HStack(alignment: .top, spacing: inset) {
-
-                        // Left: launch controls + game info
-                        VStack(alignment: .leading, spacing: 12) {
-                            launchSection
-                            statsSection
-                        }
-                        .padding(GameDetailMetrics.horizontalPadding)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background {
-                            Color(nsColor: .windowBackgroundColor)
-                            if let img = bannerImage {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .blur(radius: 60)
-                                    .saturation(1.2)
-                                    .opacity(0.25)
-                            }
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: radius, style: .continuous)
-                                .strokeBorder(.separator, lineWidth: 0.5)
-                        )
-
-                        // Right: achievements — natural 1/4 width, minimum 425 pt.
-                        // At large windows the 1/4 rule applies; at small windows the
-                        // 425 pt floor holds and the left card shrinks to whatever remains.
-                        achievementsCard(radius: radius)
-                            .frame(width: max(250, (cardWidth - inset) / 4))
-                    }
+                    infoColumns(cardWidth: cardWidth, radius: radius, inset: inset)
                 }
                 .padding(.horizontal, inset)
                 .padding(.bottom, inset)
             }
         }
-        .background {
-            // Very subtle ambient colour bleed from the game's art — fills the
-            // full column including safe areas so the tint shows in the margins
-            // and behind the navigation bar, matching the Apple Music album feel.
-            if let img = bannerImage {
-                Image(nsImage: img)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .ignoresSafeArea()
-                    .blur(radius: 80)
-                    .saturation(1.2)
-                    .opacity(0.12)
-            }
-        }
+        .background { ambientBackdrop }
         .scaleEffect(appeared ? 1 : 0.94, anchor: .center)
         .opacity(appeared ? 1 : 0)
         .blur(radius: appeared ? 0 : 6)
@@ -162,24 +131,10 @@ struct GameDetailView: View {
                 .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
 
                 Menu {
-                    // Launch mode: Offline (gbe_fork, seamless, no cloud/MP) vs
-                    // Online (real Steam in background — cloud saves, multiplayer,
-                    // EULAs, genuine DRM). Offline is the default; Online is an
-                    // opt-in per game. Picker persists via AppSettings.
-                    Menu {
-                        Picker("Launch Mode", selection: launchModeBinding) {
-                            Label("Offline (seamless)", systemImage: "bolt.fill")
-                                .tag(AppSettings.LaunchMode.offline)
-                            Label("Online (cloud saves, multiplayer)", systemImage: "cloud.fill")
-                                .tag(AppSettings.LaunchMode.online)
-                        }
-                        .pickerStyle(.inline)
-                    } label: {
-                        Label("Launch Mode", systemImage: "network")
-                    }
-
-                    Divider()
-
+                    // Launch mode moved out of this menu into the split Play
+                    // button (HANDOFF-2026-07-03-v6 Goal 1) — the mode is a
+                    // first-class control on the Play button itself, not a
+                    // buried setting.
                     Button {
                         openWindow(id: "launch-log")
                     } label: {
@@ -220,7 +175,7 @@ struct GameDetailView: View {
             }
         }
         .onExitCommand(perform: onDismiss)
-        .onChange(of: game.id) { _, _ in
+        .onChange(of: game.id) { _, newID in
             appeared = false
             heroAspectRatio = SteamLibraryHeroMetrics.aspectRatio
             appDetails = nil
@@ -230,9 +185,14 @@ struct GameDetailView: View {
             achievementsLoading = false
             achievementsUnavailable = false
             resolvedStack = nil
+            launchModeUI = AppSettings.shared.launchMode(appID: newID)
+            steamStubRequiresOnline = false
         }
         .task(id: game.id) {
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
+        }
+        .task(id: game.id) {
+            await probeLaunchModeConstraints()
         }
         .task(id: game.id) {
             await loadBannerImage()
@@ -277,6 +237,62 @@ struct GameDetailView: View {
             Button("Cancel", role: .cancel) { launcher.dismissSteamPrompt() }
         } message: { prompt in
             Text(steamPromptMessage(for: prompt))
+        }
+    }
+
+    // MARK: - Body sub-sections (extracted to keep the body expression
+    // type-checkable — the single chained expression exceeded the compiler's
+    // budget once the theater overlay was added)
+
+    /// The two-column Info + Achievements row under the banner.
+    private func infoColumns(cardWidth: CGFloat, radius: CGFloat, inset: CGFloat) -> some View {
+        HStack(alignment: .top, spacing: inset) {
+
+            // Left: launch controls + game info
+            VStack(alignment: .leading, spacing: 12) {
+                launchSection
+                statsSection
+            }
+            .padding(GameDetailMetrics.horizontalPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                Color(nsColor: .windowBackgroundColor)
+                if let img = bannerImage {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .blur(radius: 60)
+                        .saturation(1.2)
+                        .opacity(0.25)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(.separator, lineWidth: 0.5)
+            )
+
+            // Right: achievements — natural 1/4 width, minimum 250 pt.
+            // At large windows the 1/4 rule applies; at small windows the
+            // floor holds and the left card shrinks to whatever remains.
+            achievementsCard(radius: radius)
+                .frame(width: max(250, (cardWidth - inset) / 4))
+        }
+    }
+
+    /// Very subtle ambient colour bleed from the game's art — fills the
+    /// full column including safe areas so the tint shows in the margins
+    /// and behind the navigation bar, matching the Apple Music album feel.
+    @ViewBuilder
+    private var ambientBackdrop: some View {
+        if let img = bannerImage {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .ignoresSafeArea()
+                .blur(radius: 80)
+                .saturation(1.2)
+                .opacity(0.12)
         }
     }
 
@@ -421,7 +437,11 @@ struct GameDetailView: View {
         VStack(alignment: .leading, spacing: GameDetailMetrics.horizontalPadding) {
             playButton
             compatStatusCard
-            if isThisGameActive {
+            // During `.launching` the in-place LaunchGlowButton carries the
+            // live status (HANDOFF-2026-07-03-v8 rev. 3); the inline
+            // StatusCard handles installing / downloading / running /
+            // stopping.
+            if isThisGameActive && !launcher.isLaunching {
                 StatusCard(game: currentGame, launcher: launcher, openWindow: openWindow)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .animation(.easeInOut(duration: 0.2), value: isThisGameActive)
@@ -880,7 +900,12 @@ struct GameDetailView: View {
     @ViewBuilder
     private var activePlayButton: some View {
         switch launcher.launchState {
-        case .idle, .failed:
+        // NOTE: `.failed` must NOT be listed here — it has its own dedicated
+        // branch below (Retry/Reset + error caption). Listing it alongside
+        // `.idle` made that branch unreachable dead code (pre-existing bug:
+        // launch failures silently showed the plain Play button with no
+        // error message; the compiler flagged the shadowed case).
+        case .idle:
             idleButton
 
         case .installing:
@@ -897,8 +922,11 @@ struct GameDetailView: View {
             }
 
         case .launching:
+            // In-place launch glow (HANDOFF-2026-07-03-v8 rev. 3): the Play
+            // button becomes the loading surface — staged status text behind
+            // Liquid Glass with a comet of light orbiting the capsule.
             HStack(spacing: 8) {
-                ProgressButton("Launching…")
+                LaunchGlowButton(game: currentGame, launcher: launcher)
                 stopButton
             }
 
@@ -970,16 +998,46 @@ struct GameDetailView: View {
     @ViewBuilder
     private var idleButton: some View {
         if currentGame.isInstalled {
-            Button { handlePlayTapped() } label: {
-                Label("Play", systemImage: "play.fill")
-                    .font(.headline)
-                    .frame(
-                        minWidth: GameDetailMetrics.launchButtonMinWidth,
-                        minHeight: GameDetailMetrics.launchButtonHeight
-                    )
+            // Split Play button (HANDOFF-2026-07-03-v8, revised): the primary
+            // segment is a REAL Button — pixel-identical to the launching-
+            // state ProgressButton (same font, frame metrics, control size).
+            // Offline keeps the standard accent prominence; Online upgrades
+            // to the Liquid Glass prominent style on macOS 26+ so the mode
+            // switch reads instantly. The chevron opens a teardrop popover
+            // (same presentation as the Meridian Verified badge) with the
+            // cleaned-up mode picker.
+            HStack(spacing: 2) {
+                Button { handlePlayTapped() } label: {
+                    // Offline is the default — a plain "Play". Only the
+                    // Online opt-in earns a qualifier.
+                    Label(launchModeUI == .online ? "Play Online" : "Play",
+                          systemImage: "play.fill")
+                        .font(.headline)
+                        .frame(
+                            minWidth: GameDetailMetrics.launchButtonMinWidth,
+                            minHeight: GameDetailMetrics.launchButtonHeight
+                        )
+                }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+
+                // System-gray chevron (user direction: the primary stays
+                // accent blue, the chevron stays neutral).
+                Button {
+                    showLaunchModePopover.toggle()
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(minHeight: GameDetailMetrics.launchButtonHeight)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .fixedSize()
+                .help("Change launch mode")
+                .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
+                    launchModePopover
+                }
             }
-            .inactiveAwareProminence(controlActiveState == .inactive)
-            .controlSize(.large)
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
             .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
         } else {
@@ -996,6 +1054,48 @@ struct GameDetailView: View {
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
             .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "")
         }
+    }
+
+    /// The chevron's teardrop popover: two clean mode rows (icon, title,
+    /// one-line subtitle, checkmark on the current mode). Offline is
+    /// disabled for SteamStub-encrypted games with a footnote explaining why.
+    private var launchModePopover: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            LaunchModeRow(
+                icon: "bolt.fill",
+                title: "Local",
+                subtitle: "Fast & offline",
+                selected: launchModeUI == .offline,
+                disabled: steamStubRequiresOnline
+            ) {
+                launchModeBinding.wrappedValue = AppSettings.LaunchMode.offline
+                showLaunchModePopover = false
+            }
+
+            LaunchModeRow(
+                icon: "cloud.fill",
+                title: "Online",
+                subtitle: "Cloud saves & multiplayer",
+                selected: launchModeUI == .online,
+                disabled: false
+            ) {
+                launchModeBinding.wrappedValue = AppSettings.LaunchMode.online
+                showLaunchModePopover = false
+            }
+
+            if steamStubRequiresOnline {
+                Divider()
+                    .padding(.vertical, 4)
+                Text("This game's DRM needs the Steam client — Local isn't available.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
+            }
+        }
+        .padding(8)
+        .frame(width: 250)
     }
 
     private var isLauncherBusyWithOtherGame: Bool {
@@ -1035,13 +1135,42 @@ struct GameDetailView: View {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
     }
 
-    /// Binding for the per-game launch mode picker. Reads/writes the persisted
-    /// Offline/Online opt-in in AppSettings (default Offline).
+    /// Binding for the per-game launch mode menu. Reads/writes the persisted
+    /// Offline/Online opt-in in AppSettings (default Offline) and mirrors the
+    /// choice into `launchModeUI` so the split Play button re-renders.
     private var launchModeBinding: Binding<AppSettings.LaunchMode> {
         Binding(
             get: { AppSettings.shared.launchMode(appID: currentGame.id) },
-            set: { AppSettings.shared.setLaunchMode($0, appID: currentGame.id) }
+            set: { mode in
+                AppSettings.shared.setLaunchMode(mode, appID: currentGame.id)
+                launchModeUI = mode
+            }
         )
+    }
+
+    /// Syncs `launchModeUI` from AppSettings and probes the installed exe for
+    /// SteamStub DRM off the main thread. SteamStub games can ONLY run through
+    /// the Steam client, so the probe persists Online mode (idempotent — the
+    /// same switch `confirmSteamPrompt` would make after the fact) and the
+    /// mode menu disables Offline with an explanation.
+    private func probeLaunchModeConstraints() async {
+        launchModeUI = AppSettings.shared.launchMode(appID: game.id)
+        steamStubRequiresOnline = false
+        guard currentGame.isInstalled else { return }
+
+        let appID = game.id
+        let prefix = WinePrefix.defaultPrefix
+        // PE-section scan touches disk — keep it off the main thread.
+        let stub = await Task.detached(priority: .utility) {
+            prefix.gameRequiresSteamAPI(appID: appID) && prefix.gameHasSteamStubDRM(appID: appID)
+        }.value
+
+        guard !Task.isCancelled, appID == game.id else { return }
+        steamStubRequiresOnline = stub
+        if stub, AppSettings.shared.launchMode(appID: appID) == .offline {
+            AppSettings.shared.setLaunchMode(.online, appID: appID)
+            launchModeUI = .online
+        }
     }
 
     /// Whether the raw per-game Wine log exists for this game (i.e. it has
@@ -1154,6 +1283,60 @@ private extension View {
         } else {
             self.buttonStyle(.borderedProminent)
         }
+    }
+}
+
+// MARK: - Launch mode popover row
+
+/// One selectable row in the launch-mode popover: icon, title, one-line
+/// subtitle, checkmark when current. Hover highlight matches macOS menu
+/// affordances; disabled rows dim and don't respond.
+private struct LaunchModeRow: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let selected: Bool
+    let disabled: Bool
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.callout)
+                    .foregroundStyle(selected ? Color.accentColor : .secondary)
+                    .frame(width: 22)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 12)
+
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .opacity(selected ? 1 : 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                hovering && !disabled ? Color.primary.opacity(0.06) : .clear,
+                in: RoundedRectangle(cornerRadius: 7)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1)
+        .onHover { hovering = $0 }
     }
 }
 

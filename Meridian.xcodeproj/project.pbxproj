@@ -26,6 +26,7 @@
 		B0010026 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010027 /* LibraryView.swift */; };
 		B0010028 /* GameGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010029 /* GameGridView.swift */; };
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
+		B001002C /* LaunchGlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002D /* LaunchGlow.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
 		B0010034 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035 /* AppSettings.swift */; };
@@ -84,6 +85,7 @@
 		B0010027 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		B0010029 /* GameGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameGridView.swift; sourceTree = "<group>"; };
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
+		B001002D /* LaunchGlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchGlow.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
 		B0010035 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
@@ -233,6 +235,7 @@
 				B00E0061 /* SteamWebView.swift */,
 				B0010029 /* GameGridView.swift */,
 				B001002B /* GameDetailView.swift */,
+				B001002D /* LaunchGlow.swift */,
 				B00E0021 /* CachedAsyncImage.swift */,
 				B00E00C1 /* HeroArtViews.swift */,
 			);
@@ -461,6 +464,7 @@
 				B0010026 /* LibraryView.swift in Sources */,
 				B0010028 /* GameGridView.swift in Sources */,
 				B001002A /* GameDetailView.swift in Sources */,
+				B001002C /* LaunchGlow.swift in Sources */,
 				B00E00C0 /* HeroArtViews.swift in Sources */,
 				B00E0009 /* EngineSetupView.swift in Sources */,
 				B00E0020 /* CachedAsyncImage.swift in Sources */,

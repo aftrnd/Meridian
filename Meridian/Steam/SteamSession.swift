@@ -491,11 +491,17 @@ final class SteamSession {
             let code = process.terminationStatus
             log.info("[healthMonitor] steam.exe exited code=\(code) generation=\(generation)")
 
-            // Non-42 exit during running state = legitimate failure
-            // (Steam crashed, user signed out, etc.). Caller's normal
-            // failure paths take over; we just exit the monitor.
+            // Non-42 exit during running state = Steam is genuinely gone
+            // (crashed, killed externally, user signed out). The session
+            // state must not lie (fail-fast): a dead steam.exe behind
+            // `isReady == true` makes `ensureReadyForDRM` skip the entire
+            // bring-up and dispatch `-applaunch` against nothing — the
+            // fresh steam.exe then cold-boots unmanaged (no waitForLoggedOn,
+            // no suppression re-engagement) and steamwebhelper windows can
+            // surface. `.idle` is retryable — `start()` accepts it.
             guard code == 42 else {
-                log.info("[healthMonitor] non-restart exit — leaving state alone")
+                log.info("[healthMonitor] non-restart exit — marking session idle (was \(String(describing: state)))")
+                if case .running = state { state = .idle }
                 return
             }
 

@@ -402,7 +402,9 @@ final class SteamLibraryStore {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled else { break }
-                await self?.syncInstallStateFromDisk()
+                // Synchronous: the unstructured Task inherits this class's
+                // @MainActor isolation, so no hop (and no await) is needed.
+                self?.syncInstallStateFromDisk()
             }
         }
     }

@@ -131,6 +131,29 @@ final class GameProcess {
         launchedPID = 0
     }
 
+    /// Kills only the game's own processes (`pkill -9 -f <pattern>`), leaving
+    /// wineserver — and any persistent Steam session sharing it — alive.
+    ///
+    /// Used when stopping a game while Steam runs in the background: a full
+    /// `wineserver -k` takes steam.exe + steamwebhelper down with it, and
+    /// CEF treats the next Steam boot as crash recovery, surfacing webhelper
+    /// windows (user-reported Jul 3 2026). The pattern is the game's ACF
+    /// installdir name, which appears in the Wine process's command line
+    /// even after argv[0] rewrite (engine-research-findings.mdc Pattern 2).
+    func killGameProcesses(pattern: String) async {
+        let currentAppID = self.appID
+        log.info("[killGameProcesses] appID=\(currentAppID) pattern=\"\(pattern)\" — wineserver + Steam left alive")
+        monitorTask?.cancel()
+        monitorTask = nil
+        onLog = nil
+        monitorPhase = .idle
+        launchedPID = 0
+        await Task.detached {
+            Self.killProcesses(matching: pattern)
+        }.value
+        log.info("[killGameProcesses] done")
+    }
+
     /// Stops the game by killing the Wine server for the prefix.
     func stopGame(engine: WineEngine, prefix: WinePrefix) async {
         let currentAppID = self.appID
@@ -449,6 +472,22 @@ final class GameProcess {
             .filter { !$0.lowercased().contains("pgrep") }
 
         return ProcessCheckResult(count: lines.count, lines: lines)
+    }
+
+    /// Force-kills all processes whose command line matches the pattern.
+    /// pkill never matches its own process, and Meridian's command line
+    /// does not contain game installdir names, so this is self-safe.
+    private nonisolated static func killProcesses(matching pattern: String) {
+        let t = Process()
+        t.executableURL = URL(filePath: "/usr/bin/pkill")
+        t.arguments = ["-9", "-f", pattern]
+        t.standardOutput = FileHandle.nullDevice
+        t.standardError = FileHandle.nullDevice
+        try? t.run()
+        t.waitUntilExit()
+        // pkill exit 0 = killed something, 1 = no match (already gone) —
+        // both are success for a stop request.
+        log.info("[killProcesses] pkill -9 -f \"\(pattern)\" exit=\(t.terminationStatus)")
     }
 
     /// Kills the Wine server for the prefix.

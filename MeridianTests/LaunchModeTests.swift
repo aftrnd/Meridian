@@ -75,15 +75,63 @@ final class LaunchModeTests: XCTestCase {
                       "Offline (default) path must keep direct wine64 exec.")
     }
 
-    // MARK: - UI toggle
+    // MARK: - UI toggle (split Play button, HANDOFF-2026-07-03-v6 Goal 1)
 
     func testGameDetail_exposesLaunchModePicker() throws {
         let src = try readSource("Meridian/Views/Library/GameDetailView.swift")
         XCTAssertTrue(src.contains("launchModeBinding"),
-                      "GameDetailView must bind a launch-mode picker to AppSettings.")
+                      "GameDetailView must bind the launch-mode control to AppSettings.")
         XCTAssertTrue(src.contains("AppSettings.LaunchMode.offline")
                       && src.contains("AppSettings.LaunchMode.online"),
-                      "GameDetailView picker must offer both Offline and Online.")
+                      "GameDetailView's mode menu must offer both Offline and Online.")
+        // The mode lives on a split Play button, not in the ellipsis menu.
+        // The primary segment must be a REAL Button styled identically to
+        // ProgressButton (user-verified: Menu(primaryAction:) rendered at
+        // the wrong size and without the accent fill on macOS —
+        // HANDOFF-2026-07-03-v8 Goal 1). The chevron is SYSTEM GRAY
+        // (.bordered) and opens a teardrop POPOVER (like the Meridian
+        // Verified badge), not a system menu. Both modes keep the standard
+        // accent prominence — the glass-morph experiment was rejected
+        // (user direction, 2026-07-03: "the transition to normal to liquid
+        // glass, gotta go" / "keep that system gray").
+        XCTAssertTrue(src.contains("Button { handlePlayTapped() } label: {"),
+                      "The primary Play segment must be a plain Button (matches ProgressButton dims/color).")
+        XCTAssertFalse(src.contains("} primaryAction: {"),
+                       "Menu(primaryAction:) must NOT be used — it renders at the wrong size/color on macOS.")
+        XCTAssertTrue(src.contains(".popover(isPresented: $showLaunchModePopover"),
+                      "The chevron segment must open the mode picker as a teardrop popover.")
+        // Approved copy (user, Jul 3 2026): rows are "Local — Fast & offline"
+        // and "Online — Cloud saves & multiplayer".
+        XCTAssertTrue(src.contains("\"Local\"") && src.contains("\"Fast & offline\""),
+                      "The default mode row must be titled Local with the Fast & offline subtitle.")
+        XCTAssertTrue(src.contains("\"Cloud saves & multiplayer\""),
+                      "The Online row must keep the Cloud saves & multiplayer subtitle.")
+        XCTAssertFalse(src.contains("playProminence(") || src.contains(".glassProminent"),
+                       "No mode-aware glass prominence — both modes use the standard accent button; the chevron is .bordered gray.")
+        // Label contract: Offline is the default and reads plain "Play";
+        // only the Online opt-in earns a qualifier.
+        XCTAssertTrue(src.contains("launchModeUI == .online ? \"Play Online\" : \"Play\""),
+                      "The Play label must be \"Play\" for the default mode and \"Play Online\" for Online.")
+        XCTAssertFalse(src.contains("Label(\"Launch Mode\", systemImage: \"network\")"),
+                       "The old ellipsis-menu Launch Mode submenu must be gone (replaced by the split button).")
+    }
+
+    /// SteamStub games can ONLY run through the Steam client. The mode
+    /// control must reflect that constraint up-front — Offline disabled in
+    /// the menu, Online persisted by the probe — instead of letting the user
+    /// pick Offline and get prompted after the fact.
+    func testGameDetail_steamStubDisablesOfflineInModeMenu() throws {
+        let src = try readSource("Meridian/Views/Library/GameDetailView.swift")
+        XCTAssertTrue(src.contains("steamStubRequiresOnline"),
+                      "GameDetailView must track the SteamStub constraint state.")
+        XCTAssertTrue(src.contains("disabled: steamStubRequiresOnline"),
+                      "The Offline popover row must be disabled for SteamStub games.")
+        XCTAssertTrue(src.contains("gameHasSteamStubDRM"),
+                      "GameDetailView must probe the installed exe for SteamStub DRM.")
+        XCTAssertTrue(src.contains("Task.detached"),
+                      "The SteamStub probe touches disk — it must run off the main thread.")
+        XCTAssertTrue(src.contains("AppSettings.shared.setLaunchMode(.online, appID: appID)"),
+                      "The probe must persist Online for SteamStub games (same switch confirmSteamPrompt makes).")
     }
 
     // MARK: - SteamStub detection (.bind PE section)

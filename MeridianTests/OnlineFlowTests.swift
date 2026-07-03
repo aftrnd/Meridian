@@ -82,13 +82,84 @@ final class OnlineFlowTests: XCTestCase {
             return XCTFail("stopGame must exist")
         }
         let after = src[fn.lowerBound...]
-        let body = String(after.prefix(2500))
+        let body = String(after.prefix(5000))
         XCTAssertTrue(body.contains("case .launching(let appID):"),
                       "stopGame must act during .launching (was a silent no-op — Bug D)")
         XCTAssertTrue(body.contains("launchTask?.cancel()"),
                       "stopping a launch in flight must cancel the pipeline task")
         XCTAssertTrue(body.contains("cancelMonitoring()"),
                       "Online stop must stop the monitor WITHOUT killing wineserver (Steam owns it)")
+    }
+
+    // MARK: - steamwebhelper surfacing after stop (user-reported Jul 3 2026)
+
+    /// Stopping a game while the persistent Steam session is alive must NOT
+    /// `wineserver -k` (that SIGKILLs steam.exe + steamwebhelper; CEF treats
+    /// the next boot as crash recovery and surfaces webhelper windows), and
+    /// it MUST restore window suppression (the .running stop path was
+    /// missing `resumeAfterGame`, leaving the suppressor paused/in game
+    /// mode indefinitely).
+    func testStopGame_runningStopKeepsSteamAliveAndResumesSuppression() throws {
+        let src = try readSource("Meridian/Launch/Launcher.swift")
+        guard let fn = src.range(of: "func stopGame(") else {
+            return XCTFail("stopGame must exist")
+        }
+        let after = src[fn.lowerBound...]
+        let body = String(after.prefix(5000))
+
+        guard let runningCase = body.range(of: "case .running(let appID):"),
+              let launchingCase = body.range(of: "case .launching(let appID):") else {
+            return XCTFail("stopGame must handle .running and .launching")
+        }
+        let runningBody = String(body[runningCase.lowerBound..<launchingCase.lowerBound])
+
+        XCTAssertTrue(runningBody.contains("activeSession?.isReady == true"),
+                      ".running stop must check whether the persistent Steam session is alive")
+        XCTAssertTrue(runningBody.contains("killGameProcesses(pattern:"),
+                      ".running stop must kill only the game's processes when Steam shares the wineserver")
+        XCTAssertTrue(runningBody.contains("resumeAfterGame(steamPID: 0)"),
+                      ".running stop must restore window suppression (was missing — webhelper windows surfaced at will)")
+
+        let gp = try readSource("Meridian/Engine/GameProcess.swift")
+        XCTAssertTrue(gp.contains("func killGameProcesses(pattern:"),
+                      "GameProcess must expose the surgical game-only kill")
+        XCTAssertTrue(gp.contains("/usr/bin/pkill"),
+                      "killGameProcesses must use pkill -f on the game's installdir pattern")
+    }
+
+    /// A dead steam.exe behind `isReady == true` makes ensureReadyForDRM
+    /// skip the bring-up entirely and dispatch -applaunch against nothing —
+    /// the fresh steam.exe cold-boots unmanaged and webhelper windows can
+    /// surface. The health monitor must mark the session state truthfully
+    /// on a non-42 exit (fail-fast: state must reflect the observed signal).
+    func testHealthMonitor_marksSessionIdleOnNon42Exit() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        guard let fn = src.range(of: "private func monitorSteamHealth(") else {
+            return XCTFail("monitorSteamHealth must exist")
+        }
+        let after = src[fn.lowerBound...]
+        let body = String(after.prefix(3500))
+        XCTAssertTrue(body.contains("guard code == 42 else"),
+                      "only Steam's intentional-restart sentinel may trigger a relaunch (Pattern 14)")
+        XCTAssertTrue(body.contains("if case .running = state { state = .idle }"),
+                      "a non-42 exit must clear the stale .running state so the next launch does a full bring-up")
+    }
+
+    /// Offline launches with a background Steam session alive must use
+    /// game-mode suppression (Steam windows hidden, game exempt) instead of
+    /// blanket-pausing — a full pause freed steamwebhelper to render windows
+    /// for the entire play session.
+    func testOfflineLaunch_usesGameModeWhenSteamAlive() throws {
+        let src = try readSource("Meridian/Launch/Launcher.swift")
+        guard let fn = src.range(of: "private func executePipeline(") else {
+            return XCTFail("executePipeline must exist")
+        }
+        let after = src[fn.lowerBound...]
+        let body = String(after.prefix(through: after.range(of: "// MARK:")?.lowerBound ?? after.endIndex))
+        XCTAssertTrue(body.contains("if session.isReady {"),
+                      "the offline launch must branch on whether Steam is running in the background")
+        XCTAssertTrue(body.contains("enterGameMode()"),
+                      "with Steam alive, offline launches must use game-mode suppression")
     }
 
     func testCancelLaunch_stopsProcessMonitor() throws {

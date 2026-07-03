@@ -104,6 +104,14 @@ final class Launcher {
 
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
+    /// Staged launch progress for the Steam-boot overlay (HANDOFF-2026-07-03-v6
+    /// Goal 2). Same icon vocabulary as the splash (Pattern 9). The icon
+    /// follows the LATEST recognized status marker; the fraction is monotonic
+    /// per pipeline run (only fills, never regresses) so the overlay's bar
+    /// reads as steady forward progress even when statuses alternate (e.g.
+    /// "validating" ↔ "waiting for game").
+    private(set) var launchStageIcon: String = "gear"
+    private(set) var launchStageFraction: Double = 0
     private(set) var downloadProgress: Double?
     private(set) var downloadBytesDone: Int64 = 0
     private(set) var downloadBytesTotal: Int64 = 0
@@ -178,6 +186,7 @@ final class Launcher {
         closeActiveGameLog(reason: "user cancelled launch", exitCode: nil)
         launchState = .idle
         currentActivity = nil
+        resetLaunchStage()
         downloadProgress = nil
         downloadBytesDone = 0
         downloadBytesTotal = 0
@@ -193,12 +202,36 @@ final class Launcher {
         case .running(let appID):
             launchState = .stopping(appID: appID)
             currentActivity = "Stopping game…"
+            // Steam shares the prefix's wineserver. `wineserver -k` while a
+            // persistent Steam session is alive SIGKILLs steam.exe +
+            // steamwebhelper — CEF then treats the next Steam boot as crash
+            // recovery and surfaces webhelper windows, and the health
+            // monitor's non-42 exit left a stale `.running` session state
+            // (user-reported "steamwebhelper opens a lot… hit quit early",
+            // Jul 3 2026). Kill only the game's own processes whenever Steam
+            // is alive; full wineserver -k only when nothing else shares it.
+            let steamAlive = activeSession?.isReady == true
+            let gamePattern = prefix.gameInstallDir(appID: appID)
             Task { [weak self] in
                 guard let self else { return }
-                await gameProcess.stopGame(engine: engine, prefix: prefix)
+                if steamAlive, let pattern = gamePattern {
+                    await gameProcess.killGameProcesses(pattern: pattern)
+                } else {
+                    if steamAlive {
+                        log.warning("[stopGame] no installdir pattern for appID=\(appID) — falling back to wineserver -k (kills Steam)")
+                    }
+                    await gameProcess.stopGame(engine: engine, prefix: prefix)
+                }
+                // Restore blanket suppression — this was missing here, so a
+                // stop-while-running left the suppressor paused (Offline) or
+                // in game mode (Online) indefinitely, letting steamwebhelper
+                // windows surface at will.
+                steamWindow?.resumeAfterGame(steamPID: 0)
                 closeActiveGameLog(reason: "user requested stop", exitCode: nil)
                 launchState = .idle
                 currentActivity = nil
+                resetLaunchStage()
+                activeAppID = nil
             }
 
         case .launching(let appID):
@@ -209,6 +242,8 @@ final class Launcher {
             launchState = .stopping(appID: appID)
             currentActivity = "Stopping…"
             let online = AppSettings.shared.launchMode(appID: appID) == .online
+            let steamAlive = activeSession?.isReady == true
+            let gamePattern = prefix.gameInstallDir(appID: appID)
             Task { [weak self] in
                 guard let self else { return }
                 if online {
@@ -217,17 +252,29 @@ final class Launcher {
                     // tracking, keep Steam alive in the background (if it is
                     // mid-validation, letting it finish helps the next Play).
                     gameProcess.cancelMonitoring()
+                    // Best-effort: if Steam already spawned the game before
+                    // the stop, kill it — otherwise it keeps running with
+                    // its window hidden by the resumed blanket suppression.
+                    if let pattern = gamePattern {
+                        await gameProcess.killGameProcesses(pattern: pattern)
+                    }
+                    steamWindow?.resumeAfterGame(steamPID: 0)
+                } else if steamAlive, let pattern = gamePattern {
+                    // Offline launch with a background Steam session alive
+                    // (left over from an earlier Online play) — same rule as
+                    // .running: don't take Steam down with the game.
+                    await gameProcess.killGameProcesses(pattern: pattern)
                     steamWindow?.resumeAfterGame(steamPID: 0)
                 } else {
-                    // Offline: the game process may already be spawned via
-                    // wine64 — kill the prefix's wineserver (no Steam running
-                    // in Offline mode, so this only stops the game).
+                    // Offline, no Steam running: kill the prefix's wineserver
+                    // (this only stops the game).
                     await gameProcess.stopGame(engine: engine, prefix: prefix)
                     steamWindow?.resumeAfterGame(steamPID: 0)
                 }
                 closeActiveGameLog(reason: "user stopped launch in flight", exitCode: nil)
                 launchState = .idle
                 currentActivity = nil
+                resetLaunchStage()
                 activeAppID = nil
             }
 
@@ -280,6 +327,7 @@ final class Launcher {
         downloadProgress = nil
         runningSince = nil
         processesConfirmed = false
+        resetLaunchStage()
 
         let steamID = steamAuth?.steamID ?? AppSettings.shared.steamCredentialSteamID
 
@@ -356,7 +404,7 @@ final class Launcher {
 
         if needsDRM {
             launchState = .launching(appID: game.id)
-            currentActivity = "Preparing \(game.name)…"
+            setLaunchActivity("Preparing \(game.name)…")
             appendLog("Installing Steamworks compatibility shim for \(game.name)")
             do {
                 try await prefix.installSteamEmulator(
@@ -377,11 +425,22 @@ final class Launcher {
         }
 
         launchState = .launching(appID: game.id)
-        currentActivity = "Launching \(game.name)…"
+        setLaunchActivity("Launching \(game.name)…")
         appendLog("Launching \(game.name)")
 
-        // Pause window suppression so the game window appears naturally.
-        steamWindow?.pauseForGame()
+        // Let the game window appear naturally. When a persistent Steam
+        // session is alive in the background (left over from an earlier
+        // Online play), blanket-pausing suppression frees steamwebhelper to
+        // render windows for the whole play session (user-reported Jul 3
+        // 2026) — use game-mode suppression instead: Steam-owned windows
+        // stay hidden, the game (a non-Steam Wine PID) is exempt. With no
+        // Steam running there is nothing to suppress; a full pause is safest
+        // for the game window.
+        if session.isReady {
+            steamWindow?.enterGameMode()
+        } else {
+            steamWindow?.pauseForGame()
+        }
 
         // Both DRM (now satisfied in-process by the Steamworks emulator shim)
         // and DRM-free games launch directly via `wine64 game.exe`. No
@@ -421,7 +480,7 @@ final class Launcher {
             onLog: { [weak self] msg in
                 // Already invoked on the main actor — GameProcess is
                 // @MainActor and the monitor loop runs there.
-                self?.currentActivity = msg
+                self?.setLaunchActivity(msg)
             }
         )
 
@@ -525,7 +584,7 @@ final class Launcher {
         }
 
         launchState = .launching(appID: game.id)
-        currentActivity = "Connecting to Steam…"
+        setLaunchActivity("Connecting to Steam…")
         appendLog("Online mode: bringing Steam online for \(game.name)")
 
         do {
@@ -534,12 +593,12 @@ final class Launcher {
                 // login window renders; Steam persists its own session, so
                 // every later Online launch takes the silent path below.
                 try await session.signInInteractively(engine: engine) { [weak self] status in
-                    self?.currentActivity = status
+                    self?.setLaunchActivity(status)
                 }
             } else {
                 do {
                     try await session.ensureReadyForDRM(engine: engine) { [weak self] status in
-                        self?.currentActivity = status
+                        self?.setLaunchActivity(status)
                     }
                 } catch is CancellationError {
                     throw CancellationError()
@@ -551,9 +610,9 @@ final class Launcher {
                     // can re-establish a session Steam itself persists.
                     log.warning("[launchOnline] silent auth failed (\(error.localizedDescription)) — falling back to interactive sign-in")
                     appendLog("Steam session expired — opening Steam sign-in")
-                    currentActivity = "Steam sign-in required…"
+                    setLaunchActivity("Steam sign-in required…")
                     try await session.signInInteractively(engine: engine) { [weak self] status in
-                        self?.currentActivity = status
+                        self?.setLaunchActivity(status)
                     }
                 }
             }
@@ -586,7 +645,7 @@ final class Launcher {
             return
         }
 
-        currentActivity = "Launching \(game.name) through Steam…"
+        setLaunchActivity("Launching \(game.name) through Steam…")
         appendLog("Dispatching -applaunch \(game.id)")
         // Game-mode suppression: Steam chrome (steam.exe / steamwebhelper
         // windows, including the main window left over from an interactive
@@ -615,7 +674,7 @@ final class Launcher {
             engine: engine,
             prefix: prefix,
             gamePattern: gamePattern,
-            onLog: { [weak self] msg in self?.currentActivity = msg }
+            onLog: { [weak self] msg in self?.setLaunchActivity(msg) }
         )
 
         appendLog("Waiting for game to start")
@@ -634,7 +693,7 @@ final class Launcher {
                 if validating != lastReportedValidating {
                     lastReportedValidating = validating
                     if validating {
-                        currentActivity = "Steam is validating \(game.name) before launch…"
+                        setLaunchActivity("Steam is validating \(game.name) before launch…")
                         appendLog("Steam queued a validation/update for \(game.name) (StateFlags=\(acfState.stateFlags))")
                     }
                 }
@@ -1009,6 +1068,51 @@ final class Launcher {
         }
         try fm.removeItem(atPath: acfPath)
         log.info("[uninstall] removed ACF: \(acfPath)")
+    }
+
+    // MARK: - Private: launch-stage mapping (Steam-boot overlay)
+
+    /// Ordered marker table mapping launch status strings → (icon, fraction).
+    /// FIRST match wins, so more specific markers must precede their
+    /// substrings (e.g. "through Steam" before "Launching"). Statuses come
+    /// from three sources — the pipeline itself, `SteamSession`'s `onStatus`
+    /// callbacks, and `GameProcess.onLog` — all funneled through
+    /// `setLaunchActivity`. Unrecognized statuses update only the message.
+    ///
+    /// MIRROR CONTRACT: mirrored in LaunchStageTests.stageForStatus.
+    static let launchStages: [(marker: String, icon: String, fraction: Double)] = [
+        ("Connecting to Steam",         "network",                     0.10),
+        ("Downloading Steam client",    "arrow.down.circle",           0.30),
+        ("Installing Steam",            "square.and.arrow.down",       0.20),
+        ("Opening Steam sign-in",       "person.crop.circle",          0.40),
+        ("Waiting for you to sign in",  "person.crop.circle",          0.45),
+        ("sign-in required",            "person.crop.circle",          0.40),
+        ("session expired",             "person.crop.circle",          0.40),
+        ("Starting Steam",              "lock.shield",                 0.55),
+        ("through Steam",               "play.circle",                 0.72),
+        ("validating",                  "arrow.triangle.2.circlepath", 0.78),
+        ("Waiting for Steam to start",  "hourglass",                   0.85),
+        ("Waiting for game to start",   "hourglass",                   0.90),
+        ("Game is running",             "checkmark.circle.fill",       1.00),
+        ("Preparing",                   "gear",                        0.05),
+        ("Launching",                   "play.circle",                 0.72),
+    ]
+
+    /// Sets `currentActivity` and, when the status matches a known marker,
+    /// advances the staged icon + fraction for the launch overlay.
+    private func setLaunchActivity(_ status: String) {
+        currentActivity = status
+        if let stage = Self.launchStages.first(where: { status.localizedCaseInsensitiveContains($0.marker) }) {
+            launchStageIcon = stage.icon
+            launchStageFraction = max(launchStageFraction, stage.fraction)
+        }
+    }
+
+    /// Resets the staged progress at the start of a launch attempt (and on
+    /// cancel/stop) so the next run's bar starts empty.
+    private func resetLaunchStage() {
+        launchStageIcon = "gear"
+        launchStageFraction = 0
     }
 
     // MARK: - Private: helpers
