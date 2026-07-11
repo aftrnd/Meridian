@@ -26,7 +26,6 @@
 		B0010026 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010027 /* LibraryView.swift */; };
 		B0010028 /* GameGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010029 /* GameGridView.swift */; };
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
-		B001002C /* LaunchGlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002D /* LaunchGlow.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
 		B0010034 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035 /* AppSettings.swift */; };
@@ -56,6 +55,7 @@
 		B00G0001 /* SteamSessionBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00G0002 /* SteamSessionBackup.swift */; };
 		B00H0001 /* SteamCredentialAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00H0002 /* SteamCredentialAuth.swift */; };
 		B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */; };
+		7D0D0A11C0DE4450800A0001 /* GameCompatibilityDB+Godot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */; };
 		D1D8B7DD549091BB2876CCA0 /* MeridianLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE30B92B1C3871B6B2870750 /* MeridianLog.swift */; };
 		D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */; };
 		DF364F39F87A4CEA949C0F22 /* MeridianNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */; };
@@ -69,6 +69,7 @@
 		341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Unity.swift"; sourceTree = "<group>"; };
 		37A6859B8A6D4761825E4A44 /* MeridianNotifications.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianNotifications.swift; sourceTree = "<group>"; };
 		3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Custom.swift"; sourceTree = "<group>"; };
+		7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Godot.swift"; sourceTree = "<group>"; };
 		46B315635523C0CF2D44F9BA /* CategoryStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CategoryStore.swift; sourceTree = "<group>"; };
 		4F62085FF69F4F208309DA56 /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
 		A66F49292F6617F1005601F4 /* app-icon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "app-icon.icon"; sourceTree = "<group>"; };
@@ -85,7 +86,6 @@
 		B0010027 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
 		B0010029 /* GameGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameGridView.swift; sourceTree = "<group>"; };
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
-		B001002D /* LaunchGlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchGlow.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
 		B0010035 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
@@ -235,7 +235,6 @@
 				B00E0061 /* SteamWebView.swift */,
 				B0010029 /* GameGridView.swift */,
 				B001002B /* GameDetailView.swift */,
-				B001002D /* LaunchGlow.swift */,
 				B00E0021 /* CachedAsyncImage.swift */,
 				B00E00C1 /* HeroArtViews.swift */,
 			);
@@ -297,6 +296,7 @@
 				D4965BA889D288764428E3E5 /* GameProfile.swift */,
 				341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */,
 				3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */,
+				7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */,
 				2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */,
 				A7C4E1F200000004 /* GameCompatibilityDB+Unreal.swift */,
 			);
@@ -464,7 +464,6 @@
 				B0010026 /* LibraryView.swift in Sources */,
 				B0010028 /* GameGridView.swift in Sources */,
 				B001002A /* GameDetailView.swift in Sources */,
-				B001002C /* LaunchGlow.swift in Sources */,
 				B00E00C0 /* HeroArtViews.swift in Sources */,
 				B00E0009 /* EngineSetupView.swift in Sources */,
 				B00E0020 /* CachedAsyncImage.swift in Sources */,
@@ -491,6 +490,7 @@
 				8B0812FC6BBB07573ED3A149 /* GameProfile.swift in Sources */,
 				22514C5D01E68E0515FA9EAA /* GameCompatibilityDB+Unity.swift in Sources */,
 				B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */,
+				7D0D0A11C0DE4450800A0001 /* GameCompatibilityDB+Godot.swift in Sources */,
 				D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */,
 				A7C4E1F200000001 /* GamePerformanceMonitor.swift in Sources */,
 				A7C4E1F200000003 /* GameCompatibilityDB+Unreal.swift in Sources */,
@@ -530,7 +530,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.9.14.0;
+				MARKETING_VERSION = 0.9.15.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.meridian.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -564,7 +564,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.9.14.0;
+				MARKETING_VERSION = 0.9.15.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.meridian.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_ALLOW_JIT = YES;

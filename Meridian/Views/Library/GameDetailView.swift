@@ -437,11 +437,12 @@ struct GameDetailView: View {
         VStack(alignment: .leading, spacing: GameDetailMetrics.horizontalPadding) {
             playButton
             compatStatusCard
-            // During `.launching` the in-place LaunchGlowButton carries the
-            // live status (HANDOFF-2026-07-03-v8 rev. 3); the inline
-            // StatusCard handles installing / downloading / running /
-            // stopping.
-            if isThisGameActive && !launcher.isLaunching {
+            // The inline StatusCard carries live status + progress for every
+            // busy phase — installing / downloading / launching / running /
+            // stopping. During `.launching` its bar shows the staged
+            // Steam-boot progress (same look as the download flow); the Play
+            // button above stays static.
+            if isThisGameActive {
                 StatusCard(game: currentGame, launcher: launcher, openWindow: openWindow)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .animation(.easeInOut(duration: 0.2), value: isThisGameActive)
@@ -922,11 +923,24 @@ struct GameDetailView: View {
             }
 
         case .launching:
-            // In-place launch glow (HANDOFF-2026-07-03-v8 rev. 3): the Play
-            // button becomes the loading surface — staged status text behind
-            // Liquid Glass with a comet of light orbiting the capsule.
+            // The Play button stays static during a launch (user direction
+            // Jul 3 2026: no in-place morphing, no game title in the button).
+            // Live status + staged progress render in the StatusCard below,
+            // matching the download flow's look.
             HStack(spacing: 8) {
-                LaunchGlowButton(game: currentGame, launcher: launcher)
+                Button {} label: {
+                    Label(launchModeUI == .online ? "Play Online" : "Play",
+                          systemImage: "play.fill")
+                        .font(.headline)
+                        .frame(
+                            minWidth: GameDetailMetrics.launchButtonMinWidth,
+                            minHeight: GameDetailMetrics.launchButtonHeight
+                        )
+                }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+                .disabled(true)
+
                 stopButton
             }
 
@@ -1005,8 +1019,10 @@ struct GameDetailView: View {
             // to the Liquid Glass prominent style on macOS 26+ so the mode
             // switch reads instantly. The chevron opens a teardrop popover
             // (same presentation as the Meridian Verified badge) with the
-            // cleaned-up mode picker.
-            HStack(spacing: 2) {
+            // cleaned-up mode picker. Spacing matches the Running/Stop and
+            // launching-state rows (8) so the split button reads as the same
+            // control family across all launch states.
+            HStack(spacing: 8) {
                 Button { handlePlayTapped() } label: {
                     // Offline is the default — a plain "Play". Only the
                     // Online opt-in earns a qualifier.
@@ -1342,33 +1358,65 @@ private struct LaunchModeRow: View {
 
 // MARK: - Status Card
 
+/// Shared HStack metrics for `BannerCompatBadge` (.card) and `StatusCard` so
+/// icons and text share one column grid in the launch section.
+private enum CompatCardRowMetrics {
+    static let hStackSpacing: CGFloat = 11
+    /// Leading symbol column — every row icon is centered here so dynamic
+    /// stage glyphs share the verified-badge centerline and text starts flush.
+    static let iconColumnWidth: CGFloat = 26
+    static let horizontalPadding: CGFloat = 12
+    static let verticalPadding: CGFloat = 10
+}
+
 private struct StatusCard: View {
     let game: Game
     let launcher: Launcher
     let openWindow: OpenWindowAction
 
+    /// Displayed launch fraction, eased toward the effective target (staged
+    /// fraction + gentle creep while a stage is in flight).
+    @State private var displayedLaunchFraction: Double = 0
+    @State private var stageReachedAt = Date()
+    @State private var lastStagedFraction: Double = 0
+    @State private var cardAppearedAt = Date()
+
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let progress = downloadProgressValue
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 10) {
+            let progress = progressValue
+            VStack(alignment: .leading, spacing: 8) {
+                // Center-aligned so the text block shares the icon's centerline —
+                // matches BannerCompatBadge's card row (default .center HStack).
+                HStack(alignment: .center, spacing: CompatCardRowMetrics.hStackSpacing) {
                     statusIcon
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 1) {
                         Text(statusMessage(at: context.date))
-                            .font(.subheadline)
+                            .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
+                            .id(statusMessage(at: context.date))
+                            .transition(.blurReplace)
+                            .animation(.easeInOut(duration: 0.25), value: statusMessage(at: context.date))
 
-                        if let elapsed = elapsedText(at: context.date) {
+                        if let subtitle = statusSubtitle(at: context.date) {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .id(subtitle)
+                                .transition(.blurReplace)
+                                .animation(.easeInOut(duration: 0.25), value: subtitle)
+                        } else if let elapsed = elapsedText(at: context.date) {
                             Text(elapsed)
-                                .font(.caption2)
+                                .font(.caption)
                                 .foregroundStyle(.tertiary)
                                 .monospacedDigit()
                         }
                     }
 
-                    Spacer()
+                    Spacer(minLength: 6)
 
                     Button {
                         openWindow(id: "launch-log")
@@ -1380,43 +1428,107 @@ private struct StatusCard: View {
                     .foregroundStyle(.secondary)
                     .help("Open launch log window")
                 }
-                .padding(.horizontal, 12)
-                .padding(.top, 12)
-                .padding(.bottom, progress == nil ? 12 : 0)
 
                 if let progress {
-                    CapsuleProgressBar(value: progress)
+                    HStack(spacing: 8) {
+                        CapsuleProgressBar(
+                            value: progress,
+                            label: launcher.isLaunching ? "Launch progress" : "Download progress"
+                        )
+                        .frame(maxWidth: .infinity)
                         .frame(height: 8)
-                        .padding(.top, 12)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 12)
+
+                        if launcher.isLaunching {
+                            Text("\(Int((min(max(progress, 0), 1) * 100).rounded()))%")
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .contentTransition(.numericText(value: progress))
+                        }
+                    }
+                    // Align bar start with the text column; fill to the card's trailing inset.
+                    .padding(.leading, CompatCardRowMetrics.iconColumnWidth + CompatCardRowMetrics.hStackSpacing)
+                    // Lift the bar off the card's bottom edge so it sits
+                    // concentric with the rounded corner instead of hugging it.
+                    .padding(.bottom, 3)
                 }
             }
+            .padding(.horizontal, CompatCardRowMetrics.horizontalPadding)
+            .padding(.vertical, CompatCardRowMetrics.verticalPadding)
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
         }
+        .onAppear {
+            cardAppearedAt = Date()
+            stageReachedAt = Date()
+            lastStagedFraction = launcher.launchStageFraction
+            easeLaunchFraction(to: effectiveLaunchTarget(at: Date()))
+        }
+        .onChange(of: launcher.launchStageFraction) { _, newValue in
+            if newValue > lastStagedFraction {
+                lastStagedFraction = newValue
+                stageReachedAt = Date()
+            }
+            easeLaunchFraction(to: effectiveLaunchTarget(at: Date()))
+        }
+        .task(id: launcher.isLaunching) {
+            guard launcher.isLaunching else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                easeLaunchFraction(to: effectiveLaunchTarget(at: Date()))
+            }
+        }
     }
 
-    private var downloadProgressValue: Double? {
-        launcher.isInstalling ? launcher.downloadProgress : nil
+    /// Staged fraction plus a gentle creep while the current stage is in
+    /// flight — keeps the bar moving during a 20 s Steam boot even when
+    /// connection_log markers arrive in bursts.
+    private func effectiveLaunchTarget(at date: Date) -> Double {
+        let staged = launcher.launchStageFraction
+        let stallSeconds = date.timeIntervalSince(stageReachedAt)
+        let creep = min(stallSeconds * 0.005, 0.14)
+        return min(staged + creep, 0.92)
+    }
+
+    private var progressValue: Double? {
+        if launcher.isInstalling { return launcher.downloadProgress }
+        if launcher.isLaunching { return displayedLaunchFraction }
+        return nil
+    }
+
+    /// Animates the displayed launch bar toward the target. Monotonic only.
+    private func easeLaunchFraction(to target: Double) {
+        let clamped = min(max(target, 0), 1)
+        guard clamped > displayedLaunchFraction else { return }
+        withAnimation(.easeOut(duration: 0.55)) {
+            displayedLaunchFraction = clamped
+        }
     }
 
     @ViewBuilder
     private var statusIcon: some View {
-        switch launcher.launchState {
-        case .running:
-            Image(systemName: "checkmark.circle.fill")
-                .font(.body)
-                .foregroundStyle(.green)
-        case .stopping:
-            Image(systemName: "stop.circle")
-                .font(.body)
-                .foregroundStyle(.secondary)
-        default:
-            ProgressView()
-                .scaleEffect(0.6)
-                .frame(width: 18, height: 18)
+        Group {
+            switch launcher.launchState {
+            case .running:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            case .stopping:
+                Image(systemName: "stop.circle")
+                    .foregroundStyle(.secondary)
+            case .launching:
+                Image(systemName: launcher.launchStageIcon)
+                    .foregroundStyle(Color.accentColor)
+                    .symbolEffect(.pulse, options: .repeating.speed(0.35))
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(.snappy(duration: 0.35), value: launcher.launchStageIcon)
+            default:
+                Image(systemName: "arrow.down.circle")
+                    .foregroundStyle(Color.accentColor)
+            }
         }
+        .font(.title2.weight(.semibold))
+        .symbolRenderingMode(.hierarchical)
+        .frame(width: CompatCardRowMetrics.iconColumnWidth, alignment: .center)
     }
 
     private func statusMessage(at date: Date) -> String {
@@ -1424,8 +1536,7 @@ private struct StatusCard: View {
         case .installing, .downloading:
             return launcher.currentActivity ?? "Preparing download…"
         case .launching:
-            if let last = launcher.logs.last, !last.isEmpty { return last }
-            return "Launching \(game.name)…"
+            return launcher.currentActivity ?? "Getting Steam ready…"
         case .running:
             return "\(game.name) is running"
         case .stopping:
@@ -1433,6 +1544,52 @@ private struct StatusCard: View {
         default:
             return launcher.currentActivity ?? "Working…"
         }
+    }
+
+    /// One-line context under the primary status — makes the wait feel
+    /// purposeful rather than a generic spinner.
+    private func statusSubtitle(at date: Date) -> String? {
+        guard launcher.isLaunching else { return nil }
+        let activity = launcher.currentActivity ?? ""
+        let elapsed = Int(date.timeIntervalSince(cardAppearedAt))
+
+        if activity.contains("Steam is ready") {
+            return "Signed in — launching your game next"
+        }
+        if activity.contains("Finishing sign-in") {
+            return "Valve confirmed your session"
+        }
+        if activity.contains("Signing in to your Steam account") {
+            return "Using your saved Steam session"
+        }
+        if activity.contains("Connected to Steam servers") {
+            return "Online with Valve — authenticating now"
+        }
+        if activity.contains("Connecting to Steam servers") {
+            return elapsed >= 8 ? "First launch can take up to 30 seconds" : "Looking for Valve login servers"
+        }
+        if activity.contains("Starting Steam client") || activity.contains("Starting Steam") {
+            return elapsed >= 6 ? "Waking Steam in the background — no windows will appear" : "Launching the Steam client silently"
+        }
+        if activity.contains("Steam is updating itself") {
+            return "Applying a quick client update, then continuing"
+        }
+        if activity.contains("Downloading Steam client") {
+            return "One-time setup — only needed for Play Online"
+        }
+        if activity.contains("through Steam") {
+            return "Steam is handing off to the game"
+        }
+        if activity.contains("validating") {
+            return "Steam is checking your install — this finishes on its own"
+        }
+        if activity.contains("Waiting for game") {
+            return "Almost there"
+        }
+        if activity.contains("Connecting to Steam") {
+            return "Preparing the online launch path"
+        }
+        return elapsed >= 10 ? "Still working — check Logs if this takes over a minute" : nil
     }
 
     private func elapsedText(at date: Date) -> String? {
@@ -1448,6 +1605,7 @@ private struct StatusCard: View {
 
 private struct CapsuleProgressBar: View {
     let value: Double
+    var label: String = "Download progress"
 
     var body: some View {
         GeometryReader { proxy in
@@ -1462,7 +1620,7 @@ private struct CapsuleProgressBar: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Download progress")
+        .accessibilityLabel(label)
         .accessibilityValue("\(Int(min(max(value, 0), 1) * 100)) percent")
     }
 }
@@ -1875,11 +2033,12 @@ private struct BannerCompatBadge: View {
 
     private var cardBody: some View {
         Button { showingPopover.toggle() } label: {
-            HStack(spacing: 11) {
+            HStack(spacing: CompatCardRowMetrics.hStackSpacing) {
                 Image(systemName: icon)
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(color)
                     .symbolRenderingMode(.hierarchical)
+                    .frame(width: CompatCardRowMetrics.iconColumnWidth, alignment: .center)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(statusTitle)
@@ -1896,8 +2055,8 @@ private struct BannerCompatBadge: View {
                     .font(.callout)
                     .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.horizontal, CompatCardRowMetrics.horizontalPadding)
+            .padding(.vertical, CompatCardRowMetrics.verticalPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
             .overlay(

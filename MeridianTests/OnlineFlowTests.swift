@@ -221,6 +221,20 @@ final class OnlineFlowTests: XCTestCase {
                       "the short post-Connected deadline must only apply BEFORE logon activity is seen (Bug E: 12 s killed a working silent auth)")
     }
 
+    func testWaitForLoggedOn_reportsStagesToCaller() throws {
+        let src = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(src.contains("onStatus: (@MainActor (String) -> Void)? = nil"),
+                      "waitForLoggedOn must accept an onStatus callback for launch-card progress")
+        XCTAssertTrue(src.contains("report(\"Starting Steam client"),
+                      "waitForLoggedOn must report the first boot stage immediately")
+        XCTAssertTrue(src.contains("report(\"Connected to Steam servers\")"),
+                      "waitForLoggedOn must report when Valve connectivity succeeds")
+        XCTAssertTrue(src.contains("report(\"Signing in to your Steam account"),
+                      "waitForLoggedOn must report credentialed logon activity")
+        XCTAssertTrue(src.contains("func start(engine: WineEngine, onStatus:"),
+                      "start() must forward onStatus into waitForLoggedOn")
+    }
+
     func testWebhelperHeuristic_isSessionScoped() throws {
         let src = try readSource("Meridian/Steam/SteamSession.swift")
         XCTAssertTrue(src.contains("webhelperLogOffset"),

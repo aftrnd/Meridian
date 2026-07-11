@@ -85,7 +85,7 @@ final class SteamSession {
     /// (ssfn token or loginusers.vdf). If Steam can auth silently from its
     /// own on-disk state (ssfn, local.vdf) it succeeds in ~5-10 s.
     /// If not, fails after 12 s → state = .failed → sign-in sheet recovers.
-    func start(engine: WineEngine) async {
+    func start(engine: WineEngine, onStatus: (@MainActor (String) -> Void)? = nil) async {
         switch state {
         case .running:
             log.info("[start] already running — skip")
@@ -110,9 +110,11 @@ final class SteamSession {
             let loggedOn = await waitForLoggedOn(
                 engine: engine,
                 timeout: .seconds(60),
-                authTimeout: .seconds(12)
+                authTimeout: .seconds(12),
+                onStatus: onStatus
             )
             if loggedOn {
+                onStatus?("Steam is ready")
                 state = .running(pid: pid_t(pid))
                 log.info("[start] silent auth succeeded ✓ pid=\(pid)")
                 // Begin watching the long-running steam.exe so we can transparently
@@ -204,7 +206,7 @@ final class SteamSession {
 
         // 4. Start steam.exe -silent + wait for [Logged On,].
         onStatus?("Starting Steam…")
-        await start(engine: engine)
+        await start(engine: engine, onStatus: onStatus)
         guard isReady else {
             // start() already logged steam.exe diagnostics on the failure path.
             throw SessionError.steamNotReady
@@ -1114,7 +1116,15 @@ final class SteamSession {
     /// credentialed logon" window (fresh user, no session on disk — fail fast
     /// to the sign-in sheet). Once credentialed logon activity is observed,
     /// only the overall `timeout` and the explicit rejection markers apply.
-    private func waitForLoggedOn(engine: WineEngine, timeout: Duration, authTimeout: Duration) async -> Bool {
+    ///
+    /// `onStatus` emits human-readable stages as connection_log markers
+    /// appear so the launch card never sits on one message for 20+ s.
+    private func waitForLoggedOn(
+        engine: WineEngine,
+        timeout: Duration,
+        authTimeout: Duration,
+        onStatus: (@MainActor (String) -> Void)? = nil
+    ) async -> Bool {
         let connLogPath = prefix.steamInstallDir
             .appending(path: "logs/connection_log.txt")
             .path(percentEncoded: false)
@@ -1123,6 +1133,14 @@ final class SteamSession {
         var connectedAt: ContinuousClock.Instant?
         var logonActivitySeen = false
         var poll = 0
+        var lastReportedStage = ""
+        func report(_ message: String) {
+            guard message != lastReportedStage else { return }
+            lastReportedStage = message
+            onStatus?(message)
+        }
+
+        report("Starting Steam client…")
 
         while ContinuousClock.now - started < timeout {
             if Task.isCancelled { return false }
@@ -1135,6 +1153,7 @@ final class SteamSession {
                     // Steam self-update restart — keep waiting.
                     log.info("[waitForLoggedOn] code=42 self-update restart, continuing…")
                     persistentProcess = nil
+                    report("Steam is updating itself…")
                 } else {
                     log.error("[waitForLoggedOn] steam.exe exited code=\(code)")
                     return false
@@ -1157,9 +1176,18 @@ final class SteamSession {
                 return false
             }
 
-            if !logonActivitySeen, Self.hasCredentialedLogonActivity(content) {
+            // User-facing stages — most advanced marker wins (fail-fast: observable
+            // signals from connection_log, not wall-clock guesses).
+            if content.contains("RecvMsgClientLogOnResponse") && content.contains("'OK'") {
+                report("Finishing sign-in…")
+            } else if !logonActivitySeen, Self.hasCredentialedLogonActivity(content) {
                 logonActivitySeen = true
                 log.info("[waitForLoggedOn] credentialed logon in progress — extending deadline to overall timeout")
+                report("Signing in to your Steam account…")
+            } else if connectedAt != nil {
+                report("Connected to Steam servers")
+            } else if persistentProcess?.isRunning == true, poll > 4 {
+                report("Connecting to Steam servers…")
             }
 
             if connectedAt == nil, content.contains("Connectivity test: result=Connected") {

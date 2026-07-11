@@ -28,7 +28,7 @@ import Observation
 /// - `GameCompatibilityDB+Unreal.swift`  → all Unreal Engine games
 /// - `GameCompatibilityDB+Source.swift`  → all Source engine games
 /// - `GameCompatibilityDB+Custom.swift`  → custom/proprietary engine games
-/// - Future: `+Godot.swift`, etc.
+/// - `GameCompatibilityDB+Godot.swift`   → all Godot games
 ///
 /// Factory methods on `GameProfile` encode engine-specific defaults. Changing
 /// a factory (e.g. `.unity()`) updates every game of that engine type at once.
@@ -42,7 +42,7 @@ final class GameCompatibilityDB {
     /// Merges all per-engine extension arrays into a single list.
     /// Add new engine categories here as a single additional term.
     private static var allProfiles: [GameProfile] {
-        unityProfiles + unrealProfiles + sourceEngineProfiles + customEngineProfiles
+        unityProfiles + unrealProfiles + sourceEngineProfiles + customEngineProfiles + godotProfiles
     }
 
     /// All known game profiles, keyed by appID for O(1) lookup at launch time.

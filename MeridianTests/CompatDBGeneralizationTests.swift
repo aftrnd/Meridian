@@ -28,6 +28,35 @@ final class CompatDBGeneralizationTests: XCTestCase {
                       "GameProfile must expose the .unreal() engine-level factory.")
     }
 
+    func testGodotProfilesFile_existsAndIsWired() throws {
+        let dbFile = try readSource("Meridian/Engine/GameCompatibilityDB+Godot.swift")
+        XCTAssertTrue(dbFile.contains("static let godotProfiles: [GameProfile]"),
+                      "GameCompatibilityDB+Godot.swift must declare godotProfiles.")
+
+        let db = try readSource("Meridian/Engine/GameCompatibilityDB.swift")
+        XCTAssertTrue(db.contains("godotProfiles"),
+                      "allProfiles must include godotProfiles so Godot entries are loaded.")
+
+        let profile = try readSource("Meridian/Engine/GameProfile.swift")
+        XCTAssertTrue(profile.contains("static func godot("),
+                      "GameProfile must expose the .godot() engine-level factory.")
+    }
+
+    /// Guard for the Godot Forward+ black-square fix (godotengine/godot#104168,
+    /// #121201): Idols of Ash must avoid the Vulkan clustered-light path that
+    /// mis-renders on Apple Silicon. Forward Mobile was tried first and broke
+    /// the 3D scene entirely (user-verified July 11 2026), so the profile pins
+    /// the OpenGL Compatibility renderer instead.
+    func testIdolsOfAsh_avoidsForwardPlusClusteredRenderer() throws {
+        let dbFile = try readSource("Meridian/Engine/GameCompatibilityDB+Godot.swift")
+        XCTAssertTrue(dbFile.contains("appID: 4450800"),
+                      "Idols of Ash (4450800) must have a Godot compat profile.")
+        XCTAssertTrue(dbFile.contains("\"--rendering-method\", \"gl_compatibility\""),
+                      "Idols of Ash must launch with the gl_compatibility rendering method to avoid Forward+ clustered-light black squares on Apple Silicon.")
+        XCTAssertFalse(dbFile.contains("\"--rendering-method\", \"mobile\""),
+                       "Forward Mobile is known-broken for this game (3D scene renders black) — do not reintroduce it.")
+    }
+
     // MARK: - Performance ranking (mirror of GameCompatibilityDB.performanceScore)
 
     private func statusWeight(_ status: String) -> Double {

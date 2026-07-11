@@ -228,6 +228,37 @@ struct GameProfile {
         )
     }
 
+    /// Godot game preset.
+    /// Defaults: graphicsAPI=.vulkan (Godot 4 Forward+/Mobile render via Vulkan →
+    /// MoltenVK → Metal; no D3D translation layer involved).
+    static func godot(
+        appID: Int,
+        name: String,
+        status: CompatStatus = .untested,
+        graphicsAPI: GraphicsAPI = .vulkan,
+        dxmtMode: DXMTMode = .auto,
+        dllOverrides: String? = nil,
+        extraEnv: [String: String] = [:],
+        preferD3DMetal: Bool = false,
+        enableDLSSBridge: Bool = false,
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
+        verifiedWith: String? = nil,
+        notes: String
+    ) -> GameProfile {
+        GameProfile(
+            appID: appID, name: name,
+            gameEngine: .godot, graphicsAPI: graphicsAPI, status: status,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
+            extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, enableDLSSBridge: enableDLSSBridge, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
+            verifiedWith: verifiedWith, notes: notes
+        )
+    }
+
     static func source(
         appID: Int,
         name: String,
