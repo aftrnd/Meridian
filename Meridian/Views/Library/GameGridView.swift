@@ -394,36 +394,55 @@ struct CardLayoutMetrics {
     /// Fraction of the adjacent card that "peeks" at each scroll edge.
     static let peekFraction: CGFloat = 0.2
 
+    /// The content-column width at the app's DEFAULT window size
+    /// (AppDelegate.fullFrameSize 1030 − sidebar 220). The column-count step
+    /// anchors to this so the default window always shows the canonical
+    /// 5-columns + peek layout.
+    static let defaultContentWidth: CGFloat = 810
+
+    /// The card size at the default window (5 columns + peek at
+    /// `defaultContentWidth`, ≈128 pt). This is the ANCHOR for the column
+    /// step: a new column is added roughly every time another default-size
+    /// card would fit — so the default layout is exactly reproduced and
+    /// resizing feels proportional around it.
+    static var referenceCardWidth: CGFloat {
+        (defaultContentWidth - 6 * spacing) / (5 + 2 * peekFraction)
+    }
+
     /// Derives layout metrics for the given container width.
+    ///
+    /// STEPPED-PROPORTIONAL model (July 12 2026, settled): cards resize
+    /// naturally to fill the width, but the column count steps with the
+    /// window — anchored to the default-size card step so the DEFAULT window
+    /// yields exactly 5 columns at the reference size. Spacing and the
+    /// peek-slice treatment are constant at every size. Home rows clamp to
+    /// 3…5 columns; the library grid allows up to 8.
     ///
     /// - Parameters:
     ///   - containerWidth: Available width of the scroll view or grid container.
-    ///   - maxCards:       Upper bound on visible column count (default 8,
-    ///                     matching the TV app's full-screen maximum).
-    ///   - minCards:       Lower bound on visible column count (default 5).
-    ///                     The window simply shows smaller cards rather than
-    ///                     dropping below 5 columns.
+    ///   - maxCards:       Upper bound on visible column count.
+    ///   - minCards:       Lower bound on visible column count.
     static func compute(
         for containerWidth: CGFloat,
         maxCards: Int = 8,
-        minCards: Int = 5
+        minCards: Int = 3
     ) -> CardLayoutMetrics {
         let s = spacing
         let p = peekFraction
 
         guard containerWidth > 0 else {
-            let w: CGFloat = 155
-            return CardLayoutMetrics(cardWidth: w, visibleCount: minCards, leadingPadding: s + p * w)
+            let w = referenceCardWidth
+            return CardLayoutMetrics(cardWidth: w, visibleCount: 5, leadingPadding: s + p * w)
         }
 
-        // Pick N by anchoring to a target card width so the column count steps
-        // predictably with window size (rather than always maximising columns).
-        let targetWidth: CGFloat = 155
-        let rawN = Int(floor(containerWidth / (targetWidth + s)))
+        // Column count anchored to the default card step: floor(810 / 147.8)
+        // = 5 at the default width, stepping down/up as the window shrinks
+        // or grows.
+        let rawN = Int(floor(containerWidth / (referenceCardWidth + s)))
         let n = min(max(rawN, minCards), maxCards)
 
-        // No minimum card width clamp — cards shrink evenly when the window
-        // is narrow rather than reducing the column count below minCards.
+        // Proportional fit: n full cards + the peek slice fill the width
+        // exactly, with constant spacing.
         let w = (containerWidth - CGFloat(n + 1) * s) / (CGFloat(n) + 2 * p)
         let lp = s + p * w
         return CardLayoutMetrics(cardWidth: w, visibleCount: n, leadingPadding: lp)

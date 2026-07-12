@@ -33,6 +33,32 @@ struct ContentView: View {
     /// Guards the onAppear setup check so it runs exactly once per app session.
     @State private var hasCheckedSetup = false
     @State private var showingDownloadsPopover = false
+    @State private var showFriendsPanel = false
+    /// Detail-column width measured while the panel is CLOSED (the frozen
+    /// full-width layout the panel will cover).
+    @State private var detailFullWidth: CGFloat = 0
+
+    /// Friends panel width, derived from the frozen Home layout: the panel's
+    /// leading edge lands exactly at the row's natural "3 full cards + the
+    /// standard trailing peek of the 4th" boundary — the same edge treatment
+    /// the row has at the window edge when the panel is closed. Nothing in
+    /// the content ever moves or resizes; the panel is sized to make the
+    /// covered state look native (user direction July 12 2026).
+    private var friendsPanelWidth: CGFloat {
+        let w = detailFullWidth
+        guard w > 400 else { return 280 }
+        // Same 3…5 clamp as the Home rows so the panel edge math matches
+        // the actual row layout.
+        let m = CardLayoutMetrics.compute(for: w, maxCards: 5)
+        let cardStep = m.cardWidth + CardLayoutMetrics.spacing
+        let peek = CardLayoutMetrics.peekFraction * m.cardWidth
+        let minPanel: CGFloat = 240
+        // Most full cards we can keep visible while leaving >= minPanel for
+        // the panel (3 at the default window size; scales up on wide windows).
+        let k = max(3, Int(floor((w - minPanel - m.leadingPadding - peek) / cardStep)))
+        let visible = m.leadingPadding + CGFloat(k) * cardStep + peek
+        return max(w - visible, minPanel)
+    }
 
     var body: some View {
         Group {
@@ -144,6 +170,51 @@ struct ContentView: View {
                                 onSelectGame: { selectedGame = $0 }
                             )
                         }
+                        ToolbarItem(placement: .automatic) {
+                            Button {
+                                // One transaction for the inspector slide AND
+                                // the friendsPanelOpen-driven row re-layout —
+                                // without this the cards snap to their new
+                                // metrics instantly while the panel is still
+                                // sliding, which reads as jank.
+                                withAnimation(.snappy(duration: 0.28)) {
+                                    showFriendsPanel.toggle()
+                                }
+                            } label: {
+                                // Unstyled symbol — the toolbar applies the
+                                // same size/weight as the system items (e.g.
+                                // the sidebar toggle), so the icon weights
+                                // match across the strip. Plural glyph for
+                                // the friends list; outline, no fill.
+                                Image(systemName: "person.2")
+                            }
+                            // No buttonStyle override — macOS supplies the
+                            // toolbar circle / liquid glass, same as Downloads.
+                            .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
+                        }
+                    }
+                    // Discord-style trailing friends panel. Standard macOS
+                    // inspector behaviour: the window frame never changes —
+                    // content compresses in place (Apple Music lyrics-style).
+                    // Home's scroll rows read \.friendsPanelOpen and drop to
+                    // fewer, full-size cards instead of squeezing all five.
+                    .inspector(isPresented: $showFriendsPanel) {
+                        FriendsPanel()
+                            // Pinned to the computed cover width so the panel
+                            // edge lands exactly on the row's natural
+                            // 3-cards + peek boundary.
+                            .inspectorColumnWidth(
+                                min: friendsPanelWidth,
+                                ideal: friendsPanelWidth,
+                                max: friendsPanelWidth
+                            )
+                    }
+                    .environment(\.friendsPanelOpen, showFriendsPanel)
+                    .environment(\.friendsPanelCoverWidth, showFriendsPanel ? friendsPanelWidth : 0)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
+                        // Only track while closed — this is the width the
+                        // frozen layout (and thus the panel size) is based on.
+                        if !showFriendsPanel { detailFullWidth = newWidth }
                     }
             }
         }

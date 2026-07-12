@@ -10,6 +10,12 @@ final class SteamLibraryStore {
     private(set) var games: [Game] = []
     private(set) var recentGames: [Game] = []
     private(set) var friendSummaries: [PlayerSummary] = []
+    /// The signed-in user's own profile summary — drives the "you" header in
+    /// the friends panel (avatar + persona status, same data shape as friends).
+    private(set) var ownSummary: PlayerSummary?
+    /// steamID → date the friendship was created (from GetFriendList's
+    /// friend_since). Shown in the friend detail popover.
+    private(set) var friendsSince: [String: Date] = [:]
     private(set) var isLoading: Bool = false
     private(set) var loadError: String?
     private(set) var lastRefreshed: Date?
@@ -519,11 +525,19 @@ final class SteamLibraryStore {
         games.filter { settings.isFavorite(appID: $0.id) }
     }
 
-    /// Fetches friend list and their profile summaries.
+    /// Fetches friend list and their profile summaries, plus the user's own
+    /// summary (piggybacked into the first batch — no extra request).
     func fetchFriendsActivity(steamID: String, apiKey: String) async {
         do {
             let friends = try await SteamAPIService.shared.fetchFriendList(steamID: steamID, apiKey: apiKey)
-            let ids = friends.map(\.steamID)
+            friendsSince = Dictionary(
+                uniqueKeysWithValues: friends.compactMap { f in
+                    f.friendSinceDate.map { (f.steamID, $0) }
+                }
+            )
+            // Own steamID rides along so the friends panel header shows the
+            // user's live persona state without a separate request.
+            let ids = [steamID] + friends.map(\.steamID)
 
             var allSummaries: [PlayerSummary] = []
             for batch in ids.chunked(into: 100) {
@@ -531,8 +545,11 @@ final class SteamLibraryStore {
                 allSummaries.append(contentsOf: summaries)
             }
 
-            friendSummaries = allSummaries.sorted { $0.activitySortOrder < $1.activitySortOrder }
-            log.info("[fetchFriendsActivity] loaded \(allSummaries.count) friend summaries")
+            ownSummary = allSummaries.first { $0.steamID == steamID }
+            friendSummaries = allSummaries
+                .filter { $0.steamID != steamID }
+                .sorted { $0.activitySortOrder < $1.activitySortOrder }
+            log.info("[fetchFriendsActivity] loaded \(self.friendSummaries.count) friend summaries (own profile: \(self.ownSummary != nil))")
         } catch {
             log.error("[fetchFriendsActivity] failed: \(error.localizedDescription)")
         }

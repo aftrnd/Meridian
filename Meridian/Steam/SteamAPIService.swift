@@ -98,6 +98,19 @@ actor SteamAPIService {
         return friends
     }
 
+    /// Fetches a player's Steam community level (public profiles only).
+    /// One request per player — call lazily (e.g. when a friend detail view
+    /// opens), never for a whole friend list at once.
+    func fetchSteamLevel(steamID: String, apiKey: String) async throws -> Int? {
+        log.info("[fetchSteamLevel] steamID=\(steamID)")
+        let url = try buildURL(
+            path: "/IPlayerService/GetSteamLevel/v1/",
+            params: ["key": apiKey, "steamid": steamID]
+        )
+        let envelope: SteamLevelEnvelope = try await get(url)
+        return envelope.response.playerLevel
+    }
+
     /// Batch-fetches player summaries for up to 100 Steam IDs at once.
     func fetchPlayerSummaries(steamIDs: [String], apiKey: String) async throws -> [PlayerSummary] {
         guard !steamIDs.isEmpty else { return [] }
@@ -572,6 +585,14 @@ private struct FriendListEnvelope: Decodable {
         let friends: [SteamFriend]
     }
     let friendslist: FriendsList
+}
+
+private struct SteamLevelEnvelope: Decodable {
+    struct Response: Decodable {
+        let playerLevel: Int?
+        enum CodingKeys: String, CodingKey { case playerLevel = "player_level" }
+    }
+    let response: Response
 }
 
 private struct OwnedGamesEnvelope: Decodable {

@@ -35,6 +35,7 @@
 		B00A0001 /* GameArtOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00A0002 /* GameArtOverrides.swift */; };
 		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
 		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
+		7D0F0A11ABCDEF0000000001 /* FriendsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */; };
 		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B00E0001 /* WineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0002 /* WineEngine.swift */; };
 		B00E0003 /* WinePrefix.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0004 /* WinePrefix.swift */; };
@@ -99,6 +100,7 @@
 		B00A0002 /* GameArtOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameArtOverrides.swift; sourceTree = "<group>"; };
 		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
 		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
+		7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FriendsPanel.swift; sourceTree = "<group>"; };
 		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B00E0002 /* WineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineEngine.swift; sourceTree = "<group>"; };
 		B00E0004 /* WinePrefix.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WinePrefix.swift; sourceTree = "<group>"; };
@@ -211,6 +213,7 @@
 				B00E0071 /* HomeView.swift */,
 				B0010049 /* Library */,
 				B00D0003 /* Downloads */,
+				7D0F0A33ABCDEF0000000003 /* Friends */,
 				B00E0011 /* Engine */,
 				B004004B /* Settings */,
 				B004004C /* Auth */,
@@ -279,6 +282,14 @@
 				B00D0002 /* DownloadsToolbarButton.swift */,
 			);
 			path = Downloads;
+			sourceTree = "<group>";
+		};
+		7D0F0A33ABCDEF0000000003 /* Friends */ = {
+			isa = PBXGroup;
+			children = (
+				7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */,
+			);
+			path = Friends;
 			sourceTree = "<group>";
 		};
 		B00E0010 /* Engine */ = {
@@ -478,6 +489,7 @@
 				B00E0040 /* TerminationCleanup.swift in Sources */,
 				B00E0050 /* SearchView.swift in Sources */,
 				B00D0001 /* DownloadsToolbarButton.swift in Sources */,
+				7D0F0A11ABCDEF0000000001 /* FriendsPanel.swift in Sources */,
 				B00E0060 /* SteamWebView.swift in Sources */,
 				31BBDC1F93444D77B811A589 /* BootstrapManager.swift in Sources */,
 				9005918A74DB42729238EB11 /* SplashView.swift in Sources */,
@@ -530,7 +542,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.9.15.0;
+				MARKETING_VERSION = 0.9.16.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.meridian.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -564,7 +576,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				MARKETING_VERSION = 0.9.15.0;
+				MARKETING_VERSION = 0.9.16.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.meridian.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_ALLOW_JIT = YES;

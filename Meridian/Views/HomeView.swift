@@ -9,6 +9,10 @@ struct HomeView: View {
     @Binding var selectedGame: Game?
 
     @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(\.friendsPanelOpen) private var friendsPanelOpen
+    /// Trailing width covered by the friends panel — shifts edge-anchored
+    /// chevrons inward so they stay visible at the panel edge.
+    @Environment(\.friendsPanelCoverWidth) private var coverWidth
 
     @State private var carouselIndex: Int = 0
     @State private var carouselTimer: Timer?
@@ -16,12 +20,38 @@ struct HomeView: View {
     /// Measured on homeContent so all fixed-position elements share the same
     /// leading inset as the GameScrollRow section titles and cards.
     @State private var contentWidth: CGFloat = 0
+    /// Width captured the instant the friends panel opens (final design after
+    /// three iterations — history in FriendsPanelTests):
+    /// - The HERO stays pixel-locked at this width; the panel covers its
+    ///   trailing edge. It never moves or rescales.
+    /// - The GAME ROWS re-fit to the visible strip (locked − panel width) via
+    ///   `rowLayoutWidth` — a computed TARGET, not per-frame geometry — so
+    ///   they re-layout exactly once, animated inside the toggle transaction,
+    ///   showing 3 full cards with the standard trailing peek at the panel
+    ///   edge ("the exact spacing it would have if it wasn't there").
+    @State private var lockedWidth: CGFloat?
+    /// Invalidates any pending deferred lock release when the panel is
+    /// re-toggled mid-animation.
+    @State private var panelTransitionGeneration = 0
+
+    /// FINAL DESIGN (4th iteration — history in FriendsPanelTests): while the
+    /// friends panel is open, the ENTIRE Home layout is frozen at its
+    /// pre-open width. Nothing moves, nothing resizes — the panel covers the
+    /// trailing edge. ContentView sizes the panel so its edge lands exactly
+    /// at the row's natural 3-full-cards + peek boundary, so the covered
+    /// state looks intentional, not sliced mid-card.
+    private var rowLayoutWidth: CGFloat { lockedWidth ?? contentWidth }
+
     private var leadingInset: CGFloat {
-        CardLayoutMetrics.compute(for: contentWidth).leadingPadding
+        // Same 3…5 column clamp as the rows so insets always line up.
+        CardLayoutMetrics.compute(for: rowLayoutWidth, maxCards: 5).leadingPadding
     }
 
+    /// Hero shares the frozen layout width.
+    private var heroInset: CGFloat { leadingInset }
+
     private static let sectionSpacing: CGFloat = 28
-    private static let carouselCount = 3
+    private static let carouselCount = 5
     private static let carouselInterval: TimeInterval = 20
 
     private var carouselGames: [Game] {
@@ -82,6 +112,8 @@ struct HomeView: View {
                     GameScrollRow(
                         title: "Recently Played",
                         games: Array(library.recentlyPlayedGames.prefix(20)),
+                        layoutWidth: rowLayoutWidth,
+                        trailingObscured: coverWidth,
                         selectedGameID: selectedGame?.id,
                         isFavorite: { library.isFavorite(appID: $0) },
                         gameState: gameState(for:),
@@ -98,6 +130,8 @@ struct HomeView: View {
                     GameScrollRow(
                         title: "Favorites",
                         games: library.favoriteGames,
+                        layoutWidth: rowLayoutWidth,
+                        trailingObscured: coverWidth,
                         selectedGameID: selectedGame?.id,
                         isFavorite: { _ in true },
                         showFavoriteBadge: false,
@@ -109,10 +143,41 @@ struct HomeView: View {
 
                 Spacer(minLength: Self.sectionSpacing)
             }
+            // Freeze the whole layout at its pre-open width while the panel
+            // is open — the panel covers the trailing edge. The outer frame's
+            // EXPLICIT minWidth 0 stops the fixed width from propagating up
+            // as a window minimum (AppKit grew the window without it), and
+            // .leading stops the vertical ScrollView from centering the
+            // oversized child (which cropped both edges equally).
+            .frame(width: lockedWidth, alignment: .leading)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .ignoresSafeArea(edges: [.top, .bottom])
         .scrollIndicators(.hidden)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
+            // While locked, ignore the animated intermediate widths — the
+            // layout is frozen, nothing should chase the transition.
+            if lockedWidth == nil { contentWidth = newWidth }
+        }
+        .onChange(of: friendsPanelOpen) { _, open in
+            panelTransitionGeneration += 1
+            if open {
+                // Capture BEFORE the layout pass shrinks the column (onChange
+                // fires on the env flip, while contentWidth still holds the
+                // full-width measurement).
+                lockedWidth = contentWidth
+            } else {
+                // Keep the layout frozen through the close slide — it is
+                // already the final full-width layout, so the panel simply
+                // reveals it with zero per-frame re-layout. Release the lock
+                // (a visual no-op) once the animation is done.
+                let generation = panelTransitionGeneration
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                    guard generation == panelTransitionGeneration else { return }
+                    lockedWidth = nil
+                }
+            }
+        }
     }
 
     // MARK: - Update Banner
@@ -176,7 +241,7 @@ struct HomeView: View {
                     urls: game.newCDNLogoURLs + [game.logoURL] + game.logoURLFallbacks,
                     fallbackName: game.name
                 )
-                .padding(.leading, leadingInset)
+                .padding(.leading, heroInset)
                 .padding(.trailing, 24)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .id(game.id)
@@ -219,7 +284,7 @@ struct HomeView: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                 }
-                .padding(.leading, leadingInset)
+                .padding(.leading, heroInset)
                 .padding(.trailing, 24)
                 .padding(.bottom, 26.75)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -234,6 +299,11 @@ struct HomeView: View {
                         .padding(.bottom, 12)
                 }
                 .frame(maxWidth: .infinity)
+                // Re-center the page dots within the VISIBLE strip while the
+                // friends panel covers the trailing edge (they're laid out in
+                // the full locked hero width, so without this they sit
+                // off-center between the sidebar and the panel).
+                .offset(x: -coverWidth / 2)
             }
         }
         .overlay(alignment: .leading) {
@@ -247,7 +317,7 @@ struct HomeView: View {
                     restartCarouselTimer()
                 }
                 // Centre the button within the leading-inset strip.
-                .padding(.leading, max(0, (leadingInset - 24) / 2))
+                .padding(.leading, max(0, (heroInset - 24) / 2))
             }
         }
         .overlay(alignment: .trailing) {
@@ -260,7 +330,9 @@ struct HomeView: View {
                     }
                     restartCarouselTimer()
                 }
-                .padding(.trailing, max(0, (leadingInset - 24) / 2))
+                // Shift inward past the friends panel so the chevron stays
+                // visible at the panel edge, mirroring the leading side.
+                .padding(.trailing, max(0, (heroInset - 24) / 2) + coverWidth)
             }
         }
         .frame(maxWidth: .infinity)
@@ -385,6 +457,13 @@ struct HomeView: View {
 private struct GameScrollRow<MenuContent: View>: View {
     let title: String
     let games: [Game]
+    /// Layout width supplied by HomeView — the frozen pre-open width while
+    /// the friends panel is open, live width otherwise. NOT self-measured
+    /// geometry, so the row never chases animated frames.
+    let layoutWidth: CGFloat
+    /// Trailing width covered by the friends panel — the forward chevron
+    /// shifts inward by this amount to stay visible at the panel edge.
+    var trailingObscured: CGFloat = 0
     let selectedGameID: Int?
     let isFavorite: (Int) -> Bool
     var showFavoriteBadge: Bool = true
@@ -403,10 +482,12 @@ private struct GameScrollRow<MenuContent: View>: View {
     /// that fires a second idle, which was overwriting currentIndex with the
     /// wrong card on rapid taps.
     @State private var programmaticScrollTime: Date = .distantPast
-    @State private var containerWidth: CGFloat = 0
 
     private var metrics: CardLayoutMetrics {
-        CardLayoutMetrics.compute(for: containerWidth)
+        // Home rows step 3…5 columns (user direction July 12 2026): cards
+        // resize naturally within a step; the window growing adds a column
+        // (5 max) with the next card's peek slice always showing.
+        CardLayoutMetrics.compute(for: layoutWidth, maxCards: 5)
     }
 
     private var canScrollBack: Bool { currentIndex > 0 }
@@ -513,7 +594,9 @@ private struct GameScrollRow<MenuContent: View>: View {
                         showMaterial: isRowHovered,
                         onHoverChanged: { isForwardButtonHovered = $0 }
                     )
-                    .padding(.trailing, 10)
+                    // Extra inset keeps the chevron visible at the friends
+                    // panel edge, mirroring the leading side.
+                    .padding(.trailing, 10 + trailingObscured)
                     .offset(y: -22)
                 }
             }
@@ -530,7 +613,6 @@ private struct GameScrollRow<MenuContent: View>: View {
             case .ended:  isRowHovered = false
             }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { containerWidth = $0 }
     }
 }
 
@@ -616,6 +698,7 @@ private struct FriendCard: View {
     @State private var isHovered = false
     @State private var hoverLocation: CGPoint = .zero
     @State private var avatarImage: NSImage?
+    @State private var showingDetail = false
 
     private static let cardWidth: CGFloat = 180
     private static let cornerRadius: CGFloat = 10
@@ -635,8 +718,10 @@ private struct FriendCard: View {
                     .frame(width: 36, height: 36)
 
                 if friend.isOnline || friend.isInGame {
+                    // Discord-style state colors: in-game green, online blue,
+                    // away/snooze yellow, busy red (PlayerSummary.statusColor).
                     Circle()
-                        .fill(friend.isInGame ? .green : .green.opacity(0.8))
+                        .fill(friend.statusColor)
                         .frame(width: 10, height: 10)
                         .overlay(
                             Circle().strokeBorder(.black.opacity(0.3), lineWidth: 1.5)
@@ -697,6 +782,11 @@ private struct FriendCard: View {
                 isHovered = false
             }
         }
+        .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
+        .onTapGesture { showingDetail.toggle() }
+        .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
+            FriendDetailPopover(friend: friend)
+        }
         .task { await loadAvatar() }
     }
 
@@ -722,7 +812,8 @@ private struct FriendCard: View {
         if let game = friend.gameExtraInfo, !game.isEmpty {
             return game
         }
-        if friend.isOnline { return "Online" }
+        // "Online" / "Away" / "Busy" / "Snooze" etc. — real persona state.
+        if friend.isOnline { return friend.personaStateText }
         if let date = friend.lastLogoffDate {
             let formatter = RelativeDateTimeFormatter()
             formatter.unitsStyle = .abbreviated
