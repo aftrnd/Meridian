@@ -125,8 +125,10 @@ struct ContentView: View {
             // is the first thing they see.
             if splashVisible {
                 SplashView()
+                    .transition(.opacity)
             } else {
                 mainContent
+                    .transition(.opacity)
                     .overlay(alignment: .top) {
                         if let title = steamWindow.actionableDialogTitle {
                             SteamConfirmationBanner(title: title)
@@ -170,8 +172,14 @@ struct ContentView: View {
             if ready && !hasAnimatedToFullSize {
                 hasAnimatedToFullSize = true
                 NotificationCenter.default.post(name: .meridianBootstrapReady, object: nil)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    splashVisible = false
+                // The splash's own content has already faded (SplashView
+                // `isExiting`); hand off to the main content only once the
+                // window resize has landed, as a crossfade — mounting it
+                // mid-resize was the hitch.
+                DispatchQueue.main.asyncAfter(deadline: .now() + AppDelegate.launchResizeDuration) {
+                    withAnimation(.easeOut(duration: 0.35)) {
+                        splashVisible = false
+                    }
                 }
             }
         }

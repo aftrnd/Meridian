@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private static let splashSize     = NSSize(width: 480, height: 300)
     // 1016×616: clean multiples of 8 that keep the original 1030×625 aspect ratio (≈1.649).
     private static let fullFrameSize  = NSSize(width: 1016, height: 616)
+    /// Splash → full-size resize. ContentView swaps the splash for the main
+    /// content only after this has elapsed (`ContentView.splashHandoffDelay`),
+    /// so the app's heaviest layout never lands mid-resize.
+    static let launchResizeDuration: TimeInterval = 0.5
 
     private var readyObserver: NSObjectProtocol?
 
@@ -101,7 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.contentMaxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                        height: CGFloat.greatestFiniteMagnitude)
 
+        // Traffic lights fade in with the resize instead of popping at t=0.
         setTrafficLights(hidden: false, in: window)
+        setTrafficLights(alpha: 0, in: window)
 
         // Expand from the splash's current center so the final window lands
         // at the same center point that window.center() chose for the splash.
@@ -114,15 +120,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
 
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.45
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.duration = Self.launchResizeDuration
+            // Ease-out heavy: leaves the splash quickly, settles gently.
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1.0)
             window.animator().setFrame(newFrame, display: true)
+            self.setTrafficLights(alpha: 1, in: window, animated: true)
         }, completionHandler: { [weak self] in
             // Completion handler is always called on the main thread by AppKit
             MainActor.assumeIsolated {
                 guard let window = self?.mainWindow else { return }
                 window.setFrame(newFrame, display: true)
                 window.contentMinSize = window.contentRect(forFrameRect: window.frame).size
+                self?.setTrafficLights(alpha: 1, in: window)
             }
         })
 
@@ -133,6 +142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         window.standardWindowButton(.closeButton)?.isHidden = hidden
         window.standardWindowButton(.miniaturizeButton)?.isHidden = hidden
         window.standardWindowButton(.zoomButton)?.isHidden = hidden
+    }
+
+    private func setTrafficLights(alpha: CGFloat, in window: NSWindow, animated: Bool = false) {
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(kind) else { continue }
+            if animated { button.animator().alphaValue = alpha } else { button.alphaValue = alpha }
+        }
     }
 
     private var mainWindow: NSWindow? {
