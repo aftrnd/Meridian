@@ -18,9 +18,10 @@ import Foundation
 // doesn't use the clustered light-culling compute path that mis-renders under
 // MoltenVK/Metal.
 //
-// Fix pattern: launchArgs: ["--rendering-method", "mobile"] — Godot 4 honors
+// Fix pattern: pass `--rendering-method mobile` in launchArgs — Godot 4 honors
 // this standard engine flag in exported games; it overrides the project's
-// rendering method at startup.
+// rendering method at startup. (Not universal: see Idols of Ash below, where
+// Mobile also broke and gl_compatibility is the working fallback.)
 
 extension GameCompatibilityDB {
 
