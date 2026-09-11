@@ -39,18 +39,51 @@ Windows Game (.exe)
 
 Downloaded automatically on first launch, or manually via Settings → Engine. `WineEngine.detect()` validates that `wine64`, `wineserver`, and required NLS data files are all present. If any are missing, the bootstrap pipeline auto-downloads a fresh engine.
 
-### Engine quality (maintainers)
+### Engine provenance (maintainers)
 
-When **you** run `Scripts/release-engine.sh`, it packages Wine from either **CrossOver.app** on your Mac (if installed, provides Wine 11+) or the **Gcenx** `wine-crossover` cask. That only affects what goes into the `.tar.gz` you upload — **end users never install CrossOver; they just download the engine tarball.**
+`Scripts/release-engine.sh` currently **harvests pre-built binaries from an installed CrossOver Preview** (`/Applications/CrossOver Preview.app`): wineloader/wineserver, `lib/wine`, DXMT, DXVK, MoltenVK/GnuTLS/GStreamer dylibs, and Apple's D3DMetal. That only affects what goes into the `.tar.gz` you upload — **end users never install CrossOver; they just download the engine tarball.** It is, however, not a from-source build and is **not acceptable for a commercial release** — see [Commercial readiness](#commercial-readiness).
 
-### All Components Are Open Source
+### Engine Components
 
 | Component | License | Source |
 |-----------|---------|--------|
-| Wine 11 | LGPL | [winehq.org](https://www.winehq.org/) |
-| DXMT | Open source | [github.com/nicbarker/dxmt](https://github.com/nicbarker/dxmt) |
+| Wine 11 (CodeWeavers patch set: msync, Steam IPC) | LGPL | [winehq.org](https://www.winehq.org/) · [CodeWeavers sources](https://www.codeweavers.com/crossover/source) |
+| DXMT (D3D10/11 → Metal) | MIT (≤0.80) / LGPL | [github.com/3Shain/dxmt](https://github.com/3Shain/dxmt) |
 | DXVK | Zlib | [github.com/doitsujin/dxvk](https://github.com/doitsujin/dxvk) |
 | MoltenVK | Apache 2.0 | [github.com/KhronosGroup/MoltenVK](https://github.com/KhronosGroup/MoltenVK) |
+| D3DMetal (D3D12 → Metal) | **Apple proprietary** (Game Porting Toolkit terms — **non-commercial use only**) | Apple Developer |
+| gbe_fork (offline Steamworks) | LGPL — **dev-only**, see below | [github.com/Detanup01/gbe_fork](https://github.com/Detanup01/gbe_fork) |
+| DepotDownloader (Meridian arm64 fork) | GPL-2.0 — fork source must ship with every release | [github.com/SteamRE/DepotDownloader](https://github.com/SteamRE/DepotDownloader) |
+
+Everything except D3DMetal is open source. D3DMetal is the only proprietary component; it is used solely for DirectX 12 titles.
+
+## Licensing & Trial
+
+Meridian is sold outside the Mac App Store (Wine needs an unsandboxed process tree). Licensing is **offline and provider-agnostic**:
+
+- Keys are Ed25519-signed tokens: `MRDN1.<payload>.<signature>`. The app verifies them against the public key embedded in `LicenseManager.publicKeyBase64` — no activation server, no account.
+- New installs get a **14-day trial**; afterwards Play/Install present the license sheet. Status lives in Settings › License.
+- Issue keys with `swift Scripts/license-keygen.swift` (`gen` once; `sign --email … [--exp yyyy-mm-dd]` per sale). Call `sign` from your payment provider's post-purchase webhook (Paddle / Lemon Squeezy / Gumroad all work) or by hand.
+- The private key lives at `~/.config/meridian/license-signing.key` on the maintainer's machine. **Back it up** — a new keypair invalidates every issued key unless the old public key is kept in the app.
+- `LicenseManager.purchaseURL` is the "Buy Meridian" target; point it at the checkout page.
+
+## Commercial readiness
+
+What has been done so the app can be charged for, and what still blocks a paid release. Decisions were made autonomously (2026-09-10) and are reversible.
+
+**Done**
+- Offline license keys + 14-day trial (above). Play/Install are gated; Settings › License manages the key.
+- **gbe_fork "Local" mode is dev-only.** Swapping a game's `steam_api64.dll` for an emulator is a Steamworks DRM bypass; `AppSettings.launchMode(appID:)` now returns `.online` unless the `localLaunchMode` feature flag is on (Settings › Developer). Release users get a single Online Play button.
+- CI: `.github/workflows/ci.yml` builds and runs the XCTest suite on every push/PR.
+
+**Still blocking a paid release**
+1. **Engine from source.** Replace the CrossOver-harvest in `release-engine.sh` with a reproducible build: CodeWeavers' LGPL Wine source → macOS arm64, plus DXMT, DXVK, MoltenVK, GnuTLS/GStreamer from upstream. Ship license texts + an SBOM inside the tarball. Drop `cxcompatdb.so` (CrossOver-specific; only used for the D3DMetal D3D11 video path).
+2. **D3DMetal.** Not part of macOS — it ships only inside Apple's Game Porting Toolkit ("evaluation environment for Windows games", developer-login download) and inside CrossOver, which redistributes it under its own arrangement with Apple. Verified 2026-09-10: no `D3DMetal.framework` exists under `/System/Library`; the copy we stage is `com.apple.D3DMetal 4.0b1` from CrossOver Preview. Options for v1.0: **drop D3D12 support** (DXMT + DXVK only), the Whisky model (user downloads GPTK with their own Apple developer account and Meridian imports it), or ask Apple for a redistribution agreement like CodeWeavers'. Never ship it in the tarball without one of those.
+3. **Stop staging gbe_fork** into the engine tarball (`build-steamemu.sh` step in `release-engine.sh`) once the from-source engine lands; the code path is already gated.
+4. **Publish the DepotDownloader fork source** (GPL-2.0) alongside each engine release.
+5. **Actually ship**: run `Scripts/release-app.sh` (archive → sign → notarize → DMG → GitHub release). Tags `v0.9.8…v0.11.1` exist without artifacts, so installed apps currently believe `v0.9.7.1` is latest.
+6. **Legal copy**: EULA, privacy policy (Steam credentials are entered into the app; refresh token is stored DPAPI-encrypted in the prefix), support contact. Prefer Steam QR/mobile-confirm login so no password ever touches Meridian.
+7. Get a one-hour legal review of items 1–3 and of using a third-party client against Steam's Subscriber Agreement.
 
 ## Game Launch Flow
 
@@ -168,19 +201,14 @@ On every app launch, Meridian silently checks whether the app version changed si
 ### Developer release workflow
 
 ```bash
-# 1. Update Wine locally (brew update wine-crossover, or use CrossOver.app)
+# App release (preferred): bump + tag + push; CI signs, notarizes and publishes the DMG
+bash Scripts/release-app.sh --minor --tag-only
 
-# 2. Package and publish the new engine snapshot to GitHub Releases
-bash Scripts/release-engine.sh           # auto-increments patch version
-# or with explicit version:
-bash Scripts/release-engine.sh v2.1.0   # publishes v2.1.0-engine tag
-
-# 3. Bump MARKETING_VERSION in Xcode (Build Settings → Versioning)
-#    This is the version users see in Settings → Updates
-
-# 4. Build, sign, notarize, then publish the .dmg to GitHub Releases
-#    Tag: v2.1.0  (no -engine suffix — the update checker filters by this)
+# Engine release (separate line; see "Engine provenance" — currently CrossOver-harvested)
+bash Scripts/release-engine.sh           # auto-increments patch → vX.Y.Z-engine
 ```
+
+See CONTRIBUTING.md › Release flow for the one-time signing/notarization secrets the Release workflow needs.
 
 `release-engine.sh` embeds `wine/meridian-engine-version.txt` in the archive containing the release tag. The app reads this file to display the installed engine version in Settings → Updates.
 

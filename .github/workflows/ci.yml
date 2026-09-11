@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test (macOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        # Sources use `#available(macOS 26.0, *)` APIs, so the macOS 26 SDK is required.
+        run: |
+          XCODE="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Version lint
+        run: bash Scripts/check-version.sh
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test --parallel
+
+      - name: License keygen self-test
+        run: |
+          swift Scripts/license-keygen.swift gen
+          KEY=$(swift Scripts/license-keygen.swift sign --email ci@example.com --plan ci)
+          swift Scripts/license-keygen.swift verify "$KEY"

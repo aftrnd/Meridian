@@ -1,0 +1,192 @@
+name: Release
+
+# Builds, signs, notarizes and publishes Meridian when a canonical app tag
+# (vX.Y.Z — no "-engine" suffix) is pushed. This is the ONLY path that should
+# produce a public DMG: it refuses to run unsigned, and it refuses a tag whose
+# version doesn't match MARKETING_VERSION in the Xcode project.
+#
+# Required repository secrets (Settings › Secrets and variables › Actions):
+#   DEVELOPER_ID_P12_BASE64   base64 of a "Developer ID Application" .p12 export
+#   DEVELOPER_ID_P12_PASSWORD password used when exporting the .p12
+#   NOTARY_KEY_ID             App Store Connect API key ID   (Users and Access › Integrations)
+#   NOTARY_ISSUER_ID          App Store Connect issuer ID
+#   NOTARY_KEY_BASE64         base64 of the AuthKey_<KEY_ID>.p8 file
+#
+# Cut a release locally with:  bash Scripts/release-app.sh --minor --tag-only
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+env:
+  SCHEME: Meridian
+  PROJECT: Meridian.xcodeproj
+  TEAM_ID: V5448GT345
+  BUILD_ROOT: /tmp/meridian-build
+
+jobs:
+  release:
+    name: Sign, notarize, publish
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Verify tag matches project version
+        run: bash Scripts/check-version.sh "${GITHUB_REF_NAME}"
+
+      - name: Require signing secrets
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PW: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NK: ${{ secrets.NOTARY_KEY_BASE64 }}
+          NKID: ${{ secrets.NOTARY_KEY_ID }}
+          NISS: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          missing=()
+          [ -n "$P12" ]    || missing+=(DEVELOPER_ID_P12_BASE64)
+          [ -n "$P12_PW" ] || missing+=(DEVELOPER_ID_P12_PASSWORD)
+          [ -n "$NK" ]     || missing+=(NOTARY_KEY_BASE64)
+          [ -n "$NKID" ]   || missing+=(NOTARY_KEY_ID)
+          [ -n "$NISS" ]   || missing+=(NOTARY_ISSUER_ID)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Refusing to publish an unsigned build. Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Import Developer ID certificate
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PW: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
+          KC_PW="$(openssl rand -hex 24)"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security create-keychain -p "$KC_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KEYCHAIN" -P "$P12_PW" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/devid.p12"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | grep 'Developer ID Application' | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          [ -n "$IDENTITY" ] || { echo "::error::No Developer ID Application identity in the imported .p12"; exit 1; }
+          echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Archive
+        run: |
+          mkdir -p "$BUILD_ROOT"
+          xcodebuild archive \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -archivePath "$BUILD_ROOT/Meridian.xcarchive" \
+            -destination "generic/platform=macOS" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$IDENTITY" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN --timestamp --options runtime" \
+            | tee "$BUILD_ROOT/archive.log" | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
+          [ -d "$BUILD_ROOT/Meridian.xcarchive" ] || { tail -100 "$BUILD_ROOT/archive.log"; exit 1; }
+
+      - name: Export
+        run: |
+          cat > "$BUILD_ROOT/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>developer-id</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Developer ID Application</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$BUILD_ROOT/Meridian.xcarchive" \
+            -exportPath "$BUILD_ROOT/export" \
+            -exportOptionsPlist "$BUILD_ROOT/ExportOptions.plist" \
+            | tee "$BUILD_ROOT/export.log" | grep -E "error:|EXPORT (SUCCEEDED|FAILED)" || true
+          [ -d "$BUILD_ROOT/export/Meridian.app" ] || { tail -100 "$BUILD_ROOT/export.log"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$BUILD_ROOT/export/Meridian.app"
+
+      - name: Notarize and staple app
+        env:
+          NK: ${{ secrets.NOTARY_KEY_BASE64 }}
+          NKID: ${{ secrets.NOTARY_KEY_ID }}
+          NISS: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          echo "$NK" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$BUILD_ROOT/export/Meridian.app" "$BUILD_ROOT/Meridian.zip"
+          xcrun notarytool submit "$BUILD_ROOT/Meridian.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NKID" --issuer "$NISS" \
+            --wait --timeout 30m
+          xcrun stapler staple "$BUILD_ROOT/export/Meridian.app"
+
+      - name: Build, notarize and staple DMG
+        env:
+          NKID: ${{ secrets.NOTARY_KEY_ID }}
+          NISS: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="$BUILD_ROOT/dmg"
+          mkdir -p "$STAGING"
+          cp -R "$BUILD_ROOT/export/Meridian.app" "$STAGING/Meridian.app"
+          ln -sf /Applications "$STAGING/Applications"
+          DMG="$BUILD_ROOT/Meridian-$VERSION.dmg"
+          hdiutil create -volname "Meridian $VERSION" -srcfolder "$STAGING" -ov -format UDZO -imagekey zlib-level=9 "$DMG" >/dev/null
+          codesign --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NKID" --issuer "$NISS" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+          spctl --assess --type open --context context:primary-signature -v "$DMG"
+          shasum -a 256 "$DMG" | tee "$DMG.sha256"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ENGINE_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName,isPrerelease,isDraft \
+            -q '[.[] | select(.isDraft==false and .isPrerelease==false) | .tagName | select(endswith("-engine"))][0] // "unknown"')"
+          {
+            echo "## Installation"
+            echo
+            echo "1. Download **Meridian-$VERSION.dmg**"
+            echo "2. Open the .dmg and drag Meridian to Applications"
+            echo "3. Launch Meridian — the Wine engine downloads automatically on first run"
+            echo
+            echo "Signed with Developer ID and notarized by Apple. Latest engine at publish time: \`$ENGINE_TAG\`."
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat "$DMG.sha256" | sed "s#$BUILD_ROOT/##"
+            echo '```'
+          } > "$BUILD_ROOT/notes-footer.md"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$DMG" "$DMG.sha256"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "Meridian $VERSION" \
+              --generate-notes \
+              --notes-file "$BUILD_ROOT/notes-footer.md" \
+              --latest \
+              "$DMG" "$DMG.sha256"
+          fi
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" || true

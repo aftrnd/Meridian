@@ -7,6 +7,10 @@
 #   bash Scripts/release-app.sh 1.2.0        # explicit version
 #   bash Scripts/release-app.sh --minor      # bump minor  (1.0.0 → 1.1.0)
 #   bash Scripts/release-app.sh --major      # bump major  (1.0.0 → 2.0.0)
+#   bash Scripts/release-app.sh --minor --tag-only
+#       PREFERRED: bump + commit + tag + push only. The GitHub Actions Release
+#       workflow (.github/workflows/release.yml) then signs, notarizes and
+#       publishes the DMG from a clean runner — no local cert needed.
 #
 # What it does:
 #   1. Validates prerequisites and git state
@@ -114,7 +118,15 @@ git diff --staged --quiet || die "Staged changes detected. Commit them first."
 
 # ---------- determine version ----------
 
-ARG="${1:---patch}"
+TAG_ONLY=false
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --tag-only) TAG_ONLY=true ;;
+        *)          ARGS+=("$a") ;;
+    esac
+done
+ARG="${ARGS[0]:---patch}"
 
 CURRENT_VERSION="$(xcode_build_setting MARKETING_VERSION)"
 CURRENT_BUILD="$(xcode_build_setting CURRENT_PROJECT_VERSION)"
@@ -131,10 +143,40 @@ fi
 NEW_BUILD="$((CURRENT_BUILD + 1))"
 TAG="v${NEW_VERSION}"
 
+[[ "${NEW_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Version '${NEW_VERSION}' must be 3-part semver (X.Y.Z)"
+git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && die "Tag ${TAG} already exists"
+
 info "Current: ${CURRENT_VERSION} (build ${CURRENT_BUILD})"
 info "New:     ${NEW_VERSION} (build ${NEW_BUILD})"
 info "Tag:     ${TAG}"
 info "Repo:    ${REPO}"
+
+if ${TAG_ONLY}; then
+    info "Mode:    tag-only (CI Release workflow builds, signs, notarizes and publishes)"
+    echo ""
+    read -rp "  Bump to ${NEW_VERSION}, tag ${TAG} and push? [y/N] " CONFIRM
+    [[ "${CONFIRM}" =~ ^[Yy]$ ]] || { echo "  Aborted."; exit 0; }
+
+    step "Bumping version → ${NEW_VERSION} (build ${NEW_BUILD})"
+    xcrun agvtool new-marketing-version "${NEW_VERSION}" >/dev/null
+    xcrun agvtool new-version -all "${NEW_BUILD}" >/dev/null
+    bash "$(dirname "${BASH_SOURCE[0]}")/check-version.sh" "${TAG}"
+
+    step "Committing and tagging"
+    git add "${PROJECT}/project.pbxproj"
+    git commit -q -m "chore: release ${NEW_VERSION} (build ${NEW_BUILD})"
+    git tag -a "${TAG}" -m "Meridian ${NEW_VERSION}"
+
+    step "Pushing to origin"
+    git push origin HEAD
+    git push origin "${TAG}"
+
+    echo ""
+    green "✓ ${TAG} pushed — watch the Release workflow:"
+    info "https://github.com/${REPO}/actions/workflows/release.yml"
+    echo ""
+    exit 0
+fi
 
 # ---------- detect signing / notarization capability ----------
 

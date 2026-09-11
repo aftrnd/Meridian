@@ -2,6 +2,15 @@
 #
 # release-engine.sh — Assemble and publish the Meridian Wine engine from CrossOver Preview.
 #
+# !! COMMERCIAL-RELEASE BLOCKER (2026-09-10) !!
+#   This script copies CodeWeavers' COMPILED binaries out of a proprietary app
+#   install and stages Apple's D3DMetal (GPTK terms: non-commercial only) and the
+#   gbe_fork Steamworks emulator (DRM bypass; the app path is dev-flag gated).
+#   Do NOT publish a tarball from this script for a paid Meridian. It must be
+#   replaced by a from-source build (CX Wine LGPL source, DXMT, DXVK, MoltenVK)
+#   that omits D3DMetal, cxcompatdb.so and tools/steamemu. See README
+#   "Commercial readiness".
+#
 # Usage:
 #   bash Scripts/release-engine.sh [VERSION]
 #

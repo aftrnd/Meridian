@@ -43,10 +43,16 @@ The Wine engine tarball has its own lifecycle and its own tag suffix: `vX.Y.Z-en
 
 ## Release flow
 
-1. Land work on `main` via merged branches.
-2. Bump the marketing version (Xcode project / Info.plist) in a `chore(release): v0.x.y` commit.
-3. Tag: `git tag v0.x.y && git push origin v0.x.y`.
-4. `Scripts/release-app.sh` builds/uploads the app artifact; engine releases go through `Scripts/release-engine.sh` independently.
+The Xcode project (`MARKETING_VERSION` / `CURRENT_PROJECT_VERSION`) is the single source of truth for the version; `Scripts/check-version.sh` enforces 3-part semver and that both build configurations agree (runs in CI on every push).
+
+1. Land work on `main` via merged branches. Working tree must be clean.
+2. `bash Scripts/release-app.sh --minor --tag-only` (or `--patch`, `--major`, or an explicit `1.2.0`). This bumps the project, commits `chore: release X.Y.Z`, tags `vX.Y.Z` and pushes.
+3. The **Release** GitHub Actions workflow (`.github/workflows/release.yml`) picks up the tag: verifies tag == project version, archives with the Developer ID certificate, notarizes and staples the app and DMG, and publishes the GitHub release with the DMG + SHA-256. It refuses to run unsigned.
+4. `AppUpdateChecker` in installed copies sees the new release and offers the in-app update.
+
+One-time setup for the workflow (repository secrets): `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD` (a "Developer ID Application" certificate exported from Keychain Access), and `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`, `NOTARY_KEY_BASE64` (an App Store Connect API key with Developer access). Never tag without going through step 2 — a tag with no matching bump fails the workflow, and a tag with no release leaves users stranded on the previous version.
+
+Running `release-app.sh` without `--tag-only` still builds locally (needs the cert + `meridian-notarize` keychain profile on your Mac) and creates a *draft* release you must publish by hand. Engine releases go through `Scripts/release-engine.sh` independently.
 
 ## One-time cleanup (recommended)
 
