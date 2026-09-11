@@ -10,9 +10,11 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 
 ## Why Meridian
 
-**It is your real Steam.** Meridian launches games through a genuine Steam client, so cloud saves, achievements, online multiplayer, Workshop content, and DRM all behave exactly as they do on a PC. Nothing is emulated or bypassed.
+**It is your real Steam library.** Meridian signs in to your Steam account, installs games from Steam's own content servers, and shows your playtime and achievements. Every game you own on Steam is right there.
 
-**Sign in once.** Steam authentication uses the same refresh-token flow as Steam's own clients, including QR sign-in from the Steam mobile app. After the first sign-in, every launch is silent.
+**Fast, quiet launches.** By default a game starts directly through the engine in a few seconds, with no Steam client window and nothing else on screen. When a game needs the Steam client (Steam DRM, online multiplayer, cloud saves), switch it to Online with one click and Meridian runs it through the real Steam client instead.
+
+**Sign in once.** Steam authentication uses the same refresh-token flow as Steam's own clients, including QR sign-in from the Steam mobile app. After the first sign-in, everything is silent.
 
 **Native rendering.** DirectX calls are translated to Metal on the fly. Games draw directly to your display at full resolution with no virtual GPU in the way.
 
@@ -35,7 +37,8 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 ### Installing and playing
 
 - **One-click installs** using a native arm64 build of DepotDownloader, with live progress based on real bytes on disk
-- **Compatibility database** of per-game fixes (DLL overrides, renderer choice, engine quirks) applied automatically at launch
+- **Compatibility database** of per-game fixes (launch arguments, DLL overrides, renderer choice, engine quirks) applied automatically at launch
+- **Two launch modes per game.** Play runs the game directly through the engine. Play Online runs it through the real Steam client for cloud saves, multiplayer, and Steam DRM. Games that require the Steam client are detected and prompt for Online automatically.
 - **Launch loader** that shows exactly what Meridian is doing, from preparing the engine to handing off to the game
 - **Metal Performance HUD** and a forced virtual desktop for games that need a fixed resolution
 
@@ -57,10 +60,11 @@ Windows game (.exe)
 When you press Play:
 
 1. Meridian confirms the engine is installed and healthy.
-2. It creates or reuses a single Wine prefix that holds the Steam client.
-3. Steam starts silently in the background using your saved sign-in.
-4. The game is launched through Steam with `-applaunch`, so Steam handles ownership, DRM, cloud saves, and overlays.
-5. Meridian watches the game process and returns you to your library when it exits.
+2. It looks up the game in its compatibility database and prepares the launch: renderer, launch arguments, and any per-title fixes.
+3. The game starts directly through the engine. No Steam client window appears.
+4. Meridian watches the game process and returns you to your library when it exits.
+
+When you press Play Online, Meridian instead brings the real Steam client up silently in the background using your saved sign-in and launches the game through it, so Steam handles ownership, DRM, cloud saves, and overlays.
 
 ## Requirements
 
@@ -103,6 +107,7 @@ Meridian's runtime is assembled from open-source projects and installed to `~/Li
 | [DXVK](https://github.com/doitsujin/dxvk) | Direct3D 9 to Vulkan | Zlib |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan to Metal | Apache 2.0 |
 | [DepotDownloader](https://github.com/SteamRE/DepotDownloader) (Meridian arm64 fork) | Game installs from Steam's CDN | GPL-2.0 |
+| [gbe_fork](https://github.com/Detanup01/gbe_fork) | Steamworks runtime for direct launches | LGPL |
 
 Direct3D 12 titles currently use Apple's D3DMetal, which Apple distributes under its Game Porting Toolkit terms. Before the 1.0 release, Meridian will either ship Direct3D 12 support under an appropriate redistribution arrangement or leave it out of the default engine. See the roadmap below.
 
