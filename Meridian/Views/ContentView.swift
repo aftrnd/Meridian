@@ -330,7 +330,7 @@ struct ContentView: View {
                 // Inside the recede transform, so card frames stay in resting
                 // layout coordinates while the root is scaled.
                 .coordinateSpace(name: DetailTransitionRegistry.stageSpace)
-                .modifier(DetailStageRecede(fade: rootFade))
+                .modifier(DetailStageRecede(fade: rootFade, blurRadius: DetailZoomTuning.shared.params.rootBlurRadius))
                 // Only once the root is fully faded — toggling it at flight
                 // start snapped Home's under-toolbar backdrop off in a frame.
                 .modifier(DetailStageEdgeEffectSuppression(suppressed: selectedGame != nil && zoom == nil))

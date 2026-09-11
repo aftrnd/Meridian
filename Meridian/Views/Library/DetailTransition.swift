@@ -187,11 +187,15 @@ extension EnvironmentValues {
 // MARK: Root recede
 
 /// Library layer: dissolves as the page comes forward. Pure compositing
-/// (one group alpha) — no transform, so nothing in the root re-renders.
-/// Always applied (identity at fade 0) so the root keeps its identity/state.
+/// (group alpha + gaussian blur) — no transform, so nothing in the root
+/// re-lays out. Always applied (identity at fade 0) so the root keeps its
+/// identity/state.
 struct DetailStageRecede: ViewModifier, Animatable {
     /// 0 = fully visible, 1 = gone.
     var fade: Double
+    /// Blur radius at fade 1. Eased in (fade²) so the library stays crisp
+    /// while it is still mostly visible and blurs hard as it goes.
+    var blurRadius: Double
 
     // ViewModifier is main-actor isolated; Animatable's requirement isn't.
     nonisolated var animatableData: Double {
@@ -201,6 +205,7 @@ struct DetailStageRecede: ViewModifier, Animatable {
 
     func body(content: Content) -> some View {
         content
+            .blur(radius: blurRadius * fade * fade, opaque: false)
             .opacity(1 - fade)
     }
 }

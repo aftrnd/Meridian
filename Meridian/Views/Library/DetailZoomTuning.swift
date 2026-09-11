@@ -48,6 +48,8 @@ struct DetailZoomParameters: Codable, Equatable, Sendable {
     /// Finishes well before `ambientLead` so the old page is gone before the
     /// art bleeds start; back-to-back they read as one muddy fade.
     var rootFadeDuration: Double = 0.22
+    /// Library blur at the end of the dissolve (pt); 0 disables.
+    var rootBlurRadius: Double = 24
     var chromeSwap: Double  = 0.611
     var landingFade: Double = 0.25
 
@@ -144,6 +146,7 @@ struct DetailZoomTuningWindow: View {
                 row("Ambient bleed fade",    \.ambientFade, 0...1.5)
                 row("Ambient lead (× open)", \.ambientLead, 0...1.5)
                 row("Library dissolve",      \.rootFadeDuration, 0.05...1)
+                row("Library blur (pt)",     \.rootBlurRadius, 0...60)
                 row("Toolbar swap",          \.chromeSwap,  0...1)
                 row("Landing crossfade",     \.landingFade, 0...0.6)
             }
