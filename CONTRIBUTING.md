@@ -61,3 +61,32 @@ Running `release-app.sh` without `--tag-only` still builds locally (needs the ce
 git push origin --delete v0.9.13 v0.9.14.0
 git branch -d v0.9.13 v0.9.14.0
 ```
+
+## Issuing license keys
+
+Keys are Ed25519-signed tokens of the form `MRDN1.<payload>.<signature>`, verified offline against the public key embedded in `LicenseManager.publicKeyBase64`.
+
+```bash
+swift Scripts/license-keygen.swift gen                                  # once: create the signing keypair
+swift Scripts/license-keygen.swift sign --email buyer@example.com       # per sale (optional --exp yyyy-mm-dd)
+swift Scripts/license-keygen.swift verify MRDN1...                      # sanity-check a key
+```
+
+The private key lives at `~/.config/meridian/license-signing.key` on the maintainer's machine. Back it up: a new keypair invalidates every issued key unless the old public key is also kept in the app. `sign` is meant to be called from the payment provider's post-purchase webhook (Paddle, Lemon Squeezy and Gumroad all work). `LicenseManager.purchaseURL` is the "Buy Meridian" target.
+
+## Engine provenance
+
+`Scripts/release-engine.sh` currently packages pre-built binaries from an installed CrossOver Preview (`/Applications/CrossOver Preview.app`): wineloader/wineserver, `lib/wine`, DXMT, DXVK, MoltenVK/GnuTLS/GStreamer dylibs, and Apple's D3DMetal. End users never install CrossOver; they only download the resulting tarball. This is a development convenience, not a from-source build, and it must be replaced before a paid release (see below).
+
+## Release readiness
+
+What still has to happen before Meridian can be sold as a 1.0:
+
+1. **Engine from source.** Replace the CrossOver harvest in `release-engine.sh` with a reproducible build: CodeWeavers' LGPL Wine source for macOS arm64, plus DXMT, DXVK, MoltenVK, GnuTLS and GStreamer from upstream. Ship license texts and an SBOM inside the tarball. Drop `cxcompatdb.so` (CrossOver-specific; only used for the D3DMetal D3D11 video path).
+2. **D3DMetal.** It is not part of macOS; it ships only inside Apple's Game Porting Toolkit (developer-login download, evaluation terms) and inside CrossOver under CodeWeavers' own arrangement with Apple. The copy currently staged is `com.apple.D3DMetal 4.0b1` from CrossOver Preview. Options for 1.0: drop Direct3D 12 support (DXMT + DXVK only), the Whisky model (user downloads GPTK with their own Apple developer account and Meridian imports it), or a redistribution agreement with Apple. Do not ship it in the tarball without one of those.
+3. **Stop staging gbe_fork** (`build-steamemu.sh` step in `release-engine.sh`). The Local launch mode that uses it is already gated behind the `localLaunchMode` feature flag and is dev-only; release users get Online play through the real Steam client.
+4. **Publish the DepotDownloader fork source** (GPL-2.0) alongside each engine release.
+5. **Configure the Release workflow secrets** (see Release flow above) so tags produce signed, notarized DMGs. Tags `v0.9.8` through `v0.11.1` exist without artifacts; installed apps currently see `v0.9.7.1` as latest until a release is published.
+6. **Legal copy.** EULA, privacy policy (Steam credentials are entered into the app; the refresh token is stored DPAPI-encrypted in the prefix), support contact. Prefer Steam QR / mobile-confirm login so no password ever passes through Meridian.
+7. **Legal review** of items 1 to 3 and of using a third-party client against Steam's Subscriber Agreement.
+
