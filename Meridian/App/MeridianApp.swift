@@ -15,7 +15,11 @@ struct MeridianApp: App {
     @State private var categories       = CategoryStore()
     @State private var updateChecker    = AppUpdateChecker()
     @State private var engineDownloader = EngineDownloader()
+    @State private var licenseManager   = LicenseManager()
     @Environment(\.openWindow) private var openWindow
+    /// Debug builds get the Developer menu out of the box; release builds
+    /// switch it on in Settings › Developer.
+    @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
 
     private let settings = AppSettings.shared
 
@@ -41,10 +45,12 @@ struct MeridianApp: App {
                 .environment(steamWindow)
                 .environment(updateChecker)
                 .environment(engineDownloader)
+                .environment(licenseManager)
                 .onReceive(NotificationCenter.default.publisher(
                     for: NSApplication.didBecomeActiveNotification
                 )) { _ in
                     steamWindow.refreshPermission()
+                    licenseManager.refresh()
                 }
                 .task {
                     // Begin MetricKit frame-rate/GPU telemetry (B4). App-level
@@ -77,16 +83,10 @@ struct MeridianApp: App {
                 }
             }
             CommandGroup(replacing: .newItem) {}
-            CommandMenu("Meridian") {
-                Button("Sign Out of Steam") {
-                    steamAuth.signOut()
-                }
-                .disabled(!steamAuth.isAuthenticated)
-                Divider()
-                Button("Zoom Tuning…") {
-                    openWindow(id: "zoom-tuning")
-                }
-                .keyboardShortcut("z", modifiers: [.command, .option])
+            // Sign-out lives in Settings › Steam, as on macOS generally; the
+            // old second "Meridian" menu next to the app menu is gone.
+            if developerMenuEnabled {
+                DeveloperCommands()
             }
         }
 
@@ -112,7 +112,67 @@ struct MeridianApp: App {
                 .environment(steamWindow)
                 .environment(updateChecker)
                 .environment(engineDownloader)
+                .environment(licenseManager)
                 .environment(session)
         }
+    }
+}
+
+// MARK: - Developer menu
+
+/// Menu-bar "Developer" menu (Safari's Develop menu pattern): tuning windows,
+/// diagnostics, and feature flags. Only installed when
+/// `AppSettings.developerMenuKey` is on — default for debug builds.
+private struct DeveloperCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandMenu("Developer") {
+            Button("Zoom Tuning…") {
+                openWindow(id: "zoom-tuning")
+            }
+            .keyboardShortcut("z", modifiers: [.command, .option])
+
+            Button("Launch Log") {
+                openWindow(id: "launch-log")
+            }
+
+            Divider()
+
+            Button("Reveal Logs in Finder") {
+                NSWorkspace.shared.open(LogFileWriter.logsDir)
+            }
+            Button("Reveal Application Support in Finder") {
+                NSWorkspace.shared.open(LogFileWriter.logsDir.deletingLastPathComponent())
+            }
+
+            Divider()
+
+            Menu("Feature Flags") {
+                ForEach(FeatureFlag.allCases) { flag in
+                    FeatureFlagToggle(flag: flag)
+                }
+            }
+
+            Divider()
+
+            Text("\(AppSettings.isDebugBuild ? "Debug" : "Release") build \(AppUpdateChecker.currentVersion)")
+        }
+    }
+}
+
+/// One checkmark menu item / settings toggle per flag. Its own view so each
+/// flag gets its own `@AppStorage` (keys are dynamic).
+struct FeatureFlagToggle: View {
+    let flag: FeatureFlag
+    @AppStorage private var isOn: Bool
+
+    init(flag: FeatureFlag) {
+        self.flag = flag
+        _isOn = AppStorage(wrappedValue: false, flag.defaultsKey)
+    }
+
+    var body: some View {
+        Toggle(flag.title, isOn: $isOn)
     }
 }

@@ -28,9 +28,54 @@ struct SettingsView: View {
             UpdatesSettingsTab()
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
                 .tag("updates")
+
+            LicenseStatusView()
+                .tabItem { Label("License", systemImage: "checkmark.seal") }
+                .tag("license")
+
+            DeveloperSettingsTab()
+                .tabItem { Label("Developer", systemImage: "hammer") }
+                .tag("developer")
         }
         .frame(width: 520)
         .padding(24)
+    }
+}
+
+// MARK: - Developer tab
+
+/// Safari-style "Advanced" switch for the menu-bar Developer menu, plus the
+/// feature flags it also exposes. Present in every build so a release user
+/// can be walked through enabling a flag without a debug build.
+private struct DeveloperSettingsTab: View {
+    @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show Developer menu in menu bar", isOn: $developerMenuEnabled)
+            } footer: {
+                Text("Zoom tuning, launch log, log folders and feature flags. On by default in debug builds. This is a \(AppSettings.isDebugBuild ? "debug" : "release") build, version \(AppUpdateChecker.currentVersion).")
+                    .font(.caption)
+            }
+
+            Section {
+                ForEach(FeatureFlag.allCases) { flag in
+                    VStack(alignment: .leading, spacing: 2) {
+                        FeatureFlagToggle(flag: flag)
+                        Text(flag.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Feature Flags")
+            } footer: {
+                Text("Work-in-progress features. Off by default; changes apply immediately.")
+                    .font(.caption)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -461,7 +506,7 @@ private struct UpdatesSettingsTab: View {
             } header: {
                 Text("Updates")
             } footer: {
-                Text("Updates include the latest Wine engine — no separate engine download needed.")
+                Text("Checks for a new Meridian build and a new Wine engine together. Updating Meridian installs the current engine on next launch; engine-only updates appear below.")
                     .font(.caption)
             }
 
@@ -639,8 +684,9 @@ private struct UpdatesSettingsTab: View {
         return "\(v) (Build \(b))"
     }
 
+    /// Same cleaned form as the update cards ("3.1.0", not "v3.1.0-engine").
     private var engineVersionString: String {
-        if let v = engine.engineVersion { return v }
+        if let v = engine.engineVersion { return cleanTag(v) }
         return engine.isReady ? "Meridian Engine" : "Not installed"
     }
 
@@ -710,7 +756,9 @@ private struct UpdatesSettingsTab: View {
     }
 
     private func cleanTag(_ tag: String) -> String {
-        tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        var t = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        if t.hasSuffix("-engine") { t = String(t.dropLast(7)) }
+        return t
     }
 }
 
