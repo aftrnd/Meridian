@@ -45,7 +45,9 @@ struct DetailZoomParameters: Codable, Equatable, Sendable {
     /// (the `.removed` settle trails the visible landing by ~0.5 s).
     var ambientLead: Double = 0.85
     /// Library dissolve (ease-in-out), seconds — its own clock, not the spring.
-    var rootFadeDuration: Double = 0.3
+    /// Finishes well before `ambientLead` so the old page is gone before the
+    /// art bleeds start; back-to-back they read as one muddy fade.
+    var rootFadeDuration: Double = 0.22
     var chromeSwap: Double  = 0.611
     var landingFade: Double = 0.25
 
