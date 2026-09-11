@@ -86,40 +86,33 @@ final class AppSettings: @unchecked Sendable {
     /// - `.offline`: gbe_fork Steamworks shim + direct `wine64` exec. No
     ///   `steam.exe`, no auth needed at launch. Cloud saves, in-game
     ///   multiplayer, and real Steam DRM verification are NOT available — the
-    ///   game talks to a local emulator, not Valve. DEV-ONLY: replacing
-    ///   `steam_api64.dll` is a Steamworks DRM bypass, so this path is gated
-    ///   behind `FeatureFlag.localLaunchMode` and never reachable in a
-    ///   shipping build unless the flag is flipped by hand.
+    ///   game talks to a local emulator, not Valve. Fast, fully seamless, and
+    ///   the ONLY path on which per-game compat fixes (launchArgs,
+    ///   preferD3DMetal, DLL overrides) are applied — Steam owns the exe's
+    ///   environment in Online mode. This is the default.
     /// - `.online`: brings the real Steam client online in the background
     ///   (`steam.exe -silent`, authenticated from the QR/OAuth session) and
     ///   launches via `-applaunch`. Enables cloud saves, online multiplayer,
-    ///   EULAs, and genuine DRM. Requires a signed-in Steam session. This is
-    ///   the only mode for end users.
+    ///   EULAs, and genuine DRM. Requires a signed-in Steam session. The
+    ///   launcher prompts for it automatically when a game is SteamStub-
+    ///   encrypted and cannot run without the real client.
     enum LaunchMode: String {
         case offline
         case online
     }
 
-    /// App IDs the user has explicitly switched to Online mode while the
-    /// Local flag is on. Everything not in this set defaults to Offline in
-    /// that dev configuration. We store only the opt-ins so a cleared/blank
-    /// set == "all offline" for the dev path.
+    /// App IDs the user has explicitly switched to Online mode. Everything not
+    /// in this set defaults to Offline (the reliable gbe_fork path). We store
+    /// only the opt-ins so the default stays Offline even as the set of games
+    /// grows, and so a cleared/blank set == "all offline".
     private var onlineModeAppIDs: Set<Int> {
         get { Set(UserDefaults.standard.array(forKey: "onlineModeAppIDs") as? [Int] ?? []) }
         set { UserDefaults.standard.set(Array(newValue), forKey: "onlineModeAppIDs") }
     }
 
-    /// True when the dev-only gbe_fork Local mode has been enabled from
-    /// Settings › Developer.
-    var localLaunchModeEnabled: Bool {
-        UserDefaults.standard.bool(forKey: FeatureFlag.localLaunchMode.defaultsKey)
-    }
-
-    /// The effective launch mode for a game. `.online` unless the dev-only
-    /// Local flag is on, in which case the per-game opt-in applies.
+    /// The effective launch mode for a game. Defaults to `.offline`.
     func launchMode(appID: Int) -> LaunchMode {
-        guard localLaunchModeEnabled else { return .online }
-        return onlineModeAppIDs.contains(appID) ? .online : .offline
+        onlineModeAppIDs.contains(appID) ? .online : .offline
     }
 
     func setLaunchMode(_ mode: LaunchMode, appID: Int) {
@@ -442,15 +435,13 @@ final class AppSettings: @unchecked Sendable {
 /// `@AppStorage(wrappedValue: false, flag.defaultsKey)` so a flip applies live.
 enum FeatureFlag: String, CaseIterable, Identifiable {
     case friendsPanel
-    case localLaunchMode
 
     var id: String { rawValue }
     var defaultsKey: String { "feature.\(rawValue)" }
 
     var title: String {
         switch self {
-        case .friendsPanel:    "Friends Panel"
-        case .localLaunchMode: "Local launch mode (gbe_fork)"
+        case .friendsPanel: "Friends Panel"
         }
     }
 
@@ -458,8 +449,6 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
         switch self {
         case .friendsPanel:
             "Toolbar button and trailing inspector listing Steam friends by status."
-        case .localLaunchMode:
-            "Per-game Local/Online picker on the Play button. Local swaps the game's steam_api64.dll for the gbe_fork emulator — testing only, not for distribution."
         }
     }
 }

@@ -37,11 +37,6 @@ struct GameDetailView: View {
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
-    /// Dev-only gbe_fork "Local" launch mode. Off in every build by default;
-    /// when off the split Play button collapses to a single Online button.
-    @AppStorage(wrappedValue: false, FeatureFlag.localLaunchMode.defaultsKey)
-    private var localLaunchModeEnabled
-
     @State private var showEngineSetup = false
     @State private var showLicenseRequired = false
     @State private var showResetConfirm = false
@@ -1223,9 +1218,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
             // control family across all launch states.
             HStack(spacing: 8) {
                 Button { handlePlayTapped() } label: {
-                    // Only when the Local (gbe_fork) mode is available does
-                    // the Online choice earn a qualifier.
-                    Label(localLaunchModeEnabled && launchModeUI == .online ? "Play Online" : "Play",
+                    Label(launchModeUI == .online ? "Play Online" : "Play",
                           systemImage: "play.fill")
                         .font(.headline)
                         .frame(
@@ -1237,24 +1230,20 @@ private struct ScrollerVisibility: NSViewRepresentable {
                 .controlSize(.large)
 
                 // System-gray chevron (user direction: the primary stays
-                // accent blue, the chevron stays neutral). Shown only when
-                // the dev-only Local mode is enabled — release builds have
-                // a single Online path.
-                if localLaunchModeEnabled {
-                    Button {
-                        showLaunchModePopover.toggle()
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 11, weight: .semibold))
-                            .frame(minHeight: GameDetailMetrics.launchButtonHeight)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .fixedSize()
-                    .help("Change launch mode")
-                    .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
-                        launchModePopover
-                    }
+                // accent blue, the chevron stays neutral).
+                Button {
+                    showLaunchModePopover.toggle()
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(minHeight: GameDetailMetrics.launchButtonHeight)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .fixedSize()
+                .help("Change launch mode")
+                .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
+                    launchModePopover
                 }
             }
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)

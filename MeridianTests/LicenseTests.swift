@@ -218,17 +218,22 @@ final class LicenseTests: XCTestCase {
                       "Settings must have a License tab.")
     }
 
-    // MARK: - Local (gbe_fork) mode is dev-only
+    // MARK: - Licensing must not alter the launch path
 
-    func testLaunchMode_isOnlineUnlessLocalFlagEnabled() throws {
+    /// Regression guard (2026-09-10): the licensing pass briefly forced every
+    /// game to Online behind a dev flag. That made per-game compat fixes
+    /// unreachable (Steam owns the exe environment in Online mode) and put
+    /// the Steam UI in front of users. Offline stays the default and the
+    /// launch-mode picker is always available.
+    func testLaunchMode_isNotGatedByAFeatureFlag() throws {
         let src = try readSource("Meridian/Models/AppSettings.swift")
-        XCTAssertTrue(src.contains("case localLaunchMode"),
-                      "FeatureFlag must expose the dev-only Local mode switch.")
-        XCTAssertTrue(src.contains("guard localLaunchModeEnabled else { return .online }"),
-                      "launchMode(appID:) must return .online whenever the Local flag is off.")
+        XCTAssertFalse(src.contains("localLaunchMode"),
+                       "Launch mode must not be gated behind a feature flag.")
+        XCTAssertTrue(src.contains("onlineModeAppIDs.contains(appID) ? .online : .offline"),
+                      "launchMode(appID:) must default to .offline.")
 
         let detail = try readSource("Meridian/Views/Library/GameDetailView.swift")
-        XCTAssertTrue(detail.contains("if localLaunchModeEnabled {"),
-                      "The launch-mode chevron/popover must only render when the Local flag is on.")
+        XCTAssertFalse(detail.contains("localLaunchModeEnabled"),
+                       "The launch-mode chevron/popover must render unconditionally.")
     }
 }
