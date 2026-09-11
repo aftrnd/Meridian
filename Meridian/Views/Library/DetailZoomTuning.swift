@@ -32,10 +32,6 @@ struct DetailZoomParameters: Codable, Equatable, Sendable {
     var clipOverreachStart: Double = 0.23
     var clipRestInset: Double      = 200
 
-    // Library recede
-    var rootFadeStart: Double = 0
-    var rootFadeEnd: Double   = 1
-
     // Card geometry
     var hoverLift: Double = 0.015
 
@@ -44,7 +40,12 @@ struct DetailZoomParameters: Codable, Equatable, Sendable {
     var fallbackPageFadeEnd: Double = 0.5
 
     // Hand-offs
-    var ambientFade: Double = 2.25
+    var ambientFade: Double = 1.5
+    /// Fraction of the open flight after which the bleeds start fading in
+    /// (the `.removed` settle trails the visible landing by ~0.5 s).
+    var ambientLead: Double = 0.85
+    /// Library dissolve (ease-in-out), seconds — its own clock, not the spring.
+    var rootFadeDuration: Double = 0.3
     var chromeSwap: Double  = 0.611
     var landingFade: Double = 0.25
 
@@ -132,10 +133,6 @@ struct DetailZoomTuningWindow: View {
                 row("Overreach start",       \.clipOverreachStart, 0...1)
                 row("Rest inset (pt)",       \.clipRestInset,      0...600)
             }
-            Section("Library recede (progress)") {
-                row("Fade start",            \.rootFadeStart, 0...1)
-                row("Fade end",              \.rootFadeEnd,   0...1)
-            }
             Section("Card & fallback") {
                 row("Hover lift (fraction)", \.hoverLift,           0...0.06)
                 row("Fallback inset",        \.fallbackInset,       0...0.3)
@@ -143,6 +140,8 @@ struct DetailZoomTuningWindow: View {
             }
             Section("Hand-offs (s)") {
                 row("Ambient bleed fade",    \.ambientFade, 0...1.5)
+                row("Ambient lead (× open)", \.ambientLead, 0...1.5)
+                row("Library dissolve",      \.rootFadeDuration, 0.05...1)
                 row("Toolbar swap",          \.chromeSwap,  0...1)
                 row("Landing crossfade",     \.landingFade, 0...0.6)
             }

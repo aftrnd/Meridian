@@ -144,10 +144,8 @@ struct DetailZoom {
     /// Library recede. The root never transforms (a scale forces every glow
     /// blur and the hero's backgroundExtensionEffect to re-render per frame
     /// under a changing transform — visibly jerky). It stays untouched as the
-    /// page comes forward, then dissolves once the rect is about to cover it.
-    @MainActor static func rootOpacity(at p: CGFloat) -> Double {
-        1 - smoothstep(unit(p), from: tuning.rootFadeStart, to: tuning.rootFadeEnd)
-    }
+    /// page comes forward and dissolves on its own eased clock (ContentView
+    /// `rootFade`), not on the spring's progress.
 
     /// How far the page's clip extends past the stage, 0 → rest inset over
     /// the final stretch, so the ambient bleed under the toolbar fades in as
@@ -190,20 +188,20 @@ extension EnvironmentValues {
 
 /// Library layer: dissolves as the page comes forward. Pure compositing
 /// (one group alpha) — no transform, so nothing in the root re-renders.
-/// Always applied (identity at progress 0) so the root keeps its
-/// identity/state.
+/// Always applied (identity at fade 0) so the root keeps its identity/state.
 struct DetailStageRecede: ViewModifier, Animatable {
-    var progress: CGFloat
+    /// 0 = fully visible, 1 = gone.
+    var fade: Double
 
     // ViewModifier is main-actor isolated; Animatable's requirement isn't.
-    nonisolated var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
+    nonisolated var animatableData: Double {
+        get { fade }
+        set { fade = newValue }
     }
 
     func body(content: Content) -> some View {
         content
-            .opacity(DetailZoom.rootOpacity(at: progress))
+            .opacity(1 - fade)
     }
 }
 
@@ -232,12 +230,15 @@ struct DetailStageEdgeEffectSuppression: ViewModifier {
 /// overflowing content such as the ambient backdrop under the toolbar).
 struct DetailZoomReveal: ViewModifier, Animatable {
     var progress: CGFloat
+    /// Library dissolve (see ContentView.rootFade); the page's solid backing
+    /// fades with it so there is nothing to snap off at the end.
+    var rootFade: Double
     let zoom: DetailZoom?
     let stageSize: CGSize
 
-    nonisolated var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
+    nonisolated var animatableData: AnimatablePair<CGFloat, Double> {
+        get { AnimatablePair(progress, rootFade) }
+        set { progress = newValue.first; rootFade = newValue.second }
     }
 
     func body(content: Content) -> some View {
@@ -279,7 +280,7 @@ struct DetailZoomReveal: ViewModifier, Animatable {
             clip: rect.insetBy(dx: -over, dy: -over),
             cornerRadius: DetailZoom.cornerRadius(at: progress),
             opacity: zoom.poster == nil ? DetailZoom.fallbackPageOpacity(at: progress) : 1,
-            backing: DetailZoom.rootOpacity(at: progress)
+            backing: 1 - rootFade
         )
     }
 }

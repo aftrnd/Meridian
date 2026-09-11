@@ -1,7 +1,7 @@
 import Foundation
 
 /// A single Steam achievement merged from player stats + game schema.
-struct GameAchievement: Identifiable, Sendable {
+struct GameAchievement: Identifiable, Equatable, Sendable {
     var id: String { apiName }
     /// The internal Steam API name for the achievement (e.g. "ACH_WIN_ONE_GAME").
     let apiName: String

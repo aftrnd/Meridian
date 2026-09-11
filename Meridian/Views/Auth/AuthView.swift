@@ -641,7 +641,7 @@ struct APIKeyStepContent: View {
         }
         .padding(28)
         .frame(width: 460)
-        .animation(.easeInOut(duration: 0.2), value: showingWhyInfo)
+        .animation(.smooth(duration: 0.2), value: showingWhyInfo)
     }
 
     private func save() async {

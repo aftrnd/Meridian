@@ -1,6 +1,31 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Detail prefetch
+
+/// Hover is a click candidate: warm the detail page's store data and
+/// achievements so they're cached by the time the zoom lands. Debounced so a
+/// cursor sweeping a row doesn't fan out a request per card; the Keychain
+/// read for the API key happens after the debounce for the same reason.
+@MainActor
+final class DetailPrefetch {
+    private var task: Task<Void, Never>?
+
+    func begin(appID: Int, auth: SteamAuthService) {
+        guard task == nil else { return }
+        task = Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            await SteamAPIService.shared.prefetchDetail(appID: appID, steamID: auth.steamID, apiKey: auth.apiKey)
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+}
+
 // MARK: - Game Card State
 
 enum GameCardState: Equatable {
@@ -29,14 +54,22 @@ struct GameGridView: View {
     @State private var hoverLocation: CGPoint = .zero
     @State private var cardSize: CGSize = .zero
     /// Art frame in the detail stage's coordinate space — the zoom's card rect.
-    @State private var artFrame: CGRect = .zero
+    /// Held in a plain reference, NOT observed: it changes on every scroll
+    /// frame and nothing the card draws depends on it (only the registry and
+    /// the flight-source match read it), so writing it must not re-evaluate
+    /// the body. As a `@State CGRect` it re-ran every visible card's body per
+    /// frame while a row scrolled — the horizontal-scroll lag.
+    @State private var art = ArtFrameBox()
     /// Single resolved image shared across the card.
     /// Pre-populated from cache synchronously so the card never renders blank.
     @State private var loadedImage: NSImage?
     @State private var loadFailed = false
     /// Corner colors sampled from the art — drives the ambient glow bleed.
     @State private var glowColors: ImageCache.EdgeColors?
+    @State private var prefetch = DetailPrefetch()
+    @Environment(SteamAuthService.self) private var steamAuth
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.detailFlightSource) private var flightSource
 
     /// True while the detail zoom is departing from / returning to THIS card
@@ -50,6 +83,7 @@ struct GameGridView: View {
 
     private func matches(_ s: DetailFlightSource?) -> Bool {
         guard let s, s.gameID == game.id else { return false }
+        let artFrame = art.frame
         return abs(s.artFrame.midX - artFrame.midX) < 2 && abs(s.artFrame.midY - artFrame.midY) < 2
     }
 
@@ -58,6 +92,19 @@ struct GameGridView: View {
 
     private let maxTilt: Double = 6
     private let perspective: CGFloat = 0.4
+    /// Matches `DetailZoomParameters.hoverLift` (0.015 per side).
+    private static let hoverScale: CGFloat = 1.03
+
+    private var liftScale: CGFloat { isHovered ? Self.hoverScale : 1 }
+
+    /// Where the label sits once the art has lifted: it follows the art's
+    /// bottom-left corner, snapped to device pixels so the text lands sharp.
+    private var labelLift: CGSize {
+        guard isHovered else { return .zero }
+        let half = (Self.hoverScale - 1) / 2
+        func snap(_ v: CGFloat) -> CGFloat { (v * displayScale).rounded() / displayScale }
+        return CGSize(width: snap(-cardSize.width * half), height: snap(cardSize.height * half))
+    }
 
     private var tiltX: Double {
         guard isHovered, cardSize.height > 0 else { return 0 }
@@ -83,7 +130,25 @@ struct GameGridView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Transforms stop at the art: text under a scale/tilt is a bitmap
+            // being resampled, so the label below grows via real font sizes.
             artSection
+                .rotation3DEffect(
+                    .degrees(tiltX),
+                    axis: (x: 1, y: 0, z: 0),
+                    perspective: perspective
+                )
+                .rotation3DEffect(
+                    .degrees(tiltY),
+                    axis: (x: 0, y: 1, z: 0),
+                    perspective: perspective
+                )
+                .scaleEffect(liftScale)
+                .shadow(
+                    color: .black.opacity(isHovered ? 0.3 : 0.0),
+                    radius: isHovered ? 16 : 0,
+                    y: isHovered ? 8 : 0
+                )
             if isSelected {
                 Image(systemName: "chevron.compact.up")
                     .font(.system(size: 11, weight: .semibold))
@@ -91,37 +156,33 @@ struct GameGridView: View {
                     .frame(maxWidth: .infinity)
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
             }
-            infoLabel
+            // The rest-size label holds the layout slot; the visible one rides
+            // in an overlay so its growth never re-flows the grid row. Width
+            // grows with it so a truncated title keeps its ellipsis in place.
+            infoLabel(scale: 1)
+                .hidden()
+                .overlay(alignment: .topLeading) {
+                    infoLabel(scale: liftScale)
+                        .frame(width: cardSize.width > 0 ? cardSize.width * liftScale : nil, alignment: .leading)
+                        .offset(labelLift)
+                }
         }
         // Explicitly bound to the column/frame width so LazyVGrid's first lazy
         // batch doesn't let any card inflate beyond its assigned column.
         .frame(minWidth: 0, maxWidth: .infinity)
-        .rotation3DEffect(
-            .degrees(tiltX),
-            axis: (x: 1, y: 0, z: 0),
-            perspective: perspective
-        )
-        .rotation3DEffect(
-            .degrees(tiltY),
-            axis: (x: 0, y: 1, z: 0),
-            perspective: perspective
-        )
-        .scaleEffect(isHovered ? 1.03 : 1.0)
-        .shadow(
-            color: .black.opacity(isHovered ? 0.3 : 0.0),
-            radius: isHovered ? 16 : 0,
-            y: isHovered ? 8 : 0
-        )
-        .animation(hoverEasesIn ? .easeInOut(duration: 0.4) : .easeOut(duration: 0.15), value: isHovered)
+        // Critically damped spring: a cursor sweeping across the row reverses
+        // the lift mid-flight without the velocity cut an ease would make.
+        .animation(.smooth(duration: hoverEasesIn ? 0.4 : 0.15), value: isHovered)
         .animation(.interactiveSpring(response: 0.15, dampingFraction: 0.7), value: hoverLocation)
         .contentShape(Rectangle())
         .onDisappear {
             isHovered = false
             hoverLocation = .zero
+            prefetch.cancel()
             let wasSource = isFlightSource
             // Otherwise a scrolled-away card's stale frame could anchor a zoom
             // to a spot now occupied by a different card.
-            DetailTransitionRegistry.shared.forgetCard(id: game.id, artFrame: artFrame)
+            DetailTransitionRegistry.shared.forgetCard(id: game.id, artFrame: art.frame)
             if wasSource { DetailTransitionRegistry.shared.flightSourceMoved?() }
         }
         .onAppear { updatePulse() }
@@ -270,11 +331,13 @@ struct GameGridView: View {
                 isHovered = true
                 // Hover = click candidate — make this instance the flight anchor.
                 registerCard(hovered: true)
+                prefetch.begin(appID: game.id, auth: steamAuth)
             case .ended:
                 hoverEasesIn = false
                 isHovered = false
                 hoverLocation = .zero
                 registerCard(hovered: false)
+                prefetch.cancel()
             }
         }
         // Recovery for the post-scroll "stuck at false" case: when proxy.scrollTo
@@ -291,14 +354,17 @@ struct GameGridView: View {
             hoverLocation = CGPoint(x: cardSize.width / 2, y: cardSize.height / 2)
             isHovered = true
             registerCard(hovered: true)
+            prefetch.begin(appID: game.id, auth: steamAuth)
         }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(DetailTransitionRegistry.stageSpace)) } action: { frame in
             // frame(in:) includes the card's own hover lift/tilt (verified), so
             // only take layout-scale readings; the registry adds the lift itself.
             guard !isHovered else { return }
             let wasSource = isFlightSource
-            cardSize = frame.size
-            artFrame = frame
+            // Size only changes on layout, not scroll — skip the no-op write
+            // (a same-value @State set still invalidates the view).
+            if cardSize != frame.size { cardSize = frame.size }
+            art.frame = frame
             registerCard(hovered: false)
             // Scrolled out from under the returning art.
             if wasSource, !isFlightSource { DetailTransitionRegistry.shared.flightSourceMoved?() }
@@ -318,9 +384,9 @@ struct GameGridView: View {
                 hoverLocation = .zero
                 registerCard(hovered: false)
             } else if wasSource, !isSource, old?.landing == true,
-                      let p = DetailTransitionRegistry.shared.pointer, artFrame.contains(p) {
+                      let p = DetailTransitionRegistry.shared.pointer, art.frame.contains(p) {
                 hoverEasesIn = true
-                hoverLocation = CGPoint(x: p.x - artFrame.minX, y: p.y - artFrame.minY)
+                hoverLocation = CGPoint(x: p.x - art.frame.minX, y: p.y - art.frame.minY)
                 isHovered = true
                 registerCard(hovered: true)
             }
@@ -328,42 +394,19 @@ struct GameGridView: View {
     }
 
     private func registerCard(hovered: Bool) {
-        DetailTransitionRegistry.shared.recordCard(id: game.id, artFrame: artFrame, isHovered: hovered, image: loadedImage)
+        DetailTransitionRegistry.shared.recordCard(id: game.id, artFrame: art.frame, isHovered: hovered, image: loadedImage)
+    }
+
+    /// Non-observable holder for the card's stage-space art frame (see `art`).
+    @MainActor
+    private final class ArtFrameBox {
+        var frame: CGRect = .zero
     }
 
     // MARK: - Info Label (below art, TV app style)
 
-    private var infoLabel: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(game.name)
-                .font(.subheadline)
-                .fontWeight(.medium)
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .help(game.name)
-
-            HStack(spacing: 4) {
-                if isFavorite, showFavoriteBadge {
-                    Image(systemName: "heart.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.pink)
-                }
-                if game.playtimeMinutes > 0 {
-                    Text(game.playtimeFormatted)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                if game.windowsOnly {
-                    WindowsBadge()
-                }
-            }
-        }
-        // minWidth: 0 is critical — it lets the label compress to any width,
-        // so long game titles don't inflate the card or the grid column.
-        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 2)
+    private func infoLabel(scale: CGFloat) -> some View {
+        CardInfoLabel(game: game, isFavorite: isFavorite, showFavoriteBadge: showFavoriteBadge, scale: scale)
     }
 
     // MARK: - State Badge
@@ -448,6 +491,59 @@ struct GameGridView: View {
 
     private var cardBorderWidth: CGFloat {
         (isRunning || isSelected) ? 1.5 : 1
+    }
+}
+
+// MARK: - Card info label
+
+/// Title + playtime row under the art. `scale` drives real point sizes (the
+/// system text-style sizes × scale), so SwiftUI re-lays the glyphs out at each
+/// step of the hover lift instead of stretching a bitmap of them.
+private struct CardInfoLabel: View, Animatable {
+    let game: Game
+    let isFavorite: Bool
+    let showFavoriteBadge: Bool
+    var scale: CGFloat
+
+    nonisolated var animatableData: CGFloat {
+        get { scale }
+        set { scale = newValue }
+    }
+
+    private static let titleSize  = NSFont.preferredFont(forTextStyle: .subheadline).pointSize
+    private static let detailSize = NSFont.preferredFont(forTextStyle: .caption1).pointSize
+    private static let iconSize   = NSFont.preferredFont(forTextStyle: .caption2).pointSize
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(game.name)
+                .font(.system(size: Self.titleSize * scale, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(game.name)
+
+            HStack(spacing: 4) {
+                if isFavorite, showFavoriteBadge {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: Self.iconSize * scale))
+                        .foregroundStyle(.pink)
+                }
+                if game.playtimeMinutes > 0 {
+                    Text(game.playtimeFormatted)
+                        .font(.system(size: Self.detailSize * scale))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if game.windowsOnly {
+                    WindowsBadge()
+                }
+            }
+        }
+        // minWidth: 0 is critical — it lets the label compress to any width,
+        // so long game titles don't inflate the card or the grid column.
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
     }
 }
 

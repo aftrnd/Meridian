@@ -165,6 +165,14 @@ enum GameLogFile {
         logsDir.appending(path: "\(appID)-engine.log")
     }
 
+    /// Gates the "Open Game Log" / "Open Engine Log" menu items.
+    static func gameLogExists(for appID: Int) -> Bool {
+        FileManager.default.fileExists(atPath: currentURL(for: appID).path(percentEncoded: false))
+    }
+    static func engineLogExists(for appID: Int) -> Bool {
+        FileManager.default.fileExists(atPath: engineLogURL(for: appID).path(percentEncoded: false))
+    }
+
     /// Copies the game's own engine log (Unity `Player.log` or Unreal
     /// `Saved/Logs/*.log`) for THIS session into `<appID>-engine.log`.
     ///

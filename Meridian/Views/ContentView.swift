@@ -34,9 +34,19 @@ struct ContentView: View {
     @State private var hasCheckedSetup = false
     @State private var showingDownloadsPopover = false
     @State private var showFriendsPanel = false
+    /// Feature flag (Developer › Feature Flags). Off: no toolbar button, the
+    /// inspector can never open. Everything else about the panel stays wired
+    /// so flipping it on needs no relaunch.
+    @AppStorage(wrappedValue: false, FeatureFlag.friendsPanel.defaultsKey) private var friendsPanelEnabled
     /// Detail-column width measured while the panel is CLOSED (the frozen
     /// full-width layout the panel will cover).
     @State private var detailFullWidth: CGFloat = 0
+    /// `friendsPanelWidth` captured at the moment the panel opens. The
+    /// inspector is pinned to THIS, not the live computation: during the
+    /// close slide `detailFullWidth` is re-measured every frame (the panel is
+    /// already "closed"), and a per-frame retarget of the pinned column width
+    /// fought the slide.
+    @State private var friendsPanelOpenWidth: CGFloat = 280
 
     // Card ↔ detail zoom (see DetailTransition.swift).
     /// The zoom currently in flight, if any (nil once settled either way).
@@ -44,6 +54,12 @@ struct ContentView: View {
     /// 0 = library at rest, 1 = detail page at rest. The ONE animated value;
     /// root recede, page reveal and ghost all derive from it.
     @State private var zoomProgress: CGFloat = 0
+    /// Library dissolve, 0 = visible, 1 = gone. Driven by its own ease-in-out
+    /// clock matched to the flight's duration — NOT by `zoomProgress`: the
+    /// kicked spring covers most of its distance in the first frames, and a
+    /// fade slaved to it snapped the library to the window background before
+    /// the rect had grown enough to cover it (user: "jarring", 2026-09-10).
+    @State private var rootFade: Double = 0
     /// Set by `openDetail`, consumed by the page's `onAppear`: the flight
     /// starts only once the page has committed at progress 0, so its
     /// Animatable modifier has a frame to interpolate from (and the page's
@@ -118,7 +134,7 @@ struct ContentView: View {
                                 .transition(.move(edge: .top).combined(with: .opacity))
                         }
                     }
-                    .animation(.easeInOut(duration: 0.2), value: steamWindow.actionableDialogTitle)
+                    .animation(.smooth(duration: 0.2), value: steamWindow.actionableDialogTitle)
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
@@ -203,6 +219,12 @@ struct ContentView: View {
                     .toolbar {
                         // Root-page chrome only; the detail page brings its own
                         // (back, favourite, more) via its own `.toolbar`.
+                        // Items are added/removed by NSToolbar, which draws the
+                        // glass bezels itself and doesn't animate them — content
+                        // transitions inside stable items were tried (2026-09-10)
+                        // and looked half-animated: glyph fading under a bezel
+                        // that popped. The system morph needs a NavigationStack
+                        // push, which the zoom stage deliberately doesn't do.
                         if !detailChrome {
                             // Flexible space pushes everything after it to the
                             // trailing end — same pattern as GameDetailView.
@@ -216,26 +238,32 @@ struct ContentView: View {
                                 )
                             }
                             ToolbarItem(placement: .automatic) {
-                                Button {
-                                    // One transaction for the inspector slide AND
-                                    // the friendsPanelOpen-driven row re-layout —
-                                    // without this the cards snap to their new
-                                    // metrics instantly while the panel is still
-                                    // sliding, which reads as jank.
-                                    withAnimation(.snappy(duration: 0.28)) {
-                                        showFriendsPanel.toggle()
+                                if friendsPanelEnabled {
+                                    Button {
+                                        // One transaction for the inspector slide AND
+                                        // the friendsPanelOpen-driven row re-layout —
+                                        // without this the cards snap to their new
+                                        // metrics instantly while the panel is still
+                                        // sliding, which reads as jank. No bounce:
+                                        // a click carries no momentum to overshoot.
+                                        if !showFriendsPanel {
+                                            friendsPanelOpenWidth = friendsPanelWidth
+                                        }
+                                        withAnimation(.smooth(duration: 0.28)) {
+                                            showFriendsPanel.toggle()
+                                        }
+                                    } label: {
+                                        // Square label frame → macOS renders a perfect
+                                        // circle regardless of the glyph's aspect ratio
+                                        // (person.2 is wide; without this the pill
+                                        // stretches). Plural glyph; outline, no fill.
+                                        Image(systemName: "person.2")
+                                            .frame(width: 24, height: 24)
                                     }
-                                } label: {
-                                    // Square label frame → macOS renders a perfect
-                                    // circle regardless of the glyph's aspect ratio
-                                    // (person.2 is wide; without this the pill
-                                    // stretches). Plural glyph; outline, no fill.
-                                    Image(systemName: "person.2")
-                                        .frame(width: 24, height: 24)
+                                    // No buttonStyle override — macOS supplies the
+                                    // toolbar circle / liquid glass, same as Downloads.
+                                    .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
                                 }
-                                // No buttonStyle override — macOS supplies the
-                                // toolbar circle / liquid glass, same as Downloads.
-                                .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
                             }
                         }
                     }
@@ -250,17 +278,22 @@ struct ContentView: View {
                             // edge lands exactly on the row's natural
                             // 3-cards + peek boundary.
                             .inspectorColumnWidth(
-                                min: friendsPanelWidth,
-                                ideal: friendsPanelWidth,
-                                max: friendsPanelWidth
+                                min: friendsPanelOpenWidth,
+                                ideal: friendsPanelOpenWidth,
+                                max: friendsPanelOpenWidth
                             )
                     }
                     .environment(\.friendsPanelOpen, showFriendsPanel)
-                    .environment(\.friendsPanelCoverWidth, showFriendsPanel ? friendsPanelWidth : 0)
+                    .environment(\.friendsPanelCoverWidth, showFriendsPanel ? friendsPanelOpenWidth : 0)
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
                         // Only track while closed — this is the width the
                         // frozen layout (and thus the panel size) is based on.
                         if !showFriendsPanel { detailFullWidth = newWidth }
+                    }
+                    .onChange(of: friendsPanelEnabled) { _, enabled in
+                        if !enabled, showFriendsPanel {
+                            withAnimation(.smooth(duration: 0.28)) { showFriendsPanel = false }
+                        }
                     }
             }
         }
@@ -297,7 +330,7 @@ struct ContentView: View {
                 // Inside the recede transform, so card frames stay in resting
                 // layout coordinates while the root is scaled.
                 .coordinateSpace(name: DetailTransitionRegistry.stageSpace)
-                .modifier(DetailStageRecede(progress: zoomProgress))
+                .modifier(DetailStageRecede(fade: rootFade))
                 // Only once the root is fully faded — toggling it at flight
                 // start snapped Home's under-toolbar backdrop off in a frame.
                 .modifier(DetailStageEdgeEffectSuppression(suppressed: selectedGame != nil && zoom == nil))
@@ -321,7 +354,7 @@ struct ContentView: View {
                     // Outside `.id(game.id)` so a same-game close → open
                     // retargets in place; inside `.id(openGeneration)` so a
                     // fresh open never inherits a running close.
-                    .modifier(DetailZoomReveal(progress: zoomProgress, zoom: zoom, stageSize: stageSize))
+                    .modifier(DetailZoomReveal(progress: zoomProgress, rootFade: rootFade, zoom: zoom, stageSize: stageSize))
                     // Likewise usable as soon as the open starts (target 1).
                     .allowsHitTesting(zoomProgress == 1)
                     .id(openGeneration)
@@ -437,6 +470,10 @@ extension ContentView {
         let t = DetailZoomTuning.shared.params
         return .interpolatingSpring(duration: t.closeDuration, bounce: t.closeBounce, initialVelocity: t.closeKick)
     }
+    /// Library dissolve clock: a short ease-in-out on its own timer, so the
+    /// background changes smoothly but decisively rather than at the
+    /// spring's kicked first frames.
+    private var rootFadeAnimation: Animation { .easeInOut(duration: DetailZoomTuning.shared.params.rootFadeDuration) }
     /// Toolbar/title hand-off, animated separately from the un-animated zoom
     /// mount so the items crossfade instead of snapping.
     private var chromeSwap: Animation { .easeInOut(duration: DetailZoomTuning.shared.params.chromeSwap) }
@@ -488,6 +525,7 @@ extension ContentView {
             selectedGame = game
             detailChrome = true
             zoomProgress = 1
+            rootFade = 1
             return
         }
 
@@ -513,6 +551,7 @@ extension ContentView {
         guard pendingOpen else { return }
         pendingOpen = false
         let generation = zoomGeneration
+        withAnimation(rootFadeAnimation) { rootFade = 1 }
         withAnimation(openZoom, completionCriteria: .removed) {
             zoomProgress = 1
         } completion: {
@@ -542,6 +581,7 @@ extension ContentView {
         t.disablesAnimations = true
         withTransaction(t) { zoom = makeZoom(for: game, resting: true) }
         withAnimation(chromeSwap) { detailChrome = false }
+        withAnimation(rootFadeAnimation) { rootFade = 0 }
 
         withAnimation(closeZoom, completionCriteria: .removed) {
             zoomProgress = 0
@@ -579,6 +619,7 @@ extension ContentView {
             pendingOpen = false
             zoom = nil
             zoomProgress = 0
+            rootFade = 0
             detailChrome = false
             landing = false
             ghostOpacity = 1
@@ -599,6 +640,7 @@ extension ContentView {
             zoom = nil
             landing = false
             ghostOpacity = 1
+            rootFade = 0
             selectedGame = nil
         }
     }
@@ -619,6 +661,7 @@ extension ContentView {
                 pendingOpen = false
                 zoom = nil
                 zoomProgress = opening ? 1 : 0
+                rootFade = opening ? 1 : 0
                 detailChrome = opening
                 landing = false
                 ghostOpacity = 1
@@ -715,13 +758,13 @@ final class NavButtonMonitor {
 
     init() {
         token = NSEvent.addLocalMonitorForEvents(matching: [.otherMouseUp, .keyDown, .swipe]) { [weak self] event in
-            guard event.window?.isMainWindow == true,
-                  let direction = Self.direction(of: event) else { return event }
-            let typeRaw = event.type.rawValue
-            // Local monitors run on the main thread.
+            // Local monitors run on the main thread; the direction check
+            // reads the window's first responder, which is main-actor state.
             let consumed = MainActor.assumeIsolated { () -> Bool in
-                guard let self else { return false }
-                self.log.info("Navigation \(direction == .back ? "back" : "forward") via event type \(typeRaw)")
+                guard let self,
+                      event.window?.isMainWindow == true,
+                      let direction = Self.direction(of: event) else { return false }
+                self.log.info("Navigation \(direction == .back ? "back" : "forward") via event type \(event.type.rawValue)")
                 switch direction {
                 case .back:    self.onBack?()
                 case .forward: self.onForward?()
@@ -732,7 +775,7 @@ final class NavButtonMonitor {
         }
     }
 
-    private nonisolated static func direction(of event: NSEvent) -> Direction? {
+    private static func direction(of event: NSEvent) -> Direction? {
         switch event.type {
         case .otherMouseUp:
             switch event.buttonNumber {
@@ -1117,6 +1160,24 @@ private struct EngineStatusPill: View {
         case .error:          return "Engine Error"
         }
     }
+}
+
+// MARK: - Press Feedback
+
+/// `.plain` plus the pointer-down cue it lacks on macOS: the label settles
+/// to 0.97 for as long as the mouse is held. For custom-drawn surfaces
+/// (cards, art rows) only — glass-backed controls already get press feedback
+/// from `.interactive()`, and list/menu rows highlight rather than scale.
+struct PressableButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.smooth(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+extension ButtonStyle where Self == PressableButtonStyle {
+    static var pressable: PressableButtonStyle { .init() }
 }
 
 // MARK: - Glass Effect Backgrounds

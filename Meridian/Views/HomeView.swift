@@ -10,13 +10,14 @@ struct HomeView: View {
 
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.friendsPanelOpen) private var friendsPanelOpen
-    /// Trailing width covered by the friends panel — shifts edge-anchored
-    /// chevrons inward so they stay visible at the panel edge.
-    @Environment(\.friendsPanelCoverWidth) private var coverWidth
+    /// The panel's width while open (0 closed). Only used to reconstruct the
+    /// full column width when Home mounts under an already-open panel; the
+    /// chrome offsets come from live geometry (`coverWidth`).
+    @Environment(\.friendsPanelCoverWidth) private var panelWidth
 
     @State private var updateBannerDismissed = false
-    /// Measured on homeContent so all fixed-position elements share the same
-    /// leading inset as the GameScrollRow section titles and cards.
+    /// Live visible width of the content column — tracked every frame, even
+    /// through the panel slide, so `coverWidth` follows the panel edge 1:1.
     @State private var contentWidth: CGFloat = 0
     /// Width captured the instant the friends panel opens (final design after
     /// three iterations — history in FriendsPanelTests):
@@ -31,6 +32,21 @@ struct HomeView: View {
     /// Invalidates any pending deferred lock release when the panel is
     /// re-toggled mid-animation.
     @State private var panelTransitionGeneration = 0
+    /// True from a toggle until the slide has settled. While sliding, live
+    /// widths are intermediate and must not re-lock the layout.
+    @State private var panelSliding = false
+
+    /// Trailing width of the frozen layout hidden under the panel, from live
+    /// geometry (locked − visible). Tracks the panel edge exactly whatever
+    /// curve the inspector animates with, and is 0 whenever the layout
+    /// isn't locked — the chrome can never be offset by a panel that isn't
+    /// covering it (the "chevrons in the middle of the hero" bug: Home
+    /// re-mounted under an open panel with no lock, but still read the
+    /// panel width from the environment).
+    private var coverWidth: CGFloat {
+        guard let lockedWidth else { return 0 }
+        return max(0, lockedWidth - contentWidth)
+    }
 
     /// FINAL DESIGN (4th iteration — history in FriendsPanelTests): while the
     /// friends panel is open, the ENTIRE Home layout is frozen at its
@@ -150,27 +166,33 @@ struct HomeView: View {
         .ignoresSafeArea(edges: [.top, .bottom])
         .scrollIndicators(.hidden)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
-            // While locked, ignore the animated intermediate widths — the
-            // layout is frozen, nothing should chase the transition.
-            if lockedWidth == nil { contentWidth = newWidth }
+            contentWidth = newWidth
+            // Mounted (or window-resized) under a settled open panel: no
+            // toggle captured a lock, so rebuild the full column width the
+            // open would have frozen — hero full-size, panel covering it.
+            if friendsPanelOpen && !panelSliding && panelWidth > 0 {
+                lockedWidth = newWidth + panelWidth
+            }
         }
         .onChange(of: friendsPanelOpen) { _, open in
             panelTransitionGeneration += 1
-            if open {
+            let generation = panelTransitionGeneration
+            panelSliding = true
+            if open, lockedWidth == nil {
                 // Capture BEFORE the layout pass shrinks the column (onChange
                 // fires on the env flip, while contentWidth still holds the
-                // full-width measurement).
+                // full-width measurement). A reopen mid-close keeps the
+                // existing lock — contentWidth is intermediate right now.
                 lockedWidth = contentWidth
-            } else {
-                // Keep the layout frozen through the close slide — it is
-                // already the final full-width layout, so the panel simply
-                // reveals it with zero per-frame re-layout. Release the lock
-                // (a visual no-op) once the animation is done.
-                let generation = panelTransitionGeneration
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                    guard generation == panelTransitionGeneration else { return }
-                    lockedWidth = nil
-                }
+            }
+            // Keep the layout frozen through the close slide — it is
+            // already the final full-width layout, so the panel simply
+            // reveals it with zero per-frame re-layout. Release the lock
+            // (a visual no-op) once the animation is done.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                guard generation == panelTransitionGeneration else { return }
+                panelSliding = false
+                if !open { lockedWidth = nil }
             }
         }
     }
@@ -296,12 +318,17 @@ private struct HeroCarousel: View {
     let onSelect: (Game) -> Void
 
     @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(SteamAuthService.self) private var steamAuth
 
     /// Continuous page position. Whole numbers are resting pages.
     @State private var position: CGFloat = 0
     @State private var frame: CGRect = .zero
     @State private var timer: Timer?
     @State private var wheel = HeroWheelGesture()
+    @State private var prefetch = DetailPrefetch()
+    /// A cursor over the hero means the user is reading it: auto-advance
+    /// waits, and gets a full interval again once the cursor leaves.
+    @State private var isHovered = false
 
     /// Auto-advance cadence — long enough to read the hero, short enough that
     /// the row feels alive.
@@ -379,6 +406,19 @@ private struct HeroCarousel: View {
         }
         .frame(maxWidth: .infinity)
         .frame(height: 302)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active:
+                guard !isHovered else { return }
+                isHovered = true
+                timer?.invalidate()
+                prefetchCurrent()
+            case .ended:
+                isHovered = false
+                prefetch.cancel()
+                restartTimer()
+            }
+        }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame = $0 }
         .onAppear {
             startTimer()
@@ -437,6 +477,9 @@ private struct HeroCarousel: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            // No hover modifier on the glass button itself: one on top of the
+            // interactive glass rasterised its label (jagged text in light
+            // mode). Prefetch rides the hero-level hover instead.
             .modifier(HeroPageLayer(position: position, page: page, width: w, rate: Self.buttonRate, fade: 1.6))
         }
         .padding(.leading, heroInset)
@@ -511,7 +554,7 @@ private struct HeroCarousel: View {
     }
 
     private func startTimer() {
-        guard count > 1 else { return }
+        guard count > 1, !isHovered else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { _ in
             Task { @MainActor in
                 guard count > 1 else { return }
@@ -523,6 +566,14 @@ private struct HeroCarousel: View {
     private func restartTimer() {
         timer?.invalidate()
         startTimer()
+        // Paging while hovered: the likely click target is the new page.
+        if isHovered { prefetchCurrent() }
+    }
+
+    private func prefetchCurrent() {
+        guard count > 0 else { return }
+        prefetch.cancel()
+        prefetch.begin(appID: game(at: current).id, auth: steamAuth)
     }
 }
 
@@ -946,6 +997,31 @@ private struct FriendCard: View {
     }
 
     var body: some View {
+        Button { showingDetail.toggle() } label: { card }
+            .buttonStyle(.pressable)
+            .scaleEffect(isHovered ? 1.03 : 1.0)
+            .shadow(
+                color: .black.opacity(isHovered ? 0.25 : 0.0),
+                radius: isHovered ? 12 : 0,
+                y: isHovered ? 6 : 0
+            )
+            .animation(.smooth(duration: 0.15), value: isHovered)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverLocation = location
+                    isHovered = true
+                case .ended:
+                    isHovered = false
+                }
+            }
+            .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
+                FriendDetailPopover(friend: friend)
+            }
+            .task { await loadAvatar() }
+    }
+
+    private var card: some View {
         HStack(spacing: 10) {
             ZStack(alignment: .bottomTrailing) {
                 avatarView
@@ -1000,28 +1076,8 @@ private struct FriendCard: View {
                 .opacity(isHovered ? 1 : 0)
                 .allowsHitTesting(false)
         }
-        .scaleEffect(isHovered ? 1.03 : 1.0)
-        .shadow(
-            color: .black.opacity(isHovered ? 0.25 : 0.0),
-            radius: isHovered ? 12 : 0,
-            y: isHovered ? 6 : 0
-        )
-        .animation(.easeOut(duration: 0.15), value: isHovered)
-        .onContinuousHover { phase in
-            switch phase {
-            case .active(let location):
-                hoverLocation = location
-                isHovered = true
-            case .ended:
-                isHovered = false
-            }
-        }
+        // Inside the button label so the whole card is the click target.
         .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius))
-        .onTapGesture { showingDetail.toggle() }
-        .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
-            FriendDetailPopover(friend: friend)
-        }
-        .task { await loadAvatar() }
     }
 
     @ViewBuilder

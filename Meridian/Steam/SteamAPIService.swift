@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 private let log = MeridianLog(category: "SteamAPI")
 
@@ -21,8 +22,46 @@ actor SteamAPIService {
         return URLSession(configuration: config)
     }()
 
-    /// Store metadata is static for a session; cache avoids a network round-trip every time the user opens game details.
-    private var appDetailsCache: [Int: AppDetails] = [:]
+    // MARK: - Detail-page cache
+
+    /// What `GameDetailView` needs on its first frame. Lock-guarded rather
+    /// than actor-isolated so the view can read it synchronously in `init`
+    /// and mount already populated — an actor hop lands a frame late.
+    private struct DetailCache: Sendable {
+        struct Achievements: Sendable {
+            let fetched: Date
+            let items: [GameAchievement]
+        }
+        var appDetails: [Int: AppDetails] = [:]
+        var achievements: [Int: Achievements] = [:]
+        /// Achievement icons/names never change; only the player half is refetched.
+        var schemas: [Int: [String: SchemaAchievement]] = [:]
+        /// Player stats belong to one account — a different sign-in drops them.
+        var achievementsOwner = ""
+    }
+    nonisolated private let detailCache = OSAllocatedUnfairLock(initialState: DetailCache())
+    /// Within this window a fetch is served from cache outright (covers the
+    /// hover prefetch → open sequence); older entries are shown then refreshed.
+    private static let achievementsMaxAge: TimeInterval = 60
+    private var inflightAchievements: [Int: Task<[GameAchievement], Error>] = [:]
+
+    /// Synchronous cache reads for the detail page's first frame.
+    nonisolated func cachedAppDetails(appID: Int) -> AppDetails? {
+        detailCache.withLock { $0.appDetails[appID] }
+    }
+    nonisolated func cachedAchievements(appID: Int) -> [GameAchievement]? {
+        detailCache.withLock { $0.achievements[appID]?.items }
+    }
+
+    /// Warms the detail cache for a game the user is likely to open next.
+    /// Errors are swallowed — the detail page fetches for real on open.
+    func prefetchDetail(appID: Int, steamID: String, apiKey: String) async {
+        async let details: AppDetails? = try? fetchAppDetails(appID: appID)
+        async let achievements: [GameAchievement]? = steamID.isEmpty || apiKey.isEmpty
+            ? nil
+            : try? fetchPlayerAchievements(steamID: steamID, apiKey: apiKey, appID: appID)
+        _ = await (details, achievements)
+    }
 
     // MARK: - Player
 
@@ -126,9 +165,10 @@ actor SteamAPIService {
 
     // MARK: - App details (no key required — public Store API)
 
-    /// Fetches store metadata for a single appID.
+    /// Fetches store metadata for a single appID. Static for a session, so
+    /// cached after the first round-trip.
     func fetchAppDetails(appID: Int) async throws -> AppDetails {
-        if let cached = appDetailsCache[appID] {
+        if let cached = cachedAppDetails(appID: appID) {
             log.debug("[fetchAppDetails] cache hit appID=\(appID)")
             return cached
         }
@@ -143,62 +183,102 @@ actor SteamAPIService {
             throw APIError.notFound("App \(appID)")
         }
         log.info("[fetchAppDetails] appID=\(appID) name=\(data.name ?? "unknown")")
-        appDetailsCache[appID] = data
+        detailCache.withLock { $0.appDetails[appID] = data }
         return data
     }
 
     // MARK: - Achievements
 
-    /// Fetches the current user's achievement state for a game and merges it with the
-    /// game schema to produce display names and icon URLs.
+    /// The current user's achievement state for a game, merged with the game
+    /// schema for display names and icon URLs.
     ///
-    /// Returns an empty array (not an error) when the game has no achievement system,
-    /// when the user's profile is private, or when the game has no stats configured.
+    /// Served from cache when fetched within `achievementsMaxAge`; concurrent
+    /// callers (hover prefetch + page open) share one request. Returns an
+    /// empty array (not an error) when the game has no achievement system,
+    /// the profile is private, or the game has no stats configured.
     func fetchPlayerAchievements(steamID: String, apiKey: String, appID: Int) async throws -> [GameAchievement] {
+        let fresh = detailCache.withLock { cache -> [GameAchievement]? in
+            if cache.achievementsOwner != steamID {
+                cache.achievements = [:]
+                cache.achievementsOwner = steamID
+                return nil
+            }
+            guard let entry = cache.achievements[appID],
+                  Date().timeIntervalSince(entry.fetched) < Self.achievementsMaxAge else { return nil }
+            return entry.items
+        }
+        if let fresh {
+            log.debug("[fetchPlayerAchievements] cache hit appID=\(appID)")
+            return fresh
+        }
+        if let inflight = inflightAchievements[appID] {
+            return try await inflight.value
+        }
+        // The task owns its own bookkeeping so a cancelled caller (page closed
+        // mid-fetch) still leaves a warm cache and no orphaned inflight entry.
+        let task = Task<[GameAchievement], Error> {
+            defer { inflightAchievements[appID] = nil }
+            let items = try await loadPlayerAchievements(steamID: steamID, apiKey: apiKey, appID: appID)
+            detailCache.withLock { $0.achievements[appID] = .init(fetched: Date(), items: items) }
+            return items
+        }
+        inflightAchievements[appID] = task
+        return try await task.value
+    }
+
+    private func loadPlayerAchievements(steamID: String, apiKey: String, appID: Int) async throws -> [GameAchievement] {
         log.info("[fetchPlayerAchievements] appID=\(appID)")
 
-        // ── 1. Player stats ────────────────────────────────────────────────────
+        // Player stats and schema are independent — one round-trip, not two.
+        // The schema is skipped when already cached (it never changes).
         let playerURL = try buildURL(
             path: "/ISteamUserStats/GetPlayerAchievements/v1/",
             params: ["key": apiKey, "steamid": steamID, "appid": String(appID), "l": "english"]
         )
-        guard let playerEnvelope: PlayerAchievementsEnvelope = try? await get(playerURL),
+        async let playerEnvelope: PlayerAchievementsEnvelope? = try? get(playerURL)
+        async let schemaLookup: [String: SchemaAchievement] = loadSchema(apiKey: apiKey, appID: appID)
+
+        guard let playerEnvelope = await playerEnvelope,
               playerEnvelope.playerstats.success == true,
               let rawAchievements = playerEnvelope.playerstats.achievements,
               !rawAchievements.isEmpty else {
+            _ = await schemaLookup
             log.info("[fetchPlayerAchievements] appID=\(appID) no achievements or private")
             return []
         }
         log.info("[fetchPlayerAchievements] appID=\(appID) \(rawAchievements.count) achievements")
+        let schema = await schemaLookup
 
-        // ── 2. Schema (icon URLs) ──────────────────────────────────────────────
-        var schemaLookup: [String: SchemaAchievement] = [:]
-        if let schemaURL = try? buildURL(
-            path: "/ISteamUserStats/GetSchemaForGame/v2/",
-            params: ["key": apiKey, "appid": String(appID), "l": "english"]
-        ), let schema: SchemaEnvelope = try? await get(schemaURL) {
-            for ach in schema.game.availableGameStats?.achievements ?? [] {
-                schemaLookup[ach.name] = ach
-            }
-            log.debug("[fetchPlayerAchievements] schema loaded \(schemaLookup.count) entries for appID=\(appID)")
-        }
-
-        // ── 3. Merge ───────────────────────────────────────────────────────────
         return rawAchievements.map { raw in
-            let schema = schemaLookup[raw.apiname]
+            let entry = schema[raw.apiname]
             return GameAchievement(
                 apiName:     raw.apiname,
-                displayName: raw.name ?? schema?.displayName ?? raw.apiname,
-                description: raw.description ?? schema?.description,
+                displayName: raw.name ?? entry?.displayName ?? raw.apiname,
+                description: raw.description ?? entry?.description,
                 achieved:    raw.achieved == 1,
                 unlockDate:  raw.unlocktime > 0
                     ? Date(timeIntervalSince1970: TimeInterval(raw.unlocktime))
                     : nil,
-                iconURL:     schema?.icon.flatMap { URL(string: $0) },
-                iconGrayURL: schema?.icongray.flatMap { URL(string: $0) },
-                isHidden:    schema?.hidden == 1
+                iconURL:     entry?.icon.flatMap { URL(string: $0) },
+                iconGrayURL: entry?.icongray.flatMap { URL(string: $0) },
+                isHidden:    entry?.hidden == 1
             )
         }
+    }
+
+    private func loadSchema(apiKey: String, appID: Int) async -> [String: SchemaAchievement] {
+        if let cached = detailCache.withLock({ $0.schemas[appID] }) { return cached }
+        guard let schemaURL = try? buildURL(
+            path: "/ISteamUserStats/GetSchemaForGame/v2/",
+            params: ["key": apiKey, "appid": String(appID), "l": "english"]
+        ), let schema: SchemaEnvelope = try? await get(schemaURL) else { return [:] }
+        let lookup = Dictionary(
+            (schema.game.availableGameStats?.achievements ?? []).map { ($0.name, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        log.debug("[fetchPlayerAchievements] schema loaded \(lookup.count) entries for appID=\(appID)")
+        detailCache.withLock { $0.schemas[appID] = lookup }
+        return lookup
     }
 
     // MARK: - Logo hash probe via appdetails (new Steam CDN fallback)
@@ -760,7 +840,7 @@ private struct SchemaStats: Decodable {
     let achievements: [SchemaAchievement]?
 }
 
-private struct SchemaAchievement: Decodable {
+private struct SchemaAchievement: Decodable, Sendable {
     let name: String
     let displayName: String?
     let hidden: Int?

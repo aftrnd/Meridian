@@ -33,10 +33,17 @@ struct GameDetailView: View {
     @Environment(Launcher.self)           private var launcher
     @Environment(BootstrapManager.self)   private var bootstrap
     @Environment(EngineDownloader.self)   private var engineDownloader
+    @Environment(LicenseManager.self)     private var licenseManager
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
 
+    /// Dev-only gbe_fork "Local" launch mode. Off in every build by default;
+    /// when off the split Play button collapses to a single Online button.
+    @AppStorage(wrappedValue: false, FeatureFlag.localLaunchMode.defaultsKey)
+    private var localLaunchModeEnabled
+
     @State private var showEngineSetup = false
+    @State private var showLicenseRequired = false
     @State private var showResetConfirm = false
     @State private var appDetails: AppDetails? = nil
     /// Width÷height from the loaded hero `NSImage` (falls back to Steam's typical 1920×622 until decode).
@@ -73,6 +80,9 @@ struct GameDetailView: View {
     /// spring's `.removed` settle, which trails the visible motion by a good
     /// half second) so the achievements bar starts filling as the page arrives.
     @State private var achievementBarArmed = false
+    /// Bleeds start on a timer partway through the open flight (see
+    /// `bleedsVisible`); cleared the instant a close begins.
+    @State private var ambientArmed = false
     /// The chevron segment's launch-mode popover (the "teardrop" window —
     /// same presentation as the Meridian Verified badge popover).
     @State private var showLaunchModePopover = false
@@ -80,6 +90,12 @@ struct GameDetailView: View {
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
     }
+
+    /// The art bleeds (banner glow, info-card wash, column backdrop) come in
+    /// while the open spring is still settling — armed at `ambientLead` ×
+    /// open duration — rather than at the `.removed` settle that gates the
+    /// hairline, glass and scroller. Soft blurs tolerate the transform's tail.
+    private var bleedsVisible: Bool { showsAmbient || ambientArmed }
 
     init(game: Game, onDismiss: @escaping () -> Void, showsToolbar: Bool = true, showsAmbient: Bool = true) {
         self.game = game
@@ -97,6 +113,14 @@ struct GameDetailView: View {
             _bannerImage = State(initialValue: img)
             _bannerGlowColors = State(initialValue: ImageCache.shared.cachedEdgeColors(for: url))
             break
+        }
+        // Same for the info + achievements cards: cached data (hover prefetch
+        // or an earlier visit) is on screen at mount, refreshed underneath.
+        _appDetails = State(initialValue: SteamAPIService.shared.cachedAppDetails(appID: game.id))
+        if let cached = SteamAPIService.shared.cachedAchievements(appID: game.id) {
+            _achievements = State(initialValue: cached)
+        } else {
+            _achievementsLoading = State(initialValue: true)
         }
     }
 
@@ -149,7 +173,18 @@ struct GameDetailView: View {
             try? await Task.sleep(for: .seconds(lead))
             achievementBarArmed = true
         }
+        .task {
+            let p = DetailZoomTuning.shared.params
+            try? await Task.sleep(for: .seconds(p.openDuration * p.ambientLead))
+            ambientArmed = true
+        }
+        // The toolbar hands back at close start — the earliest signal that
+        // the page is leaving, so the bleeds drop with it.
+        .onChange(of: showsToolbar) { _, shown in
+            if !shown { ambientArmed = false }
+        }
         .animation(Self.ambientFade, value: showsAmbient)
+        .animation(Self.ambientFade, value: bleedsVisible)
         // Title is set by ContentView's stage (shared with the root page).
         // The native back button is replaced with an identical toolbar button
         // (same slot, same 30×28 footprint) routed through onDismiss, where
@@ -200,7 +235,7 @@ struct GameDetailView: View {
                         } label: {
                             Label("Open Game Log", systemImage: "doc.text")
                         }
-                        .disabled(!gameLogExists)
+                        .disabled(!GameLogFile.gameLogExists(for: currentGame.id))
                         .help("Raw Wine output + the resolved graphics stack for the last launch")
 
                         Button {
@@ -208,7 +243,7 @@ struct GameDetailView: View {
                         } label: {
                             Label("Open Engine Log", systemImage: "doc.text.magnifyingglass")
                         }
-                        .disabled(!engineLogExists)
+                        .disabled(!GameLogFile.engineLogExists(for: currentGame.id))
                         .help("The game engine's own log (Unity Player.log / Unreal) from the last launch")
 
                         if currentGame.isInstalled {
@@ -232,17 +267,19 @@ struct GameDetailView: View {
         .onExitCommand(perform: onDismiss)
         .onChange(of: game.id) { _, newID in
             heroAspectRatio = SteamLibraryHeroMetrics.aspectRatio
-            appDetails = nil
+            appDetails = SteamAPIService.shared.cachedAppDetails(appID: newID)
             bannerImage = nil
             bannerImageFailed = false
-            achievements = []
-            achievementsLoading = false
+            achievements = SteamAPIService.shared.cachedAchievements(appID: newID) ?? []
+            achievementsLoading = achievements.isEmpty
             achievementsUnavailable = false
             resolvedStack = nil
             launchModeUI = AppSettings.shared.launchMode(appID: newID)
             steamStubRequiresOnline = false
         }
         .task(id: game.id) {
+            // Store data is static; a cache-seeded page already has it.
+            guard appDetails == nil else { return }
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
         }
         .task(id: game.id) {
@@ -259,6 +296,9 @@ struct GameDetailView: View {
         }
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
+        }
+        .sheet(isPresented: $showLicenseRequired) {
+            LicenseRequiredSheet().environment(licenseManager)
         }
         .sheet(item: $selectedAchievement) { ach in
             AchievementDetailSheet(achievement: ach)
@@ -311,7 +351,7 @@ struct GameDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background {
                 Color(nsColor: .windowBackgroundColor)
-                if showsAmbient, let img = bannerImage {
+                if bleedsVisible, let img = bannerImage {
                     Image(nsImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
@@ -340,7 +380,7 @@ struct GameDetailView: View {
     /// and behind the navigation bar, matching the Apple Music album feel.
     @ViewBuilder
     private var ambientBackdrop: some View {
-        if showsAmbient, let img = bannerImage {
+        if bleedsVisible, let img = bannerImage {
             Image(nsImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
@@ -503,10 +543,28 @@ private struct ScrollerVisibility: NSViewRepresentable {
             // Play button (`compatStatusCard`). The banner now shows only the
             // hero art + positioned logo, matching Steam's clean library look.
             .clipShape(RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous))
+            // One rasterized layer (art + gradient + logo + clip): under the
+            // flight's fractional scale the vector clip mask was re-evaluated
+            // per frame and its anti-aliased edge crawled — most visible where
+            // the art meets the window background at high contrast. A bitmap
+            // resamples smoothly instead. Identity at 1:1.
+            .drawingGroup()
+            // Same hairline the info/achievement cards wear. Mounted only
+            // after landing like the glow — a sub-pixel stroke shimmers under
+            // the flight's fractional scale — and, unlike the glow, dropped
+            // instantly when a close begins rather than fading out under it.
+            .overlay {
+                if showsAmbient {
+                    RoundedRectangle(cornerRadius: GameDetailMetrics.cardCornerRadius, style: .continuous)
+                        .strokeBorder(.separator, lineWidth: 0.5)
+                        .allowsHitTesting(false)
+                        .transition(.asymmetric(insertion: .opacity, removal: .identity))
+                }
+            }
             // Behind the clipped hero so the blur bleeds past its edges
             // (added after clipShape → the glow itself is not clipped).
             .background {
-                if showsAmbient {
+                if bleedsVisible {
                     ArtGlowBackground(colors: bannerGlowColors,
                                       cornerRadius: GameDetailMetrics.cardCornerRadius)
                         .transition(.opacity)
@@ -575,7 +633,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
             if isThisGameActive {
                 StatusCard(game: currentGame, launcher: launcher, openWindow: openWindow)
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .animation(.easeInOut(duration: 0.2), value: isThisGameActive)
+                    .animation(.smooth(duration: 0.2), value: isThisGameActive)
             }
         }
     }
@@ -846,7 +904,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
             .padding(.vertical, 11)
         }
         .buttonStyle(.plain)
-        .modifier(GlassRoundedBackground(cornerRadius: 10))
+        .modifier(SettledGlassBackground(cornerRadius: 10, settled: showsAmbient))
     }
 
     // MARK: - Achievements card
@@ -962,7 +1020,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
                     .padding(.vertical, 11)
                 }
                 .buttonStyle(.plain)
-                .modifier(GlassRoundedBackground(cornerRadius: 10))
+                .modifier(SettledGlassBackground(cornerRadius: 10, settled: showsAmbient))
             }
         }
         .padding(GameDetailMetrics.horizontalPadding)
@@ -977,24 +1035,26 @@ private struct ScrollerVisibility: NSViewRepresentable {
 
     // MARK: - Achievement loading
 
+    /// Fetches (or, when the page mounted from cache, silently refreshes) the
+    /// achievement list. `achievementsLoading` is set at mount, not here, so
+    /// a cache-seeded page never flashes its placeholder.
     private func loadAchievements() async {
+        defer { achievementsLoading = false }
         let key = steamAuth.apiKey
         let sid = steamAuth.steamID
         guard !key.isEmpty, !sid.isEmpty else { return }
-        achievementsLoading = true
-        achievementsUnavailable = false
-        defer { achievementsLoading = false }
         do {
             let result = try await SteamAPIService.shared.fetchPlayerAchievements(
                 steamID: sid,
                 apiKey: key,
                 appID: game.id
             )
-            achievements = result
             // Empty result is valid (game has no achievement system); not an error.
+            if result != achievements { achievements = result }
+            achievementsUnavailable = false
         } catch {
-            achievements = []
-            achievementsUnavailable = true
+            // Keep whatever the cache gave us; only an empty page reports failure.
+            if achievements.isEmpty { achievementsUnavailable = true }
         }
     }
 
@@ -1163,9 +1223,9 @@ private struct ScrollerVisibility: NSViewRepresentable {
             // control family across all launch states.
             HStack(spacing: 8) {
                 Button { handlePlayTapped() } label: {
-                    // Offline is the default — a plain "Play". Only the
-                    // Online opt-in earns a qualifier.
-                    Label(launchModeUI == .online ? "Play Online" : "Play",
+                    // Only when the Local (gbe_fork) mode is available does
+                    // the Online choice earn a qualifier.
+                    Label(localLaunchModeEnabled && launchModeUI == .online ? "Play Online" : "Play",
                           systemImage: "play.fill")
                         .font(.headline)
                         .frame(
@@ -1177,20 +1237,24 @@ private struct ScrollerVisibility: NSViewRepresentable {
                 .controlSize(.large)
 
                 // System-gray chevron (user direction: the primary stays
-                // accent blue, the chevron stays neutral).
-                Button {
-                    showLaunchModePopover.toggle()
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(minHeight: GameDetailMetrics.launchButtonHeight)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .fixedSize()
-                .help("Change launch mode")
-                .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
-                    launchModePopover
+                // accent blue, the chevron stays neutral). Shown only when
+                // the dev-only Local mode is enabled — release builds have
+                // a single Online path.
+                if localLaunchModeEnabled {
+                    Button {
+                        showLaunchModePopover.toggle()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(minHeight: GameDetailMetrics.launchButtonHeight)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .fixedSize()
+                    .help("Change launch mode")
+                    .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
+                        launchModePopover
+                    }
                 }
             }
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
@@ -1328,23 +1392,8 @@ private struct ScrollerVisibility: NSViewRepresentable {
         }
     }
 
-    /// Whether the raw per-game Wine log exists for this game (i.e. it has
-    /// been launched at least once this engine install). Gates the
-    /// "Open Game Log" menu item.
-    private var gameLogExists: Bool {
-        FileManager.default.fileExists(
-            atPath: GameLogFile.currentURL(for: currentGame.id).path(percentEncoded: false)
-        )
-    }
-
-    /// Whether a collected engine log (Unity/Unreal) exists for this game.
-    private var engineLogExists: Bool {
-        FileManager.default.fileExists(
-            atPath: GameLogFile.engineLogURL(for: currentGame.id).path(percentEncoded: false)
-        )
-    }
-
     private func handleInstallTapped() {
+        guard licenseManager.allowsPlay else { showLicenseRequired = true; return }
         guard engine.isReady else { showEngineSetup = true; return }
         launcher.installOnly(
             game: currentGame, engine: engine,
@@ -1353,6 +1402,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
     }
 
     private func handlePlayTapped() {
+        guard licenseManager.allowsPlay else { showLicenseRequired = true; return }
         guard engine.isReady else { showEngineSetup = true; return }
         launcher.launch(
             game: currentGame, engine: engine,
@@ -1363,6 +1413,33 @@ private struct ScrollerVisibility: NSViewRepresentable {
 }
 
 // MARK: - Detail Row helpers
+
+/// `GlassRoundedBackground` for content inside the zoomed page. Glass is a
+/// live backdrop sample; under the flight's fractional scale it re-renders
+/// every frame and shimmers ("glassEffect() tried to update multiple times
+/// per frame"). Mid-flight the row wears the same flat card fill as its
+/// neighbours; once the page has landed it takes the real interactive glass.
+/// The branch re-identifies the row exactly once, at landing — the rows are
+/// stateless link buttons, so nothing is lost.
+private struct SettledGlassBackground: ViewModifier {
+    var cornerRadius: CGFloat = 10
+    var settled: Bool
+
+    func body(content: Content) -> some View {
+        // Glass fades IN at landing but is cut instantly when a close begins:
+        // a fading-out glass would still be sampling under the transform.
+        if settled {
+            content
+                .modifier(GlassRoundedBackground(cornerRadius: cornerRadius))
+                .transition(.asymmetric(insertion: .opacity, removal: .identity))
+        } else {
+            content
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).strokeBorder(.separator, lineWidth: 0.5))
+                .transition(.asymmetric(insertion: .identity, removal: .opacity))
+        }
+    }
+}
 
 private struct DetailRow: View {
     let icon: String

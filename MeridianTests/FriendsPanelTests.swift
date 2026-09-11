@@ -219,11 +219,27 @@ final class FriendsPanelTests: XCTestCase {
             XCTAssertTrue(source.contains(section),
                           "FriendsPanel must group friends into the \(section) section.")
         }
-        // REVERSAL GUARD (July 12 2026): the own-profile hero card was removed
-        // — Meridian can't change the user's persona state, so a "you" header
-        // was dead UI. Don't reintroduce it.
+        // Own-profile header: removed July 12 2026 (status can't be changed
+        // from Meridian), REINSTATED Sept 10 2026 by user direction as a
+        // read-only identity row matching the Steam client's friends
+        // window. It opens the same detail popover as a friend row.
+        XCTAssertTrue(source.contains("OwnProfileHeader(me: me)"),
+                      "FriendsPanel must show the user's own profile at the top, like Steam's friends list.")
         XCTAssertFalse(source.contains("ownProfileHero"),
-                       "FriendsPanel must not render an own-profile header (user-rejected as useless — status can't be changed from Meridian).")
+                       "The old editable-status hero card design must not come back — the header is read-only.")
+    }
+
+    /// Sidebar parity (Sept 10 2026): section headers are sentence case in
+    /// the sidebar's 11 pt header style, rows use the 13 pt body size, and
+    /// Offline starts collapsed so an opened panel shows who's around.
+    func testFriendsPanel_matchesSidebarTypographyAndCollapsesOffline() throws {
+        let source = try readSource("Meridian/Views/Friends/FriendsPanel.swift")
+        XCTAssertFalse(source.contains("Text(title.uppercased())"),
+                       "No all-caps section headers — sentence case like the sidebar.")
+        XCTAssertFalse(source.contains(".textCase(.uppercase)"),
+                       "No all-caps labels in the friends surfaces.")
+        XCTAssertTrue(source.contains("collapsedSections: Set<String> = [\"Offline\"]"),
+                      "Offline must start collapsed.")
     }
 
     /// Online friends use GREEN, not Steam blue (user direction July 12 2026:

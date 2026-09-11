@@ -82,7 +82,6 @@ struct LibraryView: View {
             .padding(.vertical, CardLayoutMetrics.spacing)
         }
         .ignoresSafeArea(edges: [.top, .bottom])
-        .scrollIndicators(.hidden)
     }
 
     // MARK: - Context menu
@@ -212,7 +211,6 @@ struct LibraryView: View {
             .padding(.vertical, CardLayoutMetrics.spacing)
         }
         .ignoresSafeArea(edges: [.top, .bottom])
-        .scrollIndicators(.hidden)
     }
 
     private func errorView(_ message: String) -> some View {
