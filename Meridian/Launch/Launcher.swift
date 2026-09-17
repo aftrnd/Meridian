@@ -461,6 +461,11 @@ final class Launcher {
             return
         }
 
+        // Install state cannot change while a game runs; avoid a main-actor
+        // filesystem scan of every library entry every five seconds.
+        library?.setInstallStatePollingSuspended(true)
+        defer { library?.setInstallStatePollingSuspended(false) }
+
         // Begin process monitoring. Pass the game's installdir as `gamePattern`
         // so detection uses `pgrep -f "<installdir>"` against the game's own
         // process — the game-specific path. With nil (the previous behaviour)

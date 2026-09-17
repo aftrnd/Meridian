@@ -1372,6 +1372,20 @@ final class GameInstallTests: XCTestCase {
                       "Seeding must cover Source (registry), Unity and Unreal (launch args).")
     }
 
+    func testInstallStatePolling_pausesWhileGameRuns() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let library = try String(contentsOf: root.appending(path: "Meridian/Steam/SteamLibraryStore.swift"), encoding: .utf8)
+        XCTAssertTrue(library.contains("func setInstallStatePollingSuspended(_ suspended: Bool)"),
+                      "SteamLibraryStore must expose a lifecycle method that cancels the install-state poll during gameplay.")
+        XCTAssertTrue(library.contains("guard !installStatePollingSuspended else { return }"),
+                      "A suspended poll must not be restarted by a library refresh while a game is running.")
+
+        let launcher = try String(contentsOf: root.appending(path: "Meridian/Launch/Launcher.swift"), encoding: .utf8)
+        XCTAssertTrue(launcher.contains("library?.setInstallStatePollingSuspended(true)") &&
+                      launcher.contains("defer { library?.setInstallStatePollingSuspended(false) }"),
+                      "Launcher must suspend polling after it spawns a game and resume it for every game-exit path.")
+    }
+
     func testEngine_surfacesD3DMetalAndDxmtVersions() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let src = try String(contentsOf: root.appending(path: "Meridian/Engine/WineEngine.swift"), encoding: .utf8)
