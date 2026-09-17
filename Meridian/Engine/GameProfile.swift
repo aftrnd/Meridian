@@ -14,7 +14,7 @@ enum GameEngine: String {
 /// What DirectX/Vulkan API the game renders with.
 /// Drives DXMT vs DXVK selection at launch.
 enum GraphicsAPI: String {
-    case dx9       // DirectX 9 → DXVK (d3d9) or DXMT where supported → Metal
+    case dx9       // DirectX 9 → wined3d → OpenGL → Metal (no d3d9 backend on this engine yet)
     case dx11      // DirectX 11 → DXMT → Metal
     case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
@@ -160,7 +160,7 @@ struct GameProfile {
 
     var translationLayerDescription: String {
         switch graphicsAPI {
-        case .dx9:     return "DXVK → MoltenVK → Metal"
+        case .dx9:     return "wined3d → OpenGL → Metal"
         case .dx11:    return "DXMT → Metal"
         case .dx12:    return "GPTK → D3DMetal → Metal"
         case .vulkan:  return "MoltenVK"

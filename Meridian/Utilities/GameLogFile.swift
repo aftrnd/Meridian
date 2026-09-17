@@ -364,15 +364,17 @@ struct GameStackReport {
         case gptk        // D3D12 → GPTK → D3DMetal → Metal
         case dxvk        // D3D9/10/11 → DXVK → MoltenVK → Metal
         case wined3d     // D3D → Wine builtin (wined3d) → MoltenVK → Metal
+        case wined3dGL   // D3D9 → Wine builtin (wined3d) → Apple OpenGL → Metal
         case unknown     // No D3D override seen (OpenGL/Vulkan game, or unconfigured)
 
         var translationLayer: String {
             switch self {
-            case .dxmt:    return "DXMT → Metal"
-            case .gptk:    return "GPTK → D3DMetal → Metal"
-            case .dxvk:    return "DXVK → MoltenVK → Metal"
-            case .wined3d: return "Wine builtin (wined3d) → MoltenVK → Metal"
-            case .unknown: return "Wine default (no D3D override — OpenGL/Vulkan or unconfigured)"
+            case .dxmt:      return "DXMT → Metal"
+            case .gptk:      return "GPTK → D3DMetal → Metal"
+            case .dxvk:      return "DXVK → MoltenVK → Metal"
+            case .wined3d:   return "Wine builtin (wined3d) → MoltenVK → Metal"
+            case .wined3dGL: return "Wine builtin (wined3d) → OpenGL → Metal"
+            case .unknown:   return "Wine default (no D3D override — OpenGL/Vulkan or unconfigured)"
             }
         }
     }
@@ -414,14 +416,27 @@ struct GameStackReport {
         let dllPath = environment["WINEDLLPATH"] ?? ""
         let overridesStr = environment["WINEDLLOVERRIDES"] ?? ""
         let overrides = parseOverrides(overridesStr)
+        let backend = environment["CX_GRAPHICS_BACKEND"]
+        let declaredAPI = resolved?.graphicsAPI ?? profile?.graphicsAPI
 
+        // CX Wine selects the D3D implementation from `CX_GRAPHICS_BACKEND`
+        // (cxcompatdb prepends `$CX_ROOT/lib/<backend>` to the builtin search
+        // list); WINEDLLPATH alone is never consulted ahead of `lib/wine`. So the
+        // backend is the primary signal and the path/override pair is only a
+        // fallback for environments that predate it. The DX9 branch comes first
+        // because a d3d11 backend says nothing about which d3d9 a DX9 game gets:
+        // no engine backend covers d3d9, so it is wined3d, and wined3d's d3d9
+        // path on macOS is the OpenGL renderer (CLI-verified 2026-09-16, HL2:
+        // `lib/wine/i386-windows/d3d9.dll` + AppleMetalOpenGLRenderer mapped).
         let renderer: Renderer
-        if environment["CX_GRAPHICS_BACKEND"] == "d3dmetal" {
-            // preferD3DMetal path: CX Wine's cxcompatdb prepends GPTK's
-            // D3DMetal builtins; WINEDLLOVERRIDES is intentionally cleared, so
-            // this MUST be checked before the override-based branches or the
-            // renderer mis-reports as .unknown (the pre-B4 bug).
+        if declaredAPI == .dx9, overrides["d3d9"] == nil, backend != "dxvk" {
+            renderer = .wined3dGL
+        } else if backend == "d3dmetal" {
             renderer = .gptk
+        } else if backend == "dxvk" {
+            renderer = .dxvk
+        } else if backend == "dxmt" {
+            renderer = .dxmt
         } else if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
             renderer = .gptk
         } else if dllPath.contains("/dxvk") {
@@ -439,7 +454,6 @@ struct GameStackReport {
         // Prefer the merged resolver values (engine/API/bitness/status with
         // provenance) over the bare explicit profile. Falls back to the
         // profile when no resolved stack was supplied (cold cache).
-        let declaredAPI = resolved?.graphicsAPI ?? profile?.graphicsAPI
         let declaredEngine = resolved?.engine ?? profile?.gameEngine
         let status = resolved?.status ?? profile?.status
 
