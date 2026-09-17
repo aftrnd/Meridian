@@ -399,10 +399,13 @@ final class SteamLibraryStore {
 
     // MARK: - Install state polling
 
+    @ObservationIgnored private var installStatePollingSuspended = false
+
     /// Starts a 5-second background poll that re-reads ACF files and updates
     /// `isInstalled` flags without a full API refresh. Called once after the
     /// library loads; idempotent — cancels any prior task before starting.
     func startInstallStatePolling() {
+        guard !installStatePollingSuspended else { return }
         installPollTask?.cancel()
         installPollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -412,6 +415,21 @@ final class SteamLibraryStore {
                 // @MainActor isolation, so no hop (and no await) is needed.
                 self?.syncInstallStateFromDisk()
             }
+        }
+    }
+
+    /// Stops filesystem polling while a game is active, then resumes it when
+    /// the game exits. A running game cannot become newly installed.
+    func setInstallStatePollingSuspended(_ suspended: Bool) {
+        guard installStatePollingSuspended != suspended else { return }
+        installStatePollingSuspended = suspended
+        if suspended {
+            installPollTask?.cancel()
+            installPollTask = nil
+            log.info("[installPoll] suspended while a game is running")
+        } else {
+            log.info("[installPoll] resumed after game exit")
+            startInstallStatePolling()
         }
     }
 
