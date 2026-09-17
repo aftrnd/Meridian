@@ -1344,6 +1344,34 @@ final class GameInstallTests: XCTestCase {
                       "dxmtMode == .disabled must clear the dxmt backend, not just flip the override to builtin.")
     }
 
+    /// User-verified 2026-09-17 (HL2, M3 Pro, 5K Studio Display): D3D fullscreen
+    /// as a composited borderless window + point-resolution mouse tracking made
+    /// mouse-look choppy while rendering was smooth. `CaptureDisplaysForFullscreen`
+    /// + `RetinaMode` fixed it; Retina mode makes games default to the native
+    /// desktop, so first launches are steered to the display's scaled
+    /// resolution. Guard the prefix write, its bootstrap wiring + counter reset,
+    /// and the first-launch-only seeding.
+    func testMacDriverDisplayKeys_andFirstLaunchResolution_areWired() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let prefix = try String(contentsOf: root.appending(path: "Meridian/Engine/WinePrefix.swift"), encoding: .utf8)
+        XCTAssertTrue(prefix.contains(#"("CaptureDisplaysForFullscreen", "y")"#) && prefix.contains(#"("RetinaMode", "y")"#),
+                      "writeMacDriverDisplayKeys must write CaptureDisplaysForFullscreen=y and RetinaMode=y.")
+        XCTAssertTrue(prefix.contains("static let macDriverDisplayRegistrationVersion"),
+                      "Mac Driver display keys must be a versioned prefix write.")
+
+        let bootstrap = try String(contentsOf: root.appending(path: "Meridian/App/BootstrapManager.swift"), encoding: .utf8)
+        XCTAssertTrue(bootstrap.contains("await prefix.writeMacDriverDisplayKeys(engine: engine)"),
+                      "Bootstrap step 3 must apply the Mac Driver display keys.")
+        XCTAssertTrue(bootstrap.contains("settings.macDriverDisplayAppliedVersion = 0"),
+                      "resetVersionedRegistryCounters must zero the Mac Driver counter so a rebuilt prefix gets the keys again.")
+
+        let launcher = try String(contentsOf: root.appending(path: "Meridian/Launch/Launcher.swift"), encoding: .utf8)
+        XCTAssertTrue(launcher.contains("guard AppSettings.shared.lastLaunchDate(appID: game.id) == nil"),
+                      "Resolution seeding must only happen on a game's first launch — never override the user's choice.")
+        XCTAssertTrue(launcher.contains(#""ScreenWidth""#) && launcher.contains(#""-screen-fullscreen""#) && launcher.contains(#""-ResX="#),
+                      "Seeding must cover Source (registry), Unity and Unreal (launch args).")
+    }
+
     func testEngine_surfacesD3DMetalAndDxmtVersions() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let src = try String(contentsOf: root.appending(path: "Meridian/Engine/WineEngine.swift"), encoding: .utf8)

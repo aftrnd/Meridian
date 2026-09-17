@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Observation
 
 private let log = MeridianLog(category: "GameProcess")
@@ -239,6 +240,7 @@ final class GameProcess {
         var pollCount = 0
         var pidExited = false
         var consecutiveDetected = 0
+        var detectedPIDs: Set<Int32> = []
 
         while !Task.isCancelled {
             let elapsed = ContinuousClock.now - startupBegan
@@ -273,6 +275,7 @@ final class GameProcess {
                 }.value
                 gameDetected = result.count > 0
                 detectionMethod = "game-specific(\(result.count))"
+                if gameDetected { detectedPIDs = result.pids }
 
                 if pollCount <= 3 || result.count > 0 {
                     for line in result.lines {
@@ -287,6 +290,7 @@ final class GameProcess {
                 let newPIDs = result.pids.subtracting(self.baselinePIDs)
                 gameDetected = !newPIDs.isEmpty
                 detectionMethod = "fallback-delta(new=\(newPIDs.count))"
+                if gameDetected { detectedPIDs = newPIDs }
             }
 
             if gameDetected {
@@ -300,6 +304,7 @@ final class GameProcess {
                 log.info("[monitor:startup] game CONFIRMED after \(pollCount) polls (\(elapsed)) via \(detectionMethod)")
                 appendLog("Game confirmed running (via \(detectionMethod))")
                 onLog?("Game is running")
+                activateGameApplication(pids: detectedPIDs)
                 return true
             }
 
@@ -436,6 +441,32 @@ final class GameProcess {
     }
 
     // MARK: - Process Detection
+
+    /// Brings the game's Wine process to the front once it is confirmed.
+    ///
+    /// winemac defers display-mode changes while its NSApplication is not
+    /// active and applies them on `applicationDidBecomeActive`. With
+    /// `CaptureDisplaysForFullscreen` a cold launch therefore asked for
+    /// 2560×1440, found the mode, and drew a quarter-size frame in the corner
+    /// of the captured 5K display until the user minimised/reopened the game
+    /// (user-observed 2026-09-17, `+display` trace: "match mode 10" with no
+    /// switch). Wine creates its NSApplication a little after the process
+    /// appears, so retry for a few seconds until activation sticks.
+    private func activateGameApplication(pids: Set<Int32>) {
+        guard !pids.isEmpty else { return }
+        Task { @MainActor in
+            for attempt in 0..<12 {
+                for pid in pids {
+                    guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+                    if app.isActive { return }
+                    if app.activate(from: .current, options: []) {
+                        log.info("[monitor] activated game app pid=\(pid) (attempt \(attempt + 1))")
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
 
     struct ProcessCheckResult: Sendable {
         let count: Int
