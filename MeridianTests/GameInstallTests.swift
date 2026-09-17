@@ -1211,13 +1211,18 @@ final class GameInstallTests: XCTestCase {
     /// Mirror of `GameStackReport.resolve` renderer inference. Returns the
     /// `Renderer.rawValue` Wine will actually use for a given resolved env.
     /// WHENEVER the production inference changes, update this mirror.
-    private func resolveRenderer(env: [String: String]) -> String {
+    private func resolveRenderer(env: [String: String], declaredAPI: String? = nil) -> String {
         let dllPath = env["WINEDLLPATH"] ?? ""
         let overrides = parseOverridesMirror(env["WINEDLLOVERRIDES"] ?? "")
-        if env["CX_GRAPHICS_BACKEND"] == "d3dmetal" {
-            // preferD3DMetal: cxcompatdb prepends GPTK D3DMetal builtins;
-            // WINEDLLOVERRIDES is cleared. Must be checked FIRST (B4 fix).
+        let backend = env["CX_GRAPHICS_BACKEND"]
+        if declaredAPI == "dx9", overrides["d3d9"] == nil, backend != "dxvk" {
+            return "wined3dGL"
+        } else if backend == "d3dmetal" {
             return "gptk"
+        } else if backend == "dxvk" {
+            return "dxvk"
+        } else if backend == "dxmt" {
+            return "dxmt"
         } else if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
             return "gptk"
         } else if dllPath.contains("/dxvk") {
@@ -1236,6 +1241,8 @@ final class GameInstallTests: XCTestCase {
         let env = [
             "WINEDLLPATH": "/engine/wine/lib/dxmt:/engine/wine/lib/wine",
             "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b;d3d10core=n,b",
+            "CX_GRAPHICS_BACKEND": "dxmt",
+            "CX_ROOT": "/engine/wine",
         ]
         XCTAssertEqual(resolveRenderer(env: env), "dxmt")
     }
@@ -1245,6 +1252,7 @@ final class GameInstallTests: XCTestCase {
         let env = [
             "WINEDLLPATH": "/engine/wine/lib/gptk/wine:/engine/wine/lib/wine",
             "WINEDLLOVERRIDES": "d3d11=n,b;d3d10core=n,b;d3d12,dxgi=b",
+            "CX_GRAPHICS_BACKEND": "d3dmetal",
         ]
         XCTAssertEqual(resolveRenderer(env: env), "gptk")
     }
@@ -1258,13 +1266,29 @@ final class GameInstallTests: XCTestCase {
     }
 
     func testStackReport_inferWined3dWhenDXMTDisabled() {
-        // A game with dxmtMode == .disabled: d3d11 forced to builtin.
+        // A game with dxmtMode == .disabled: d3d11 forced to builtin and the
+        // dxmt backend dropped (otherwise `b` would still resolve to DXMT).
         let env = [
             "WINEDLLPATH": "/engine/wine/lib/dxmt:/engine/wine/lib/wine",
             "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b;d3d10core=n,b;d3d11,dxgi=b",
         ]
         // Last entry wins per Wine: d3d11=b → wined3d.
         XCTAssertEqual(resolveRenderer(env: env), "wined3d")
+    }
+
+    func testStackReport_inferWined3dGLForDX9WithoutD3D9Backend() {
+        // HL2 (32-bit DX9) under the default DX11 env: the dxmt backend says
+        // nothing about d3d9, which stays Wine's builtin → OpenGL. Before this
+        // the header claimed "DXMT → Metal" for a game on AppleMetalOpenGLRenderer.
+        let env = [
+            "WINEDLLPATH": "/engine/wine/lib/dxmt:/engine/wine/lib/wine",
+            "WINEDLLOVERRIDES": "d3d11=n,b;dxgi=n,b;d3d10core=n,b",
+            "CX_GRAPHICS_BACKEND": "dxmt",
+        ]
+        XCTAssertEqual(resolveRenderer(env: env, declaredAPI: "dx9"), "wined3dGL")
+        // A dxvk backend DOES cover d3d9.
+        var vk = env; vk["CX_GRAPHICS_BACKEND"] = "dxvk"
+        XCTAssertEqual(resolveRenderer(env: vk, declaredAPI: "dx9"), "dxvk")
     }
 
     func testStackReport_inferUnknownWhenNoD3DOverride() {
@@ -1288,10 +1312,36 @@ final class GameInstallTests: XCTestCase {
     func testStackReport_productionChecksGraphicsBackendFirst() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let src = try String(contentsOf: root.appending(path: "Meridian/Utilities/GameLogFile.swift"), encoding: .utf8)
-        XCTAssertTrue(src.contains(#"environment["CX_GRAPHICS_BACKEND"] == "d3dmetal""#),
-                      "GameStackReport.resolve must detect the D3DMetal backend so preferD3DMetal games don't report unknown.")
+        XCTAssertTrue(src.contains(#"let backend = environment["CX_GRAPHICS_BACKEND"]"#),
+                      "GameStackReport.resolve must read CX_GRAPHICS_BACKEND — it is the switch CX Wine actually honours.")
+        XCTAssertTrue(src.contains(#"backend == "d3dmetal""#) && src.contains(#"backend == "dxmt""#),
+                      "GameStackReport.resolve must map the d3dmetal and dxmt backends before falling back to path/override heuristics.")
+        XCTAssertTrue(src.contains("case wined3dGL"),
+                      "GameStackReport.Renderer must distinguish wined3d's OpenGL d3d9 path (what DX9 titles get on this engine).")
         XCTAssertTrue(src.contains("CX_GRAPHICS_BACKEND") && src.contains("relevantEnvKeys"),
                       "CX_GRAPHICS_BACKEND must be in the per-game log header's relevantEnvKeys.")
+    }
+
+    /// CX Wine's loader searches its own lib/wine ahead of every WINEDLLPATH
+    /// entry, so DXMT was never selected by WINEDLLPATH + `n,b` alone
+    /// (CLI-verified 2026-09-16: Big Walk mapped lib/wine d3d11.dll and logged
+    /// `wined3d_adapter_create Using the Vulkan renderer`). The switch CX Wine
+    /// honours is CX_GRAPHICS_BACKEND + CX_ROOT. Guard that both default DX11
+    /// (dxmt) and DX12 (d3dmetal) routing set it, and that the DXMT opt-out
+    /// clears it (otherwise `d3d11=b` would still resolve to DXMT).
+    func testGraphicsRouting_usesCXGraphicsBackendSwitch() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let engine = try String(contentsOf: root.appending(path: "Meridian/Engine/WineEngine.swift"), encoding: .utf8)
+        XCTAssertTrue(engine.contains(#"env["CX_GRAPHICS_BACKEND"] = "dxmt""#),
+                      "WineEngine.environment(for:) must select DXMT via CX_GRAPHICS_BACKEND=dxmt.")
+        XCTAssertTrue(engine.contains(#"env["CX_ROOT"] = cxRootPath"#),
+                      "WineEngine.environment(for:) must set CX_ROOT so cxcompatdb can resolve $CX_ROOT/lib/dxmt.")
+
+        let session = try String(contentsOf: root.appending(path: "Meridian/Steam/SteamSession.swift"), encoding: .utf8)
+        XCTAssertEqual(session.components(separatedBy: #"env["CX_GRAPHICS_BACKEND"] = "d3dmetal""#).count - 1, 2,
+                       "SteamSession.gameEnvironment must route BOTH the DX12 path and preferD3DMetal through CX_GRAPHICS_BACKEND=d3dmetal.")
+        XCTAssertTrue(session.contains(#"env.removeValue(forKey: "CX_GRAPHICS_BACKEND")"#),
+                      "dxmtMode == .disabled must clear the dxmt backend, not just flip the override to builtin.")
     }
 
     func testEngine_surfacesD3DMetalAndDxmtVersions() throws {

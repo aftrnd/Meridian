@@ -828,6 +828,11 @@ final class SteamSession {
                     overriding: ["d3d11", "dxgi"],
                     with: "b"
                 )
+                // Without this cxcompatdb would still prepend lib/dxmt and
+                // `b` would resolve to DXMT, not wined3d.
+                if env["CX_GRAPHICS_BACKEND"] == "dxmt" {
+                    env.removeValue(forKey: "CX_GRAPHICS_BACKEND")
+                }
             case .required, .auto:
                 break
             }
@@ -859,6 +864,10 @@ final class SteamSession {
                 overriding: ["d3d12", "dxgi"],
                 with: "b"
             )
+            // CX Wine only honours the backend switch for builtin selection
+            // (see WineEngine.environment); D3DMetal owns d3d12 + dxgi.
+            env["CX_ROOT"] = engine.cxRootPath
+            env["CX_GRAPHICS_BACKEND"] = "d3dmetal"
         }
 
         // D3DMetal opt-in (per-game). Routes D3D11/DXGI/D3D12 through Apple GPTK

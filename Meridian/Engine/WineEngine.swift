@@ -659,6 +659,7 @@ final class WineEngine {
             let unixDir = "\(lib)/wine/x86_64-unix"
 
             let l64Suffix = lib64Path.map { ":\($0)" } ?? ""
+            let dxmtUnixDir = "\(lib)/dxmt/x86_64-unix"
 
             if let gptk = gptkPath {
                 // GPTK present (CX Wine ABI confirmed): D3D12 → D3DMetal → Metal
@@ -666,42 +667,36 @@ final class WineEngine {
                 // DYLD includes gptk paths so libd3dshared.dylib/D3DMetal load when a
                 // D3D12 game's WINEDLLPATH routes through gptk/wine. Also includes
                 // lib/dxmt/x86_64-unix for winemetal.so (DXMT's Metal bridge).
-                let dxmtUnixDir = "\(lib)/dxmt/x86_64-unix"
                 env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(dxmtUnixDir):\(unixDir)\(l64Suffix)"
                 env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
-
-                // DX11 default: DXMT first in WINEDLLPATH, Wine builtins as fallback.
-                // D3D12 games override both WINEDLLPATH and WINEDLLOVERRIDES in
-                // SteamSession.gameEnvironment(for:engine:) based on
-                // profile.graphicsAPI == .dx12.
-                let dxmtLibDir = "\(lib)/dxmt"
-                env["WINEDLLPATH"] = "\(dxmtLibDir):\(lib)/wine"
-
-                // Force Wine to load native PE versions of d3d11/dxgi/d3d10core
-                // BEFORE its own builtin wined3d implementations.
-                //
-                // CRITICAL — without this override, Wine prefers the much
-                // smaller wined3d-based `lib/wine/x86_64-windows/d3d11.dll`
-                // (426 KB) over the full DXMT `lib/dxmt/x86_64-windows/d3d11.dll`
-                // (4.8 MB). The wined3d path then translates D3D11 → Vulkan →
-                // MoltenVK → Metal which has many partial-stub format/feature
-                // gaps (CLI-verified May 20 2026 game log: a Bogos Binted
-                // launch produced 30+ lines of
-                // `err:winediag:wined3d_adapter_create Using the Vulkan
-                //  renderer for d3d10/11 applications` and
-                // `fixme:d3d11:d3d11_device_CheckFormatSupport ... partial-stub!`
-                // before silently failing to render).
-                //
-                // `n,b` order means "try native (PE) first, fall back to
-                // builtin if not found." Wine searches WINEDLLPATH for the
-                // native version; since `lib/dxmt` is first, it finds DXMT's
-                // PE there. Builtin path is preserved as a safety net for
-                // environments where DXMT isn't present.
-                env["WINEDLLOVERRIDES"] = "d3d11=n,b;dxgi=n,b;d3d10core=n,b"
-
                 env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)\(l64Suffix)"
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(dxmtUnixDir):\(unixDir)\(l64Suffix)"
+            }
+
+            if dxmtPath != nil {
+                // DX11 default: DXMT → Metal.
+                //
+                // `CX_GRAPHICS_BACKEND` is the switch that actually selects the
+                // D3D implementation. CX Wine's loader searches its own
+                // `lib/wine` BEFORE any WINEDLLPATH entry, so WINEDLLPATH +
+                // `d3d11=n,b` alone never picked DXMT — every DX11 game ran
+                // wined3d's Vulkan backend (CLI-verified 2026-09-16 via lsof on
+                // Big Walk: `lib/wine/x86_64-windows/d3d11.dll` mapped +
+                // `err:winediag:wined3d_adapter_create Using the Vulkan
+                // renderer`). With the backend set, `cxcompatdb.so` prepends
+                // `$CX_ROOT/lib/dxmt` to the builtin search list: same run
+                // mapped lib/dxmt d3d11+dxgi+winemetal.so, zero wined3d output,
+                // game rendered. `SteamSession.gameEnvironment` overrides the
+                // backend to `d3dmetal` for DX12 / preferD3DMetal titles.
+                //
+                // WINEDLLPATH + overrides are kept: they are what
+                // `GameStackReport` reads back, and `n,b` still lets a game
+                // directory's own native d3d11 win when one is shipped.
+                env["CX_ROOT"] = cxRootPath
+                env["CX_GRAPHICS_BACKEND"] = "dxmt"
+                env["WINEDLLPATH"] = "\(lib)/dxmt:\(lib)/wine"
+                env["WINEDLLOVERRIDES"] = "d3d11=n,b;dxgi=n,b;d3d10core=n,b"
             }
         }
 

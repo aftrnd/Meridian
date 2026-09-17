@@ -46,7 +46,18 @@ extension GameCompatibilityDB {
             prefix without a wipe; (2) `BootstrapManager.resetVersionedRegistryCounters()` \
             now zeros ALL four versioned counters on BOTH prefix create AND engine reset, \
             so the registry and the counters can never drift out of sync again. \
-            Re-verification on the Jun 19 2026 build pending.
+            Re-verification on the Jun 19 2026 build pending. \
+            \
+            RENDER PATH (CLI-verified Sep 16 2026, M3 Pro, v3.1.0-engine): 32-bit DX9 \
+            via `bin/shaderapidx9.dll` → Wine builtin d3d9 (wined3d) → Apple OpenGL. \
+            78 fps at 1280x800 with fps_max 0 in d1_trainstation_01, ~220% CPU (Rosetta). \
+            Every Vulkan-backed alternative renders black on this engine: CX DXVK d3d9 \
+            (`CX_GRAPHICS_BACKEND=dxvk`) fails MSL compile with duplicate resource \
+            bindings, Valve's `-vulkan` (bundled dxvk_d3d9) the same, wined3d \
+            `renderer=vulkan` fails every SM2/3 shader (`shader_spirv_compile_shader \
+            ret -5`). 64-bit wined3d-vk works, so the 32-bit Vulkan thunk path is the \
+            suspect. `mat_queue_mode 2` measured no gain. Do not add a d3d9 override \
+            until a d3d9 backend is verified to draw — see docs/HL2-PERFORMANCE.md.
             """
         ),
 
