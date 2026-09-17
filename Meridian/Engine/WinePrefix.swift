@@ -2293,6 +2293,45 @@ struct WinePrefix: Sendable {
     /// create and reset) prevents the skip from recurring.
     static let steamInstallPathRegistrationVersion = 4
 
+    // MARK: - Mac Driver display keys
+
+    /// Increment when the `HKCU\Software\Wine\Mac Driver` display set below changes.
+    ///
+    /// History:
+    ///   1 — `CaptureDisplaysForFullscreen=y` + `RetinaMode=y`. User-verified
+    ///       2026-09-17 on HL2 (M3 Pro, 5K Studio Display @ 60 Hz): without
+    ///       them a D3D fullscreen game is a borderless window composited by
+    ///       WindowServer and Wine tracks the mouse in *points*, so half of
+    ///       every physical-pixel movement truncates to zero — mouse-look
+    ///       reads as choppy while the rendering is smooth. Capture gives the
+    ///       game the display exclusively ("big improvement"); Retina mode
+    ///       delivers full-resolution deltas ("feels better" → "smooth").
+    ///       Retina mode also makes games see the native desktop (5120×2880
+    ///       here), so `Launcher.seedDefaultResolution` steers first launches
+    ///       to the display's scaled resolution.
+    static let macDriverDisplayRegistrationVersion = 1
+
+    /// Writes the winemac display keys that make D3D fullscreen exclusive and
+    /// mouse tracking pixel-accurate. Idempotent (`reg add /f`).
+    func writeMacDriverDisplayKeys(engine: WineEngine) async {
+        let values: [(String, String)] = [
+            ("CaptureDisplaysForFullscreen", "y"),
+            ("RetinaMode", "y"),
+        ]
+        for (name, data) in values {
+            do {
+                try await engine.run(
+                    args: ["reg", "add", "HKCU\\Software\\Wine\\Mac Driver",
+                           "/v", name, "/t", "REG_SZ", "/d", data, "/f"],
+                    prefix: self
+                )
+            } catch {
+                log.error("[writeMacDriverDisplayKeys] failed \(name): \(error.localizedDescription)")
+            }
+        }
+        log.info("[writeMacDriverDisplayKeys] CaptureDisplaysForFullscreen=y RetinaMode=y ✓")
+    }
+
     // MARK: - Windows Version Registration
 
     /// Increment when the Windows-version registry mapping changes. Valve

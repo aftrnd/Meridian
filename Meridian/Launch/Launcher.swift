@@ -899,7 +899,6 @@ final class Launcher {
 
         let compat = GameCompatibilityDB.shared
         let profile = compat.profile(for: game.id)
-        let launchArgs = profile?.launchArgs ?? []
 
         // Warm the stack resolver (local file detection + cached PCGamingWiki
         // enrichment, merged with any explicit compat profile) BEFORE building
@@ -908,6 +907,13 @@ final class Launcher {
         // network failure / offline this still returns local-only detection;
         // on a cold cache `gameEnvironment` falls back to prior behaviour.
         let resolvedStack = await GameStackResolver.shared.resolve(appID: game.id, installDir: gamePath)
+
+        let launchArgs = (profile?.launchArgs ?? []) + (await seedDefaultResolution(
+            game: game,
+            engine: engine,
+            gameEngine: profile?.gameEngine ?? resolvedStack.engine,
+            profileArgs: profile?.launchArgs ?? []
+        ))
 
         let env = session.gameEnvironment(for: game.id, engine: engine)
 
@@ -975,6 +981,62 @@ final class Launcher {
         log.info("[launch] pid=\(pid)")
 
         return GameLaunchResult(pid: pid, process: process)
+    }
+
+    // MARK: - Private: first-launch resolution
+
+    /// The display's scaled ("Default for display") resolution in points, e.g.
+    /// 2560×1440 on a 5K Studio Display. With winemac `RetinaMode=y` games see
+    /// the native pixel desktop and default to it; native 5K is fill-bound on
+    /// the GL path (user-verified: equally choppy mouse AND video) while the
+    /// scaled resolution is smooth. Uses the screen the Meridian window is on.
+    static func defaultGameResolution() -> (width: Int, height: Int)? {
+        guard let screen = NSApp.keyWindow?.screen ?? NSScreen.main else { return nil }
+        let size = screen.frame.size
+        return (Int(size.width.rounded()), Int(size.height.rounded()))
+    }
+
+    /// On a game's FIRST launch (no `AppSettings.launchTimestamps` entry) point
+    /// its fullscreen resolution at `defaultGameResolution()`. Never touches a
+    /// game that has already been launched — the user's own choice wins after
+    /// that. Returns extra launch args for engines configured that way; Source
+    /// is seeded through its registry settings key instead.
+    private func seedDefaultResolution(
+        game: Game,
+        engine: WineEngine,
+        gameEngine: GameEngine,
+        profileArgs: [String]
+    ) async -> [String] {
+        guard AppSettings.shared.lastLaunchDate(appID: game.id) == nil,
+              let res = Self.defaultGameResolution() else { return [] }
+        let w = String(res.width), h = String(res.height)
+
+        switch gameEngine {
+        case .source:
+            // Source persists video settings under HKCU\Software\Valve\Source\<mod>\Settings.
+            // The mod folder is the `-game` argument; without one we cannot name the key.
+            guard let i = profileArgs.firstIndex(of: "-game"), i + 1 < profileArgs.count else { return [] }
+            let key = "HKCU\\Software\\Valve\\Source\\\(profileArgs[i + 1])\\Settings"
+            for (name, value) in [("ScreenWidth", w), ("ScreenHeight", h), ("ScreenWindowed", "0")] {
+                _ = try? await engine.run(
+                    args: ["reg", "add", key, "/v", name, "/t", "REG_DWORD", "/d", value, "/f"],
+                    prefix: prefix
+                )
+            }
+            log.info("[launch] first launch appID=\(game.id): seeded Source video settings \(w)x\(h) fullscreen")
+            return []
+        case .unity:
+            log.info("[launch] first launch appID=\(game.id): Unity \(w)x\(h) fullscreen")
+            return ["-screen-width", w, "-screen-height", h, "-screen-fullscreen", "1"]
+        case .unreal:
+            log.info("[launch] first launch appID=\(game.id): Unreal \(w)x\(h) fullscreen")
+            return ["-ResX=\(w)", "-ResY=\(h)", "-fullscreen"]
+        case .godot:
+            log.info("[launch] first launch appID=\(game.id): Godot \(w)x\(h) fullscreen")
+            return ["--resolution", "\(w)x\(h)", "--fullscreen"]
+        case .custom, .unknown:
+            return []
+        }
     }
 
     /// Append a `Reason:` trailer to the active per-game log and release

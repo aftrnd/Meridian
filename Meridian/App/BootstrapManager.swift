@@ -344,6 +344,12 @@ final class BootstrapManager {
             await prefix.registerWoW64ComClasses(engine: engine)
             settings.wow64ComRegistrationAppliedVersion = WinePrefix.wow64ComRegistrationVersion
         }
+        // winemac display keys — exclusive fullscreen + pixel-accurate mouse
+        // (user-verified fix for choppy mouse-look, see WinePrefix).
+        if settings.macDriverDisplayAppliedVersion < WinePrefix.macDriverDisplayRegistrationVersion {
+            await prefix.writeMacDriverDisplayKeys(engine: engine)
+            settings.macDriverDisplayAppliedVersion = WinePrefix.macDriverDisplayRegistrationVersion
+        }
 
         guard !Task.isCancelled else { return }
 
@@ -393,6 +399,7 @@ final class BootstrapManager {
         settings.windowsVersionAppliedVersion = 0
         settings.staleSteamServiceCleanupVersion = 0
         settings.wow64ComRegistrationAppliedVersion = 0
+        settings.macDriverDisplayAppliedVersion = 0
     }
 
     private static func engineVersionFileModTime() -> Double {

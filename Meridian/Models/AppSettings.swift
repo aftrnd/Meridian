@@ -263,6 +263,13 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "steamInstallPathRegistrationVersion") }
     }
 
+    /// Tracks which `WinePrefix.macDriverDisplayRegistrationVersion` (fullscreen
+    /// capture + Retina mouse tracking) has been written to the current prefix.
+    var macDriverDisplayAppliedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: "macDriverDisplayAppliedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "macDriverDisplayAppliedVersion") }
+    }
+
     /// Tracks whether the prefix's reported Windows version has been set to `win10`.
     ///
     /// Valve deprecated Windows 7/8 support for the Steam client in late 2024 — any
