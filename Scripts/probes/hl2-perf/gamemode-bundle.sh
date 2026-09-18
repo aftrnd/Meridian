@@ -90,8 +90,14 @@ open(loader, "wb").write(data)
 open(plist_out, "wb").write(new)
 print(f"patched __info_plist: {len(new)} bytes at offset {off} (section {size})")
 PY
-  codesign --force --sign - --preserve-metadata=entitlements,flags,runtime --identifier com.meridian.game "$LOADER" 2>&1 | grep -v 'replacing existing' || true
+  # allow-dyld on the REAL loader: without it dyld drops DYLD_INSERT_LIBRARIES for every Wine
+  # process (only the bin/wine64 stub ever had it). Team identifier is not preserved: ad hoc + team id is SIGKILLed.
+  ents=$(mktemp /tmp/loader-ents.XXXXXX.plist)
+  "$(cd "$(dirname "$0")" && pwd)/loader-entitlements.sh" emit "$BACKUP" "$ents" >/dev/null
+  codesign --force --sign - --entitlements "$ents" --preserve-metadata=flags,runtime --identifier com.meridian.game "$LOADER" 2>&1 | grep -v 'replacing existing' || true
+  rm -f "$ents"
   codesign -dv "$LOADER" 2>&1 | grep -E '^(Identifier|Signature|Info.plist)'
+  codesign -d --entitlements :- "$LOADER" 2>/dev/null | grep -q allow-dyld-environment-variables && echo 'allow-dyld: yes'
   plutil -lint "$BUNDLE/Contents/Info.plist"
   name=$(winetemp_name)
   echo "winetemp dir: $T/$name"
