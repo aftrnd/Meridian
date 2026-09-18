@@ -19,6 +19,8 @@
 # ~/Library/Application Support/com.meridian.app/engine/wine (backup kept beside it as
 # wine.cx-original; `revert` restores it). Every Wine process then runs from inside
 # ~/Library/Application Support/com.meridian.app/games/Meridian Game.app.
+# GM_NO_GAMEMODE=1 builds the same bundle WITHOUT the games category: the process is a
+# RunningBoard-managed app but gamepolicyd ignores it (discriminator for Pattern 34).
 set -eu
 APP="$HOME/Library/Application Support/com.meridian.app"
 if [[ "${GM_LIVE:-0}" == 1 ]]; then
@@ -47,9 +49,9 @@ prepare)
     cp /Applications/Meridian.app/Contents/Resources/AppIcon.icns "$BUNDLE/Contents/Resources/AppIcon.icns"
   fi
   date '+%Y-%m-%d %H:%M:%S' > "$STATE"
-  python3 - "$LOADER" "$BUNDLE/Contents/Info.plist" <<'PY'
+  python3 - "$LOADER" "$BUNDLE/Contents/Info.plist" "${GM_NO_GAMEMODE:-0}" <<'PY'
 import struct, sys, subprocess
-loader, plist_out = sys.argv[1], sys.argv[2]
+loader, plist_out, no_gamemode = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 data = bytearray(open(loader, "rb").read())
 # locate __TEXT,__info_plist via otool -l
 out = subprocess.check_output(["otool", "-l", loader], text=True).splitlines()
@@ -75,9 +77,9 @@ new = b"""<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundleShortVersionString</key><string>11.10</string>
 <key>CFBundleVersion</key><string>11.10</string>
 <key>NSPrincipalClass</key><string>WineApplication</string>
-<key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+""" + (b"" if no_gamemode else b"""<key>LSApplicationCategoryType</key><string>public.app-category.games</string>
 <key>GCSupportsGameMode</key><true/>
-<key>NSHighResolutionCapable</key><true/>
+""") + b"""<key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 """
