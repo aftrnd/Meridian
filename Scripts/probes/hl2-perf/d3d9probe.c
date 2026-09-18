@@ -35,6 +35,11 @@ static const char *PS =
     "float4 tint : register(c0);\n"
     "float4 main(float2 uv : TEXCOORD0) : COLOR { return tex2D(s0, uv) * tint; }\n";
 
+/* Constant-only variant: isolates the constant-buffer path from texture sampling. */
+static const char *PS_FLAT =
+    "float4 tint : register(c0);\n"
+    "float4 main(float2 uv : TEXCOORD0) : COLOR { return tint; }\n";
+
 struct Vertex { float x, y, z, u, v; };
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -124,12 +129,17 @@ int main(void)
     if (FAILED(hr)) { if (err) printf("%s\n", (char *)ID3D10Blob_GetBufferPointer(err)); return fail("D3DCompile vs", hr); }
     hr = compile(PS, strlen(PS), "ps", NULL, NULL, "main", "ps_2_0", 0, 0, (void **)&psb, (void **)&err);
     if (FAILED(hr)) { if (err) printf("%s\n", (char *)ID3D10Blob_GetBufferPointer(err)); return fail("D3DCompile ps", hr); }
+    ID3DBlob *psfb = NULL;
+    hr = compile(PS_FLAT, strlen(PS_FLAT), "psflat", NULL, NULL, "main", "ps_2_0", 0, 0, (void **)&psfb, (void **)&err);
+    if (FAILED(hr)) { if (err) printf("%s\n", (char *)ID3D10Blob_GetBufferPointer(err)); return fail("D3DCompile psflat", hr); }
 
-    IDirect3DVertexShader9 *vs = NULL; IDirect3DPixelShader9 *ps = NULL;
+    IDirect3DVertexShader9 *vs = NULL; IDirect3DPixelShader9 *ps = NULL, *psflat = NULL;
     hr = IDirect3DDevice9_CreateVertexShader(dev, (const DWORD *)ID3D10Blob_GetBufferPointer(vsb), &vs);
     if (FAILED(hr)) return fail("CreateVertexShader", hr);
     hr = IDirect3DDevice9_CreatePixelShader(dev, (const DWORD *)ID3D10Blob_GetBufferPointer(psb), &ps);
     if (FAILED(hr)) return fail("CreatePixelShader", hr);
+    hr = IDirect3DDevice9_CreatePixelShader(dev, (const DWORD *)ID3D10Blob_GetBufferPointer(psfb), &psflat);
+    if (FAILED(hr)) return fail("CreatePixelShader flat", hr);
 
     /* 2×2 texture, every texel (R=200, G=100, B=50). */
     IDirect3DTexture9 *tex = NULL;
@@ -165,10 +175,52 @@ int main(void)
 
     /* tint = (0.5, 1, 1, 1) → expected pixel R=100 G=100 B=50 (±2). */
     static const float tint[4] = { 0.5f, 1.f, 1.f, 1.f };
+    static const float flat[4] = { 0.2f, 0.4f, 0.6f, 1.f }; /* → 51,102,153 */
 
     IDirect3DSurface9 *bb = NULL, *sys = NULL;
     IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
     IDirect3DDevice9_CreateOffscreenPlainSurface(dev, 256, 256, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, NULL);
+
+    /* Diagnostic A: clear-only readback (tests GetRenderTargetData itself). */
+    IDirect3DDevice9_Clear(dev, 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(10, 20, 30), 1.f, 0);
+    if (bb && sys && SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(dev, bb, sys)) &&
+        SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY))) {
+        DWORD px = *(DWORD *)((BYTE *)lr.pBits + 128 * lr.Pitch + 128 * 4);
+        IDirect3DSurface9_UnlockRect(sys);
+        printf("READBACK clear=%lu,%lu,%lu expected=10,20,30\n", (px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+    }
+
+    /* Diagnostic B: constant-only draw (tests the cbuffer path without sampling). */
+    IDirect3DDevice9_Clear(dev, 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 255), 1.f, 0);
+    IDirect3DDevice9_BeginScene(dev);
+    IDirect3DDevice9_SetVertexDeclaration(dev, vdecl);
+    IDirect3DDevice9_SetStreamSource(dev, 0, vb, 0, sizeof(struct Vertex));
+    IDirect3DDevice9_SetVertexShader(dev, vs);
+    IDirect3DDevice9_SetPixelShader(dev, psflat);
+    IDirect3DDevice9_SetPixelShaderConstantF(dev, 0, flat, 1);
+    IDirect3DDevice9_SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+    IDirect3DDevice9_SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    IDirect3DDevice9_SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+    IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLESTRIP, 0, 2);
+    IDirect3DDevice9_EndScene(dev);
+    if (bb && sys && SUCCEEDED(IDirect3DDevice9_GetRenderTargetData(dev, bb, sys)) &&
+        SUCCEEDED(IDirect3DSurface9_LockRect(sys, &lr, NULL, D3DLOCK_READONLY))) {
+        DWORD px = *(DWORD *)((BYTE *)lr.pBits + 128 * lr.Pitch + 128 * 4);
+        IDirect3DSurface9_UnlockRect(sys);
+        printf("CONSTANT flat=%lu,%lu,%lu expected=51,102,153\n", (px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+    }
+
+    /* Diagnostic C: read the texture back directly (tests the upload, not sampling). */
+    {
+        IDirect3DSurface9 *lvl0 = NULL;
+        if (SUCCEEDED(IDirect3DTexture9_GetSurfaceLevel(tex, 0, &lvl0)) &&
+            SUCCEEDED(IDirect3DSurface9_LockRect(lvl0, &lr, NULL, D3DLOCK_READONLY))) {
+            DWORD px = *(DWORD *)lr.pBits;
+            IDirect3DSurface9_UnlockRect(lvl0);
+            printf("TEXTURE texel=0x%08lx expected=0xffc86432\n", (unsigned long)px);
+        }
+        if (lvl0) IDirect3DSurface9_Release(lvl0);
+    }
 
     int result = 1;
     DWORD t0 = GetTickCount();
