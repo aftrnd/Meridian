@@ -5,7 +5,8 @@
 set -u
 VARIANT="${1:-gl}"; BITS="${2:-64}"; DBG="${3:--all}"
 APP="$HOME/Library/Application Support/com.meridian.app"
-ENG="$APP/engine/wine"
+# ENGINE=/tmp/engine-gm targets a staged clone (see stage-modern-dxvk.sh) instead of the live engine.
+ENG="${ENGINE:-$APP/engine/wine}"
 LIB="$ENG/lib"
 DIR=/tmp/d3d9probe
 SRC="$(cd "$(dirname "$0")" && pwd)/d3d9probe.c"
@@ -39,5 +40,5 @@ cd "$DIR"
 echo "=== variant=$VARIANT bits=$BITS $(date '+%H:%M:%S')" | tee "$OUT"
 perl -e 'alarm shift; exec @ARGV' 12 "$ENG/bin/wine64" "$DIR/d3d9probe$BITS.exe" >>"$OUT" 2>&1
 echo "exit=$?" >>"$OUT"
-grep -E "^(d3d9probe|ADAPTER|CAPS|TEXMEM|FORMATS|PIXEL|FRAMES|RESULT|FAIL|exit=)" "$OUT"
+grep -E "^(d3d9probe|ADAPTER|CAPS|TEXMEM|FORMATS|READBACK|CONSTANT|TEXTURE|PIXEL|FRAMES|RESULT|FAIL|exit=)" "$OUT"
 echo "--- err/warn lines: $(grep -cE ':(err|warn):' "$OUT")  (log: $OUT)"
