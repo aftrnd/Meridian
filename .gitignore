@@ -24,9 +24,5 @@ build/
 /engine/
 /bottles/
 
-# CrossOver research notes — personal use, never distribute
-Scripts/cx-engine-research.md
-Scripts/test-steamcmd-login.sh
-
 # Editor
 .vscode/
