@@ -31,6 +31,55 @@ Branching, commits, versioning, releases: [CONTRIBUTING.md](CONTRIBUTING.md).
 5. **No SPM dependencies.** Never block the main actor.
 6. **No force-pushing `main`.** Never delete remote branches, rewrite pushed history, or tag a release without the user's explicit OK.
 
+## Two assistants: Qwen first, Claude for the hard parts
+
+Nick runs **Qwen locally (served by oMLX)** as the default assistant and brings in **Claude Code** for complex work.
+The two can't talk directly. They coordinate through one file: **`Scripts/HANDOFF-ACTIVE.md`** (gitignored and local, like the other `HANDOFF-*.md` files).
+
+**At the start of every session:** if `Scripts/HANDOFF-ACTIVE.md` exists and is addressed to you, read it before doing anything else.
+
+### When Qwen should escalate to Claude
+
+Stop and write a handoff, instead of trying again, when **any** of these is true:
+- You've made **two attempts** and still can't state the root cause with evidence (log lines, CLI output).
+- The work touches **Wine, Steam auth or bootstrap, the engine, or the graphics stack** (DXMT/DXVK/GPTK/MoltenVK) beyond a one-line, well-understood change.
+- The change spans **more than ~3 files**, alters concurrency or actor isolation, or restructures a subsystem.
+- Your self-review says "not the cleanest way", but you can't see how to get there.
+- It's a release, a history rewrite, or anything in the hard rules you're unsure about.
+
+Escalating early is correct. Two failed patches cost more than a handoff.
+
+### When Claude should hand back to Qwen
+
+Once the hard part is solved, the remaining work is mechanical (applying the pattern elsewhere, tests, docs, wrap-up), and Claude has written it down.
+
+### Handoff format
+
+Overwrite `Scripts/HANDOFF-ACTIVE.md` with:
+
+```markdown
+# Handoff: <topic>
+From: <Qwen|Claude> → To: <Claude|Qwen>   Date: YYYY-MM-DD   Branch: <branch>
+
+## Goal
+<one or two sentences: what "done" looks like>
+
+## State
+<what's changed so far: commits, uncommitted files, what's verified vs. untested>
+
+## Evidence
+<exact commands run, their output, relevant meridian.log lines. Facts, not guesses.>
+
+## Tried and ruled out
+<each dead end, and why it failed>
+
+## Blocked on / the ask
+<the specific question or task for the receiver>
+```
+
+**On receiving:** read it, do the work, then either write a return handoff to the other assistant or, if the work is finished,
+move the file to `Scripts/archive/HANDOFF-YYYY-MM-DD-<topic>.md` and save the findings where `knowledge-preservation.mdc` says they belong.
+
 ## Builds, versions & releases
 
 Meridian has exactly **two** kinds of build. Anything else is wrong.
@@ -107,3 +156,4 @@ Never tag without the user's go-ahead.
 ### 5. Report
 
 End with a short summary: the branch decision and why, the commits made, what was pushed and where, whether it was merged, any leftover branches, and whether a release is suggested.
+If work is being passed to the other assistant, write `Scripts/HANDOFF-ACTIVE.md` before pushing.
