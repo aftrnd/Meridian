@@ -47,3 +47,6 @@ Scripts/archive/
 
 # Installed agent skills — third-party copies; skills-lock.json (tracked) records source + hash
 /.agents/
+
+# Claude Code personal settings (permissions etc.)
+.claude/settings.local.json
