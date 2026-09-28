@@ -1,7 +1,7 @@
 # Meridian — Agent Foundation
 
-The single source of agent rules for this repo, shared by every assistant (Claude Code, Qwen, Cursor, Copilot).
-`CLAUDE.md` and `QWEN.md` just import this file. **Edit rules here, not in the shims.**
+The single source of agent rules for this repo, shared by every assistant: Claude Code, and Qwen via VS Code Copilot Chat.
+`CLAUDE.md` just imports this file. Copilot Chat loads it directly (`chat.useAgentsMdFile`). **Edit rules here, not in the shims.**
 
 Meridian is a native Swift 6 / SwiftUI macOS app that plays Steam (Windows) games on Mac through a Wine/CrossOver engine.
 Architecture map and code conventions: [.github/copilot-instructions.md](.github/copilot-instructions.md).
@@ -33,14 +33,14 @@ Branching, commits, versioning, releases: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Two assistants: Qwen first, Claude for the hard parts
 
-Nick runs **Qwen locally (served by oMLX)** as the default assistant and brings in **Claude Code** for complex work.
+Nick runs **Qwen locally (served by oMLX, driven from VS Code Copilot Chat)** as the default assistant and brings in **Claude Code** for complex work.
 The two can't talk directly. They coordinate through one file: **`Scripts/HANDOFF-ACTIVE.md`** (gitignored and local, like the other `HANDOFF-*.md` files).
 
 **At the start of every session:** if `Scripts/HANDOFF-ACTIVE.md` exists and is addressed to you, read it before doing anything else.
 
 ### When Qwen should escalate to Claude
 
-Stop and write a handoff, instead of trying again, when **any** of these is true:
+Stop and write a handoff (in Copilot Chat: `/handoff`), instead of trying again, when **any** of these is true:
 - You've made **two attempts** and still can't state the root cause with evidence (log lines, CLI output).
 - The work touches **Wine, Steam auth or bootstrap, the engine, or the graphics stack** (DXMT/DXVK/GPTK/MoltenVK) beyond a one-line, well-understood change.
 - The change spans **more than ~3 files**, alters concurrency or actor isolation, or restructures a subsystem.
@@ -114,7 +114,7 @@ If the honest answer to "cleanest way?" is no, say so and propose the better app
 
 ## "Wrap up and push" protocol
 
-When the user says *wrap up*, *push*, *ship it*, *let's commit*, or anything similar, **always run this procedure**. Don't just `git push`.
+When the user says *wrap up*, *push*, *ship it*, *let's commit*, or anything similar (or runs `/wrap-up` in Copilot Chat), **always run this procedure**. Don't just `git push`.
 
 ### 1. Inventory
 
