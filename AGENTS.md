@@ -86,7 +86,15 @@ Meridian has exactly **two** kinds of build. Anything else is wrong.
 
 | Build | How | Signed with | Where it runs |
 |---|---|---|---|
-| **Dev build** | The user presses Run in Xcode (Debug) | Apple Development (local) | From Xcode's DerivedData. Never copied anywhere. |
+| **Dev build** | The user opens **`Meridian.xcodeproj`** in Xcode and presses Run (Debug) | Apple Development (local) | From Xcode's DerivedData. Never copied anywhere. |
+
+**Open `Meridian.xcodeproj`, never the repo folder or `Package.swift`.** `Package.swift` exists only for `swift test`. Opened in Xcode, it builds a bare executable with no `.app` bundle.
+That crashes at launch with `bundleProxyForCurrentProcess is nil` (from `UNUserNotificationCenter.current()` in `AppDelegate`), and the bundle URL ends in `Products/Debug/` instead of `Meridian.app`.
+
+**Signing: don't add profile-requiring entitlements.** Local dev signing uses a free **Personal Team** (`V5448GT345`), and Apple won't register `com.meridian.app` to it ("identifier … not available").
+Any entitlement or capability that needs a provisioning profile breaks the dev build with "No profiles for 'com.meridian.app'". That includes `keychain-access-groups`/Keychain Sharing, iCloud, push, and app groups.
+Keep `Meridian.entitlements` to hardened-runtime exceptions and network access only. Keychain code uses the login keychain (no `kSecAttrAccessGroup`, no `kSecUseDataProtectionKeychain`), which needs no entitlement.
+Don't work around this with side entitlements files or separate signing setups (the old "Meridian-adhoc" approach). Fix the main entitlements file.
 | **Release** | `bash Scripts/release-app.sh --patch\|--minor --tag-only` → GitHub Actions | Developer ID, notarized and stapled | The DMG from GitHub Releases, or the in-app update |
 
 When the user asks for a "release", a "release build", or "put it in Applications":
