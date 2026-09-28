@@ -17,31 +17,33 @@ struct SplashView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // minLength ensures the logo never sits flush against the window
-            // edge when a tall phase (e.g. permissionGate) is active.
-            Spacer(minLength: 24)
-
-            // Fixed width — the logo never changes size regardless of which
-            // bootstrap phase renders below it.
-            Image("MeridianLogo")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 220)
-                .foregroundStyle(.primary)
-
-            Spacer().frame(height: 32)
-
-            if isFailed {
-                failedContent
-            } else if case .awaitingPermission = bootstrap.phase {
+            if case .awaitingPermission = bootstrap.phase {
+                // Replaces the logo: logo + gate don't fit in the 300pt splash.
                 permissionGate
-            } else if case .downloadingEngine = bootstrap.phase {
-                engineDownloadContent
+                    .frame(maxHeight: .infinity)
             } else {
-                statusContent
-            }
+                Spacer(minLength: 24)
 
-            Spacer()
+                // Fixed width — the logo never changes size regardless of which
+                // bootstrap phase renders below it.
+                Image("MeridianLogo")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 220)
+                    .foregroundStyle(.primary)
+
+                Spacer().frame(height: 32)
+
+                if isFailed {
+                    failedContent
+                } else if case .downloadingEngine = bootstrap.phase {
+                    engineDownloadContent
+                } else {
+                    statusContent
+                }
+
+                Spacer()
+            }
 
             finePrint
         }
@@ -84,43 +86,55 @@ struct SplashView: View {
     /// Full-screen gate that blocks the bootstrap pipeline until the user grants
     /// Accessibility permission or explicitly chooses to continue without it.
     private var permissionGate: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "hand.raised.fill")
-                .font(.system(size: 36, weight: .semibold))
-                .foregroundStyle(.blue)
+        VStack(spacing: 0) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 64, height: 64)
+                .overlay(alignment: .bottomTrailing) {
+                    Image(systemName: "accessibility")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 24, height: 24)
+                        .background(.blue, in: Circle())
+                        .overlay(Circle().strokeBorder(.background, lineWidth: 2))
+                        .offset(x: 2, y: 2)
+                }
+                .accessibilityHidden(true)
 
-            VStack(spacing: 6) {
-                Text("Permission Required")
-                    .font(.headline)
-                Text("Meridian needs Accessibility access to keep Steam running silently in the background. Without it, Steam windows will appear during game installs and launches.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 24)
+            Text("Allow Accessibility Access")
+                .font(.title3.weight(.semibold))
+                .padding(.top, 14)
 
-            Button {
-                steamWindow.requestPermission()
-            } label: {
-                Label("Open System Settings", systemImage: "gear")
-                    .frame(minWidth: 200)
+            Text("Meridian uses Accessibility to keep Steam’s windows hidden while your games install and launch.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 360)
+                .padding(.top, 6)
+
+            HStack(spacing: 12) {
+                Button("Continue Without Access") {
+                    bootstrap.skipPermissionRequirement()
+                }
+
+                Button("Open System Settings") {
+                    steamWindow.requestPermission()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
             }
-            .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .padding(.top, 20)
 
-            Text("After enabling Meridian in Privacy & Security → Accessibility,\nreturn here and setup will continue automatically.")
+            Text("Turn on Meridian in Privacy & Security → Accessibility.\nSetup continues automatically.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-
-            Button("Continue Without Permission") {
-                bootstrap.skipPermissionRequirement()
-            }
-            .buttonStyle(.plain)
-            .font(.caption)
-            .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 12)
         }
+        .padding(.horizontal, 32)
         .transition(.opacity.combined(with: .scale(scale: 0.97)))
     }
 

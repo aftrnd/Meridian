@@ -1,8 +1,11 @@
 {
+  "features" : [
+    "specular-location"
+  ],
   "fill-specializations" : [
     {
       "value" : {
-        "automatic-gradient" : "display-p3:0.78809,0.60742,1.00000,1.00000"
+        "automatic-gradient" : "display-p3:0.82353,0.50870,1.00000,1.00000"
       }
     },
     {
@@ -12,42 +15,49 @@
   ],
   "groups" : [
     {
+      "blur-material" : 1,
       "layers" : [
         {
-          "blend-mode-specializations" : [
-            {
-              "appearance" : "tinted",
-              "value" : "normal"
-            }
-          ],
+          "blend-mode" : "normal",
           "fill-specializations" : [
             {
-              "value" : "automatic"
+              "value" : {
+                "linear-gradient" : [
+                  "extended-gray:0.00000,1.00000",
+                  "display-p3:0.04000,0.04000,0.04000,0.90000"
+                ],
+                "orientation" : {
+                  "start" : {
+                    "x" : 0.5000000000000006,
+                    "y" : 0
+                  },
+                  "stop" : {
+                    "x" : 0.5000000000000006,
+                    "y" : 1
+                  }
+                }
+              }
             },
             {
               "appearance" : "dark",
               "value" : {
-                "solid" : "display-p3:0.78809,0.60742,1.00000,1.00000"
+                "automatic-gradient" : "display-p3:0.82353,0.50870,1.00000,1.00000"
               }
             },
             {
               "appearance" : "tinted",
               "value" : {
-                "solid" : "extended-gray:1.00000,1.00000"
+                "solid" : "display-p3:1.00000,1.00000,1.00000,1.00000"
               }
             }
           ],
           "glass" : true,
-          "image-name" : "file.svg",
-          "name" : "file",
-          "opacity-specializations" : [
-            {
-              "appearance" : "tinted",
-              "value" : 1
-            }
-          ],
+          "hidden" : false,
+          "image-name" : "meridian-logo.svg",
+          "name" : "meridian-logo",
+          "opacity" : 1,
           "position" : {
-            "scale" : 1.8,
+            "scale" : 0.89,
             "translation-in-points" : [
               -8,
               0
@@ -55,10 +65,28 @@
           }
         }
       ],
-      "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.5
+      "lighting" : "individual",
+      "refractivity" : {
+        "depth" : 0.161640625,
+        "enabled" : false,
+        "strength" : 0.116171875
       },
+      "shadow-specializations" : [
+        {
+          "value" : {
+            "kind" : "neutral",
+            "opacity" : 0.2
+          }
+        },
+        {
+          "appearance" : "dark",
+          "value" : {
+            "kind" : "neutral",
+            "opacity" : 0.2
+          }
+        }
+      ],
+      "specular" : "inside",
       "translucency" : {
         "enabled" : true,
         "value" : 0.5
