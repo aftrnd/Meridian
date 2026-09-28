@@ -36,7 +36,11 @@ Scripts/test-steamcmd-login.sh
 # not part of the public source distribution.
 Scripts/HANDOFF-*.md
 Scripts/verified-architecture.md
+Scripts/archive/
 /docs/
 
 # Editor
 .vscode/
+
+# Memory files - local development knowledge, never push to GitHub
+/memories/
