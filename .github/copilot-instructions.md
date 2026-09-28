@@ -1,5 +1,7 @@
 # Meridian — Agent Instructions
 
+Shared agent rules (hard rules, self-review, wrap-up/branch protocol) live in `AGENTS.md` at the repo root — read it first.
+
 Meridian is a native Swift 6 / SwiftUI macOS app (macOS 15+) that plays PC (Steam) games on Mac via CrossOver/Wine technology. Zero external SPM dependencies; StrictConcurrency enabled.
 
 ## Architecture Map
@@ -27,14 +29,15 @@ Runtime data lives under `~/Library/Application Support/com.meridian.app/` (engi
 
 ## Build & Test
 
+**Agents never build or run the app** — the user builds in Xcode (see `AGENTS.md` hard rules and `.cursor/rules/xcode-build-only.mdc`). Run `swift test` only when asked, with:
+
 ```bash
 export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer  # CLT lacks macro plugins + XCTest
-swift build --build-system native   # default swiftbuild backend fails codesign on the resource bundle (Dropbox xattrs)
-swift test --build-system native    # XCTest suite in MeridianTests/
+swift test --build-system native    # default swiftbuild backend fails codesign on the resource bundle (Dropbox xattrs)
 ```
 Xcode project (`Meridian.xcodeproj`) is for signing/entitlements/IDE. Many tests are **contract tests** that grep source files for expected patterns — if you rename APIs or change key strings (timer intervals, stage names), check MeridianTests/ for assertions on source text.
 
-`Scripts/` builds external artifacts (Wine engine tarball, DepotDownloader fork, dylibs) — do not touch unless working on engine packaging. `Scripts/HANDOFF-*.md` files are historical context on past debugging sessions.
+`Scripts/` builds external artifacts (Wine engine tarball, DepotDownloader fork, dylibs) — do not touch unless working on engine packaging.
 
 ## Hard Rules
 

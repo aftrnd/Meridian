@@ -10,7 +10,9 @@ Meridian uses **trunk-based development with short-lived branches** — the righ
 | `<type>/<topic>` | Short-lived work branches, e.g. `perf/ui-main-thread`, `fix/steam-auth-retry`, `feat/cloud-saves`. | Branch from `main`, merge back with `--no-ff` (or a PR), delete after merge. Days not weeks. |
 | `backup/*` | Ad-hoc safety snapshots before risky operations. | Fine to keep locally; prune when stale. |
 
-Branch types mirror commit prefixes: `feat/`, `fix/`, `perf/`, `docs/`, `chore/`, `refactor/`.
+Branch types mirror commit prefixes: `feat/`, `fix/`, `perf/`, `docs/`, `chore/`, `refactor/`, `test/`.
+
+**When to branch vs. commit to `main`:** trivial, no-behavior-change work (docs, comments, `.gitignore`) may go straight to `main`. Everything else gets a `<type>/<topic>` branch and merges back `--no-ff` only once verified in Xcode. Merge commits carry a `STABLE:` line so `main`'s first-parent history reads as a list of revert points. The full decision table agents follow on "wrap up and push" is in [AGENTS.md](AGENTS.md#wrap-up-and-push-protocol).
 
 **Do NOT create version-named branches** (`v0.9.13`). Versions are tags, not branches — a branch named like a tag shadows it and confuses `git checkout`. (Legacy `v0.9.13` / `v0.9.14.0` branches predate this doc and can be deleted; the tags preserve those points.)
 
