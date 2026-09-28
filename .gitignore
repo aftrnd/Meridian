@@ -44,3 +44,6 @@ Scripts/archive/
 
 # Memory files - local development knowledge, never push to GitHub
 /memories/
+
+# Installed agent skills — third-party copies; skills-lock.json (tracked) records source + hash
+/.agents/
