@@ -20,9 +20,6 @@ build/
 *.swp
 *~
 
-# Cursor AI (local development rules and state)
-.cursor/
-
 # Meridian runtime data (downloaded at runtime, not checked in)
 /engine/
 /bottles/
@@ -30,23 +27,6 @@ build/
 # CrossOver research notes — personal use, never distribute
 Scripts/cx-engine-research.md
 Scripts/test-steamcmd-login.sh
-.cursor/debug-*.log
-
-# Internal / AI session docs — development handoffs and working-state notes,
-# not part of the public source distribution.
-Scripts/HANDOFF-*.md
-Scripts/verified-architecture.md
-Scripts/archive/
-/docs/
 
 # Editor
 .vscode/
-
-# Memory files - local development knowledge, never push to GitHub
-/memories/
-
-# Installed agent skills — third-party copies; skills-lock.json (tracked) records source + hash
-/.agents/
-
-# Claude Code personal settings (permissions etc.)
-.claude/settings.local.json
