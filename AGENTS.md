@@ -29,7 +29,7 @@ Branching, commits, versioning, releases: [CONTRIBUTING.md](CONTRIBUTING.md).
 3. **Fix root causes, don't pile on.** Before adding a workaround, ask whether the layer underneath is wrong. Deleting code is often the right fix.
 4. **The UI is pixel-perfect.** Refactors and performance work must not change visible appearance.
 5. **No SPM dependencies.** Never block the main actor.
-6. **No force-pushing `main`.** Never delete remote branches, rewrite pushed history, or tag a release without the user's explicit OK.
+6. **No force-pushing `main`.** Never rewrite pushed history, delete **unmerged** branches, or delete/move tags, and never tag a release without the user's explicit OK. Deleting branches already **fully merged** into `main` is standing-approved (see [Repo hygiene](#repo-hygiene)).
 
 ## Two assistants: Qwen first, Claude for the hard parts
 
@@ -107,6 +107,17 @@ When the user asks for a "release", a "release build", or "put it in Application
 
 **Versions:** never edit `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` by hand. `release-app.sh` owns them. The format is 3-part `0.MINOR.PATCH`, and the tag is `v{MARKETING_VERSION}`. Engine releases are a separate line (`vX.Y.Z-engine`, via `release-engine.sh`). Details: `versioning.mdc`.
 
+## Repo hygiene
+
+GitHub must stay clean and current. **After every wrap-up, `origin` holds `main`, branches for work genuinely in progress, and tags. Nothing else.**
+
+- **Merged branches:** delete them locally and on origin right after the merge (`git push origin --delete <branch>`). This is standing-approved. First check `git rev-list --count main..<branch>` is `0`.
+- **Unmerged work to set aside:** don't leave it on a branch. Ask the user, then preserve it as an annotated tag `archive/<branch-name>` with a one-line reason, push the tag, and delete the branch. Existing example: `archive/main-pre-v0.9.12`.
+- **No `backup/*` or version-named branches on origin.** Backups become `archive/*` tags, and versions are tags.
+- **Tags are permanent.** Never delete or move `vX.Y.Z`, `vX.Y.Z-engine`, or `archive/*` tags. Releases and the update checker depend on them.
+- **Stale work:** an unmerged branch older than ~2 weeks gets flagged at wrap-up (merge it, archive it, or state why it's still active).
+- **GitHub itself:** when `gh` is available, also check for open PRs, draft releases, and failed Actions runs, and report them at wrap-up.
+
 ## Self-review before saying "done"
 
 Before you report any change as finished, answer these questions honestly and fix what fails. Then give a one-line verdict in your reply.
@@ -129,7 +140,8 @@ When the user says *wrap up*, *push*, *ship it*, *let's commit*, or anything sim
 ```bash
 git status --short
 git branch --show-current
-git fetch origin && git log --oneline origin/main..HEAD   # unpushed commits
+git fetch --prune origin && git log --oneline origin/main..HEAD   # unpushed commits
+git branch --merged main | grep -vE '^\*|^  main$'; git branch -r --merged origin/main | grep -v -e 'origin/main' -e HEAD   # merged leftovers to delete
 git log --oneline $(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-engine')..origin/main  # changes since the last release
 ```
 
@@ -140,10 +152,10 @@ git log --oneline $(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]
 | On `main`, change is **trivial**: docs, comments, `.gitignore`, a single-file chore, no behavior change | Commit directly to `main` and push. |
 | On `main`, change is **anything else**: touches Swift behavior, spans several commits, is unverified, experimental, or a probe | **Cut a branch first**: `git switch -c <type>/<topic>` (uncommitted changes carry over). Then follow the branch rows below. |
 | On `main` with **unpushed** commits that should have been a branch | Stop and propose moving them (`git branch <type>/<topic>` then reset `main` to `origin/main`). **Ask before resetting.** |
-| On a `<type>/<topic>` branch, work **complete and user-verified** (built and ran in Xcode) | Commit, `git switch main && git pull --ff-only && git merge --no-ff <branch>`, push `main`, delete the branch locally and on origin (ask first for origin). |
+| On a `<type>/<topic>` branch, work **complete and user-verified** (built and ran in Xcode) | Commit, `git switch main && git pull --ff-only && git merge --no-ff <branch>`, push `main`, delete the branch locally and on origin. |
 | On a branch, work **incomplete or unverified** | Commit (mark WIP in the `STABLE:` line) and push **the branch only**: `git push -u origin <branch>`. Don't merge. |
 | **Unrelated changes mixed together** | Split them into separate commits, and separate branches when they're non-trivial. One topic per branch. |
-| On a stale or unexpected branch (`v0.9.x`, `agents/*`, `backup/*`) | Don't commit there. Cut a proper branch from `main` and flag the stale one. |
+| On a stale or unexpected branch (`v0.9.x`, `agents/*`, `backup/*`) | Don't commit there. Cut a proper branch from `main`, then handle the stale one per [Repo hygiene](#repo-hygiene). |
 
 Branch names use `<type>/<short-kebab-topic>`, where `<type>` is `feat`, `fix`, `perf`, `refactor`, `docs`, `chore` or `test`, matching the commit prefix.
 Example: `fix/steam-auth-retry`. **Never name a branch like a version.** Versions are tags.
@@ -161,7 +173,11 @@ If `main` now has user-facing changes since the last `vX.Y.Z` tag, **suggest** a
 use `--patch` for fixes and perf, `--minor` for features, then run `bash Scripts/release-app.sh --<level> --tag-only`.
 Never tag without the user's go-ahead.
 
-### 5. Report
+### 5. Hygiene
+
+Delete every leftover branch already merged into `main`, locally and on origin. Report any unmerged branch older than about 2 weeks and ask whether to archive it. See [Repo hygiene](#repo-hygiene).
+
+### 6. Report
 
 End with a short summary: the branch decision and why, the commits made, what was pushed and where, whether it was merged, any leftover branches, and whether a release is suggested.
 If work is being passed to the other assistant, write `Scripts/HANDOFF-ACTIVE.md` before pushing.
