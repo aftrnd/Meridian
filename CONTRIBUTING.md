@@ -41,7 +41,9 @@ While pre-1.0, breaking/behavioral changes are allowed in minor bumps — that's
 
 ### Engine tags (separate artifact line)
 
-The Wine engine tarball has its own lifecycle and its own tag suffix: `vX.Y.Z-engine` (created by `Scripts/release-engine.sh`). This is intentional — engine versions move independently of app versions. Keep the `-engine` suffix; never tag an app release with it.
+The Wine engine tarball has its own lifecycle and its own tag suffix: `vX.Y.Z-engine` (created by `Scripts/engine/publish-engine.sh`). This is intentional — engine versions move independently of app versions. Keep the `-engine` suffix; never tag an app release with it.
+
+The engine **major** is a compatibility contract. Apps only install engines whose major matches `WineEngine.supportedEngineMajor`; bump the major (and that constant, in the same app release) whenever the engine layout changes in a way older apps can't drive. Publish the new-major engine before the app that requires it, or fresh installs of that app find no engine.
 
 ## Release flow
 
@@ -54,7 +56,7 @@ The Xcode project (`MARKETING_VERSION` / `CURRENT_PROJECT_VERSION`) is the singl
 
 One-time setup for the workflow (repository secrets): `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD` (a "Developer ID Application" certificate exported from Keychain Access), and `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`, `NOTARY_KEY_BASE64` (an App Store Connect API key with Developer access). Never tag without going through step 2 — a tag with no matching bump fails the workflow, and a tag with no release leaves users stranded on the previous version.
 
-Running `release-app.sh` without `--tag-only` still builds locally (needs the cert + `meridian-notarize` keychain profile on your Mac) and creates a *draft* release you must publish by hand. Engine releases go through `Scripts/release-engine.sh` independently.
+Running `release-app.sh` without `--tag-only` still builds locally (needs the cert + `meridian-notarize` keychain profile on your Mac) and creates a *draft* release you must publish by hand. Engine releases go through `Scripts/engine/publish-engine.sh` independently.
 
 ## Repo hygiene
 
@@ -74,17 +76,37 @@ The private key lives at `~/.config/meridian/license-signing.key` on the maintai
 
 ## Engine provenance
 
-`Scripts/release-engine.sh` currently packages pre-built binaries from an installed CrossOver Preview (`/Applications/CrossOver Preview.app`): wineloader/wineserver, `lib/wine`, DXMT, DXVK, MoltenVK/GnuTLS/GStreamer dylibs, and Apple's D3DMetal. End users never install CrossOver; they only download the resulting tarball. This is a development convenience, not a from-source build, and it must be replaced before a paid release (see below).
+The engine is built from source on an Apple Silicon Mac by `Scripts/engine/` — no CrossOver install is involved:
+
+| Step | Script | What it does |
+|---|---|---|
+| 1 | `build-deps.sh` | Cross-compiles the x86_64 libraries Wine loads (gmp, nettle, GnuTLS, freetype, SDL2, GLib, GStreamer) and fetches MoltenVK from Khronos |
+| 2 | `build-wine.sh` | Builds Wine 11.0 from CodeWeavers' published CrossOver source (LGPL), with WoW64 for 32-bit games |
+| 3 | `package-engine.sh` | Adds DXMT, Meridian's helpers and DepotDownloader; relinks, strips, signs; builds the prefix template; writes license texts |
+| 4 | `smoke/smoke-test.sh` | Headless D3D11 (DXMT and wined3d, 32/64-bit), swap-chain presentation, and HTTPS through Wine |
+| 5 | `publish-engine.sh` | Runs 1–4, then creates the `vX.Y.Z-engine` GitHub release |
+
+```bash
+brew install meson ninja cmake bison flex autoconf automake libtool mingw-w64 coreutils gh
+bash Scripts/engine/publish-engine.sh v4.0.1-engine --no-upload   # build + test only
+bash Scripts/engine/publish-engine.sh v4.0.1-engine               # build, test, publish
+```
+
+Builds happen in `~/meridian-engine-build` (outside Dropbox). Library builds are stamped, so reruns are incremental.
+
+**Renderer selection.** Wine searches its own `lib/wine` before any `WINEDLLPATH` entry, so the D3D front-ends Meridian switches between (`d3d11`, `dxgi`, `d3d10core`, `d3d12`, `d3d12core`) are kept out of it, in one directory per implementation (`lib/dxmt`, `lib/wined3d`). `WineEngine.dllSearchPath(preferring:)` puts the chosen one first. CrossOver does the same job with its closed-source `cxcompatdb.so`, which Meridian does not ship.
+
+**Not in the engine:** Apple's D3DMetal, `cxcompatdb.so`, the gbe_fork Steamworks emulator, and any Valve binary. Steamworks games run through the real Steam client; the client and its current `steam.exe` come from Valve's CDN at first use.
 
 ## Release readiness
 
 What still has to happen before Meridian can be sold as a 1.0:
 
-1. **Engine from source.** Replace the CrossOver harvest in `release-engine.sh` with a reproducible build: CodeWeavers' LGPL Wine source for macOS arm64, plus DXMT, DXVK, MoltenVK, GnuTLS and GStreamer from upstream. Ship license texts and an SBOM inside the tarball. Drop `cxcompatdb.so` (CrossOver-specific; only used for the D3DMetal D3D11 video path).
-2. **D3DMetal.** It is not part of macOS; it ships only inside Apple's Game Porting Toolkit (developer-login download, evaluation terms) and inside CrossOver under CodeWeavers' own arrangement with Apple. The copy currently staged is `com.apple.D3DMetal 4.0b1` from CrossOver Preview. Options for 1.0: drop Direct3D 12 support (DXMT + DXVK only), the Whisky model (user downloads GPTK with their own Apple developer account and Meridian imports it), or a redistribution agreement with Apple. Do not ship it in the tarball without one of those.
-3. **Decide how gbe_fork ships.** The default direct-launch path swaps a game's `steam_api64.dll` for the gbe_fork Steamworks runtime so titles start without `steam.exe`. It is staged by the `build-steamemu.sh` step in `release-engine.sh`. Confirm the LGPL obligations are met in the tarball (license text, source link) and get the legal review in item 7 to cover it.
-4. **Publish the DepotDownloader fork source** (GPL-2.0) alongside each engine release.
+1. ~~**Engine from source.**~~ Done: `Scripts/engine/` (see Engine provenance). Still to do: run it in CI so engine releases are reproducible, and publish the DepotDownloader fork source (GPL-2.0) with each engine release.
+2. **Direct3D 12.** The shipped engine has no D3D12 → Metal path (D3DMetal is not redistributable without an agreement with Apple; vkd3d on MoltenVK does not work). Options: leave DX12 games unsupported for 1.0 and say so in the compatibility rating, the Whisky model (user imports Apple's Game Porting Toolkit; `WineEngine` already routes to `lib/gptk` when present), or a redistribution agreement.
+3. ~~**gbe_fork.**~~ Done: not shipped; Steamworks games launch through the real Steam client.
+4. **Publish engine v4 and the app together.** v0.11.1 and earlier install any `-engine` release and cannot drive the v4 layout, so publish `v4.0.0-engine` immediately before the first app release that has `supportedEngineMajor = 4`.
 5. **Configure the Release workflow secrets** (see Release flow above) so tags produce signed, notarized DMGs. Tags `v0.9.8` through `v0.11.1` exist without artifacts; installed apps currently see `v0.9.7.1` as latest until a release is published.
 6. **Legal copy.** EULA, privacy policy (Steam credentials are entered into the app; the refresh token is stored DPAPI-encrypted in the prefix), support contact. Prefer Steam QR / mobile-confirm login so no password ever passes through Meridian.
-7. **Legal review** of items 1 to 3 and of using a third-party client against Steam's Subscriber Agreement.
+7. **Legal review** of the engine's LGPL compliance (license texts ship in `licenses/`; source is CodeWeavers' public tarball plus `Scripts/engine/`) and of using a third-party client against Steam's Subscriber Agreement.
 
