@@ -393,22 +393,16 @@ final class BootstrapTests: XCTestCase {
                       "refreshSteamStubFromEngineIfStale must early-return when prefix steam.exe is healthy (Steam self-updates this; rolling back triggers a self-update loop)")
     }
 
-    /// WineEngine.environment(for:) must explicitly set
-    /// `WINEDLLOVERRIDES=d3d11,dxgi,d3d10core=n,b` (or merge equivalent)
-    /// so Wine prefers the native DXMT PE DLLs in `lib/dxmt/` over the
-    /// 426 KB wined3d builtins in `lib/wine/x86_64-windows/`. Without
-    /// the override, CLI-verified May 20 2026 that a Bogos Binted launch
-    /// produced 30+ lines of
-    /// `err:winediag:wined3d_adapter_create Using the Vulkan renderer
-    ///  for d3d10/11 applications` and `partial-stub` format errors,
-    /// because Wine loaded its built-in wined3d d3d11 ahead of DXMT.
+    /// WineEngine.environment(for:) sets `d3d11,dxgi,d3d10core=n,b` alongside
+    /// the DXMT-first search path, so a game directory's own native d3d11
+    /// still wins and Wine's prefix placeholders never shadow DXMT.
     func testWineEngine_forcesDXMTLoadOrder() throws {
         let src = try readSource("Meridian/Engine/WineEngine.swift")
 
         XCTAssertTrue(src.contains("WINEDLLOVERRIDES"),
                       "WineEngine.environment must set WINEDLLOVERRIDES so DXMT wins over wined3d")
         XCTAssertTrue(src.contains("d3d11=n,b") || src.contains("d3d11,dxgi"),
-                      "WINEDLLOVERRIDES must force d3d11 to native-first so DXMT loads from WINEDLLPATH (lib/dxmt) before the wined3d builtin in lib/wine/x86_64-windows")
+                      "WINEDLLOVERRIDES must force d3d11 to native-first")
         XCTAssertTrue(src.contains("dxgi=n,b") || src.contains("dxgi,d3d10core"),
                       "WINEDLLOVERRIDES must force dxgi to native-first so DXMT's dxgi loads (IDXGIAdapter4 + format support)")
         XCTAssertTrue(src.contains("d3d10core=n,b") || src.contains("d3d10core,"),
@@ -419,6 +413,31 @@ final class BootstrapTests: XCTestCase {
     /// lib64/gstreamer-1.0 or Unity VideoPlayer / Media Foundation video renders
     /// black (no decoder discovered). Regression guard for the No-I'm-not-a-Human
     /// intro-video fix (June 2026).
+    /// Mirror of `WineEngine.isSupportedEngineTag`.
+    private func isSupportedEngineTag(_ tag: String, major: Int = 4) -> Bool {
+        tag.hasPrefix("v\(major).") && tag.hasSuffix("-engine")
+    }
+
+    /// Engine updates must never cross a major version: v4 changed the engine
+    /// layout (renderers selected by search path), so an app built for v4 must
+    /// not pick up v3 or v5, and both update paths must apply the same filter.
+    func testEngineUpdates_stayWithinSupportedMajor() throws {
+        XCTAssertTrue(isSupportedEngineTag("v4.0.0-engine"))
+        XCTAssertTrue(isSupportedEngineTag("v4.12.3-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v3.1.0-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v5.0.0-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v40.0.0-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v4.0.0"))
+
+        let engine = try readSource("Meridian/Engine/WineEngine.swift")
+        XCTAssertTrue(engine.contains(#"tag.hasPrefix("v\(supportedEngineMajor).") && tag.hasSuffix("-engine")"#),
+                      "WineEngine.isSupportedEngineTag must match the mirror above")
+        for file in ["Meridian/Engine/EngineDownloader.swift", "Meridian/Engine/AppUpdateChecker.swift"] {
+            XCTAssertTrue(try readSource(file).contains("WineEngine.isSupportedEngineTag(tagName)"),
+                          "\(file) must filter engine releases with isSupportedEngineTag")
+        }
+    }
+
     func testWineEngine_setsGStreamerPluginPathForVideo() throws {
         let src = try readSource("Meridian/Engine/WineEngine.swift")
         XCTAssertTrue(src.contains("GST_PLUGIN_SYSTEM_PATH_1_0"),
@@ -427,37 +446,16 @@ final class BootstrapTests: XCTestCase {
                       "the GStreamer plugin path must point at lib64/gstreamer-1.0")
     }
 
-    /// D3DMetal opt-in (preferD3DMetal) must route D3D11 through Apple GPTK using
-    /// CX Wine's native graphics-backend switch (CX_GRAPHICS_BACKEND=d3dmetal +
-    /// CX_ROOT), NOT a WINEDLLOVERRIDES hack (which loads wined3d's builtin, not
-    /// GPTK — proven June 19 2026). Required so Media Foundation / Unity
-    /// VideoPlayer cutscenes render (DXMT cannot service the MF D3D11 texture
-    /// path). See engine-research-findings.mdc Pattern 22.
-    func testSteamSession_preferD3DMetalUsesGraphicsBackendSwitch() throws {
+    /// D3DMetal opt-in (preferD3DMetal) must put GPTK's builtins first on the
+    /// search path and drop the DXMT-first overrides. Required so Media
+    /// Foundation / Unity VideoPlayer cutscenes render on engines that carry
+    /// GPTK (DXMT cannot service the MF D3D11 texture path; Pattern 22).
+    func testSteamSession_preferD3DMetalRoutesGPTKFirst() throws {
         let src = try readSource("Meridian/Steam/SteamSession.swift")
         XCTAssertTrue(src.contains("preferD3DMetal"),
                       "gameEnvironment must branch on profile.preferD3DMetal")
-        XCTAssertTrue(src.contains("CX_GRAPHICS_BACKEND") && src.contains("d3dmetal"),
-                      "preferD3DMetal must set CX_GRAPHICS_BACKEND=d3dmetal (CX-native backend switch)")
-        XCTAssertTrue(src.contains("CX_ROOT"),
-                      "preferD3DMetal must set CX_ROOT so cxcompatdb resolves $CX_ROOT/lib64/apple_gptk")
         XCTAssertTrue(src.contains("env.removeValue(forKey: \"WINEDLLOVERRIDES\")"),
-                      "preferD3DMetal must strip the DXMT-first WINEDLLOVERRIDES so GPTK's cxcompatdb-prepended builtins win")
-    }
-
-    /// The engine must self-heal the `lib64/apple_gptk -> ../lib/gptk` symlink
-    /// that CX Wine's cxcompatdb.so requires for CX_GRAPHICS_BACKEND=d3dmetal.
-    /// Covers engines downloaded before the symlink was added to release-engine.sh.
-    func testWineEngine_ensuresAppleGptkSymlink() throws {
-        let src = try readSource("Meridian/Engine/WineEngine.swift")
-        XCTAssertTrue(src.contains("ensureAppleGptkSymlink"),
-                      "WineEngine must define ensureAppleGptkSymlink()")
-        XCTAssertTrue(src.contains("apple_gptk") && src.contains("../lib/gptk"),
-                      "ensureAppleGptkSymlink must create lib64/apple_gptk -> ../lib/gptk")
-        XCTAssertTrue(src.contains("if gptkPath != nil { Self.ensureAppleGptkSymlink() }"),
-                      "detect() must call ensureAppleGptkSymlink when GPTK is present")
-        XCTAssertTrue(src.contains("var cxRootPath"),
-                      "WineEngine must expose cxRootPath (the wine root used as CX_ROOT)")
+                      "preferD3DMetal must strip the DXMT-first WINEDLLOVERRIDES")
     }
 
     // MARK: - Package directory quiescence logic

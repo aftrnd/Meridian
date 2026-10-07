@@ -38,9 +38,9 @@ extension GameCompatibilityDB {
             render BLACK under DXMT — DXMT cannot service the Media Foundation \
             video processor's D3D11 texture path (GStreamer/VideoToolbox decodes \
             the NV12 frame fine, but it never presents onto Unity's DXMT D3D11 \
-            device). preferD3DMetal routes D3D11 through Apple GPTK (D3DMetal) via \
-            CX_GRAPHICS_BACKEND=d3dmetal + CX_ROOT — the same complete D3D11 \
-            implementation CrossOver 26 uses, which DOES service the video path. \
+            device). preferD3DMetal routes D3D11 through Apple GPTK (D3DMetal) — a \
+            complete D3D11 implementation that DOES service the video path — on \
+            engines that carry it. \
             CLI + user-verified June 19 2026: cutscenes show image+sound. \
             skipSteamDRM: steam_api64.dll is in Plugins/x86_64/ but the game \
             handles SteamAPI_Init() failure gracefully — running steam.exe first \

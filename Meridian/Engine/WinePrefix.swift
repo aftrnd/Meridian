@@ -735,15 +735,13 @@ struct WinePrefix: Sendable {
     // lines 39-42) before the update can complete. Stuck in a perpetual-
     // old-stub loop.
     //
-    // Fix: `release-engine.sh` copies a current `steam.exe` stub from CX
-    // Preview's Steam bottle into the engine tarball at
+    // Fix: SteamClientBootstrap installs Valve's `steam_client_win64`
+    // packages, whose `steam_win64_steamrow` bootstrapper package carries the
+    // current 64-bit steam.exe (present in Valve's live manifest, checked
+    // 2026-10-06). Engines up to v3.x also bundled a stub at
     //   `$ENGINE/wine/share/meridian/steam.exe.stub`
-    // and this function overwrites the freshly-SteamSetup'd stub with the
-    // bundled one whenever its size differs.
-    //
-    // Per [update-system.mdc], CX Preview is a BUILD-TIME reference only —
-    // this function only reads from the engine tarball, never from CX at
-    // runtime.
+    // as a repair seed; source-built engines (v4+) do not ship Valve
+    // binaries, and this function is a no-op without one.
 
     /// Path to the bundled stub inside the engine tarball.
     private static func bundledSteamStubURL() -> URL {

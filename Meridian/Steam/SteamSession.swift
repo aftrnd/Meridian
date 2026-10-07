@@ -817,22 +817,15 @@ final class SteamSession {
         if let profile {
             switch profile.dxmtMode {
             case .disabled:
-                // Per-game opt-out of DXMT. Replace the d3d11/dxgi pair
-                // from the global override with builtin (wined3d) so games
-                // that DXMT mis-renders fall back gracefully. d3d10core is
-                // left as `n,b` because the global override already
-                // includes it and disabling DXMT for one game shouldn't
-                // also nuke d3d10core for it.
+                // Per-game opt-out of DXMT: Wine's own D3D for games DXMT
+                // mis-renders. Dropping lib/dxmt from the search path is what
+                // selects wined3d; `b` keeps a game-shipped d3d11 from winning.
+                env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)
                 env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
                     env["WINEDLLOVERRIDES"],
                     overriding: ["d3d11", "dxgi"],
                     with: "b"
                 )
-                // Without this cxcompatdb would still prepend lib/dxmt and
-                // `b` would resolve to DXMT, not wined3d.
-                if env["CX_GRAPHICS_BACKEND"] == "dxmt" {
-                    env.removeValue(forKey: "CX_GRAPHICS_BACKEND")
-                }
             case .required, .auto:
                 break
             }
@@ -851,53 +844,25 @@ final class SteamSession {
             if let a = profile?.graphicsAPI, a != .unknown { return a }
             return GameStackResolver.shared.cached(appID: appID)?.graphicsAPI ?? .unknown
         }()
-        if effectiveAPI == .dx12,
-           let gptk = engine.gptkPath,
-           let lib = engine.libraryPath {
-            env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
-            // Route d3d12 + dxgi through GPTK builtins. Preserve
-            // d3d11/d3d10core overrides from the global DX11 default —
-            // some DX12 games still load d3d11 for legacy components
-            // (e.g. Unity's preprocessor probe) and need DXMT there.
+        if effectiveAPI == .dx12, let gptk = engine.gptkPath {
+            // GPTK's builtins (d3d12, dxgi, d3d11) first in the search path.
+            env["WINEDLLPATH"] = engine.dllSearchPath(preferring: "\(gptk)/wine")
             env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
                 env["WINEDLLOVERRIDES"],
                 overriding: ["d3d12", "dxgi"],
                 with: "b"
             )
-            // CX Wine only honours the backend switch for builtin selection
-            // (see WineEngine.environment); D3DMetal owns d3d12 + dxgi.
-            env["CX_ROOT"] = engine.cxRootPath
-            env["CX_GRAPHICS_BACKEND"] = "d3dmetal"
         }
 
-        // D3DMetal opt-in (per-game). Routes D3D11/DXGI/D3D12 through Apple GPTK
-        // (D3DMetal) using CX Wine's NATIVE graphics-backend switch rather than
-        // hand-hacked WINEDLLOVERRIDES (the latter was tried June 2026 and failed
-        // — `d3d11=b` always loads wined3d's builtin from lib/wine, never GPTK's).
-        //
-        // Mechanism: `CX_GRAPHICS_BACKEND=d3dmetal` makes CX Wine's `cxcompatdb.so`
-        // prepend `$CX_ROOT/lib64/apple_gptk/wine/x86_64-windows` (the GPTK
-        // d3d11/dxgi/d3d12 PE builtins) to the DLL search path, so they win as
-        // builtins. We therefore STRIP the DXMT-first WINEDLLOVERRIDES that
-        // engine.environment(for:) sets and clear WINEDLLPATH's DXMT entry so the
-        // prepended GPTK builtins are not shadowed. `WineEngine.ensureAppleGptkSymlink`
-        // guarantees the `lib64/apple_gptk` path resolves.
-        //
+        // D3DMetal opt-in (per-game): D3D11/DXGI/D3D12 all from Apple GPTK.
         // Why: DXMT cannot service the Media Foundation video processor's D3D11
         // texture path → Unity VideoPlayer / MF cutscenes render black. D3DMetal
-        // is a complete D3D11 implementation that DOES service it. CLI + user-
-        // verified June 2026 on "No, I'm not a Human" (matches CrossOver 26).
-        // See engine-research-findings.mdc Pattern 22.
-        if profile?.preferD3DMetal == true,
-           let gptk = engine.gptkPath {
-            env["CX_ROOT"] = engine.cxRootPath
-            env["CX_GRAPHICS_BACKEND"] = "d3dmetal"
+        // is a complete D3D11 implementation that does (user-verified June 2026
+        // on "No, I'm not a Human"; engine-research-findings.mdc Pattern 22).
+        // Only engines that carry lib/gptk have it; the shipped engine does not.
+        if profile?.preferD3DMetal == true, let gptk = engine.gptkPath {
+            env["WINEDLLPATH"] = engine.dllSearchPath(preferring: "\(gptk)/wine")
             env.removeValue(forKey: "WINEDLLOVERRIDES")
-            if let lib = engine.libraryPath {
-                env["WINEDLLPATH"] = "\(gptk)/wine:\(lib)/wine"
-            } else {
-                env.removeValue(forKey: "WINEDLLPATH")
-            }
         }
 
         // DLSS → MetalFX bridge (GPTK 4 `nvngx-on-metalfx`). When a DLSS title
@@ -1342,7 +1307,7 @@ enum SessionError: LocalizedError {
 /// Filter verbose/noisy Wine debug lines from stderr output.
 private func filterWineStderr(_ raw: String) -> String {
     let noisy = [
-        "fixme:", "err:cxcompatdb", "CX_ROOT",
+        "fixme:",
         "Task policy set failed",
         "err:ole:start_rpcss",
         "fixme:shcore:SetCurrentProcessExplicitAppUserModelID",

@@ -67,8 +67,6 @@ enum GameLogFile {
         "DYLD_FALLBACK_FRAMEWORK_PATH",
         "DYLD_INSERT_LIBRARIES",
         "CX_APPLEGPTK_LIBD3DSHARED_PATH",
-        "CX_GRAPHICS_BACKEND",
-        "CX_ROOT",
         "WINEMSYNC",
         "MTL_HUD_ENABLED",
         "ROSETTA_ADVERTISE_AVX",
@@ -416,36 +414,25 @@ struct GameStackReport {
         let dllPath = environment["WINEDLLPATH"] ?? ""
         let overridesStr = environment["WINEDLLOVERRIDES"] ?? ""
         let overrides = parseOverrides(overridesStr)
-        let backend = environment["CX_GRAPHICS_BACKEND"]
         let declaredAPI = resolved?.graphicsAPI ?? profile?.graphicsAPI
 
-        // CX Wine selects the D3D implementation from `CX_GRAPHICS_BACKEND`
-        // (cxcompatdb prepends `$CX_ROOT/lib/<backend>` to the builtin search
-        // list); WINEDLLPATH alone is never consulted ahead of `lib/wine`. So the
-        // backend is the primary signal and the path/override pair is only a
-        // fallback for environments that predate it. The DX9 branch comes first
-        // because a d3d11 backend says nothing about which d3d9 a DX9 game gets:
-        // no engine backend covers d3d9, so it is wined3d, and wined3d's d3d9
-        // path on macOS is the OpenGL renderer (CLI-verified 2026-09-16, HL2:
+        // The engine keeps every switchable D3D front-end outside lib/wine, so
+        // the FIRST WINEDLLPATH entry is the implementation Wine loads
+        // (WineEngine.dllSearchPath). The DX9 branch comes first because no
+        // engine backend covers d3d9: it is wined3d, whose d3d9 path on macOS
+        // is the OpenGL renderer (CLI-verified 2026-09-16, HL2:
         // `lib/wine/i386-windows/d3d9.dll` + AppleMetalOpenGLRenderer mapped).
+        let preferred = dllPath.split(separator: ":").first.map(String.init) ?? ""
         let renderer: Renderer
-        if declaredAPI == .dx9, overrides["d3d9"] == nil, backend != "dxvk" {
+        if declaredAPI == .dx9, overrides["d3d9"] == nil, !preferred.contains("/dxvk") {
             renderer = .wined3dGL
-        } else if backend == "d3dmetal" {
+        } else if preferred.contains("/gptk") {
             renderer = .gptk
-        } else if backend == "dxvk" {
+        } else if preferred.contains("/dxvk") {
             renderer = .dxvk
-        } else if backend == "dxmt" {
+        } else if preferred.hasSuffix("/dxmt") {
             renderer = .dxmt
-        } else if dllPath.contains("/gptk"), overrides["d3d12"] == "b" {
-            renderer = .gptk
-        } else if dllPath.contains("/dxvk") {
-            renderer = .dxvk
-        } else if dllPath.contains("/dxmt"), let m = overrides["d3d11"], m.hasPrefix("n") {
-            // n,b = native (DXMT PE) preferred, builtin fallback.
-            renderer = .dxmt
-        } else if overrides["d3d11"] == "b" {
-            // DXMT explicitly disabled for this game → Wine's builtin wined3d.
+        } else if preferred.hasSuffix("/wined3d") {
             renderer = .wined3d
         } else {
             renderer = .unknown
