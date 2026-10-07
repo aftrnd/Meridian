@@ -413,6 +413,20 @@ final class BootstrapTests: XCTestCase {
     /// lib64/gstreamer-1.0 or Unity VideoPlayer / Media Foundation video renders
     /// black (no decoder discovered). Regression guard for the No-I'm-not-a-Human
     /// intro-video fix (June 2026).
+    /// The Steam-process accessory dylib must never create NSApp in its
+    /// constructor: winemac.drv only installs its own WineApplication when
+    /// NSApp is nil, so an early plain NSApplication makes every Steam
+    /// process die with "Failed to start Cocoa app main loop" (steam.exe exit
+    /// 152). Reproduced and fixed headlessly 2026-10-07.
+    func testWineAccessory_doesNotCreateNSAppBeforeWine() throws {
+        let src = try readSource("Scripts/wine-accessory/meridian_wine_accessory.m")
+        let ctor = src.components(separatedBy: "__attribute__((constructor))").last ?? ""
+        XCTAssertFalse(ctor.contains("[NSApplication sharedApplication]"),
+                       "The constructor must not call [NSApplication sharedApplication]; leave NSApp to winemac.drv")
+        XCTAssertTrue(src.contains("+ (void)load"),
+                      "The setActivationPolicy: swizzle must install in +load (no NSApp needed)")
+    }
+
     /// Mirror of `WineEngine.isSupportedEngineTag`.
     private func isSupportedEngineTag(_ tag: String, major: Int = 4) -> Bool {
         tag.hasPrefix("v\(major).") && tag.hasSuffix("-engine")

@@ -115,36 +115,24 @@ static void meridian_wine_accessory_init(void) {
     NSLog(@"[meridian-wine-accessory] dylib loaded pid=%d ppid=%d",
           pid, ppid);
 
-    // Trigger NSApp initialisation + apply accessory policy immediately.
-    // After swizzling, even a call with `.regular` will end up as `.accessory`
-    // via the swapped implementation. The explicit call here is belt-and-
-    // suspenders for cases where winemac.drv reads the policy back before
-    // setting it.
-    dispatch_block_t apply = ^{
-        NSApplication *app = [NSApplication sharedApplication];
-        BOOL ok = [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
-        os_log_info(accessory_log(),
-            "[meridian-wine-accessory] setActivationPolicy(.accessory) = %{public}s pid=%{public}d",
-            ok ? "YES" : "NO", pid);
-        NSLog(@"[meridian-wine-accessory] setActivationPolicy(.accessory) = %@ pid=%d",
-              ok ? @"YES" : @"NO", pid);
-    };
-    if ([NSThread isMainThread]) {
-        apply();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), apply);
-    }
+    // Do NOT touch `NSApp` here. winemac.drv creates its own NSApplication
+    // subclass only when `NSApp` is still nil (`run_cocoa_app`: `if (!NSApp)
+    // [WineApplication sharedApplication]`). Creating a plain NSApplication
+    // first makes the Mac driver fail with "Failed to start Cocoa app main
+    // loop", so steam.exe exits 152 before it can sign in. The swizzled
+    // setter installed in +load already turns winemac's own
+    // `setActivationPolicy:NSApplicationActivationPolicyRegular` into
+    // `.accessory`.
 
-    // Re-assert on `NSApplicationDidFinishLaunching` in case something
-    // bypasses the swizzled setter (e.g. a private API that mutates
-    // activation policy without calling setActivationPolicy:).
+    // Re-assert once the app has launched, in case something bypasses the
+    // swizzled setter (e.g. a private API that mutates activation policy
+    // without calling setActivationPolicy:).
     [[NSNotificationCenter defaultCenter]
         addObserverForName:NSApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification * _Nonnull note) {
-        BOOL ok = [[NSApplication sharedApplication]
-            setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        BOOL ok = [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         os_log_info(accessory_log(),
             "[meridian-wine-accessory] re-assert .accessory after launch = %{public}s",
             ok ? "YES" : "NO");

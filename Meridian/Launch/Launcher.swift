@@ -650,13 +650,15 @@ final class Launcher {
                 return
             }
             // Neither silent auto-login nor the interactive sign-in reached
-            // [Logged On,]. Tear the whole Steam runtime down before surfacing
-            // the error so no Steam UI is ever left on screen
-            // (development-standards: Steam UI is never shown). Offline mode
-            // remains the working default.
+            // [Logged On,] — Steam failed to start or to sign in (the log has
+            // which). Tear the whole Steam runtime down before surfacing the
+            // error so no Steam UI is ever left on screen
+            // (development-standards: Steam UI is never shown). No "Offline
+            // mode" advice: Steamworks games have no offline path in the
+            // shipped engine.
             await session.shutdown(engine: engine)
             steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("Steam couldn't sign in to launch \(game.name) online. Switch this game to Offline mode to play now. (Online mode needs a completed Steam sign-in.)", error: error)
+            fail("Meridian couldn't connect to Steam to launch \(game.name). Please try again.", error: error)
             return
         }
 
@@ -728,12 +730,12 @@ final class Launcher {
             if lastReportedValidating {
                 fail("Steam is still validating \(game.name). Wait a moment and press Play again — the download/validation continues in the background.")
             } else {
-                fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+                fail("\(game.name) didn't start through Steam. Please try again.")
             }
             return
         case .exited, .idle, .failed:
             steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+            fail("\(game.name) didn't start through Steam. Please try again.")
             return
         case .startup:
             // Cancelled (Stop button / cancelLaunch). Teardown is owned by
