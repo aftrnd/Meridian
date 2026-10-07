@@ -189,14 +189,28 @@ final class LicenseTests: XCTestCase {
     func testLicenseManager_trialAndGateContracts() throws {
         let src = try readSource("Meridian/Models/LicenseManager.swift")
         XCTAssertTrue(src.contains("static let trialLength = 14"), "Trial is 14 days.")
-        XCTAssertTrue(src.contains("case .licensed, .trial: true") && src.contains("case .trialExpired, .invalid: false"),
-                      "allowsPlay must be true only while licensed or in trial.")
+        XCTAssertTrue(src.contains("case .licensed, .trial, .developer: true") && src.contains("case .trialExpired, .invalid: false"),
+                      "allowsPlay must be true only while licensed, in trial, or in a Debug build.")
         // The trial start is the EARLIER of UserDefaults and the on-disk marker,
         // so wiping one store cannot restart the trial.
         XCTAssertTrue(src.contains("[fromDefaults, fromFile].compactMap({ $0 }).min()"),
                       "Trial start must take the earlier of the two persisted timestamps.")
         XCTAssertTrue(src.contains("func activate(key: String) -> License.VerificationError?"),
                       "activate returns the error instead of mutating status on failure.")
+    }
+
+    /// Debug builds must never hit the trial gate (the trial clock starts on
+    /// a developer's first launch and expires mid-development), while still
+    /// letting every license state be simulated from the scheme's arguments.
+    func testDebugBuilds_skipLicensingUnlessSimulated() throws {
+        let src = try readSource("Meridian/Models/LicenseManager.swift")
+        XCTAssertTrue(src.contains("if AppSettings.isDebugBuild, let simulated = simulatedStatus() {"),
+                      "refresh() must short-circuit to the simulated/developer status in Debug builds.")
+        XCTAssertTrue(src.contains("case nil:            .developer"),
+                      "With no -license.simulate argument a Debug build must be .developer.")
+        for state in ["\"trial\"", "\"trialExpired\"", "\"invalid\""] {
+            XCTAssertTrue(src.contains("case \(state):"), "license.simulate must support \(state).")
+        }
     }
 
     func testGameDetail_gatesPlayAndInstallOnLicense() throws {

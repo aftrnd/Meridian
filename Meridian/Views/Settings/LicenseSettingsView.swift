@@ -98,6 +98,21 @@ struct LicenseStatusView: View {
                     .foregroundStyle(.secondary)
             }
 
+        case .developer:
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Developer build")
+                        .fontWeight(.medium)
+                    Text("Licensing is off. Launch with -license.simulate to test a state.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "hammer.fill")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+            }
+
         case .trialExpired:
             Label {
                 VStack(alignment: .leading, spacing: 2) {
