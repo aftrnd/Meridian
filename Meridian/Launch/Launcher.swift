@@ -389,6 +389,16 @@ final class Launcher {
         // DRM-free games skip this entirely.
         let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)
 
+        // The shipped engine does not carry the gbe_fork emulator (replacing a
+        // game's Valve steam_api is not something a commercial build ships),
+        // so Steamworks games run through the real Steam client. Engines that
+        // carry tools/steamemu (developer builds) keep the direct path below.
+        if needsDRM, engine.steamApi64EmuURL == nil {
+            log.info("[pipeline] appID=\(game.id) uses Steamworks and the engine has no emulator — launching through Steam")
+            await launchOnline(game: game, engine: engine, session: session)
+            return
+        }
+
         // SteamStub exe encryption cannot be satisfied by the shim — the exe
         // itself is encrypted and only a running, signed-in Steam client can
         // decrypt it. Don't attempt a shim launch that would fail opaquely;

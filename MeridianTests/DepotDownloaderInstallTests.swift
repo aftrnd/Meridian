@@ -324,13 +324,16 @@ final class DepotDownloaderInstallTests: XCTestCase {
                       "configs.user.ini must set the user's account_steamid for the emulator")
     }
 
-    /// release-engine.sh must stage the emulator into the engine tarball.
-    func testReleaseEngine_stagesSteamEmu() throws {
-        let src = try readSource("Scripts/release-engine.sh")
-        XCTAssertTrue(src.contains("build-steamemu.sh"),
-                      "release-engine.sh must run build-steamemu.sh")
-        XCTAssertTrue(src.contains("tools/steamemu"),
-                      "the emulator must stage into engine tools/steamemu")
+    /// The shipped engine must not carry the emulator, and without it the
+    /// launcher must send Steamworks games through the real Steam client
+    /// instead of failing in installSteamEmulator.
+    func testShippedEngine_omitsSteamEmu_andLauncherFallsBackToSteam() throws {
+        let pkg = try readSource("Scripts/engine/package-engine.sh")
+        XCTAssertFalse(pkg.contains("build-steamemu.sh"),
+                       "package-engine.sh must not stage the gbe_fork emulator")
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("if needsDRM, engine.steamApi64EmuURL == nil {"),
+                      "Launcher must route Steamworks games to launchOnline when the engine has no emulator")
     }
 
     /// build-steamemu.sh must pin a release tag (reproducible) and stage the
@@ -361,10 +364,10 @@ final class DepotDownloaderInstallTests: XCTestCase {
                       "installed manifest must write StateFlags=4 (fully installed)")
     }
 
-    func testReleaseEngine_stagesDepotDownloader() throws {
-        let src = try readSource("Scripts/release-engine.sh")
+    func testPackageEngine_stagesDepotDownloader() throws {
+        let src = try readSource("Scripts/engine/package-engine.sh")
         XCTAssertTrue(src.contains("build-depotdownloader.sh"),
-                      "release-engine.sh must build/stage the DepotDownloader fork")
+                      "package-engine.sh must build/stage the DepotDownloader fork")
         XCTAssertTrue(src.contains("tools/depotdownloader"),
                       "DepotDownloader must stage into engine tools/depotdownloader")
     }
