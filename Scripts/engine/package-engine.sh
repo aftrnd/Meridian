@@ -56,15 +56,17 @@ stage_wine() {
     # The app launches bin/wine64 (historical name); Wine 11 has one loader.
     cp "$W/bin/wine" "$W/bin/wine64"
 
-    # Wine's PE side builds with -g; without stripping, every DLL (and its
-    # copy in the prefix template's system32) carries DWARF.
-    say "Stripping debug info"
-    find "$W/lib/wine/x86_64-windows" -name '*.dll' -o -name '*.exe' -o -name '*.drv' -o -name '*.sys' \
-        | xargs x86_64-w64-mingw32-strip --strip-debug 2>/dev/null || true
-    find "$W/lib/wine/i386-windows" -type f \
-        | xargs i686-w64-mingw32-strip --strip-debug 2>/dev/null || true
-    find "$W/lib/wine/x86_64-unix" -type f | xargs strip -S 2>/dev/null || true
-    strip -S "$W/bin/wine" "$W/bin/wine64" "$W/bin/wineserver"
+    # Wine's PE side builds with -g and keeps COFF symbol tables; without
+    # stripping, every DLL (and its copy in the prefix template's system32)
+    # is ~1.5x larger. Exports live in the export table, not the symbol
+    # table, and strip keeps the "Wine builtin DLL" marker.
+    say "Stripping symbols"
+    find "$W/lib/wine/x86_64-windows" -type f ! -name '*.a' -print0 \
+        | xargs -0 x86_64-w64-mingw32-strip -s 2>/dev/null || true
+    find "$W/lib/wine/i386-windows" -type f ! -name '*.a' -print0 \
+        | xargs -0 i686-w64-mingw32-strip -s 2>/dev/null || true
+    find "$W/lib/wine/x86_64-unix" -type f -print0 | xargs -0 strip -x 2>/dev/null || true
+    strip -x "$W/bin/wine" "$W/bin/wine64" "$W/bin/wineserver"
 
     say "Moving Wine's D3D front-ends to lib/wined3d"
     local arch dll
