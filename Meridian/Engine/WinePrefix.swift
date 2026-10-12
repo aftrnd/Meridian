@@ -1163,17 +1163,12 @@ struct WinePrefix: Sendable {
     /// Pass an empty `steamID64` to skip (user not signed in yet — no userdata
     /// directory exists).
     func writeUserNotificationPreferences(steamID64: String) throws {
-        guard !steamID64.isEmpty, let sid = UInt64(steamID64) else {
+        guard let cfgURL = localConfigURL(steamID64: steamID64) else {
             log.debug("[writeUserNotificationPrefs] no SteamID64 — skipping")
             return
         }
-        // Steam's userdata/ uses the 32-bit account ID, not the full 64-bit ID.
-        // AccountID = SteamID64 - 76561197960265728 (the public-universe base).
-        let accountID = sid &- 76561197960265728
-        let userDir = steamInstallDir.appending(path: "userdata/\(accountID)/config")
-        let cfgPath = userDir.appending(path: "localconfig.vdf").path(percentEncoded: false)
-        let fm = FileManager.default
-        try fm.createDirectory(at: userDir, withIntermediateDirectories: true)
+        let cfgPath = cfgURL.path(percentEncoded: false)
+        try FileManager.default.createDirectory(at: cfgURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         // Keys confirmed in Steam's HTML5 UI source (`steamui/chunk~*.js`) as
         // the settings backing:
@@ -1201,9 +1196,37 @@ struct WinePrefix: Sendable {
         // scanning userdata while we write (rare — Steam reads localconfig only
         // at post-login hydration).
         try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
-        log.info("[writeUserNotificationPrefs] merged into \(cfgPath) (accountID=\(accountID), existing=\(existing.count) bytes)")
+        log.info("[writeUserNotificationPrefs] merged into \(cfgPath) (existing=\(existing.count) bytes)")
     }
 
+    /// The signed-in user's `userdata/<accountID>/config/localconfig.vdf`, or
+    /// nil without a SteamID64. Steam's userdata/ uses the 32-bit account ID:
+    /// SteamID64 - 76561197960265728 (the public-universe base).
+    func localConfigURL(steamID64: String) -> URL? {
+        guard let sid = UInt64(steamID64) else { return nil }
+        let accountID = sid &- 76561197960265728
+        return steamInstallDir.appending(path: "userdata/\(accountID)/config/localconfig.vdf")
+    }
+
+    /// Steam's app info cache, which lists each game's license agreements.
+    var appInfoCacheURL: URL {
+        steamInstallDir.appending(path: "appcache/appinfo.vdf")
+    }
+
+    /// Records license agreements the player accepted in Meridian where
+    /// Steam's own dialog does. Only while Steam is stopped: Steam reads the
+    /// file when it starts and writes its own copy back while it runs
+    /// (Pattern 47).
+    func writeEulaAcceptances(_ eulas: [SteamEula], steamID64: String) throws {
+        guard let url = localConfigURL(steamID64: steamID64) else { return }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var config = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        for appID in Set(eulas.map(\.appID)) {
+            config = SteamEula.recording(eulas, appID: appID, in: config)
+        }
+        try config.write(to: url, atomically: true, encoding: .utf8)
+        log.info("[writeEulaAcceptances] recorded \(eulas.map { "\($0.id)=\($0.version)" }.joined(separator: ", ")) in \(url.path(percentEncoded: false))")
+    }
 
     /// The Notifications / Sounds suppression blocks, as depth-1 children of
     /// `UserLocalConfigStore`. Used by `mergeNotificationPreferences`.

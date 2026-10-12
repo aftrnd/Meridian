@@ -89,6 +89,42 @@ final class Launcher {
         steamPrompt = nil
     }
 
+    // MARK: - License agreements (shown by Meridian, recorded for Steam)
+
+    /// A game's license agreements the player hasn't accepted. Meridian shows
+    /// them in its own sheet before Steam starts the game; Steam's dialog
+    /// would open its whole library window (Pattern 47).
+    struct EulaPrompt: Identifiable, Equatable {
+        let game: Game
+        let eulas: [SteamEula]
+        var id: Int { game.id }
+    }
+
+    private(set) var eulaPrompt: EulaPrompt?
+
+    /// The player accepted every agreement in the sheet: hand the answers to
+    /// Steam (written before it next starts) and launch again.
+    func acceptEulas(
+        engine: WineEngine,
+        session: SteamSession,
+        steamAuth: SteamAuthService? = nil,
+        library: SteamLibraryStore? = nil
+    ) {
+        guard let prompt = eulaPrompt else { return }
+        eulaPrompt = nil
+        log.info("[eula] accepted \(prompt.eulas.map(\.id).joined(separator: ", ")) for appID=\(prompt.game.id)")
+        session.recordEulaAcceptances(prompt.eulas)
+        launch(game: prompt.game, engine: engine, session: session, steamAuth: steamAuth, library: library)
+    }
+
+    /// The player declined: nothing is recorded and the game doesn't start.
+    func declineEulas() {
+        if let prompt = eulaPrompt {
+            log.info("[eula] declined for appID=\(prompt.game.id)")
+        }
+        eulaPrompt = nil
+    }
+
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
     /// The few beats the launch card names. Steam reports a dozen statuses on
@@ -415,6 +451,24 @@ final class Launcher {
             launchState = .idle
             currentActivity = nil
             return
+        }
+
+        // The game's license agreement, asked in Meridian's own sheet.
+        let appID = game.id
+        let appInfoURL = prefix.appInfoCacheURL
+        let localConfigURL = prefix.localConfigURL(steamID64: AppSettings.shared.steamCredentialSteamID)
+        let pending = session.pendingEulaAcceptances
+        if let localConfigURL {
+            let unaccepted = await Task.detached(priority: .userInitiated) {
+                SteamEula.unaccepted(appID: appID, appInfo: appInfoURL, localConfig: localConfigURL, pending: pending)
+            }.value
+            if !unaccepted.isEmpty {
+                log.info("[launchOnline] \(game.name) needs \(unaccepted.map(\.id).joined(separator: ", ")) accepted — asking")
+                eulaPrompt = EulaPrompt(game: game, eulas: unaccepted)
+                launchState = .idle
+                currentActivity = nil
+                return
+            }
         }
 
         launchState = .launching(appID: game.id)

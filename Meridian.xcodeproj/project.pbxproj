@@ -39,6 +39,8 @@
 		B0010036A /* GameAchievement.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010036B /* GameAchievement.swift */; };
 		B00A0001 /* GameArtOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00A0002 /* GameArtOverrides.swift */; };
 		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
+		B0E5A001 /* SteamEula.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5A002 /* SteamEula.swift */; };
+		B0E5B001 /* EulaSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5B002 /* EulaSheet.swift */; };
 		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
 		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B00E0001 /* WineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0002 /* WineEngine.swift */; };
@@ -108,6 +110,8 @@
 		B001003C /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Package.swift; path = ../Package.swift; sourceTree = "<group>"; };
 		B00A0002 /* GameArtOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameArtOverrides.swift; sourceTree = "<group>"; };
 		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
+		B0E5A002 /* SteamEula.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamEula.swift; sourceTree = "<group>"; };
+		B0E5B002 /* EulaSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EulaSheet.swift; sourceTree = "<group>"; };
 		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
 		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B00E0002 /* WineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineEngine.swift; sourceTree = "<group>"; };
@@ -193,6 +197,7 @@
 				B0010011 /* SteamAPIService.swift */,
 				B0010013 /* SteamLibraryStore.swift */,
 				B00AI002 /* SteamAppInfoResolver.swift */,
+				B0E5A002 /* SteamEula.swift */,
 				B00F0002 /* SteamSession.swift */,
 				B00G0002 /* SteamSessionBackup.swift */,
 				B00F0004 /* SteamWindow.swift */,
@@ -257,6 +262,7 @@
 				B00E0061 /* SteamWebView.swift */,
 				B0010029 /* GameGridView.swift */,
 				B001002B /* GameDetailView.swift */,
+				B0E5B002 /* EulaSheet.swift */,
 				B00E0021 /* CachedAsyncImage.swift */,
 				B0DE0002 /* DetailTransition.swift */,
 				B0DE0004 /* DetailZoomTuning.swift */,
@@ -473,6 +479,7 @@
 				B0010010 /* SteamAPIService.swift in Sources */,
 				B0010012 /* SteamLibraryStore.swift in Sources */,
 				B00AI001 /* SteamAppInfoResolver.swift in Sources */,
+				B0E5A001 /* SteamEula.swift in Sources */,
 				B0010014 /* Game.swift in Sources */,
 				B0010016 /* PlayerSummary.swift in Sources */,
 				B00E0001 /* WineEngine.swift in Sources */,
@@ -490,6 +497,7 @@
 				B0010026 /* LibraryView.swift in Sources */,
 				B0010028 /* GameGridView.swift in Sources */,
 				B001002A /* GameDetailView.swift in Sources */,
+				B0E5B001 /* EulaSheet.swift in Sources */,
 				B00E00C0 /* HeroArtViews.swift in Sources */,
 				B00E0009 /* EngineSetupView.swift in Sources */,
 				B00E0020 /* CachedAsyncImage.swift in Sources */,

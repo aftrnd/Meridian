@@ -317,6 +317,20 @@ struct GameDetailView: View {
         } message: { prompt in
             Text(steamPromptMessage(for: prompt))
         }
+        // A game's license agreement, before Steam starts it (Pattern 47).
+        .sheet(item: Binding(
+            get: { launcher.eulaPrompt },
+            set: { if $0 == nil { launcher.declineEulas() } }
+        )) { prompt in
+            EulaSheet(
+                prompt: prompt,
+                onAccept: {
+                    launcher.acceptEulas(engine: engine, session: session,
+                                         steamAuth: steamAuth, library: library)
+                },
+                onCancel: { launcher.declineEulas() }
+            )
+        }
     }
 
     // MARK: - Body sub-sections (extracted to keep the body expression

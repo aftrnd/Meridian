@@ -61,6 +61,15 @@ final class SteamSession {
     /// after that (DepotDownloader) is unknown to it until it restarts.
     private var appsSteamLoaded: Set<Int> = []
 
+    /// License agreements the player accepted in Meridian, written into
+    /// Steam's localconfig.vdf the next time steam.exe starts: Steam reads
+    /// that file only when it starts (Pattern 47).
+    private(set) var pendingEulaAcceptances: [SteamEula] = []
+
+    func recordEulaAcceptances(_ eulas: [SteamEula]) {
+        pendingEulaAcceptances += eulas.filter { !pendingEulaAcceptances.contains($0) }
+    }
+
     /// Steam client download progress while `bootstrapSteamClientIfNeeded`
     /// downloads; nil otherwise (including while it installs). Drives the
     /// onboarding progress ring.
@@ -250,6 +259,8 @@ final class SteamSession {
                 // Otherwise -applaunch fails at once with AppError_18 and no
                 // game ever starts (Endacopia, The Baby in Yellow, Oct 12 2026).
                 log.info("[ensureReadyForDRM] appID=\(appID) was installed after Steam started — restarting Steam so it loads the game")
+            } else if !pendingEulaAcceptances.isEmpty {
+                log.info("[ensureReadyForDRM] license agreement accepted in Meridian — restarting Steam so it reads the answer")
             } else {
                 return
             }
@@ -1093,6 +1104,16 @@ final class SteamSession {
         prefix.clearCrashMarker()
 
         appsSteamLoaded = prefix.appManifestIDs()
+        if !pendingEulaAcceptances.isEmpty {
+            do {
+                try prefix.writeEulaAcceptances(pendingEulaAcceptances,
+                                                steamID64: AppSettings.shared.steamCredentialSteamID)
+                pendingEulaAcceptances = []
+            } catch {
+                // Steam asks in its own window instead (Launcher shows it).
+                log.error("[launchSteamProcess] couldn't record accepted license agreements: \(error.localizedDescription)")
+            }
+        }
         connectionLogOffset = connectionLogFileSize()
         webhelperLogOffset = fileSize(of: prefix.steamInstallDir
             .appending(path: "logs/webhelper_js.txt")
