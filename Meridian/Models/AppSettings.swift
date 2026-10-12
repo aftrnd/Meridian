@@ -15,6 +15,14 @@ final class AppSettings: @unchecked Sendable {
     }
 
     /// Show the Metal performance HUD overlay during gameplay.
+    /// Extra Wine trace channels for games (e.g. `+mfplat,+loaddll`), added
+    /// to `WINEDEBUG` for Steam and everything it launches. Empty by default.
+    /// Output lands in the game's log (`GameLogFile`).
+    var wineDebugChannels: String {
+        get { (UserDefaults.standard.string(forKey: "wineDebugChannels") ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+        set { UserDefaults.standard.set(newValue, forKey: "wineDebugChannels") }
+    }
+
     var metalHUD: Bool {
         get { UserDefaults.standard.bool(forKey: "metalHUD") }
         set { UserDefaults.standard.set(newValue, forKey: "metalHUD") }
@@ -22,11 +30,11 @@ final class AppSettings: @unchecked Sendable {
 
     /// Enable msync (Mach-semaphore NT-sync) for all Wine processes.
     ///
-    /// CX Wine ships marzent's msync patch. `WINEMSYNC=1` replaces the
+    /// The engine's Wine carries marzent's msync patch. `WINEMSYNC=1` replaces the
     /// eventfd-emulation esync path with native Mach semaphores, cutting CPU
     /// sync overhead substantially on Apple Silicon (marzent's own FFXIV
     /// bench: 219 fps msync+ulock vs 145 fps esync vs 93 fps server-side).
-    /// CrossOver applies it bottle-wide; Meridian sets it on BOTH the game
+    /// Meridian sets it on BOTH the game
     /// (`environment(for:)`) and admin/steam.exe (`steamCMDEnvironment(for:)`)
     /// paths so every wineserver in the prefix is started with the SAME msync
     /// setting — the msync client aborts (`exit(1)`) if it attaches to a
@@ -36,6 +44,14 @@ final class AppSettings: @unchecked Sendable {
     var msyncEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "msyncEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "msyncEnabled") }
         set { UserDefaults.standard.set(newValue, forKey: "msyncEnabled") }
+    }
+
+    /// Steam's own sign-in has completed on this Mac (`SteamSession.signInInteractively`).
+    /// Launches then start Steam silently; if Steam ever rejects its saved
+    /// session, the launch falls back to Steam's sign-in window.
+    var steamClientSignedIn: Bool {
+        get { UserDefaults.standard.bool(forKey: "steamClientSignedIn") }
+        set { UserDefaults.standard.set(newValue, forKey: "steamClientSignedIn") }
     }
 
     /// Force Wine virtual desktop at a fixed resolution instead of windowed mode.
@@ -78,50 +94,6 @@ final class AppSettings: @unchecked Sendable {
         var ids = installedAppIDs
         ids.remove(appID)
         installedAppIDs = ids
-    }
-
-    // MARK: - Launch Mode (Offline gbe_fork vs Online steam.exe)
-
-    /// How a game is launched:
-    /// - `.offline`: gbe_fork Steamworks shim + direct `wine64` exec. No
-    ///   `steam.exe`, no auth needed at launch. Cloud saves, in-game
-    ///   multiplayer, and real Steam DRM verification are NOT available — the
-    ///   game talks to a local emulator, not Valve. Fast, fully seamless, and
-    ///   the ONLY path on which per-game compat fixes (launchArgs,
-    ///   preferD3DMetal, DLL overrides) are applied — Steam owns the exe's
-    ///   environment in Online mode. This is the default.
-    /// - `.online`: brings the real Steam client online in the background
-    ///   (`steam.exe -silent`, authenticated from the QR/OAuth session) and
-    ///   launches via `-applaunch`. Enables cloud saves, online multiplayer,
-    ///   EULAs, and genuine DRM. Requires a signed-in Steam session. The
-    ///   launcher prompts for it automatically when a game is SteamStub-
-    ///   encrypted and cannot run without the real client.
-    enum LaunchMode: String {
-        case offline
-        case online
-    }
-
-    /// App IDs the user has explicitly switched to Online mode. Everything not
-    /// in this set defaults to Offline (the reliable gbe_fork path). We store
-    /// only the opt-ins so the default stays Offline even as the set of games
-    /// grows, and so a cleared/blank set == "all offline".
-    private var onlineModeAppIDs: Set<Int> {
-        get { Set(UserDefaults.standard.array(forKey: "onlineModeAppIDs") as? [Int] ?? []) }
-        set { UserDefaults.standard.set(Array(newValue), forKey: "onlineModeAppIDs") }
-    }
-
-    /// The effective launch mode for a game. Defaults to `.offline`.
-    func launchMode(appID: Int) -> LaunchMode {
-        onlineModeAppIDs.contains(appID) ? .online : .offline
-    }
-
-    func setLaunchMode(_ mode: LaunchMode, appID: Int) {
-        var ids = onlineModeAppIDs
-        switch mode {
-        case .online:  ids.insert(appID)
-        case .offline: ids.remove(appID)
-        }
-        onlineModeAppIDs = ids
     }
 
     // MARK: - Hidden Games
@@ -384,7 +356,7 @@ final class AppSettings: @unchecked Sendable {
     // IAuthenticationService REST API), the resulting refresh_token is persisted
     // here so it can be re-injected into the prefix's local.vdf on every cold
     // start. The DPAPI ciphertext that lands in local.vdf is keyed to
-    // deterministic Wine inputs (user name "crossover" + accountName entropy +
+    // deterministic Wine inputs (the fixed Windows user name + accountName entropy +
     // compile-time Wine secret + embedded salt) so the same refresh_token
     // re-encrypts to a valid blob each launch.
 

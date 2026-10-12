@@ -411,9 +411,7 @@ final class SteamLibraryStore {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled else { break }
-                // Synchronous: the unstructured Task inherits this class's
-                // @MainActor isolation, so no hop (and no await) is needed.
-                self?.syncInstallStateFromDisk()
+                await self?.syncInstallStateFromDisk()
             }
         }
     }
@@ -434,17 +432,26 @@ final class SteamLibraryStore {
     }
 
     /// Reads ACF state for every game in the library and updates `isInstalled`
-    /// in-memory when it differs from disk. Lightweight: stat() per game, no network.
+    /// in-memory when it differs from disk. The disk scan runs OFF the main
+    /// actor: done here it read every game's ACF and re-parsed
+    /// libraryfolders.vdf per game, ~22 ms of main thread every 5 s, a
+    /// dropped frame each time (Instruments, Oct 11 2026). Only the diff is
+    /// applied here.
     @MainActor
-    private func syncInstallStateFromDisk() {
+    private func syncInstallStateFromDisk() async {
         guard !games.isEmpty else { return }
-        let prefix = WinePrefix.defaultPrefix
-        guard prefix.exists else { return }
+        let appIDs = games.map(\.id)
+        let installed = await Task.detached(priority: .utility) { () -> Set<Int>? in
+            let prefix = WinePrefix.defaultPrefix
+            guard prefix.exists else { return nil }
+            return prefix.fullyInstalledAppIDs(among: appIDs)
+        }.value
+        guard let installed, !Task.isCancelled else { return }
 
         var changedIDs = Set<Int>()
         for idx in games.indices {
             let appID = games[idx].id
-            let onDisk = prefix.isGameFullyInstalled(appID: appID)
+            let onDisk = installed.contains(appID)
             guard games[idx].isInstalled != onDisk else { continue }
             games[idx].isInstalled = onDisk
             changedIDs.insert(appID)
@@ -457,7 +464,7 @@ final class SteamLibraryStore {
         }
         guard !changedIDs.isEmpty else { return }
         for idx in recentGames.indices where changedIDs.contains(recentGames[idx].id) {
-            recentGames[idx].isInstalled = prefix.isGameFullyInstalled(appID: recentGames[idx].id)
+            recentGames[idx].isInstalled = installed.contains(recentGames[idx].id)
         }
     }
 

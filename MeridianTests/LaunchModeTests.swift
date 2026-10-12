@@ -1,11 +1,9 @@
 import XCTest
 
-/// Guard tests for Phase A3 — per-game Offline (gbe_fork) vs Online
-/// (real steam.exe `-applaunch`) launch modes.
-///
-/// Offline is the default (proven, seamless, no cloud/multiplayer). Online is
-/// an opt-in that brings the real Steam client online in the background so
-/// cloud saves, online multiplayer, EULAs, and genuine DRM work.
+/// Guard tests for launching: every game goes through the real Steam client
+/// (`-applaunch`), started silently, so cloud saves, achievements and
+/// multiplayer always work. The per-game Offline mode (gbe_fork emulator +
+/// direct wine64) was removed Oct 8 2026.
 final class LaunchModeTests: XCTestCase {
 
     private var repoRoot: URL {
@@ -16,35 +14,7 @@ final class LaunchModeTests: XCTestCase {
         try String(contentsOf: repoRoot.appending(path: relativePath), encoding: .utf8)
     }
 
-    // MARK: - AppSettings persistence contract
-
-    func testAppSettings_defaultsToOfflineAndPersistsOnlineOptIn() throws {
-        let src = try readSource("Meridian/Models/AppSettings.swift")
-        XCTAssertTrue(src.contains("enum LaunchMode"),
-                      "AppSettings must define a LaunchMode enum.")
-        XCTAssertTrue(src.contains("case offline") && src.contains("case online"),
-                      "LaunchMode must have offline + online cases.")
-        XCTAssertTrue(src.contains("func launchMode(appID:"),
-                      "AppSettings must expose launchMode(appID:).")
-        XCTAssertTrue(src.contains("func setLaunchMode("),
-                      "AppSettings must expose setLaunchMode(_:appID:).")
-        // Default must be Offline: the getter returns .online ONLY when the
-        // appID is in the opt-in set, else .offline.
-        XCTAssertTrue(src.contains("onlineModeAppIDs.contains(appID) ? .online : .offline"),
-                      "launchMode must default to .offline (Online is opt-in only).")
-    }
-
     // MARK: - Launcher wiring
-
-    func testLauncher_branchesOnLaunchMode() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        XCTAssertTrue(src.contains("AppSettings.shared.launchMode(appID:"),
-                      "Launcher must consult AppSettings.launchMode to pick Offline vs Online.")
-        XCTAssertTrue(src.contains("func launchOnline("),
-                      "Launcher must implement the Online-mode launch path.")
-        XCTAssertTrue(src.contains("== .online"),
-                      "Launcher must branch to Online when launchMode == .online.")
-    }
 
     func testOnlineMode_usesSteamApplaunchNotGbeFork() throws {
         let src = try readSource("Meridian/Launch/Launcher.swift")
@@ -65,80 +35,9 @@ final class LaunchModeTests: XCTestCase {
                        "Online mode must NOT launchDirect — Steam owns the launch (avoids the custom-args dialog, Pattern 20).")
     }
 
-    func testOfflineMode_remainsGbeForkDefault() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        // The default (non-online) path must still use the gbe_fork shim +
-        // direct exec that is proven reliable today.
-        XCTAssertTrue(src.contains("installSteamEmulator"),
-                      "Offline (default) path must keep the gbe_fork Steamworks shim.")
-        XCTAssertTrue(src.contains("launchDirect("),
-                      "Offline (default) path must keep direct wine64 exec.")
-    }
+    // MARK: - SteamStub detection
 
-    // MARK: - UI toggle (split Play button, HANDOFF-2026-07-03-v6 Goal 1)
-
-    func testGameDetail_exposesLaunchModePicker() throws {
-        let src = try readSource("Meridian/Views/Library/GameDetailView.swift")
-        XCTAssertTrue(src.contains("launchModeBinding"),
-                      "GameDetailView must bind the launch-mode control to AppSettings.")
-        XCTAssertTrue(src.contains("AppSettings.LaunchMode.offline")
-                      && src.contains("AppSettings.LaunchMode.online"),
-                      "GameDetailView's mode menu must offer both Offline and Online.")
-        // The mode lives on a split Play button, not in the ellipsis menu.
-        // The primary segment must be a REAL Button styled identically to
-        // ProgressButton (user-verified: Menu(primaryAction:) rendered at
-        // the wrong size and without the accent fill on macOS —
-        // HANDOFF-2026-07-03-v8 Goal 1). The chevron is SYSTEM GRAY
-        // (.bordered) and opens a teardrop POPOVER (like the Meridian
-        // Verified badge), not a system menu. Both modes keep the standard
-        // accent prominence — the glass-morph experiment was rejected
-        // (user direction, 2026-07-03: "the transition to normal to liquid
-        // glass, gotta go" / "keep that system gray").
-        XCTAssertTrue(src.contains("Button { handlePlayTapped() } label: {"),
-                      "The primary Play segment must be a plain Button (matches ProgressButton dims/color).")
-        XCTAssertFalse(src.contains("} primaryAction: {"),
-                       "Menu(primaryAction:) must NOT be used — it renders at the wrong size/color on macOS.")
-        XCTAssertTrue(src.contains(".popover(isPresented: $showLaunchModePopover"),
-                      "The chevron segment must open the mode picker as a teardrop popover.")
-        // Approved copy (user, Jul 3 2026): rows are "Local — Fast & offline"
-        // and "Online — Cloud saves & multiplayer".
-        XCTAssertTrue(src.contains("\"Local\"") && src.contains("\"Fast & offline\""),
-                      "The default mode row must be titled Local with the Fast & offline subtitle.")
-        XCTAssertTrue(src.contains("\"Cloud saves & multiplayer\""),
-                      "The Online row must keep the Cloud saves & multiplayer subtitle.")
-        XCTAssertFalse(src.contains("playProminence(") || src.contains(".glassProminent"),
-                       "No mode-aware glass prominence — both modes use the standard accent button; the chevron is .bordered gray.")
-        // Label contract: Offline is the default and reads plain "Play";
-        // only the Online opt-in earns a qualifier.
-        XCTAssertTrue(src.contains("launchModeUI == .online ? \"Play Online\" : \"Play\""),
-                      "The Play label must be \"Play\" for the default mode and \"Play Online\" for Online.")
-        XCTAssertFalse(src.contains("Label(\"Launch Mode\", systemImage: \"network\")"),
-                       "The old ellipsis-menu Launch Mode submenu must be gone (replaced by the split button).")
-    }
-
-    /// SteamStub games can ONLY run through the Steam client. The mode
-    /// control must reflect that constraint up-front — Offline disabled in
-    /// the menu, Online persisted by the probe — instead of letting the user
-    /// pick Offline and get prompted after the fact.
-    func testGameDetail_steamStubDisablesOfflineInModeMenu() throws {
-        let src = try readSource("Meridian/Views/Library/GameDetailView.swift")
-        XCTAssertTrue(src.contains("steamStubRequiresOnline"),
-                      "GameDetailView must track the SteamStub constraint state.")
-        XCTAssertTrue(src.contains("disabled: steamStubRequiresOnline"),
-                      "The Offline popover row must be disabled for SteamStub games.")
-        XCTAssertTrue(src.contains("gameHasSteamStubDRM"),
-                      "GameDetailView must probe the installed exe for SteamStub DRM.")
-        XCTAssertTrue(src.contains("Task.detached"),
-                      "The SteamStub probe touches disk — it must run off the main thread.")
-        XCTAssertTrue(src.contains("AppSettings.shared.setLaunchMode(.online, appID: appID)"),
-                      "The probe must persist Online for SteamStub games (same switch confirmSteamPrompt makes).")
-    }
-
-    // MARK: - SteamStub detection (.bind PE section)
-
-    /// Mirror of GameStackDetector.hasSteamStub
-    /// MIRROR CONTRACT: must match GameStackDetector.hasSteamStub in
-    /// Meridian/Engine/GameStackResolver.swift.
+    /// Mirror of GameStackDetector.hasSteamStub (the `.bind` PE section probe).
     private func hasSteamStub(exe: URL) -> Bool {
         guard let fh = try? FileHandle(forReadingFrom: exe) else { return false }
         defer { try? fh.close() }
@@ -217,35 +116,7 @@ final class LaunchModeTests: XCTestCase {
         XCTAssertFalse(hasSteamStub(exe: notPE), "Non-PE files must return false")
     }
 
-    // MARK: - SteamStub → Online prompt wiring
-
-    /// SteamStub-encrypted exes cannot run under the gbe_fork shim (the exe
-    /// itself is encrypted; only a signed-in Steam client decrypts it). The
-    /// Offline pipeline must detect this and raise the consent prompt instead
-    /// of attempting a shim launch that fails opaquely.
-    func testLauncher_promptsForSteamOnSteamStubGames() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        XCTAssertTrue(src.contains("gameHasSteamStubDRM"),
-                      "The Offline pipeline must probe for SteamStub DRM")
-        XCTAssertTrue(src.contains("enum SteamPrompt"),
-                      "Launcher must publish a SteamPrompt for UI consent")
-        XCTAssertTrue(src.contains("case steamRequired(Game)")
-                      && src.contains("case signInRequired(Game)"),
-                      "SteamPrompt must cover SteamStub (steamRequired) and first-time Online (signInRequired)")
-        XCTAssertTrue(src.contains("func confirmSteamPrompt(") && src.contains("func dismissSteamPrompt()"),
-                      "Launcher must expose confirm/dismiss entry points for the prompt")
-        XCTAssertTrue(src.contains("setLaunchMode(.online, appID: game.id)"),
-                      "Confirming the SteamStub prompt must switch the game to Online mode")
-
-        let prefixSrc = try readSource("Meridian/Engine/WinePrefix.swift")
-        XCTAssertTrue(prefixSrc.contains("func gameHasSteamStubDRM(appID:"),
-                      "WinePrefix must expose the SteamStub probe")
-        let resolverSrc = try readSource("Meridian/Engine/GameStackResolver.swift")
-        XCTAssertTrue(resolverSrc.contains("static func hasSteamStub(exe:"),
-                      "GameStackDetector must implement the .bind PE section probe")
-    }
-
-    // MARK: - One-time interactive Steam sign-in (Online mode)
+    // MARK: - One-time Steam sign-in
 
     /// Online mode's auth contract (HANDOFF-2026-07-02-v2/v3):
     /// - Injected tokens are REJECTED by Valve's CM (Pattern 6) and feed the
@@ -279,8 +150,8 @@ final class LaunchModeTests: XCTestCase {
         }
 
         let launcher = try readSource("Meridian/Launch/Launcher.swift")
-        XCTAssertTrue(launcher.contains("hasSteamLoginSession()"),
-                      "launchOnline must branch silent-vs-interactive on the on-disk Steam session")
+        XCTAssertTrue(launcher.contains("AppSettings.shared.steamClientSignedIn"),
+                      "launchOnline must branch silent-vs-interactive on Meridian's record of Steam's sign-in, not on Steam's files")
         XCTAssertTrue(launcher.contains(".signInRequired(game)"),
                       "First-time Online must raise the consent prompt before any Steam window opens")
         XCTAssertTrue(launcher.contains("signInInteractively"),
@@ -290,4 +161,100 @@ final class LaunchModeTests: XCTestCase {
         XCTAssertTrue(detail.contains("launcher.steamPrompt") && detail.contains("confirmSteamPrompt"),
                       "GameDetailView must render the Steam consent prompt and wire confirm/dismiss")
     }
+
+    /// Valve can end Steam's saved sign-in on its own (meridian.log Oct 11
+    /// 2026: 'Access Denied' for a sign-in that logged on 7 times on Oct 8).
+    /// Meridian forgets the sign-in and, inside the same launch, opens Steam's
+    /// sign-in with the card saying why. An alert and then a fresh launch
+    /// read as a restart (user, Oct 11 2026).
+    func testSteamSignOut_signsInWithinTheSameLaunch() throws {
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(session.contains("log.error(\"[waitForLoggedOn] Valve rejected token — auth failed\")\n                killWebhelper()\n                return .signedOut"),
+                      "A Valve rejection must come back as .signedOut, not a generic failure")
+        guard let mark = session.range(of: "private func markSignedOut()") else {
+            return XCTFail("SteamSession must have markSignedOut()")
+        }
+        let markBody = String(session[mark.upperBound...].prefix(400))
+        XCTAssertTrue(markBody.contains("AppSettings.shared.steamClientSignedIn = false"),
+                      "A sign-out must clear Meridian's record of Steam's sign-in so a later cold launch asks first")
+        XCTAssertTrue(markBody.contains("SteamSessionBackup.clear()"),
+                      "A sign-out must drop the session backup, which would only restore the rejected sign-in")
+        XCTAssertTrue(session.contains("throw state == .signedOut ? SessionError.signedOut : SessionError.steamNotReady"),
+                      "ensureReadyForDRM must tell a sign-out apart from other failures")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        guard let catchSignOut = launcher.range(of: "} catch SessionError.signedOut where !Task.isCancelled {") else {
+            return XCTFail("launchOnline must catch a Steam sign-out separately")
+        }
+        let branch = String(launcher[catchSignOut.upperBound...].prefix(900))
+        let signOutBranch = String(branch[..<(branch.range(of: "} catch {")?.lowerBound ?? branch.endIndex)])
+        XCTAssertTrue(signOutBranch.contains("try await signInToSteam(.signedOut, appID: game.id, session: session, engine: engine)"),
+                      "A sign-out must continue into Steam's sign-in within the same launch")
+        XCTAssertFalse(signOutBranch.contains("steamPrompt") || signOutBranch.contains("launchState = .idle"),
+                       "A sign-out must not end the launch and start over")
+    }
+
+    /// Steam boots in the background once the library is up, so Play doesn't
+    /// wait on it. A Play during the warm-up must JOIN it (start() skips while
+    /// .startingSilent, so racing it reported "not ready" mid-boot), and a
+    /// sign-out the warm-up found sends Play straight to Steam's sign-in.
+    func testSteamWarmUp_isJoinedByPlay() throws {
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(session.contains("guard warmUpTask == nil, state == .idle, AppSettings.shared.steamClientSignedIn else { return }"),
+                      "Warm-up only for a Mac where Steam's own sign-in succeeded (no sign-in window from the background)")
+        XCTAssertTrue(session.contains("if let warmUpTask {"),
+                      "ensureReadyForDRM must wait for a running warm-up instead of racing it")
+        XCTAssertTrue(session.contains("try await bringUpForDRM(engine: engine, appID: nil, onStatus: nil)"),
+                      "The warm-up must use the inner bring-up, or it would wait on itself")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("let signedOut = session.state == .signedOut"),
+                      "Play must use a sign-out the warm-up already found")
+        XCTAssertTrue(launcher.contains("try await signInToSteam(.signedOut, appID: game.id, session: session, engine: engine)"),
+                      "A known sign-out goes straight to Steam's sign-in")
+
+        let content = try readSource("Meridian/Views/ContentView.swift")
+        XCTAssertTrue(content.contains("session.warmUp(engine: engine)"),
+                      "The app must warm Steam up once the library is loaded")
+    }
+
+    /// Steam reads appmanifest_*.acf once per start. A game Meridian installs
+    /// while Steam runs (DepotDownloader) is unknown to it, and -applaunch
+    /// fails at once with AppError_18 (Steam console_log, Oct 12 2026:
+    /// Endacopia and The Baby in Yellow, both installed after Steam started).
+    /// Play restarts Steam first for such a game.
+    func testGameInstalledAfterSteamStarted_restartsSteamBeforeLaunch() throws {
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(session.contains("appsSteamLoaded = prefix.appManifestIDs()"),
+                      "Every steam.exe start must record which games Steam loaded")
+        XCTAssertTrue(session.contains("} else if let appID, !appsSteamLoaded.contains(appID) {"),
+                      "A ready Steam that never loaded the game must be restarted before -applaunch")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("try await session.ensureReadyForDRM(engine: engine, appID: game.id)"),
+                      "Play must tell Steam's bring-up which game it is for")
+        XCTAssertTrue(launcher.contains("try await session.ensureReadyForDRM(engine: engine, appID: appID)"),
+                      "The bring-up after Steam's sign-in must check the game too")
+    }
+
+    func testEveryLaunchGoesThroughSteam_withItsArguments() throws {
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("await launchOnline(game: game, engine: engine, session: session, library: library)"),
+                      "The pipeline must hand every game to launchOnline.")
+        XCTAssertFalse(launcher.contains("func launchDirect("),
+                       "There is no direct wine64 launch path any more.")
+        XCTAssertTrue(launcher.contains("launchArguments(for: game, engine: engine)"),
+                      "Compat-profile arguments (HL2 -game, Unity -force-d3d11) must still reach the game through Steam.")
+
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(session.contains(#"["-applaunch", "\(appID)"] + arguments"#),
+                      "launchGameViaSteam must forward the arguments after -applaunch <appID>.")
+
+        let settings = try readSource("Meridian/Models/AppSettings.swift")
+        XCTAssertFalse(settings.contains("enum LaunchMode"), "There is no per-game launch mode setting.")
+        let detail = try readSource("Meridian/Views/Library/GameDetailView.swift")
+        XCTAssertFalse(detail.contains("Play Online"), "The Play button has no Online/Offline variant.")
+        XCTAssertFalse(detail.contains("launchModePopover"), "There is no launch-mode picker.")
+    }
+
 }

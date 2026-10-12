@@ -40,9 +40,42 @@ final class SteamSession {
         case running(pid: pid_t)
         /// Silent auth failed or steam.exe crashed. ContentView shows sign-in sheet.
         case failed(String)
+        /// Steam has no usable sign-in: Valve rejected the saved one, or
+        /// none was saved. Only Steam's own sign-in fixes this, and the
+        /// player is asked before it opens.
+        case signedOut
     }
 
+    /// How a wait for `[Logged On,` ended.
+    enum LogonResult: Equatable { case loggedOn, signedOut, failed }
+
     private(set) var state: State = .idle
+
+    /// `WINEDEBUG` the running steam.exe (and so every game it launches)
+    /// was started with. Changing the trace channels in Settings restarts
+    /// Steam before the next launch (`ensureReadyForDRM`).
+    private var runningWineDebug: String?
+
+    /// Apps with an appmanifest when the running steam.exe started. Steam
+    /// reads `appmanifest_*.acf` once per start, so a game Meridian installs
+    /// after that (DepotDownloader) is unknown to it until it restarts.
+    private var appsSteamLoaded: Set<Int> = []
+
+    /// Steam client download progress while `bootstrapSteamClientIfNeeded`
+    /// downloads; nil otherwise (including while it installs). Drives the
+    /// onboarding progress ring.
+    struct DownloadProgress: Equatable {
+        let received: Int64
+        let total: Int64
+        var fraction: Double { total > 0 ? min(1, Double(received) / Double(total)) : 0 }
+    }
+    private(set) var clientDownload: DownloadProgress?
+
+    /// What a running one-time Steam sign-in is doing (onboarding shows it as
+    /// a checklist); nil when no sign-in is running. "Waiting for the user" is
+    /// `SteamWindow.isSignInWindowShown`.
+    enum SignInPhase: Equatable { case downloading, installing, starting, updating, finishing }
+    private(set) var signInPhase: SignInPhase?
 
     var isReady: Bool {
         if case .running = state { return true }
@@ -73,6 +106,11 @@ final class SteamSession {
     /// fighting the user's explicit shutdown.
     private var healthGeneration: Int = 0
 
+    /// A background bring-up started by `warmUp` (nil otherwise). Play joins
+    /// it rather than racing it: `start()` skips while `.startingSilent`, so a
+    /// second caller would otherwise see "not ready" mid-boot.
+    private var warmUpTask: Task<Void, Never>?
+
     // MARK: - Dependency injection (set by MeridianApp)
 
     var steamWindow: SteamWindow?
@@ -93,7 +131,7 @@ final class SteamSession {
         case .startingSilent:
             log.info("[start] already starting — skip")
             return
-        case .idle, .failed:
+        case .idle, .failed, .signedOut:
             // `.failed` is retryable — a prior silent-auth failure (e.g. a
             // lazy DRM warm that didn't reach [Logged On,) must be able to
             // re-attempt cleanly. launchSteamProcess no-ops if a live process
@@ -107,13 +145,14 @@ final class SteamSession {
         do {
             try await launchSteamProcess(engine: engine)
             let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
-            let loggedOn = await waitForLoggedOn(
+            let result = await waitForLoggedOn(
                 engine: engine,
                 timeout: .seconds(60),
                 authTimeout: .seconds(12),
                 onStatus: onStatus
             )
-            if loggedOn {
+            switch result {
+            case .loggedOn:
                 onStatus?("Steam is ready")
                 state = .running(pid: pid_t(pid))
                 log.info("[start] silent auth succeeded ✓ pid=\(pid)")
@@ -122,7 +161,10 @@ final class SteamSession {
                 // Without this, the user's running game dies the next time Valve
                 // pushes a client update mid-session — CLI-confirmed May 20 2026.
                 startHealthMonitor(engine: engine)
-            } else {
+            case .signedOut:
+                logSteamFailureDiagnostics(reason: "Steam has no usable sign-in")
+                markSignedOut()
+            case .failed:
                 log.warning("[start] silent auth timed out — sign-in sheet will handle re-auth")
                 logSteamFailureDiagnostics(reason: "silent auth did not reach [Logged On,")
                 state = .failed("Steam could not authenticate silently. Please sign in.")
@@ -160,9 +202,59 @@ final class SteamSession {
     /// user never downloads the Steam client nor runs steam.exe.
     func ensureReadyForDRM(
         engine: WineEngine,
+        appID: Int? = nil,
         onStatus: (@MainActor (String) -> Void)? = nil
     ) async throws {
-        if isReady { return }
+        if let warmUpTask {
+            onStatus?("Starting Steam…")
+            // Stop during the wait stops the warm-up too.
+            await withTaskCancellationHandler {
+                await warmUpTask.value
+            } onCancel: {
+                warmUpTask.cancel()
+            }
+        }
+        try await bringUpForDRM(engine: engine, appID: appID, onStatus: onStatus)
+    }
+
+    /// Starts Steam silently in the background so Play doesn't wait ~10-15 s
+    /// for it (user, Oct 11 2026: "why does it have to wait till we want to
+    /// play a game"). Every game launches through Steam now, so Steam is
+    /// needed for any Play. Only once Steam's own sign-in has succeeded on
+    /// this Mac (no sign-in window can appear from here), and a sign-out
+    /// Valve has made is found here rather than mid-launch (`state ==
+    /// .signedOut`, which `Launcher` checks before it starts).
+    func warmUp(engine: WineEngine) {
+        guard warmUpTask == nil, state == .idle, AppSettings.shared.steamClientSignedIn else { return }
+        log.info("[warmUp] starting Steam in the background")
+        warmUpTask = Task {
+            do {
+                try await bringUpForDRM(engine: engine, appID: nil, onStatus: nil)
+            } catch {
+                log.info("[warmUp] Steam isn't ready (\(error.localizedDescription)); Play will handle it")
+            }
+            warmUpTask = nil
+        }
+    }
+
+    private func bringUpForDRM(
+        engine: WineEngine,
+        appID: Int?,
+        onStatus: (@MainActor (String) -> Void)?
+    ) async throws {
+        if isReady {
+            let wanted = engine.steamClientEnvironment(for: prefix)["WINEDEBUG"]
+            if wanted != runningWineDebug {
+                log.info("[ensureReadyForDRM] Wine trace channels changed (\(runningWineDebug ?? "none") → \(wanted ?? "none")) — restarting Steam")
+            } else if let appID, !appsSteamLoaded.contains(appID) {
+                // Otherwise -applaunch fails at once with AppError_18 and no
+                // game ever starts (Endacopia, The Baby in Yellow, Oct 12 2026).
+                log.info("[ensureReadyForDRM] appID=\(appID) was installed after Steam started — restarting Steam so it loads the game")
+            } else {
+                return
+            }
+            await shutdown(engine: engine)
+        }
         log.info("[ensureReadyForDRM] bringing Steam runtime online for DRM launch (state=\(String(describing: state)))")
 
         // 1. Steam stub — silent install, only if absent.
@@ -209,7 +301,7 @@ final class SteamSession {
         await start(engine: engine, onStatus: onStatus)
         guard isReady else {
             // start() already logged steam.exe diagnostics on the failure path.
-            throw SessionError.steamNotReady
+            throw state == .signedOut ? SessionError.signedOut : SessionError.steamNotReady
         }
         log.info("[ensureReadyForDRM] Steam ready for DRM ✓")
     }
@@ -229,16 +321,18 @@ final class SteamSession {
     /// user-verified Jul 2 2026 on our engine once the prefix had the complete
     /// wine.inf registration (Pattern 24 / v3.1.0-engine).
     ///
-    /// Window policy: suppression is paused while the sign-in window is up
-    /// (it must render and receive input — the ONE sanctioned Steam window
-    /// besides EULA/purchase dialogs), and re-engaged the moment
-    /// `[Logged On,` appears so Steam's post-login main window never paints.
+    /// Window policy: `SteamWindow.beginSignIn()` shows only Steam's sign-in
+    /// window (centred over Meridian; everything else stays hidden).
+    /// Suppression re-engages at `[Logged On,`, and once Steam has saved its
+    /// session it is shut down, so its post-login library window never stays
+    /// up. Callers that need Steam running start it silently afterwards.
     func signInInteractively(
         engine: WineEngine,
         timeout: Duration = .seconds(300),
         onStatus: (@MainActor (String) -> Void)? = nil
     ) async throws {
         if isReady { return }
+        defer { signInPhase = nil }
         log.info("[signInInteractively] starting interactive Steam sign-in (state=\(String(describing: state)))")
 
         // Same deferred bring-up as ensureReadyForDRM steps 1-2.
@@ -258,10 +352,12 @@ final class SteamSession {
         await shutdown(engine: engine)
 
         state = .startingSilent
-        // Pause suppression so the sign-in window can render and take input.
-        steamWindow?.pauseForGame()
+        // Show Steam's sign-in window — centred over Meridian, everything else
+        // Steam opens stays hidden.
+        steamWindow?.beginSignIn()
 
-        onStatus?("Opening Steam sign-in…")
+        signInPhase = .starting
+        onStatus?("Starting Steam…")
         do {
             try await launchSteamProcess(engine: engine, interactive: true)
         } catch {
@@ -270,8 +366,7 @@ final class SteamSession {
             throw error
         }
 
-        onStatus?("Waiting for you to sign in to Steam…")
-        let loggedOn = await waitForInteractiveLogon(timeout: timeout)
+        let loggedOn = await waitForInteractiveLogon(timeout: timeout, onStatus: onStatus)
 
         // Re-engage suppression FIRST so Steam's post-login main window is
         // hidden before it paints.
@@ -294,26 +389,25 @@ final class SteamSession {
             throw SessionError.steamNotReady
         }
 
-        let pid = persistentProcess.flatMap { $0.isRunning ? $0.processIdentifier : nil } ?? 0
-        if pid == 0 {
-            // steam.exe self-updated (code=42) mid-sign-in and re-exec'd with
-            // a PID we don't own. Window suppression still covers it (the
-            // polling discovery + game-mode pgrep find the new PID), but the
-            // code=42 health monitor cannot watch a process we have no handle
-            // for — a mid-game Steam self-update will not be auto-restarted
-            // this session.
-            log.warning("[signInInteractively] steam.exe re-exec'd during sign-in (code=42) — pid unknown, health monitor inactive")
-        }
-        state = .running(pid: pid_t(pid))
-        startHealthMonitor(engine: engine)
+        AppSettings.shared.steamClientSignedIn = true
+        signInPhase = .finishing
+        onStatus?("Signed in. Finishing up…")
 
-        // Snapshot Steam's own freshly-written session so it survives prefix
-        // resets. Steam flushes local.vdf shortly after logon (Pattern 12).
-        Task {
-            try? await Task.sleep(for: .seconds(5))
-            SteamSessionBackup.snapshot(prefix: self.prefix)
+        // Steam opens its full library window right after signing in, and
+        // nothing needs it. Quit Steam, but only after it has saved its
+        // session: closing it 5 s after logon lost the session (meridian.log
+        // Oct 7 21:19:08 → silent start 21:20:49 "no session on disk").
+        // Only the file's modification time is checked, never its contents.
+        // A few seconds of slack: Steam can save just before the log poll
+        // notices the logon.
+        if await waitForSavedSession(since: Date().addingTimeInterval(-5), timeout: .seconds(45)) {
+            SteamSessionBackup.snapshot(prefix: prefix)
+            await shutdown(engine: engine)
+        } else {
+            log.warning("[signInInteractively] Steam hasn't saved its session yet — leaving it running hidden")
+            state = .running(pid: persistentProcess.map { pid_t($0.processIdentifier) } ?? 0)
         }
-        log.info("[signInInteractively] ✓ signed in — Steam persisted its own session")
+        log.info("[signInInteractively] ✓ signed in; Steam saved its session and was closed")
     }
 
     /// Interactive variant of `waitForLoggedOn`: the user is typing
@@ -322,7 +416,37 @@ final class SteamSession {
     /// Fails fast only when steam.exe itself exits (user closed the window,
     /// or a crash) — the timeout is a last-resort safety net for an abandoned
     /// sign-in window.
-    private func waitForInteractiveLogon(timeout: Duration) async -> Bool {
+    /// Waits until Steam has saved its sign-in after `since`: both
+    /// `local.vdf` and `config/loginusers.vdf` (the account list auto-login
+    /// starts from) modified. Polls modification dates only.
+    ///
+    /// `local.vdf` alone is not enough: on Oct 7 21:19 Steam wrote it within
+    /// 5 s of logon but had not written loginusers.vdf yet, and the next
+    /// silent start found no session (21:20:49, 21:34:41 "no session on disk").
+    private func waitForSavedSession(since: Date, timeout: Duration) async -> Bool {
+        let files = [prefix.localAppDataSteamDir.appending(path: "local.vdf"),
+                     prefix.steamConfigDir.appending(path: "loginusers.vdf")]
+        func modified(_ url: URL) -> Bool {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))
+            return (attributes?[.modificationDate] as? Date).map { $0 > since } ?? false
+        }
+        let started = ContinuousClock.now
+        while ContinuousClock.now - started < timeout {
+            if files.allSatisfy(modified) {
+                log.info("[savedSession] Steam saved its sign-in")
+                try? await Task.sleep(for: .seconds(2))  // let Steam finish its other config writes
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        log.warning("[savedSession] no save within \(timeout) (local.vdf=\(modified(files[0])) loginusers.vdf=\(modified(files[1])))")
+        return false
+    }
+
+    private func waitForInteractiveLogon(
+        timeout: Duration,
+        onStatus: (@MainActor (String) -> Void)?
+    ) async -> Bool {
         let connLogPath = prefix.steamInstallDir
             .appending(path: "logs/connection_log.txt")
             .path(percentEncoded: false)
@@ -335,6 +459,8 @@ final class SteamSession {
                 let code = p.terminationStatus
                 if code == 42 {
                     log.info("[interactiveLogon] code=42 self-update restart, continuing…")
+                    signInPhase = .updating
+                    onStatus?("Updating Steam…")
                     persistentProcess = nil
                 } else {
                     log.error("[interactiveLogon] steam.exe exited code=\(code) — window closed or crashed before sign-in")
@@ -382,6 +508,7 @@ final class SteamSession {
             log.info("[bootstrapClient] installed steam.exe is 32-bit — re-bootstrapping with win64 client")
         }
 
+        signInPhase = .downloading
         // Engage suppression before the download in case Steam ever renders UI.
         steamWindow?.startSuppressing()
         try? prefix.ensureSteamCFG()
@@ -389,13 +516,19 @@ final class SteamSession {
 
         let installDir = prefix.steamInstallDir
         let progress: @Sendable (Int64, Int64) -> Void = { downloaded, total in
-            Task { @MainActor in
-                let pct = total > 0 ? Int(downloaded * 100 / total) : 0
-                let mb = downloaded / 1_048_576
-                let totalMB = total / 1_048_576
-                onStatus?("Downloading Steam client… \(mb)/\(totalMB) MB (\(pct)%)")
+            Task { @MainActor [weak self] in
+                if total > 0, downloaded < total {
+                    self?.clientDownload = DownloadProgress(received: downloaded, total: total)
+                    self?.signInPhase = .downloading
+                    onStatus?("Downloading Steam")
+                } else {
+                    self?.clientDownload = nil
+                    self?.signInPhase = .installing
+                    onStatus?("Installing Steam")
+                }
             }
         }
+        defer { clientDownload = nil }
 
         log.info("[bootstrapClient] native download into \(installDir.path(percentEncoded: false))")
         do {
@@ -539,18 +672,23 @@ final class SteamSession {
             }
             process = newProcess
 
-            let loggedOn = await waitForLoggedOn(
+            let result = await waitForLoggedOn(
                 engine: engine,
                 timeout: .seconds(120),
                 authTimeout: .seconds(30)
             )
             guard generation == healthGeneration else { return }
 
-            if loggedOn {
+            switch result {
+            case .loggedOn:
                 let pid = newProcess.isRunning ? newProcess.processIdentifier : 0
                 state = .running(pid: pid_t(pid))
                 log.info("[healthMonitor] ✓ Steam restored after self-update (pid=\(pid))")
-            } else {
+            case .signedOut:
+                logSteamFailureDiagnostics(reason: "self-update relaunch has no usable sign-in")
+                markSignedOut()
+                return
+            case .failed:
                 log.error("[healthMonitor] Steam did not reach Logged On after self-update")
                 logSteamFailureDiagnostics(reason: "self-update relaunch did not reach [Logged On,")
                 state = .failed("Steam restart didn't complete sign-in. Try quitting and reopening Meridian.")
@@ -579,8 +717,12 @@ final class SteamSession {
         steamWindow?.stopSuppressing()
 
         // Send steam.exe -shutdown via a second process instance. Steam's IPC
-        // dispatches this as a graceful shutdown request to the running instance.
-        if let wineURL = engine.wineExecutableURL {
+        // dispatches this as a graceful shutdown request to the running
+        // instance. Only when Steam is running: with none to receive it,
+        // `-shutdown` starts a full Steam with its library, store popup and
+        // friends list on screen (Oct 8 2026, after quitting Meridian).
+        let steamRunning = await Task.detached(operation: { Self.isSteamRunning() }).value
+        if steamRunning, let wineURL = engine.wineExecutableURL {
             let shutdown = Process()
             shutdown.executableURL = wineURL
             shutdown.arguments = [prefix.steamExePath.path(percentEncoded: false), "-shutdown"]
@@ -588,7 +730,13 @@ final class SteamSession {
             shutdown.standardOutput = FileHandle.nullDevice
             shutdown.standardError = FileHandle.nullDevice
             try? shutdown.run()
-            try? await Task.sleep(for: .seconds(2))
+            // Let Steam exit on its own (it writes its config on the way
+            // out); force-kill only after 15 s.
+            let started = ContinuousClock.now
+            repeat {
+                try? await Task.sleep(for: .milliseconds(500))
+            } while await Task.detached(operation: { Self.isSteamRunning() }).value
+                && ContinuousClock.now - started < .seconds(15)
         }
 
         // Always kill — orphan processes can exist outside our tracking.
@@ -599,7 +747,18 @@ final class SteamSession {
 
     /// Aggressive kill of all Wine processes in the prefix. Used before starting
     /// a fresh steam.exe and during termination cleanup.
-    func killAllWineProcesses(engine: WineEngine) {
+    nonisolated private static func isSteamRunning() -> Bool {
+        let p = Process()
+        p.executableURL = URL(filePath: "/usr/bin/pgrep")
+        p.arguments = ["-f", "Steam\\\\steam.exe"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+        func killAllWineProcesses(engine: WineEngine) {
         log.info("[killAll] pkill steam.exe + wineserver -k")
         pkill(["-9", "-f", "steamwebhelper"])
         pkill(["-9", "-f", "steam.exe"])
@@ -726,15 +885,14 @@ final class SteamSession {
     ///   detects the running Steam's IPC pipe and forwards the command,
     ///   exiting in ~1 s. Same pattern as `steam://install` forwarding.
     ///
-    /// Non-DRM games (no `steam_api64.dll`) keep using direct wine64 exec —
-    /// no Steam involvement needed and a faster launch path. See
-    /// `Launcher.launchDirect`.
-    func launchGameViaSteam(appID: Int, engine: WineEngine) throws {
+    /// Every game launches this way (Offline was removed Oct 8 2026).
+    /// `arguments` reach the game's command line.
+    func launchGameViaSteam(appID: Int, arguments: [String] = [], engine: WineEngine) throws {
         guard isReady else {
             throw SessionError.steamNotReady
         }
-        log.info("[launchGameViaSteam] dispatching -applaunch \(appID) via IPC")
-        try sendSteamCommand(["-applaunch", "\(appID)"], engine: engine)
+        log.info("[launchGameViaSteam] dispatching -applaunch \(appID) \(arguments.joined(separator: " ")) via IPC")
+        try sendSteamCommand(["-applaunch", "\(appID)"] + arguments, engine: engine)
     }
 
     /// Cancel an in-progress install.
@@ -924,14 +1082,17 @@ final class SteamSession {
             return
         }
 
-        // Write registry keys for silent/minimized mode before starting.
-        await configureSteamRegistry(engine: engine)
-        try? await Task.sleep(for: .seconds(2))
+        // Write registry keys for silent/minimized mode before starting
+        // (once per bottle; each key is its own Wine process).
+        if await configureSteamRegistry(engine: engine) {
+            try? await Task.sleep(for: .seconds(2))
+        }
 
         try? prefix.ensureSteamCFG()
         prefix.stripBootStrapperInhibit()
         prefix.clearCrashMarker()
 
+        appsSteamLoaded = prefix.appManifestIDs()
         connectionLogOffset = connectionLogFileSize()
         webhelperLogOffset = fileSize(of: prefix.steamInstallDir
             .appending(path: "logs/webhelper_js.txt")
@@ -948,12 +1109,15 @@ final class SteamSession {
 
         log.info("[launchSteamProcess] wine64 \(args.joined(separator: " "))")
 
-        let env = engine.steamCMDEnvironment(for: prefix)
+        var env = engine.steamClientEnvironment(for: prefix)
+        // The accessory dylib gives Steam's sign-in window macOS chrome
+        // (rounded corners, shadow, fade-in) — only for this launch.
+        if interactive { env["MERIDIAN_STEAM_SIGNIN"] = "1" }
         // Diagnostic: confirm the DYLD_INSERT_LIBRARIES dock-suppression payload
         // is in the env Steam will see. If this is missing or the dylib path
         // is broken, the Wine subprocess won't get demoted to .accessory and
         // we'll see a wine64 Dock icon. Pair with the `[meridian-wine-
-        // accessory]` lines that show up in `[steam.exe:stderr]` from the
+        // accessory]` lines in logs/wine-steam.log from the
         // dylib's own NSLog when it loads successfully.
         if let dyld = env["DYLD_INSERT_LIBRARIES"] {
             let exists = FileManager.default.fileExists(atPath: dyld)
@@ -967,12 +1131,19 @@ final class SteamSession {
         process.arguments = args
         process.environment = env
         process.standardOutput = FileHandle.nullDevice
-
-        let stderrPipe = Pipe()
-        process.standardError = stderrPipe
+        // Steam's and its games' Wine output, kernel-written to disk
+        // (GameLogFile.steamOutputURL); Launcher copies each game session's
+        // slice into the game's log.
+        let output = GameLogFile.beginSteamOutput(arguments: args)
+        process.standardError = output ?? FileHandle.nullDevice
+        process.terminationHandler = { finished in
+            log.info("[steam.exe] exited code=\(finished.terminationStatus)")
+        }
 
         try process.run()
+        try? output?.close()  // the child holds its own descriptor
         persistentProcess = process
+        runningWineDebug = env["WINEDEBUG"]
         let pid = process.processIdentifier
         log.info("[launchSteamProcess] pid=\(pid) interactive=\(interactive)")
 
@@ -991,27 +1162,19 @@ final class SteamSession {
             engineDirPath: WineEngine.engineDir.path(percentEncoded: false),
             libraryPath: engine.libraryPath
         )
-
-        // Drain stderr in background for diagnostics.
-        Task.detached {
-            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            if let raw = String(data: data, encoding: .utf8), !raw.isEmpty {
-                let filtered = filterWineStderr(raw)
-                let lines = filtered.components(separatedBy: .newlines).prefix(80)
-                for line in lines where !line.isEmpty {
-                    log.info("[steam.exe:stderr] \(line)")
-                }
-                if raw.count > 4000 {
-                    log.info("[steam.exe:stderr] (truncated \(raw.count) chars)")
-                }
-            }
-            if !process.isRunning {
-                log.info("[steam.exe] exited code=\(process.terminationStatus)")
-            }
-        }
     }
 
-    private func configureSteamRegistry(engine: WineEngine) async {
+    /// Bump when the keys below change so existing bottles get them once.
+    private static let steamRegistryVersion = "2"
+
+    /// Writes Steam's registry keys unless this bottle already has this
+    /// version of them. They cost about 5 s per launch (one Wine process
+    /// per key, then a settle delay) and never change between launches.
+    /// Returns whether it wrote anything.
+    private func configureSteamRegistry(engine: WineEngine) async -> Bool {
+        let marker = prefix.path.appending(path: ".meridian-steam-registry")
+        if (try? String(contentsOf: marker, encoding: .utf8)) == Self.steamRegistryVersion { return false }
+        defer { try? Self.steamRegistryVersion.write(to: marker, atomically: true, encoding: .utf8) }
         let wine64URL = engine.wine64URL
         let env = engine.steamCMDEnvironment(for: prefix)
         await Task.detached(priority: .userInitiated) {
@@ -1028,10 +1191,6 @@ final class SteamSession {
             reg(["reg", "add",
                  "HKCU\\Software\\Valve\\Steam",
                  "/v", "StartMinimized", "/t", "REG_DWORD", "/d", "1", "/f"])
-            reg(["reg", "add",
-                 "HKCU\\Software\\Valve\\Steam",
-                 "/v", "WebProcessCmdLine",
-                 "/t", "REG_SZ", "/d", "--no-sandbox --disable-gpu", "/f"])
             // Suppress Steam's post-login "you have new games" toast burst.
             // After silent auth, Steam scans cloud-known + locally-cached
             // appmanifests and announces every "installed" game via Windows
@@ -1052,7 +1211,22 @@ final class SteamSession {
             reg(["reg", "add",
                  "HKCU\\Software\\Valve\\Steam",
                  "/v", "EnableGameOverlay", "/t", "REG_DWORD", "/d", "0", "/f"])
+            // Per executable (an empty value disables the DLL), because games
+            // inherit steam.exe's environment and need both:
+            // - mmdevapi: Steam's own sounds stay off.
+            // - winegstreamer: with the GStreamer plugin paths games need for
+            //   video, Steam's web UI stalled before loading the saved
+            //   account, so every silent start failed (CLI-bisected Oct 8
+            //   2026, Pattern 39). Steam never had working GStreamer before.
+            for exe in ["steam.exe", "steamwebhelper.exe"] {
+                for dll in ["mmdevapi", "winegstreamer"] {
+                    reg(["reg", "add",
+                         "HKCU\\Software\\Wine\\AppDefaults\\\(exe)\\DllOverrides",
+                         "/v", dll, "/t", "REG_SZ", "/d", "", "/f"])
+                }
+            }
         }.value
+        return true
     }
 
     // MARK: - Private: wait for auth outcome
@@ -1082,9 +1256,10 @@ final class SteamSession {
         return false
     }
 
-    /// Wait for `[Logged On, ]` in connection_log.txt.
-    /// Returns true on success, false on timeout (state remains unchanged — caller sets it).
-    /// Fast-fails immediately on explicit rejection from Valve CM.
+    /// Wait for `[Logged On, ]` in connection_log.txt. State remains unchanged;
+    /// the caller sets it from the result. `.signedOut` when Valve rejects the
+    /// saved sign-in (fast-fail) or Steam starts no logon at all; `.failed` on
+    /// a crash, a wedged webhelper or the overall timeout.
     ///
     /// `authTimeout` bounds the "Connected but Steam has NOT started a
     /// credentialed logon" window (fresh user, no session on disk — fail fast
@@ -1098,7 +1273,7 @@ final class SteamSession {
         timeout: Duration,
         authTimeout: Duration,
         onStatus: (@MainActor (String) -> Void)? = nil
-    ) async -> Bool {
+    ) async -> LogonResult {
         let connLogPath = prefix.steamInstallDir
             .appending(path: "logs/connection_log.txt")
             .path(percentEncoded: false)
@@ -1117,7 +1292,7 @@ final class SteamSession {
         report("Starting Steam client…")
 
         while ContinuousClock.now - started < timeout {
-            if Task.isCancelled { return false }
+            if Task.isCancelled { return .failed }
             poll += 1
 
             // If tracked process exited non-42, fail immediately.
@@ -1130,7 +1305,7 @@ final class SteamSession {
                     report("Steam is updating itself…")
                 } else {
                     log.error("[waitForLoggedOn] steam.exe exited code=\(code)")
-                    return false
+                    return .failed
                 }
             }
 
@@ -1139,7 +1314,7 @@ final class SteamSession {
             if content.contains("[Logged On, ") {
                 log.info("[waitForLoggedOn] ✓ Logged On after \(poll) polls")
                 killWebhelper()
-                return true
+                return .loggedOn
             }
 
             // Fast-fail: Valve explicitly rejected the token.
@@ -1147,7 +1322,7 @@ final class SteamSession {
                 || content.contains("Sending SteamServerConnectFailure_t Invalid Password") {
                 log.error("[waitForLoggedOn] Valve rejected token — auth failed")
                 killWebhelper()
-                return false
+                return .signedOut
             }
 
             // User-facing stages — most advanced marker wins (fail-fast: observable
@@ -1176,7 +1351,7 @@ final class SteamSession {
             if !logonActivitySeen, let ca = connectedAt, ContinuousClock.now - ca > authTimeout {
                 log.warning("[waitForLoggedOn] no credentialed logon activity within \(authTimeout) of Connected — no session on disk")
                 killWebhelper()
-                return false
+                return .signedOut
             }
 
             // Webhelper connect failures = silent auth wedged (hidden
@@ -1192,7 +1367,7 @@ final class SteamSession {
                 if failures >= 2 {
                     log.error("[waitForLoggedOn] webhelper connect failed ×\(failures) this session — rejecting")
                     killWebhelper()
-                    return false
+                    return .failed
                 }
             }
 
@@ -1200,7 +1375,20 @@ final class SteamSession {
         }
 
         log.warning("[waitForLoggedOn] overall timeout after \(timeout) (logonActivitySeen=\(logonActivitySeen))")
-        return false
+        return .failed
+    }
+
+    /// Steam has no usable sign-in. Forget that Steam was signed in, so the
+    /// next launch asks before opening Steam's sign-in, and drop the backup of
+    /// Steam's session file: restoring it would only bring back the rejected
+    /// sign-in. Valve can end a saved sign-in on its own (meridian.log
+    /// Oct 11 2026: a 4-day-old Steam sign-in that logged on 7 times on Oct 8
+    /// came back 'Access Denied' with Meridian not running in between).
+    private func markSignedOut() {
+        log.warning("[signedOut] Steam has no usable sign-in; the next launch asks to sign in again")
+        AppSettings.shared.steamClientSignedIn = false
+        SteamSessionBackup.clear()
+        state = .signedOut
     }
 
     // MARK: - Private: helpers
@@ -1290,29 +1478,18 @@ final class SteamSession {
 
 enum SessionError: LocalizedError {
     case steamNotReady
+    /// Steam has no usable sign-in (`State.signedOut`).
+    case signedOut
     case installRestartFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .steamNotReady:
             return "Steam is not ready. Please sign in first."
+        case .signedOut:
+            return "Steam signed you out on this Mac. Sign in to Steam again to play."
         case .installRestartFailed(let name):
-            return "Couldn't restart Steam to begin downloading \(name). The install is queued — try again in a moment."
+            return "Couldn't restart Steam to begin downloading \(name). The install is queued. Try again in a moment."
         }
     }
-}
-
-// MARK: - Wine stderr filter
-
-/// Filter verbose/noisy Wine debug lines from stderr output.
-private func filterWineStderr(_ raw: String) -> String {
-    let noisy = [
-        "fixme:",
-        "Task policy set failed",
-        "err:ole:start_rpcss",
-        "fixme:shcore:SetCurrentProcessExplicitAppUserModelID",
-    ]
-    return raw.components(separatedBy: .newlines)
-        .filter { line in !noisy.contains(where: { line.contains($0) }) }
-        .joined(separator: "\n")
 }

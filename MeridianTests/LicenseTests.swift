@@ -234,20 +234,4 @@ final class LicenseTests: XCTestCase {
 
     // MARK: - Licensing must not alter the launch path
 
-    /// Regression guard (2026-09-10): the licensing pass briefly forced every
-    /// game to Online behind a dev flag. That made per-game compat fixes
-    /// unreachable (Steam owns the exe environment in Online mode) and put
-    /// the Steam UI in front of users. Offline stays the default and the
-    /// launch-mode picker is always available.
-    func testLaunchMode_isNotGatedByAFeatureFlag() throws {
-        let src = try readSource("Meridian/Models/AppSettings.swift")
-        XCTAssertFalse(src.contains("localLaunchMode"),
-                       "Launch mode must not be gated behind a feature flag.")
-        XCTAssertTrue(src.contains("onlineModeAppIDs.contains(appID) ? .online : .offline"),
-                      "launchMode(appID:) must default to .offline.")
-
-        let detail = try readSource("Meridian/Views/Library/GameDetailView.swift")
-        XCTAssertFalse(detail.contains("localLaunchModeEnabled"),
-                       "The launch-mode chevron/popover must render unconditionally.")
-    }
 }

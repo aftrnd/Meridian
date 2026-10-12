@@ -107,6 +107,44 @@ final class SteamWindow {
     private var steamOwnedPIDs: Set<pid_t> = []
     private var pollTick = 0
 
+    /// Wine processes that can own windows, kept from KVO on
+    /// `NSWorkspace.runningApplications` instead of walking the running apps
+    /// per tick. Every per-app read is LaunchServices XPC: `bundleIdentifier`
+    /// / `executableURL` aren't cached for apps without a bundle (every Wine
+    /// process), and even `processIdentifier` is re-fetched after each main
+    /// run loop turn (NSRunningApplication.h). Walking ~150 apps per 250 ms
+    /// tick was 85% of Meridian's main thread, then still ~12 ms/s with a
+    /// per-PID cache, and dropped frames while scrolling and zooming
+    /// (Instruments Animation Hitches + Time Profiler, Oct 11 2026).
+    private var winePIDs: Set<pid_t> = []
+    /// Every listed app, classified once: its pid if it is Wine, nil if not.
+    /// Holding the app keeps its identity from being reused while listed.
+    private var classifiedApps: [ObjectIdentifier: (app: NSRunningApplication, winePID: pid_t?)] = [:]
+    /// Just-launched apps LaunchServices can't name yet; retried each tick
+    /// (never classified "not Wine", or their windows would never be hidden).
+    private var unclassifiedApps: [NSRunningApplication] = []
+    private var runningAppsObservation: NSKeyValueObservation?
+
+    /// Interactive Steam sign-in (`beginSignIn()`): Steam's sign-in window is
+    /// the one window shown — centred over Meridian and brought forward once.
+    /// Everything else Steam opens (updater, helper windows) stays hidden.
+    private var signInMode = false {
+        didSet { if !signInMode { isSignInWindowShown = false } }
+    }
+    private var presentedSignInWindows: Set<CFHashCode> = []
+
+    /// Steam is waiting on the player mid-launch (a game's EULA, a choice of
+    /// launch option): every titled Steam window is shown, centred over
+    /// Meridian once, until `endSteamPrompt()`. Steam titles its EULA dialog
+    /// just "Steam", so the title allowlist hid it and the launch waited for
+    /// an answer nobody could give (Super Battle Golf, Oct 12 2026).
+    private var promptMode = false
+    private var presentedPromptWindows: Set<CFHashCode> = []
+
+    /// True once Steam's sign-in window has been presented in sign-in mode
+    /// (onboarding switches from "Starting Steam" to "scan the code").
+    private(set) var isSignInWindowShown = false
+
     /// Command-line substrings identifying Steam-owned Wine processes. These
     /// survive Wine's argv[0] rewrite (the Windows path still contains the
     /// process name — engine-research-findings.mdc Pattern 2).
@@ -143,8 +181,37 @@ final class SteamWindow {
         suppressionActive = true
         isSuppressing = true
         gameMode = false
+        signInMode = false
         engageLayers()
         log.info("[SteamWindow] suppression started")
+    }
+
+    /// Present Steam's own sign-in for the one-time interactive sign-in: keep
+    /// every other Steam window hidden, centre the sign-in window over
+    /// Meridian's window and bring it forward. Ends when any other mode
+    /// starts (`startSuppressing()` after logon). Without Accessibility
+    /// permission Steam's window simply appears where Steam places it.
+    func beginSignIn() {
+        guard isPermissionGranted else {
+            log.warning("[SteamWindow] no AX permission — sign-in window shown unmanaged")
+            return
+        }
+        suppressionActive = true
+        isSuppressing = true
+        gameMode = false
+        signInMode = true
+        presentedSignInWindows = []
+        isSignInWindowShown = false
+        engageLayers()
+        log.info("[SteamWindow] sign-in mode — presenting Steam's sign-in window")
+    }
+
+    /// Re-centre Steam's sign-in window over Meridian and bring it forward
+    /// (it can fall behind Meridian when the user clicks back into the app).
+    func bringSignInForward() {
+        guard signInMode else { return }
+        presentedSignInWindows = []
+        hideAllKnownWine()
     }
 
     /// Enter game-mode suppression for an Online (`-applaunch`) launch:
@@ -161,16 +228,37 @@ final class SteamWindow {
         suppressionActive = true
         isSuppressing = true
         gameMode = true
+        signInMode = false
+        promptMode = false
         refreshSteamOwnedPIDs()
         engageLayers()
         log.info("[SteamWindow] game mode — suppressing Steam windows only")
+    }
+
+    /// Show Steam's windows while it waits on the player during a launch
+    /// (`Launcher` reads that from Steam's console log). Game mode only.
+    func presentSteamPrompt() {
+        guard gameMode, !promptMode else { return }
+        promptMode = true
+        presentedPromptWindows = []
+        refreshSteamOwnedPIDs()
+        hideAllKnownWine()
+        log.info("[SteamWindow] Steam is waiting on the player — showing its window")
+    }
+
+    /// Steam has its answer: hide its windows again.
+    func endSteamPrompt() {
+        guard promptMode else { return }
+        promptMode = false
+        hideAllKnownWine()
+        log.info("[SteamWindow] Steam's prompt answered — hiding its windows again")
     }
 
     /// Register a newly-launched Wine PID immediately.
     /// Called by SteamSession right after starting steam.exe (and for the
     /// short-lived `-applaunch` IPC forwarders). All call sites are Steam-side
     /// processes, so the PID also joins the game-mode Steam-owned set without
-    /// waiting for the next pgrep refresh.
+    /// waiting for the next refresh.
     func registerPID(_ pid: pid_t) {
         guard isPermissionGranted, suppressionActive else { return }
         steamOwnedPIDs.insert(pid)
@@ -187,6 +275,7 @@ final class SteamWindow {
         suppressionActive = false
         isSuppressing = false
         gameMode = false
+        signInMode = false
         actionableDialogTitle = nil
         log.info("[SteamWindow] paused — game window will appear")
     }
@@ -197,6 +286,8 @@ final class SteamWindow {
         suppressionActive = true
         isSuppressing = true
         gameMode = false
+        signInMode = false
+        promptMode = false
         if steamPID > 0 {
             if entries[steamPID] == nil { installObserver(for: steamPID) }
             hideWindows(for: steamPID)
@@ -210,16 +301,22 @@ final class SteamWindow {
         suppressionActive = false
         isSuppressing = false
         gameMode = false
+        signInMode = false
         actionableDialogTitle = nil
         stopPollingTimer()
         for pid in entries.keys { removeObserver(for: pid) }
         entries.removeAll()
+        runningAppsObservation = nil
+        classifiedApps.removeAll()
+        unclassifiedApps.removeAll()
+        winePIDs.removeAll()
         log.info("[SteamWindow] stopped")
     }
 
     // MARK: - Private: layers
 
     private func engageLayers() {
+        watchRunningApps()
         hideAllKnownWine()
         startPollingTimer()
     }
@@ -247,13 +344,14 @@ final class SteamWindow {
         }
 
         // Discover new Wine PIDs and install observers.
-        for pid in currentWinePIDs() {
+        if !unclassifiedApps.isEmpty { classifyPendingApps() }
+        for pid in winePIDs {
             if entries[pid] == nil { installObserver(for: pid) }
         }
 
         // In game mode, refresh the Steam-owned PID set about once per second
         // (steam.exe/steamwebhelper PIDs are long-lived — including after a
-        // code=42 self-update re-exec, which the pgrep refresh picks up even
+        // code=42 self-update re-exec, which the refresh picks up even
         // though the new PID was never registered by SteamSession).
         if gameMode, pollTick % 4 == 0 {
             refreshSteamOwnedPIDs()
@@ -265,7 +363,7 @@ final class SteamWindow {
 
     private func hideAllKnownWine() {
         guard suppressionActive else { return }
-        for pid in Set(entries.keys).union(Set(currentWinePIDs())) {
+        for pid in winePIDs.union(entries.keys) {
             hideWindows(for: pid)
         }
     }
@@ -322,6 +420,9 @@ final class SteamWindow {
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
               let windows = windowsRef as? [AXUIElement] else { return }
 
+        let isWebhelper = signInMode
+            && Self.commandLine(of: pid)?.lowercased().contains("steamwebhelper") == true
+
         var surfacedTitle: String?
         for window in windows {
             // Read the title so EULA / agreement / purchase dialogs are
@@ -331,9 +432,16 @@ final class SteamWindow {
             AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
             let title = titleRef as? String
 
-            if Self.policy(forTitle: title) == .surface {
-                // Bring it back on-screen (un-minimize) so the user can act.
-                AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, false as CFTypeRef)
+            if isWebhelper, Self.isSignInWindow(title: title, size: Self.size(of: window)) {
+                presentSignInWindow(window, pid: pid)
+                continue
+            }
+
+            // Steam waiting on the player, or a dialog the allowlist names:
+            // bring it back from off-screen so the user can act.
+            if (promptMode && gameMode && Self.isPromptWindow(title: title, size: Self.size(of: window)))
+                || Self.policy(forTitle: title) == .surface {
+                present(window, pid: pid, once: &presentedPromptWindows)
                 surfacedTitle = title
                 continue
             }
@@ -354,38 +462,166 @@ final class SteamWindow {
         }
     }
 
-    // MARK: - Private: process detection
+    // MARK: - Private: sign-in presentation
 
-    /// Synchronously refreshes the set of Steam-owned Wine PIDs via pgrep.
-    /// Cheap (two pgrep spawns, ~10 ms) and rate-limited by the caller to
-    /// about once per second in game mode.
-    private func refreshSteamOwnedPIDs() {
-        var pids: Set<pid_t> = []
-        for pattern in Self.steamProcessPatterns {
-            let t = Process()
-            t.executableURL = URL(filePath: "/usr/bin/pgrep")
-            t.arguments = ["-f", pattern]
-            let pipe = Pipe()
-            t.standardOutput = pipe
-            t.standardError = FileHandle.nullDevice
-            try? t.run()
-            t.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            for line in out.split(separator: "\n") {
-                if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) {
-                    pids.insert(pid)
-                }
-            }
-        }
-        steamOwnedPIDs = pids
+    /// Steam's sign-in window during `beginSignIn()`: a titled steamwebhelper
+    /// window of dialog size. Matched by size, not title (the title is
+    /// localized). Steam's helper windows ("ANGLE Mock Window", 0×0 browser
+    /// hosts) are tiny or untitled, and its library window, which opens the
+    /// moment sign-in succeeds, is far larger than 900×700, so it stays hidden.
+    ///
+    /// MIRROR CONTRACT: mirrored in WindowClassificationTests.
+    static func isSignInWindow(title: String?, size: CGSize) -> Bool {
+        guard let title, !title.isEmpty else { return false }
+        return (300...900).contains(size.width) && (200...700).contains(size.height)
     }
 
-    private func currentWinePIDs() -> [pid_t] {
-        NSRunningApplication.runningApplications(withBundleIdentifier: "")
-            .filter { $0.executableURL?.path.contains("wineloader") == true
-                   || $0.executableURL?.path.contains("wine64") == true
-                   || $0.executableURL?.path.contains("/wine/") == true }
-            .map { $0.processIdentifier }
+    /// A Steam window worth showing while Steam waits on the player: titled
+    /// and dialog-sized (its EULA window was "Steam", 1010×600). Its helper
+    /// windows are untitled or tiny.
+    ///
+    /// MIRROR CONTRACT: mirrored in WindowClassificationTests.
+    static func isPromptWindow(title: String?, size: CGSize) -> Bool {
+        guard let title, !title.isEmpty else { return false }
+        return size.width >= 300 && size.height >= 200
+    }
+
+    private static func size(of window: AXUIElement) -> CGSize {
+        var sizeRef: AnyObject?
+        var size = CGSize.zero
+        if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+           let value = sizeRef, CFGetTypeID(value) == AXValueGetTypeID() {
+            AXValueGetValue(value as! AXValue, .cgSize, &size)
+        }
+        return size
+    }
+
+    private func presentSignInWindow(_ window: AXUIElement, pid: pid_t) {
+        guard present(window, pid: pid, once: &presentedSignInWindows) else { return }
+        isSignInWindowShown = true
+        log.info("[SteamWindow] presented sign-in window pid=\(pid)")
+    }
+
+    /// Un-minimizes `window` and, the first time it is seen, centres it over
+    /// Meridian's window and brings it forward. Later polls leave its
+    /// position alone so the user can move it. Returns true that first time.
+    @discardableResult
+    private func present(_ window: AXUIElement, pid: pid_t, once presented: inout Set<CFHashCode>) -> Bool {
+        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, false as CFTypeRef)
+        guard presented.insert(CFHash(window)).inserted else { return false }
+
+        if let anchor = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }),
+           let primary = NSScreen.screens.first {
+            // AX positions are top-left based on the primary display.
+            let size = Self.size(of: window)
+            var origin = CGPoint(x: anchor.frame.midX - size.width / 2,
+                                 y: primary.frame.maxY - anchor.frame.midY - size.height / 2)
+            if let value = AXValueCreate(.cgPoint, &origin) {
+                AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+            }
+        }
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            NSApp.yieldActivation(to: app)
+            app.activate()
+        }
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        return true
+    }
+
+    // MARK: - Private: process detection
+
+    /// Refreshes the set of Steam-owned Wine PIDs from each process's
+    /// command line. A sysctl per process, no subprocess, so it is cheap on
+    /// the main actor.
+    private func refreshSteamOwnedPIDs() {
+        steamOwnedPIDs = Set(winePIDs.filter { pid in
+            guard let commandLine = Self.commandLine(of: pid) else { return false }
+            return Self.steamProcessPatterns.contains { commandLine.contains($0) }
+        })
+    }
+
+    /// Starts following `NSWorkspace.runningApplications`, which changes on
+    /// the main run loop as apps launch and quit.
+    private func watchRunningApps() {
+        guard runningAppsObservation == nil else { return }
+        runningAppsObservation = NSWorkspace.shared.observe(\.runningApplications) { @Sendable [weak self] _, _ in
+            guard let self else { return }
+            Task { @MainActor [weak self] in self?.syncRunningApps() }
+        }
+        syncRunningApps()
+    }
+
+    /// Wine processes with an app connection (the ones that can own windows).
+    /// winemac names each one after its Windows program: no bundle
+    /// identifier, `localizedName` "steamwebhelper.exe", executable a link in
+    /// a `winetemp-…` folder (probed Oct 7 2026 with notepad.exe). Looking
+    /// them up by an empty bundle identifier or by engine paths
+    /// matched none of them, so suppression never saw steamwebhelper, which
+    /// draws both Steam's sign-in and its library window.
+    ///
+    /// Only apps not seen before are classified; the rest are matched by
+    /// identity, without reading any of their properties.
+    private func syncRunningApps() {
+        let apps = NSWorkspace.shared.runningApplications
+        let listed = Set(apps.map(ObjectIdentifier.init))
+        classifiedApps = classifiedApps.filter { listed.contains($0.key) }
+        unclassifiedApps = apps.filter { classifiedApps[ObjectIdentifier($0)] == nil }
+        classifyPendingApps()
+    }
+
+    private func classifyPendingApps() {
+        var unknown: [NSRunningApplication] = []
+        for app in unclassifiedApps {
+            guard let isWine = Self.wineClassification(of: app) else {
+                unknown.append(app)
+                continue
+            }
+            classifiedApps[ObjectIdentifier(app)] = (app, isWine ? app.processIdentifier : nil)
+        }
+        unclassifiedApps = unknown
+        winePIDs = Set(classifiedApps.values.compactMap(\.winePID))
+    }
+
+    /// Whether an app is a Wine process, or nil while LaunchServices doesn't
+    /// know its executable yet (a just-launched process; never cache "no"
+    /// for it, or its windows would never be hidden).
+    private static func wineClassification(of app: NSRunningApplication) -> Bool? {
+        if app.bundleIdentifier != nil { return false }
+        guard let path = app.executableURL?.path else { return nil }
+        return path.contains("/winetemp-") || path.contains("/wine/") || path.contains("wine64")
+    }
+
+    /// A process's arguments joined by spaces (what `pgrep -f` matches), read
+    /// with `KERN_PROCARGS2`. Wine rewrites argv to the Windows command line,
+    /// so this names the Windows program (steam.exe, steamwebhelper.exe);
+    /// the executable and `localizedName` are only "wine" (Pattern 2).
+    nonisolated static func commandLine(of pid: pid_t) -> String? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return nil }
+        return parseProcArgs(Array(buffer.prefix(size)))
+    }
+
+    /// Parses a `KERN_PROCARGS2` buffer: argc (Int32), the executable path,
+    /// NUL padding, then argc NUL-terminated arguments.
+    /// MIRROR CONTRACT: mirrored in WindowClassificationTests.
+    nonisolated static func parseProcArgs(_ buffer: [UInt8]) -> String? {
+        let header = MemoryLayout<Int32>.size
+        guard buffer.count > header else { return nil }
+        let argc = buffer.prefix(header).withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        var index = header
+        while index < buffer.count, buffer[index] != 0 { index += 1 }  // executable path
+        while index < buffer.count, buffer[index] == 0 { index += 1 }  // padding
+        var args: [String] = []
+        while index < buffer.count, args.count < argc {
+            let start = index
+            while index < buffer.count, buffer[index] != 0 { index += 1 }
+            args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return args.isEmpty ? nil : args.joined(separator: " ")
     }
 
     private func isProcessAlive(_ pid: pid_t) -> Bool {
