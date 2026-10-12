@@ -117,7 +117,7 @@ final class SteamCredentialAuth {
     /// the password flow's output, so every downstream consumer (DepotDownloader,
     /// local.vdf, Online-mode steam.exe) is unchanged.
     ///
-    /// This is the CrossOver-equivalent auth: Steam authenticates the session
+    /// Steam authenticates the session
     /// through its own trusted QR channel; Meridian never types credentials
     /// into `steam.exe` and never shows a Steam window. `persistence: 1` is
     /// guaranteed for QR logins (email-Guard accounts cannot use QR at all).
@@ -276,6 +276,22 @@ final class SteamCredentialAuth {
         }
     }
 
+    /// Expiry (`exp` claim) of a Steam JWT refresh token, or nil when the
+    /// token isn't a decodable JWT. Local decode only — no signature check
+    /// and no network; used to skip renewal while the token has time left.
+    nonisolated static func refreshTokenExpiry(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count == 3 else { return nil }
+        var payload = parts[1].replacingOccurrences(of: "-", with: "+")
+                              .replacingOccurrences(of: "_", with: "/")
+        while payload.count % 4 != 0 { payload += "=" }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = json["exp"] as? Double
+        else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+
     /// `nonisolated` form encoder for use by `renewRefreshToken`.
     /// Same strict percent-encoding contract as the instance `formEncode`.
     nonisolated private static func formEncodeStatic(_ params: [String: String]) -> String {
@@ -418,13 +434,11 @@ final class SteamCredentialAuth {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        // Sent as protobuf because `device_details` is a nested message that
+        // form fields can't carry. `format=json` keeps the JSON response.
         request.httpBody = formEncode([
-            "device_friendly_name": "Meridian on Mac",
-            // platform_type 1 = SteamClient → persistence:1 refresh token
-            // (matches the password flow; required so the token is usable for
-            // client logon, DepotDownloader, and local.vdf auto-login).
-            "platform_type":        "1",
-            "website_id":           "Client",
+            "input_protobuf_encoded": Self.qrSessionRequest(deviceName: "Meridian on Mac").base64EncodedString(),
+            "format":                 "json",
         ]).data(using: .utf8)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -451,6 +465,30 @@ final class SteamCredentialAuth {
             interval: interval,
             steamID: (resp?["steamid"] as? String) ?? ""
         )
+    }
+
+    /// `CAuthentication_BeginAuthSessionViaQR_Request` as protobuf bytes.
+    ///
+    /// The Steam client's own QR login sends `device_details` (steamui JS:
+    /// os_type, platform_type, gaming_device_type, friendly name). Without it
+    /// the minted token works for DepotDownloader but steam.exe's logon is
+    /// answered 'Invalid Password'. platform_type 1 = SteamClient
+    /// (persistence:1 token), os_type 16 = Windows 10 (what steam.exe reports
+    /// under Wine), gaming_device_type 1 = standard PC.
+    nonisolated static func qrSessionRequest(deviceName: String) -> Data {
+        func varint(_ value: UInt64) -> [UInt8] {
+            var v = value, out: [UInt8] = []
+            while v >= 0x80 { out.append(UInt8(v & 0x7F) | 0x80); v >>= 7 }
+            return out + [UInt8(v)]
+        }
+        func int(_ field: UInt64, _ value: UInt64) -> [UInt8] { varint(field << 3) + varint(value) }
+        func bytes(_ field: UInt64, _ value: [UInt8]) -> [UInt8] {
+            varint(field << 3 | 2) + varint(UInt64(value.count)) + value
+        }
+        func string(_ field: UInt64, _ value: String) -> [UInt8] { bytes(field, Array(value.utf8)) }
+
+        let deviceDetails = string(1, deviceName) + int(2, 1) + int(3, 16) + int(4, 1)
+        return Data(string(1, deviceName) + int(2, 1) + bytes(3, deviceDetails) + string(4, "Client"))
     }
 
     /// Extracts the 64-bit steamID from a Steam JWT's `sub` claim.

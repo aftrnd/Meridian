@@ -7,8 +7,12 @@ private let log = MeridianLog(category: "AppDelegate")
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
 
     private static let splashSize     = NSSize(width: 480, height: 300)
-    // 1016×616: clean multiples of 8 that keep the original 1030×625 aspect ratio (≈1.649).
-    private static let fullFrameSize  = NSSize(width: 1016, height: 616)
+    // 1040×625, whole points throughout. Width: the sidebar is exactly 1/5
+    // (208, ContentView) and the content column 832
+    // (`CardLayoutMetrics.defaultContentWidth`). Height: Home's first row sits
+    // centred under the hero, 62.5 pt from the hero to the card art and 62.5
+    // from the art to the window bottom (hero 302 + 62.5 + art 198 + 62.5).
+    private static let fullFrameSize  = NSSize(width: 1040, height: 625)
     /// Splash → full-size resize. ContentView swaps the splash for the main
     /// content only after this has elapsed (`ContentView.splashHandoffDelay`),
     /// so the app's heaviest layout never lands mid-resize.
@@ -40,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Call synchronously — no async hop. The window exists by the time
         // applicationDidFinishLaunching fires. An async dispatch gives macOS
         // window restoration one runloop cycle to restore the previous full-size
-        // frame (1016×616) before we can override it, causing the wrong size to
+        // frame (1040×625) before we can override it, causing the wrong size to
         // flash on screen. Synchronous call wins the race.
         enforceMainWindowLaunchFrame()
 
@@ -61,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         // Prevent macOS window restoration from applying the previous session's
-        // frame (full-size 1016×616). Must be set before setContentSize so the
+        // frame (full-size 1040×625). Must be set before setContentSize so the
         // restore system never overrides what we're about to write.
         window.isRestorable = false
         window.setFrameAutosaveName("")

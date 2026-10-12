@@ -99,6 +99,8 @@ final class LicenseManager {
         /// A key is stored but no longer verifies (tampered, expired, or
         /// signed for a different public key).
         case invalid(String)
+        /// Debug build: licensing is off. See `simulatedStatus`.
+        case developer
     }
 
     /// Ed25519 public key matching the private key in
@@ -114,6 +116,11 @@ final class LicenseManager {
 
     nonisolated static let licenseKeyDefaultsKey = "license.key"
     nonisolated static let trialStartDefaultsKey = "license.trialStartedAt"
+    /// Debug builds only: simulate a license state instead of `.developer`.
+    /// Set it as a launch argument (Edit Scheme › Run › Arguments), e.g.
+    /// `-license.simulate trialExpired`; values: `trial`, `trialExpired`,
+    /// `invalid`, `real` (the actual stored key / trial clock).
+    nonisolated static let simulateDefaultsKey = "license.simulate"
 
     private(set) var status: Status = .trial(daysRemaining: trialLength)
 
@@ -138,7 +145,7 @@ final class LicenseManager {
     /// Launching and installing games is allowed while licensed or in trial.
     var allowsPlay: Bool {
         switch status {
-        case .licensed, .trial: true
+        case .licensed, .trial, .developer: true
         case .trialExpired, .invalid: false
         }
     }
@@ -176,6 +183,10 @@ final class LicenseManager {
     /// Re-derives `status` from persisted state. Called at init and after
     /// any mutation; cheap enough to call on app activation.
     func refresh() {
+        if AppSettings.isDebugBuild, let simulated = simulatedStatus() {
+            status = simulated
+            return
+        }
         if let key = storedKey {
             do {
                 status = .licensed(try License.verify(key: key, publicKeyBase64: Self.publicKeyBase64, now: now()))
@@ -189,6 +200,21 @@ final class LicenseManager {
             }
         }
         status = trialStatus()
+    }
+
+    // MARK: Debug builds
+
+    /// The status a Debug build runs with: `.developer` unless
+    /// `license.simulate` asks for a specific state; nil means "use the real
+    /// license logic".
+    private func simulatedStatus() -> Status? {
+        switch defaults.string(forKey: Self.simulateDefaultsKey) {
+        case nil:            .developer
+        case "trial":        .trial(daysRemaining: 3)
+        case "trialExpired": .trialExpired
+        case "invalid":      .invalid(Self.describe(.badSignature))
+        default:             nil
+        }
     }
 
     // MARK: Trial

@@ -62,13 +62,12 @@ struct GameProfile {
     let extraEnv: [String: String]
 
     /// When true, route D3D11/DXGI/D3D12 through Apple GPTK (D3DMetal) instead of
-    /// the default DXMT path, using CX Wine's native graphics-backend switch
-    /// (`CX_GRAPHICS_BACKEND=d3dmetal` + `CX_ROOT`). DXMT cannot service the Media
-    /// Foundation video processor's D3D11 texture path, so Unity VideoPlayer /
-    /// MF video cutscenes render black under DXMT. D3DMetal is a complete D3D11
-    /// implementation that DOES service it (CLI + user-verified June 2026 on
-    /// "No, I'm not a Human" — same path CrossOver 26 uses). See
-    /// `SteamSession.gameEnvironment` and `engine-research-findings.mdc` Pattern 22.
+    /// the default DXMT path, on engines that carry `lib/gptk`. DXMT cannot
+    /// service the Media Foundation video processor's D3D11 texture path, so
+    /// Unity VideoPlayer / MF video cutscenes render black under DXMT. D3DMetal is
+    /// a complete D3D11 implementation that DOES service it (CLI + user-verified
+    /// June 2026 on "No, I'm not a Human"). See `SteamSession.gameEnvironment` and
+    /// `engine-research-findings.mdc` Pattern 22.
     let preferD3DMetal: Bool
 
     /// When true, route the game's DLSS calls to Apple MetalFX via GPTK 4's

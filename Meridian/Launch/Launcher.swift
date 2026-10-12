@@ -10,15 +10,11 @@ private let log = MeridianLog(category: "Launcher")
 ///
 /// - Installs run headlessly via the DepotDownloader fork (`installHeadless`)
 ///   using the persisted OAuth refresh_token — no steam.exe involvement.
-/// - ALL launches (DRM and DRM-free) go through wine64 direct execution
-///   (`launchDirect`) — no steam.exe, no Steam IPC.
-/// - DRM games (those shipping `steam_api64.dll`) get a Steamworks API shim
-///   first (Phase 4, HANDOFF-2026-06-19): `prefix.installSteamEmulator`
-///   replaces the game's Valve steam_api(64).dll with the open-source gbe_fork
-///   emulator, so `SteamAPI_Init()` succeeds locally using the user's steamID +
-///   the appID — no steam.exe, no auth, no "Who's playing" window. The
-///   steam.exe `-applaunch` path (`SteamSession.launchGameViaSteam`) is kept
-///   only as a documented fallback for SteamStub exe-encrypted titles.
+/// - Every launch goes through the real Steam client, started silently
+///   (`launchOnline` → `SteamSession.launchGameViaSteam`, `-applaunch`), so
+///   cloud saves, achievements and multiplayer always work. The Offline mode
+///   (gbe_fork Steamworks emulator + direct wine64 exec) was removed Oct 8
+///   2026.
 @Observable
 @MainActor
 final class Launcher {
@@ -55,18 +51,14 @@ final class Launcher {
     /// (GameDetailView) renders it as an alert; the user's choice re-enters
     /// the pipeline via `confirmSteamPrompt` / `dismissSteamPrompt`.
     enum SteamPrompt: Equatable {
-        /// The game's exe is SteamStub-encrypted (`.bind` PE section) — the
-        /// gbe_fork shim cannot decrypt it, so Offline mode cannot run it.
-        /// Offer switching the game to Online (real Steam client).
-        case steamRequired(Game)
-        /// Online mode needs a ONE-TIME interactive Steam sign-in (no
+        /// Launching needs a ONE-TIME interactive Steam sign-in (no
         /// Steam-written session exists on this prefix yet). Explain that a
         /// Steam window will open once before actually opening it.
         case signInRequired(Game)
 
         var game: Game {
             switch self {
-            case .steamRequired(let g), .signInRequired(let g): return g
+            case .signInRequired(let g): return g
             }
         }
     }
@@ -78,9 +70,8 @@ final class Launcher {
     /// a later cold launch re-prompts instead of silently opening Steam.
     private var approvedInteractiveSignInAppID: Int?
 
-    /// User confirmed the pending prompt: switch SteamStub games to Online
-    /// mode, mark the interactive sign-in as approved, and re-enter the
-    /// launch pipeline.
+    /// User confirmed the pending prompt: mark the interactive sign-in as
+    /// approved and re-enter the launch pipeline.
     func confirmSteamPrompt(
         engine: WineEngine,
         session: SteamSession,
@@ -90,10 +81,6 @@ final class Launcher {
         guard let prompt = steamPrompt else { return }
         steamPrompt = nil
         let game = prompt.game
-        if case .steamRequired = prompt {
-            AppSettings.shared.setLaunchMode(.online, appID: game.id)
-            appendLog("Switched \(game.name) to Online mode (SteamStub DRM requires the Steam client)")
-        }
         approvedInteractiveSignInAppID = game.id
         launch(game: game, engine: engine, session: session, steamAuth: steamAuth, library: library)
     }
@@ -102,20 +89,92 @@ final class Launcher {
         steamPrompt = nil
     }
 
+    // MARK: - License agreements (shown by Meridian, recorded for Steam)
+
+    /// A game's license agreements the player hasn't accepted. Meridian shows
+    /// them in its own sheet before Steam starts the game; Steam's dialog
+    /// would open its whole library window (Pattern 47).
+    struct EulaPrompt: Identifiable, Equatable {
+        let game: Game
+        let eulas: [SteamEula]
+        var id: Int { game.id }
+    }
+
+    private(set) var eulaPrompt: EulaPrompt?
+
+    /// The player accepted every agreement in the sheet: hand the answers to
+    /// Steam (written before it next starts) and launch again.
+    func acceptEulas(
+        engine: WineEngine,
+        session: SteamSession,
+        steamAuth: SteamAuthService? = nil,
+        library: SteamLibraryStore? = nil
+    ) {
+        guard let prompt = eulaPrompt else { return }
+        eulaPrompt = nil
+        log.info("[eula] accepted \(prompt.eulas.map(\.id).joined(separator: ", ")) for appID=\(prompt.game.id)")
+        session.recordEulaAcceptances(prompt.eulas)
+        launch(game: prompt.game, engine: engine, session: session, steamAuth: steamAuth, library: library)
+    }
+
+    /// The player declined: nothing is recorded and the game doesn't start.
+    func declineEulas() {
+        if let prompt = eulaPrompt {
+            log.info("[eula] declined for appID=\(prompt.game.id)")
+        }
+        eulaPrompt = nil
+    }
+
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
-    /// Staged launch progress for the Steam-boot overlay (HANDOFF-2026-07-03-v6
-    /// Goal 2). Same icon vocabulary as the splash (Pattern 9). The icon
-    /// follows the LATEST recognized status marker; the fraction is monotonic
-    /// per pipeline run (only fills, never regresses) so the overlay's bar
-    /// reads as steady forward progress even when statuses alternate (e.g.
-    /// "validating" ↔ "waiting for game").
-    private(set) var launchStageIcon: String = "gear"
+    /// The few beats the launch card names. Steam reports a dozen statuses on
+    /// its way up; the player only needs to know which of these is happening,
+    /// so the card's headline changes only when the beat does. The usual
+    /// launch is just `gettingReady` then `startingGame`; the rest are the
+    /// moments worth explaining.
+    enum LaunchPhase: Equatable {
+        case gettingReady, settingUpSteam, updatingSteam, startingGame, checkingFiles
+    }
+
+    /// Staged launch progress for the launch card. The phase follows the
+    /// LATEST recognized status marker; the fraction is monotonic per
+    /// pipeline run (only fills, never regresses) so the bar reads as steady
+    /// forward progress even when statuses alternate (e.g. "validating" ↔
+    /// "waiting for game").
+    private(set) var launchPhase: LaunchPhase = .gettingReady
     private(set) var launchStageFraction: Double = 0
+
+    /// Why the launch is waiting on Steam's own sign-in, while it does; nil
+    /// otherwise. The card says so and holds the bar still.
+    enum SteamSignIn: Equatable {
+        /// Steam was never signed in on this Mac (the player said yes to
+        /// `SteamPrompt.signInRequired`), or didn't sign in on its own.
+        case required
+        /// Valve rejected Steam's saved sign-in (Pattern 42).
+        case signedOut
+    }
+    private(set) var steamSignIn: SteamSignIn?
+    /// A short, happy line under "Starting the game…": what Steam is doing for
+    /// the launch, from its own console log. nil outside that beat.
+    private(set) var launchStep: String?
+    /// The step Steam is waiting on the player for mid-launch (`ShowEula`),
+    /// while its window is shown; nil otherwise. The card asks for it.
+    private(set) var steamWaitingOnPlayer: String?
     private(set) var downloadProgress: Double?
     private(set) var downloadBytesDone: Int64 = 0
     private(set) var downloadBytesTotal: Int64 = 0
     private(set) var downloadRateBps: Double = 0
+
+    /// "1.2 GB of 4.5 GB · 12.3 MB/s" while bytes are flowing, nil before.
+    var downloadProgressText: String? {
+        guard isInstalling, downloadBytesTotal > 0 else { return nil }
+        let style = ByteCountFormatStyle(style: .file)
+        var text = "\(downloadBytesDone.formatted(style)) of \(downloadBytesTotal.formatted(style))"
+        if downloadRateBps > 0 {
+            text += " · \(Int64(downloadRateBps).formatted(style))/s"
+        }
+        return text
+    }
     private(set) var logs: [String] = []
     private(set) var activeAppID: Int?
     private(set) var processesConfirmed: Bool = false
@@ -125,12 +184,8 @@ final class Launcher {
     private let prefix = WinePrefix.defaultPrefix
     private var launchTask: Task<Void, Never>?
 
-    /// Per-game stderr file handle, opened in `launchDirect` and closed
-    /// in the pipeline's exit path. Held across the running phase so the
-    /// kernel can keep writing every byte the game emits straight to disk
-    /// without Meridian-side draining (avoids the
-    /// `availableData` blocking issue described in
-    /// `engine-research-findings.mdc` Pattern 1).
+    /// Per-game log file handle, opened in `launchOnline` and closed on
+    /// every exit path (`closeActiveGameLog`).
     private var activeGameLogHandle: FileHandle?
 
     /// The game's `steamapps/common/<dir>` directory for the active session,
@@ -139,6 +194,9 @@ final class Launcher {
     /// `Saved/Logs`) for THIS session into `<appID>-engine.log`.
     private var activeGameInstallDir: URL?
     private var activeLaunchStartedAt: Date?
+    /// Where the Steam output file (GameLogFile.steamOutputURL) stood when
+    /// the game was handed to Steam; the rest is this session's Wine output.
+    private var activeSteamOutputOffset: UInt64?
 
     var steamWindow: SteamWindow?
 
@@ -223,7 +281,7 @@ final class Launcher {
                     await gameProcess.stopGame(engine: engine, prefix: prefix)
                 }
                 // Restore blanket suppression — this was missing here, so a
-                // stop-while-running left the suppressor paused (Offline) or
+                // stop-while-running left the suppressor paused or
                 // in game mode (Online) indefinitely, letting steamwebhelper
                 // windows surface at will.
                 steamWindow?.resumeAfterGame(steamPID: 0)
@@ -241,36 +299,21 @@ final class Launcher {
             launchTask?.cancel()
             launchState = .stopping(appID: appID)
             currentActivity = "Stopping…"
-            let online = AppSettings.shared.launchMode(appID: appID) == .online
-            let steamAlive = activeSession?.isReady == true
             let gamePattern = prefix.gameInstallDir(appID: appID)
             Task { [weak self] in
                 guard let self else { return }
-                if online {
-                    // Steam owns the process tree; killing wineserver would
-                    // take the persistent Steam session down with it. Stop
-                    // tracking, keep Steam alive in the background (if it is
-                    // mid-validation, letting it finish helps the next Play).
-                    gameProcess.cancelMonitoring()
-                    // Best-effort: if Steam already spawned the game before
-                    // the stop, kill it — otherwise it keeps running with
-                    // its window hidden by the resumed blanket suppression.
-                    if let pattern = gamePattern {
-                        await gameProcess.killGameProcesses(pattern: pattern)
-                    }
-                    steamWindow?.resumeAfterGame(steamPID: 0)
-                } else if steamAlive, let pattern = gamePattern {
-                    // Offline launch with a background Steam session alive
-                    // (left over from an earlier Online play) — same rule as
-                    // .running: don't take Steam down with the game.
+                // Steam owns the process tree; killing wineserver would take
+                // the persistent Steam session down with it. Stop tracking,
+                // keep Steam alive in the background (if it is mid-validation,
+                // letting it finish helps the next Play).
+                gameProcess.cancelMonitoring()
+                // Best-effort: if Steam already spawned the game before the
+                // stop, kill it — otherwise it keeps running with its window
+                // hidden by the resumed blanket suppression.
+                if let pattern = gamePattern {
                     await gameProcess.killGameProcesses(pattern: pattern)
-                    steamWindow?.resumeAfterGame(steamPID: 0)
-                } else {
-                    // Offline, no Steam running: kill the prefix's wineserver
-                    // (this only stops the game).
-                    await gameProcess.stopGame(engine: engine, prefix: prefix)
-                    steamWindow?.resumeAfterGame(steamPID: 0)
                 }
+                steamWindow?.resumeAfterGame(steamPID: 0)
                 closeActiveGameLog(reason: "user stopped launch in flight", exitCode: nil)
                 launchState = .idle
                 currentActivity = nil
@@ -368,219 +411,41 @@ final class Launcher {
             return
         }
 
-        // Online mode: bring the real Steam client online (authenticated from
-        // the QR/OAuth session) and launch via `-applaunch`. This is the path
-        // that enables cloud saves, in-game multiplayer, EULAs, and genuine
-        // Steam DRM — the game talks to Valve, not a local emulator. Opt-in
-        // per game (AppSettings.launchMode); default is Offline (gbe_fork).
-        if AppSettings.shared.launchMode(appID: game.id) == .online {
-            await launchOnline(game: game, engine: engine, session: session)
-            return
-        }
-
-        // DRM games (those shipping `steam_api64.dll`) call SteamAPI_Init(),
-        // which normally needs a running, logged-in steam.exe. Phase 4
-        // (HANDOFF-2026-06-19) replaces that with a Steamworks API shim:
-        // `installSteamEmulator` swaps the game's Valve steam_api(64).dll for
-        // the open-source gbe_fork emulator, so SteamAPI_Init() succeeds
-        // locally using the user's steamID + the appID — NO steam.exe, no
-        // auth, no "Who's playing" window. Ownership is already proven (the
-        // game was downloaded by DepotDownloader with the user's OAuth token).
-        // DRM-free games skip this entirely.
-        let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)
-
-        // SteamStub exe encryption cannot be satisfied by the shim — the exe
-        // itself is encrypted and only a running, signed-in Steam client can
-        // decrypt it. Don't attempt a shim launch that would fail opaquely;
-        // ask the user to switch this game to Online mode instead.
-        if needsDRM, prefix.gameHasSteamStubDRM(appID: game.id) {
-            log.info("[pipeline] appID=\(game.id) is SteamStub-encrypted — prompting for Online mode")
-            appendLog("\(game.name) uses SteamStub DRM — the Steam client is required to run it")
-            steamPrompt = .steamRequired(game)
-            launchState = .idle
-            currentActivity = nil
-            return
-        }
-
-        if needsDRM {
-            launchState = .launching(appID: game.id)
-            setLaunchActivity("Preparing \(game.name)…")
-            appendLog("Installing Steamworks compatibility shim for \(game.name)")
-            do {
-                try await prefix.installSteamEmulator(
-                    appID: game.id,
-                    steamID: steamID,
-                    accountName: AppSettings.shared.steamCredentialAccountName,
-                    personaName: steamAuth?.displayName ?? "",
-                    engine: engine
-                )
-            } catch is CancellationError {
-                launchState = .idle
-                currentActivity = nil
-                return
-            } catch {
-                fail("Couldn't prepare \(game.name) to run without Steam: \(error.localizedDescription)", error: error)
-                return
-            }
-        }
-
-        launchState = .launching(appID: game.id)
-        setLaunchActivity("Launching \(game.name)…")
-        appendLog("Launching \(game.name)")
-
-        // Let the game window appear naturally. When a persistent Steam
-        // session is alive in the background (left over from an earlier
-        // Online play), blanket-pausing suppression frees steamwebhelper to
-        // render windows for the whole play session (user-reported Jul 3
-        // 2026) — use game-mode suppression instead: Steam-owned windows
-        // stay hidden, the game (a non-Steam Wine PID) is exempt. With no
-        // Steam running there is nothing to suppress; a full pause is safest
-        // for the game window.
-        if session.isReady {
-            steamWindow?.enterGameMode()
-        } else {
-            steamWindow?.pauseForGame()
-        }
-
-        // Both DRM (now satisfied in-process by the Steamworks emulator shim)
-        // and DRM-free games launch directly via `wine64 game.exe`. No
-        // steam.exe, no Steam IPC. The steam.exe `-applaunch` path
-        // (`SteamSession.ensureReadyForDRM` / `launchGameViaSteam`) is retained
-        // as a documented fallback for SteamStub exe-encrypted titles the shim
-        // can't satisfy, but is not used on the default launch path.
-        if needsDRM {
-            prefix.writeSteamAppID(game.id)
-        }
-
-        let result: GameLaunchResult
-        do {
-            result = try await launchDirect(game: game, engine: engine, session: session, drmShimActive: needsDRM)
-        } catch {
-            steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("Could not launch game: \(error.localizedDescription)", error: error)
-            return
-        }
-
-        // Install state cannot change while a game runs; avoid a main-actor
-        // filesystem scan of every library entry every five seconds.
-        library?.setInstallStatePollingSuspended(true)
-        defer { library?.setInstallStatePollingSuspended(false) }
-
-        // Begin process monitoring. Pass the game's installdir as `gamePattern`
-        // so detection uses `pgrep -f "<installdir>"` against the game's own
-        // process — the game-specific path. With nil (the previous behaviour)
-        // the monitor falls back to PID-set baseline tracking which can't see
-        // the game's process when wineserver hands it off, leaving the user
-        // stuck at "Launching…" until the 120 s timeout fires.
-        let gamePattern = prefix.gameInstallDir(appID: game.id)
-        if gamePattern == nil {
-            log.warning("[pipeline] no installdir for appID=\(game.id) — monitor will use fallback PID-set detection")
-        }
-        gameProcess.startMonitoring(
-            appID: game.id,
-            launchedPID: result.pid,
-            engine: engine,
-            prefix: prefix,
-            gamePattern: gamePattern,
-            onLog: { [weak self] msg in
-                // Already invoked on the main actor — GameProcess is
-                // @MainActor and the monitor loop runs there.
-                self?.setLaunchActivity(msg)
-            }
-        )
-
-        // Don't flip `launchState` to `.running` until Phase 1 confirms the
-        // game's own process is actually alive. Set state from observed
-        // monitor outcome — never optimistically. UI stays in `.launching`
-        // (showing "Launching <game>…") until the game is genuinely running
-        // OR a real failure surfaces. Previously `.running` was set
-        // immediately after `launchDirect` returned, so any silent crash
-        // during startup left the UI claiming "running" while nothing was
-        // visible — the symptom user reported May 19 2026.
-        appendLog("Waiting for game to start")
-        while gameProcess.monitorPhase == .startup {
-            try? await Task.sleep(for: .milliseconds(500))
-            if Task.isCancelled { break }
-        }
-
-        switch gameProcess.monitorPhase {
-        case .running:
-            AppSettings.shared.recordLaunch(appID: game.id)
-            runningSince = Date()
-            launchState = .running(appID: game.id)
-            currentActivity = nil
-            processesConfirmed = true
-            appendLog("Game running")
-            log.info("[pipeline] game confirmed running appID=\(game.id)")
-        case .timedOut:
-            steamWindow?.resumeAfterGame(steamPID: 0)
-            closeActiveGameLog(reason: "startup timeout (game process never appeared)", exitCode: nil)
-            fail("\(game.name) didn't start in time. Check ~/Library/Application Support/com.meridian.app/logs/games/\(game.id).log for the game's own output.")
-            return
-        case .failed(let reason):
-            steamWindow?.resumeAfterGame(steamPID: 0)
-            closeActiveGameLog(reason: "monitor failed: \(reason)", exitCode: nil)
-            fail("\(game.name) couldn't start: \(reason)")
-            return
-        case .exited, .idle:
-            // Game's startup phase completed without ever entering `.running`
-            // — the game process either never appeared or appeared and
-            // disappeared faster than the monitor's confirm window. Either
-            // way the user sees nothing, so report it as a fast-exit.
-            steamWindow?.resumeAfterGame(steamPID: 0)
-            closeActiveGameLog(reason: "game exited during startup phase before confirmation", exitCode: nil)
-            fail("\(game.name) exited immediately. Check ~/Library/Application Support/com.meridian.app/logs/games/\(game.id).log for the game's own output.")
-            return
-        case .startup:
-            // Cancelled during startup polling — task cancellation path.
-            gameProcess.cancelMonitoring()
-            steamWindow?.resumeAfterGame(steamPID: 0)
-            closeActiveGameLog(reason: "launch cancelled by user during startup", exitCode: nil)
-            launchState = .idle
-            currentActivity = nil
-            return
-        }
-
-        // Wait for runningPhase to detect normal exit. Polls until the
-        // monitor leaves `.running` (becomes `.exited` or `.idle`).
-        while gameProcess.monitorPhase == .running {
-            try? await Task.sleep(for: .milliseconds(500))
-            if Task.isCancelled { break }
-        }
-
-        steamWindow?.resumeAfterGame(steamPID: 0)
-        closeActiveGameLog(reason: "game exited normally", exitCode: nil)
-        launchState = .idle
-        currentActivity = nil
-        runningSince = nil
-        activeAppID = nil
-        appendLog("Game exited")
-        log.info("[pipeline] game exited appID=\(game.id)")
+        // Every game launches through the real Steam client (`-applaunch`),
+        // so cloud saves, achievements and multiplayer always work. Offline
+        // (a local Steamworks emulator, or no Steam at all) was removed
+        // Oct 8 2026: it cost cloud saves and achievements.
+        await launchOnline(game: game, engine: engine, session: session, library: library)
     }
 
     // MARK: - Private: Online-mode launch (real Steam, -applaunch)
 
-    /// Launches a game in Online mode: brings the real Steam client online in
+    /// Launches a game: brings the real Steam client online in
     /// the background (authenticated from the QR/OAuth session), then dispatches
     /// `steam.exe -applaunch <appID>` via IPC. Steam owns the launch — cloud
     /// saves sync, online multiplayer works, EULAs are handled by Steam itself,
     /// and DRM verification is genuine. No Steam window is shown; the suppressor
     /// hides everything except user-actionable dialogs (EULA/purchase — A2).
     ///
-    /// Unlike Offline mode we do NOT install the gbe_fork shim (that would make
-    /// the game talk to a local emulator instead of Valve) and we do NOT
-    /// `launchDirect` — Steam picks the exe and applies launch options itself,
-    /// which also avoids the "launching with custom args" dialog for UE
-    /// launcher chains (Pattern 20).
-    private func launchOnline(game: Game, engine: WineEngine, session: SteamSession) async {
+    /// Steam picks the exe and applies launch options itself, which also
+    /// avoids the "launching with custom args" dialog for UE launcher chains
+    /// (Pattern 20).
+    private func launchOnline(game: Game, engine: WineEngine, session: SteamSession, library: SteamLibraryStore?) async {
         // First-time Online on this prefix: no Steam-written session exists,
         // so a ONE-TIME interactive sign-in (a real Steam window) is needed.
         // Never open a Steam window without asking first — raise the consent
         // prompt and bail; `confirmSteamPrompt` re-enters with approval.
-        let hasSession = prefix.hasSteamLoginSession()
+        // Meridian records Steam's own sign-in (it doesn't inspect Steam's
+        // files): Steam's saved login doesn't set loginusers.vdf MostRecent,
+        // so that file check asked again right after a successful sign-in.
+        let hasSession = AppSettings.shared.steamClientSignedIn
+        // Valve ended Steam's saved sign-in, found by the background warm-up
+        // or an earlier launch: go straight to Steam's sign-in (as a launch
+        // that finds it does) rather than booting Steam into a rejection again.
+        let signedOut = session.state == .signedOut
         let approved = approvedInteractiveSignInAppID == game.id
         approvedInteractiveSignInAppID = nil // one-shot
-        if !hasSession && !approved {
+        if !hasSession && !approved && !signedOut {
             log.info("[launchOnline] no Steam session on disk — prompting for one-time sign-in")
             steamPrompt = .signInRequired(game)
             launchState = .idle
@@ -588,37 +453,61 @@ final class Launcher {
             return
         }
 
+        // The game's license agreement, asked in Meridian's own sheet.
+        let appID = game.id
+        let appInfoURL = prefix.appInfoCacheURL
+        let localConfigURL = prefix.localConfigURL(steamID64: AppSettings.shared.steamCredentialSteamID)
+        let pending = session.pendingEulaAcceptances
+        if let localConfigURL {
+            let unaccepted = await Task.detached(priority: .userInitiated) {
+                SteamEula.unaccepted(appID: appID, appInfo: appInfoURL, localConfig: localConfigURL, pending: pending)
+            }.value
+            if !unaccepted.isEmpty {
+                log.info("[launchOnline] \(game.name) needs \(unaccepted.map(\.id).joined(separator: ", ")) accepted — asking")
+                eulaPrompt = EulaPrompt(game: game, eulas: unaccepted)
+                launchState = .idle
+                currentActivity = nil
+                return
+            }
+        }
+
         launchState = .launching(appID: game.id)
         setLaunchActivity("Connecting to Steam…")
         appendLog("Online mode: bringing Steam online for \(game.name)")
 
         do {
-            if !hasSession {
+            if signedOut {
+                try await signInToSteam(.signedOut, appID: game.id, session: session, engine: engine)
+            } else if !hasSession {
                 // User approved the one-time interactive sign-in. Steam's own
                 // login window renders; Steam persists its own session, so
                 // every later Online launch takes the silent path below.
-                try await session.signInInteractively(engine: engine) { [weak self] status in
-                    self?.setLaunchActivity(status)
-                }
+                try await signInToSteam(.required, appID: game.id, session: session, engine: engine)
             } else {
                 do {
-                    try await session.ensureReadyForDRM(engine: engine) { [weak self] status in
+                    try await session.ensureReadyForDRM(engine: engine, appID: game.id) { [weak self] status in
                         self?.setLaunchActivity(status)
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch SessionError.signedOut where !Task.isCancelled {
+                    // Steam's saved sign-in no longer works. The player already
+                    // pressed Play, so go straight to Steam's sign-in in this
+                    // same launch: the card says Steam signed them out and the
+                    // bar holds where it is. An alert followed by a fresh
+                    // launch read as a restart (user, Oct 11 2026).
+                    log.info("[launchOnline] Steam signed out, opening Steam's sign-in")
+                    appendLog("Steam signed you out, opening Steam's sign-in")
+                    try await signInToSteam(.signedOut, appID: game.id, session: session, engine: engine)
                 } catch {
                     if Task.isCancelled { throw CancellationError() }
-                    // The on-disk session went stale (Valve rejected it or the
-                    // silent auth timed out). Retry DIFFERENTLY (fail-fast
-                    // rule): fall back to the interactive sign-in so the user
-                    // can re-establish a session Steam itself persists.
+                    // Silent auth failed for another reason (timeout, wedged
+                    // webhelper). Retry DIFFERENTLY (fail-fast rule): fall
+                    // back to the interactive sign-in so the user can
+                    // re-establish a session Steam itself persists.
                     log.warning("[launchOnline] silent auth failed (\(error.localizedDescription)) — falling back to interactive sign-in")
-                    appendLog("Steam session expired — opening Steam sign-in")
-                    setLaunchActivity("Steam sign-in required…")
-                    try await session.signInInteractively(engine: engine) { [weak self] status in
-                        self?.setLaunchActivity(status)
-                    }
+                    appendLog("Steam didn't sign in on its own, opening Steam's sign-in")
+                    try await signInToSteam(.required, appID: game.id, session: session, engine: engine)
                 }
             }
         } catch is CancellationError {
@@ -640,17 +529,18 @@ final class Launcher {
                 return
             }
             // Neither silent auto-login nor the interactive sign-in reached
-            // [Logged On,]. Tear the whole Steam runtime down before surfacing
-            // the error so no Steam UI is ever left on screen
-            // (development-standards: Steam UI is never shown). Offline mode
-            // remains the working default.
+            // [Logged On,] — Steam failed to start or to sign in (the log has
+            // which). Tear the whole Steam runtime down before surfacing the
+            // error so no Steam UI is ever left on screen
+            // (development-standards: Steam UI is never shown).
             await session.shutdown(engine: engine)
             steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("Steam couldn't sign in to launch \(game.name) online. Switch this game to Offline mode to play now. (Online mode needs a completed Steam sign-in.)", error: error)
+            fail("Meridian couldn't connect to Steam to launch \(game.name). Please try again.", error: error)
             return
         }
 
         setLaunchActivity("Launching \(game.name) through Steam…")
+        launchStep = "Handing off to Steam"
         appendLog("Dispatching -applaunch \(game.id)")
         // Game-mode suppression: Steam chrome (steam.exe / steamwebhelper
         // windows, including the main window left over from an interactive
@@ -660,9 +550,28 @@ final class Launcher {
         // suppression pause here disabled ALL hiding and let Steam's full
         // post-login UI stay on screen (Bug A, HANDOFF-2026-07-02-v4).
         steamWindow?.enterGameMode()
+        // Per-game log: a header now, and at exit the game's own engine log
+        // (Unity Player.log). Wine's output goes to Steam, which owns the
+        // game's process (Pattern 20).
+        let arguments = await launchArguments(for: game, engine: engine)
+        activeGameInstallDir = prefix.gameInstallDir(appID: game.id)
+            .map { prefix.steamInstallDir.appending(path: "steamapps/common/\($0)") }
+        activeLaunchStartedAt = Date()
+        activeSteamOutputOffset = GameLogFile.steamOutputSize()
+        // Before the dispatch, so every line Steam writes in answer is read.
+        let consoleLog = prefix.steamInstallDir.appending(path: "logs/console_log.txt")
+        var consoleLogOffset = Self.fileSize(consoleLog)
+        activeGameLogHandle = GameLogFile.beginSession(
+            appID: game.id,
+            gameName: game.name,
+            executable: "steam.exe -applaunch \(game.id)",
+            launchArgs: arguments,
+            environment: engine.steamClientEnvironment(for: prefix)
+        )
         do {
-            try session.launchGameViaSteam(appID: game.id, engine: engine)
+            try session.launchGameViaSteam(appID: game.id, arguments: arguments, engine: engine)
         } catch {
+            closeActiveGameLog(reason: "Steam did not accept the launch", exitCode: nil)
             steamWindow?.resumeAfterGame(steamPID: 0)
             fail("Could not launch \(game.name) through Steam: \(error.localizedDescription)", error: error)
             return
@@ -682,7 +591,17 @@ final class Launcher {
             onLog: { [weak self] msg in self?.setLaunchActivity(msg) }
         )
 
+        // Install state cannot change while a game runs; avoid a main-actor
+        // filesystem scan of every library entry every five seconds.
+        library?.setInstallStatePollingSuspended(true)
+        defer { library?.setInstallStatePollingSuspended(false) }
+
         appendLog("Waiting for game to start")
+        var latestStep: String?
+        var stepShownAt = ContinuousClock.now
+        var openedAt: ContinuousClock.Instant?
+        var pendingWait: (step: String, since: ContinuousClock.Instant)?
+        var steamFailed = false
         // Steam-side failure/progress signal (fail-fast rule): if Steam
         // decided the app needs an update/validation instead of launching, the
         // ACF's StateFlags leaves "4". Report THAT instead of a mislabeled
@@ -693,6 +612,33 @@ final class Launcher {
         while gameProcess.monitorPhase == .startup {
             try? await Task.sleep(for: .milliseconds(500))
             if Task.isCancelled { break }
+            // Steam's own launch steps, each line shown at least 1.2 s so a
+            // burst stays readable (the latest wins when it is time).
+            let appended = Self.readAppended(consoleLog, from: &consoleLogOffset)
+            for event in Self.steamLaunchEvents(in: appended, appID: game.id) {
+                switch event {
+                case .waitingForPlayer(let step):
+                    pendingWait = (step, .now)
+                case .answered, .task:
+                    pendingWait = nil
+                    if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
+                }
+                guard case .task(let task) = event else { continue }
+                if let step = Self.launchStepText(for: task, gameName: game.name) { latestStep = step }
+                if task == "CreatingProcess" { openedAt = .now }
+                if task == "Failed" { steamFailed = true }
+            }
+            if steamFailed { break }
+            // Steam answers some prompts itself within a second (no
+            // interstitials to show); one still open is the player's to answer.
+            if let pendingWait, steamWaitingOnPlayer == nil, ContinuousClock.now - pendingWait.since >= .seconds(1) {
+                showSteamPrompt(pendingWait.step)
+            }
+            if let openedAt, ContinuousClock.now - openedAt > .seconds(5) { latestStep = "Almost there" }
+            if let latestStep, latestStep != launchStep, ContinuousClock.now - stepShownAt >= .milliseconds(1200) {
+                launchStep = latestStep
+                stepShownAt = .now
+            }
             if let acfState = prefix.gameDownloadProgress(appID: game.id) {
                 let validating = acfState.stateFlags != "4"
                 if validating != lastReportedValidating {
@@ -705,6 +651,20 @@ final class Launcher {
             }
         }
 
+        launchStep = nil
+        if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
+
+        if steamFailed {
+            // Steam gave up on the launch itself (a declined EULA, an
+            // AppError): nothing will start, so say so now instead of
+            // waiting out the startup timeout.
+            gameProcess.cancelMonitoring()
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "Steam did not start the game", exitCode: nil)
+            fail("Steam didn't start \(game.name). Please try again.")
+            return
+        }
+
         switch gameProcess.monitorPhase {
         case .running:
             AppSettings.shared.recordLaunch(appID: game.id)
@@ -715,15 +675,17 @@ final class Launcher {
             appendLog("Game running (Online mode)")
         case .timedOut:
             steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "startup timeout (game process never appeared)", exitCode: nil)
             if lastReportedValidating {
-                fail("Steam is still validating \(game.name). Wait a moment and press Play again — the download/validation continues in the background.")
+                fail("Steam is still validating \(game.name). Wait a moment and press Play again. The download/validation continues in the background.")
             } else {
-                fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+                fail("\(game.name) didn't start through Steam. Please try again.")
             }
             return
         case .exited, .idle, .failed:
             steamWindow?.resumeAfterGame(steamPID: 0)
-            fail("\(game.name) didn't start through Steam. Check logs/games/\(game.id).log, or try Offline mode.")
+            closeActiveGameLog(reason: "game exited during startup", exitCode: nil)
+            fail("\(game.name) didn't start through Steam. Please try again.")
             return
         case .startup:
             // Cancelled (Stop button / cancelLaunch). Teardown is owned by
@@ -731,6 +693,7 @@ final class Launcher {
             // suppression restored even if they raced us.
             gameProcess.cancelMonitoring()
             steamWindow?.resumeAfterGame(steamPID: 0)
+            closeActiveGameLog(reason: "launch cancelled during startup", exitCode: nil)
             launchState = .idle
             currentActivity = nil
             return
@@ -741,6 +704,7 @@ final class Launcher {
             if Task.isCancelled { break }
         }
         steamWindow?.resumeAfterGame(steamPID: 0)
+        closeActiveGameLog(reason: "game exited", exitCode: nil)
         launchState = .idle
         currentActivity = nil
         runningSince = nil
@@ -773,9 +737,9 @@ final class Launcher {
         let resuming = prefix.isGameInstalled(appID: game.id)
             || FileManager.default.fileExists(atPath: installDir.path(percentEncoded: false))
         launchState = .installing(appID: game.id)
-        currentActivity = resuming
-            ? "Resuming download for \(game.name)…"
-            : "Preparing download for \(game.name)…"
+        // Steps only: the numbers are `downloadProgressText`, so the line
+        // that names the step doesn't change on every progress tick.
+        currentActivity = resuming ? "Resuming download…" : "Preparing download…"
         downloadProgress = nil
         downloadBytesDone = 0
         downloadBytesTotal = 0
@@ -796,7 +760,7 @@ final class Launcher {
                 guard let self else { return }
                 switch phase {
                 case "connecting": self.currentActivity = "Connecting to Steam…"
-                case "loggedon":   self.currentActivity = "Starting download for \(game.name)…"
+                case "loggedon":   self.currentActivity = "Starting download…"
                 default:           break
                 }
             },
@@ -825,15 +789,9 @@ final class Launcher {
                     lastSampleAt = now
                 }
 
-                let pctInt = Int(fraction * 100)
-                let doneMB = done / (1024 * 1024)
-                let totalMB = total / (1024 * 1024)
-                let rateText = self.downloadRateBps > 0
-                    ? String(format: " · %.1f MB/s", self.downloadRateBps / (1024 * 1024))
-                    : ""
-                self.currentActivity = total > 0
-                    ? "Downloading \(game.name)… \(pctInt)% (\(doneMB) / \(totalMB) MB\(rateText))"
-                    : "Downloading \(game.name)…"
+                if self.currentActivity != "Downloading…" {
+                    self.currentActivity = "Downloading…"
+                }
             }
         )
 
@@ -863,129 +821,32 @@ final class Launcher {
 
         downloadProgress = 1.0
         downloadRateBps = 0
-        currentActivity = "\(game.name) installed"
+        currentActivity = "Installed"
         appendLog("\(game.name) install complete (\(result.bytesDownloaded / (1024 * 1024)) MB)")
         log.info("[installHeadless] ✓ appID=\(game.id) bytes=\(result.bytesDownloaded) buildid=\(result.buildID)")
     }
 
-    // MARK: - Private: launch via wine64
+    // MARK: - Private: launch arguments
 
-    private func launchDirect(
-        game: Game,
-        engine: WineEngine,
-        session: SteamSession,
-        drmShimActive: Bool
-    ) async throws -> GameLaunchResult {
-        guard let installDir = prefix.gameInstallDir(appID: game.id) else {
-            throw LaunchError.noInstallDir(game.id)
-        }
-
-        let gamePath = prefix.steamInstallDir
-            .appending(path: "steamapps/common/\(installDir)")
-        let gamePathStr = gamePath.path(percentEncoded: false)
-
-        let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(atPath: gamePathStr) else {
-            throw LaunchError.cannotListDir(gamePathStr)
-        }
-
-        let exeFiles = contents.filter { $0.hasSuffix(".exe") }
-            .filter {
-                let lower = $0.lowercased()
-                return !lower.contains("crash") && !lower.contains("redist") && !lower.contains("unins")
-            }
-
-        guard let mainExe = exeFiles.first(where: { !$0.lowercased().contains("unity") }) ?? exeFiles.first else {
-            throw LaunchError.noExecutable(gamePathStr)
-        }
-
-        let exePath = gamePath.appending(path: mainExe).path(percentEncoded: false)
-        log.info("[launch] appID=\(game.id) exe=\(exePath)")
-
-        let compat = GameCompatibilityDB.shared
-        let profile = compat.profile(for: game.id)
-
-        // Warm the stack resolver (local file detection + cached PCGamingWiki
-        // enrichment, merged with any explicit compat profile) BEFORE building
-        // the env, so `gameEnvironment` can route a detected/PCGW DX12 game
-        // through GPTK even when it has no hand-written compat entry. On a
-        // network failure / offline this still returns local-only detection;
-        // on a cold cache `gameEnvironment` falls back to prior behaviour.
-        let resolvedStack = await GameStackResolver.shared.resolve(appID: game.id, installDir: gamePath)
-
-        let launchArgs = (profile?.launchArgs ?? []) + (await seedDefaultResolution(
-            game: game,
-            engine: engine,
-            gameEngine: profile?.gameEngine ?? resolvedStack.engine,
-            profileArgs: profile?.launchArgs ?? []
-        ))
-
-        let env = session.gameEnvironment(for: game.id, engine: engine)
-
-        // Resolve the graphics/translation stack from the FINAL env (+ the
-        // merged metadata) and log a one-liner to meridian.log + embed a detail
-        // block in the per-game header. This makes "what stack did this game
-        // run with?" answerable at a glance — active renderer (DXMT / GPTK /
-        // DXVK / wined3d), translation layer, bitness, DRM shim, Metal HUD,
-        // compat status, and the provenance of each fact.
-        let stackReport = GameStackReport.resolve(
-            appID: game.id,
-            gameName: game.name,
-            profile: profile,
-            resolved: resolvedStack,
-            environment: env,
-            drmShimActive: drmShimActive,
-            engineVersion: engine.engineVersion
-        )
-        log.info("[launch] \(stackReport.summaryLine)")
-
-        let process = Process()
-        process.executableURL = engine.wine64URL
-        process.currentDirectoryURL = gamePath
-        process.arguments = [exePath] + launchArgs
-        process.environment = env
-
-        // Record session context so the engine-log collector (run on exit in
-        // closeActiveGameLog) knows which install dir to scan for Unreal logs
-        // and which launch instant to filter Unity Player.log freshness
-        // against. Without launchStartedAt we could copy a stale log from a
-        // previous run.
-        activeGameInstallDir = gamePath
-        activeLaunchStartedAt = Date()
-
-        // Per-game log: hand Wine a kernel-level FileHandle for stdout and
-        // stderr. The Wine subprocess tree writes every byte directly to
-        // disk; no Meridian-side draining required. This avoids the
-        // availableData blocking issue (Pattern 1 in
-        // engine-research-findings.mdc) AND gives us a complete game log
-        // even when wineserver outlives the parent wine64 process.
-        let logHandle = GameLogFile.beginSession(
-            appID: game.id,
-            gameName: game.name,
-            executable: exePath,
-            launchArgs: launchArgs,
-            environment: env,
-            stackReport: stackReport
-        )
-        activeGameLogHandle = logHandle
-        if let logHandle {
-            process.standardOutput = logHandle
-            process.standardError = logHandle
-            log.info("[launch] per-game log → \(GameLogFile.currentURL(for: game.id).path(percentEncoded: false))")
+    /// The game's compat-profile arguments plus, on its first launch, a
+    /// default resolution. Steam forwards them to the game:
+    /// `-applaunch <id> <args>` passed `-force-d3d11` with no prompt
+    /// (CLI-verified Oct 8 2026).
+    private func launchArguments(for game: Game, engine: WineEngine) async -> [String] {
+        let profile = GameCompatibilityDB.shared.profile(for: game.id)
+        let profileArgs = profile?.launchArgs ?? []
+        guard AppSettings.shared.lastLaunchDate(appID: game.id) == nil,
+              let installDir = prefix.gameInstallDir(appID: game.id) else { return profileArgs }
+        let gamePath = prefix.steamInstallDir.appending(path: "steamapps/common/\(installDir)")
+        let gameEngine: GameEngine
+        if let profile {
+            gameEngine = profile.gameEngine
         } else {
-            // Fallback: black-hole both streams. Better than reintroducing
-            // a Pipe that may block; the user can still read meridian.log
-            // for Wine errors that bubble up through other layers.
-            log.warning("[launch] per-game log unavailable — stderr will not be captured")
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            gameEngine = await GameStackResolver.shared.resolve(appID: game.id, installDir: gamePath).engine
         }
-
-        try process.run()
-        let pid = process.processIdentifier
-        log.info("[launch] pid=\(pid)")
-
-        return GameLaunchResult(pid: pid, process: process)
+        return profileArgs + (await seedDefaultResolution(
+            game: game, engine: engine, gameEngine: gameEngine, profileArgs: profileArgs
+        ))
     }
 
     // MARK: - Private: first-launch resolution
@@ -1050,29 +911,33 @@ final class Launcher {
     private func closeActiveGameLog(reason: String, exitCode: Int32?) {
         guard let handle = activeGameLogHandle else { return }
         let appID = activeAppID ?? 0
-
-        // Collect the game's own engine log (Unity Player.log / Unreal
-        // Saved/Logs) for this session into <appID>-engine.log BEFORE writing
-        // the trailer, so the diagnostic artifact is captured even on the
-        // crash / timeout / fast-exit paths — exactly when it's most needed.
-        let lowLevelDir = prefix.driveC
-            .appending(path: "users/crossover/AppData/LocalLow")
-        GameLogFile.collectEngineLogs(
-            appID: appID,
-            lowLevelDir: lowLevelDir,
-            installDir: activeGameInstallDir,
-            launchStartedAt: activeLaunchStartedAt
-        )
-
-        GameLogFile.endSession(
-            handle: handle,
-            appID: appID,
-            reason: reason,
-            exitCode: exitCode
-        )
+        let lowLevelDir = prefix.userProfileDir.appending(path: "AppData/LocalLow")
+        let installDir = activeGameInstallDir
+        let startedAt = activeLaunchStartedAt
+        let steamOutputOffset = activeSteamOutputOffset
         activeGameLogHandle = nil
         activeGameInstallDir = nil
         activeLaunchStartedAt = nil
+        activeSteamOutputOffset = nil
+
+        // File work (the Wine output slice can be tens of MB) stays off the
+        // main actor.
+        Task.detached(priority: .utility) {
+            // Collect the game's own engine log (Unity Player.log / Unreal
+            // Saved/Logs) for this session into <appID>-engine.log BEFORE
+            // writing the trailer, so the diagnostic artifact is captured even
+            // on the crash / timeout / fast-exit paths.
+            GameLogFile.collectEngineLogs(
+                appID: appID,
+                lowLevelDir: lowLevelDir,
+                installDir: installDir,
+                launchStartedAt: startedAt
+            )
+            if let steamOutputOffset {
+                GameLogFile.appendSteamOutput(since: steamOutputOffset, to: handle)
+            }
+            GameLogFile.endSession(handle: handle, appID: appID, reason: reason, exitCode: exitCode)
+        }
     }
 
     // MARK: - Private: uninstall
@@ -1137,47 +1002,67 @@ final class Launcher {
         log.info("[uninstall] removed ACF: \(acfPath)")
     }
 
+    // MARK: - Private: Steam's sign-in inside a launch
+
+    /// Steam's own sign-in, then Steam started silently again for the game
+    /// (signing in closes Steam). `steamSignIn` is set only while the player
+    /// is needed, so the card shows "Sign in to Steam" and then carries on
+    /// from where the bar stood.
+    private func signInToSteam(_ reason: SteamSignIn, appID: Int, session: SteamSession, engine: WineEngine) async throws {
+        steamSignIn = reason
+        do {
+            try await session.signInInteractively(engine: engine) { [weak self] status in
+                self?.setLaunchActivity(status)
+            }
+        } catch {
+            steamSignIn = nil
+            throw error
+        }
+        steamSignIn = nil
+        try await session.ensureReadyForDRM(engine: engine, appID: appID) { [weak self] status in
+            self?.setLaunchActivity(status)
+        }
+    }
+
     // MARK: - Private: launch-stage mapping (Steam-boot overlay)
 
-    /// Ordered marker table mapping launch status strings → (icon, fraction).
+    /// Ordered marker table mapping launch status strings → (phase, fraction).
     /// FIRST match wins, so more specific markers must precede their
-    /// substrings (e.g. "through Steam" before "Launching"). Statuses come
-    /// from three sources — the pipeline itself, `SteamSession`'s `onStatus`
-    /// callbacks, and `GameProcess.onLog` — all funneled through
-    /// `setLaunchActivity`. Unrecognized statuses update only the message.
+    /// substrings (e.g. "Connecting to Steam servers" before "Connecting to
+    /// Steam"). Statuses come from three sources (the pipeline itself,
+    /// `SteamSession`'s `onStatus` callbacks, and `GameProcess.onLog`), all
+    /// funneled through `setLaunchActivity`. Unrecognized statuses update
+    /// only `currentActivity` (the launch log). Steam's sign-in is not a
+    /// marker: the card follows `steamSignIn` instead.
     ///
-    /// MIRROR CONTRACT: mirrored in LaunchStageTests.stageForStatus.
-    static let launchStages: [(marker: String, icon: String, fraction: Double)] = [
-        ("Connecting to Steam servers", "network",                     0.54),
-        ("Connected to Steam servers",  "network",                     0.58),
-        ("Signing in to your Steam account", "lock.shield",            0.62),
-        ("Finishing sign-in",           "lock.shield",                 0.66),
-        ("Steam is ready",              "checkmark.shield",            0.70),
-        ("Steam is updating itself",    "arrow.triangle.2.circlepath", 0.50),
-        ("Starting Steam client",       "gear",                        0.46),
-        ("Connecting to Steam",         "network",                     0.08),
-        ("Downloading Steam client",    "arrow.down.circle",           0.28),
-        ("Installing Steam",            "square.and.arrow.down",       0.18),
-        ("Opening Steam sign-in",       "person.crop.circle",          0.38),
-        ("Waiting for you to sign in",  "person.crop.circle",          0.42),
-        ("sign-in required",            "person.crop.circle",          0.38),
-        ("session expired",             "person.crop.circle",          0.38),
-        ("Starting Steam",              "lock.shield",                 0.42),
-        ("through Steam",               "play.circle",                 0.76),
-        ("validating",                  "arrow.triangle.2.circlepath", 0.82),
-        ("Waiting for Steam to start",  "hourglass",                   0.88),
-        ("Waiting for game to start",   "hourglass",                   0.92),
-        ("Game is running",             "checkmark.circle.fill",       1.00),
-        ("Preparing",                   "gear",                        0.04),
-        ("Launching",                   "play.circle",                 0.76),
+    /// MIRROR CONTRACT: mirrored in LaunchStageTests.launchStages.
+    static let launchStages: [(marker: String, phase: LaunchPhase, fraction: Double)] = [
+        ("Connecting to Steam servers",      .gettingReady,   0.54),
+        ("Connected to Steam servers",       .gettingReady,   0.58),
+        ("Signing in to your Steam account", .gettingReady,   0.62),
+        ("Finishing sign-in",                .gettingReady,   0.66),
+        ("Steam is ready",                   .gettingReady,   0.70),
+        ("Steam is updating itself",         .updatingSteam,  0.50),
+        ("Updating Steam",                   .updatingSteam,  0.50),
+        ("Starting Steam client",            .gettingReady,   0.46),
+        ("Connecting to Steam",              .gettingReady,   0.08),
+        ("Downloading Steam",                .settingUpSteam, 0.28),
+        ("Installing Steam",                 .settingUpSteam, 0.18),
+        ("Signed in",                        .gettingReady,   0.44),
+        ("Starting Steam",                   .gettingReady,   0.42),
+        ("through Steam",                    .startingGame,   0.76),
+        ("validating",                       .checkingFiles,  0.82),
+        ("Waiting for Steam to start",       .startingGame,   0.88),
+        ("Waiting for game to start",        .startingGame,   0.92),
+        ("Game is running",                  .startingGame,   1.00),
     ]
 
     /// Sets `currentActivity` and, when the status matches a known marker,
-    /// advances the staged icon + fraction for the launch overlay.
+    /// advances the staged phase + fraction for the launch card.
     private func setLaunchActivity(_ status: String) {
         currentActivity = status
         if let stage = Self.launchStages.first(where: { status.localizedCaseInsensitiveContains($0.marker) }) {
-            launchStageIcon = stage.icon
+            launchPhase = stage.phase
             launchStageFraction = max(launchStageFraction, stage.fraction)
         }
     }
@@ -1185,8 +1070,91 @@ final class Launcher {
     /// Resets the staged progress at the start of a launch attempt (and on
     /// cancel/stop) so the next run's bar starts empty.
     private func resetLaunchStage() {
-        launchStageIcon = "gear"
+        launchStep = nil
+        steamWaitingOnPlayer = nil
+        launchPhase = .gettingReady
         launchStageFraction = 0
+    }
+
+    // MARK: - Steam's launch steps
+
+    /// One of Steam's launch events in console_log.txt (CLI-verified Oct 12
+    /// 2026, the cabin game and Super Battle Golf).
+    enum SteamLaunchEvent: Equatable {
+        /// `LaunchApp changed task to SynchronizingCloud with ""`
+        case task(String)
+        /// `LaunchApp waiting for user response to ShowEula ""`: Steam shows
+        /// a dialog and waits (it answers `ShowInterstitials` itself when
+        /// there are none).
+        case waitingForPlayer(String)
+        /// `LaunchApp continues with user response "ShowEula"`
+        case answered
+    }
+
+    /// Steam's launch events for `appID`, oldest first, from lines like
+    /// `GameAction [AppID 4069520, ActionID 1] : LaunchApp …`. Steam writes
+    /// CRLF, and "\r\n" is one Character, so splitting on "\n" saw a whole
+    /// poll as one line and only its first event (the EULA wait was missed).
+    nonisolated static func steamLaunchEvents(in text: String, appID: Int) -> [SteamLaunchEvent] {
+        let marker = "GameAction [AppID \(appID),"
+        func word(after prefix: String, in line: Substring) -> String? {
+            guard let range = line.range(of: prefix) else { return nil }
+            return String(line[range.upperBound...].prefix { $0 != " " })
+        }
+        return text.split(whereSeparator: \.isNewline).compactMap { line in
+            guard line.contains(marker) else { return nil }
+            if let task = word(after: "LaunchApp changed task to ", in: line) { return .task(task) }
+            if let step = word(after: "LaunchApp waiting for user response to ", in: line) { return .waitingForPlayer(step) }
+            if line.contains("LaunchApp continues with user response") { return .answered }
+            return nil
+        }
+    }
+
+    /// Shows (or, with nil, hides) Steam's window while it waits on the
+    /// player, and holds the startup timeout and the card meanwhile.
+    private func showSteamPrompt(_ step: String?) {
+        steamWaitingOnPlayer = step
+        gameProcess.startupHeld = step != nil
+        if let step {
+            appendLog("Steam is waiting for your answer (\(step)); showing its window")
+            steamWindow?.presentSteamPrompt()
+        } else {
+            steamWindow?.endSteamPrompt()
+        }
+    }
+
+    /// The happy-path line for one of Steam's launch steps, or nil to keep the
+    /// current line (the steps that don't mean anything to a player).
+    nonisolated static func launchStepText(for task: String, gameName: String) -> String? {
+        switch task {
+        case "UpdatingAppTicket", "SiteLicenseSeatCheckout": return "Checking with Steam"
+        case "RunningInstallScript": return "Finishing setup"
+        case "SynchronizingCloud": return "Syncing your saves"
+        case "SynchronizingStats": return "Loading your achievements"
+        case "CreatingProcess": return "Opening \(gameName)"
+        default: return nil
+        }
+    }
+
+    private nonisolated static func fileSize(_ url: URL) -> UInt64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))
+        return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// Whole lines appended to `url` since `offset`, which moves past them; a
+    /// line Steam is still writing waits for the next poll. A few hundred
+    /// bytes per poll while a game starts.
+    private nonisolated static func readAppended(_ url: URL, from offset: inout UInt64) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard size > offset else { offset = size; return "" }
+        try? handle.seek(toOffset: offset)
+        let data = (try? handle.readToEnd()) ?? Data()
+        guard let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")) else { return "" }
+        let complete = data[data.startIndex...lastNewline]
+        offset += UInt64(complete.count)
+        return String(decoding: complete, as: UTF8.self)
     }
 
     // MARK: - Private: helpers
@@ -1195,6 +1163,8 @@ final class Launcher {
         log.error("[pipeline] failed: \(message)")
         launchState = .failed(message)
         currentActivity = nil
+        launchStep = nil
+        steamWaitingOnPlayer = nil
         downloadProgress = nil
         appendLog("Error: \(message)")
     }
@@ -1235,20 +1205,6 @@ extension Launcher {
 
 // MARK: - Errors
 
-enum LaunchError: LocalizedError {
-    case noInstallDir(Int)
-    case cannotListDir(String)
-    case noExecutable(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .noInstallDir(let id):  return "Cannot find install directory for appID \(id)."
-        case .cannotListDir(let p):  return "Cannot list game directory: \(p)"
-        case .noExecutable(let p):   return "No game executable found in \(p)"
-        }
-    }
-}
-
 enum InstallError: LocalizedError {
     case notSignedIn
     case installerMissing
@@ -1263,9 +1219,3 @@ enum InstallError: LocalizedError {
     }
 }
 
-// MARK: - GameLaunchResult
-
-struct GameLaunchResult: Sendable {
-    let pid: Int32
-    let process: Process
-}

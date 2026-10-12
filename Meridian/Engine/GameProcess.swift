@@ -54,6 +54,11 @@ final class GameProcess {
 
     var confirmedRunning: Bool { monitorPhase == .running }
 
+    /// Set while Steam waits on the player before it starts the game (an
+    /// EULA): the startup timeout counts from when this clears, so reading
+    /// the agreement never times the launch out.
+    var startupHeld = false
+
     private var monitorTask: Task<Void, Never>?
     private var onLog: ((String) -> Void)?
 
@@ -236,13 +241,14 @@ final class GameProcess {
         onLog?("Waiting for Steam to start the game…")
         log.info("[monitor:startup] phase=startup | timeout=\(Self.startupTimeout) | gamePattern=\(gamePattern ?? "fallback")")
 
-        let startupBegan = ContinuousClock.now
+        var startupBegan = ContinuousClock.now
         var pollCount = 0
         var pidExited = false
         var consecutiveDetected = 0
         var detectedPIDs: Set<Int32> = []
 
         while !Task.isCancelled {
+            if startupHeld { startupBegan = .now }
             let elapsed = ContinuousClock.now - startupBegan
             if elapsed >= Self.startupTimeout {
                 log.error("[monitor:startup] TIMEOUT — no game processes after \(Self.startupTimeout)")

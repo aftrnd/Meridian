@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ImageIO
 
 // MARK: - Detail prefetch
 
@@ -24,6 +25,192 @@ final class DetailPrefetch {
         task?.cancel()
         task = nil
     }
+}
+
+// MARK: - Capsule art
+
+/// One loader for a game's portrait capsule, shared by the cards and the
+/// Library's prefetch: both resolve the same URL, decode once (off the main
+/// actor, at card size) and never fetch the same art twice at once.
+enum CapsuleArt {
+    /// Long side the art is decoded to: 600×900, native for the new-CDN
+    /// capsule, sharp for the largest cards (~260 pt at 2×) and for the zoom
+    /// ghost while it's visible. The legacy 2× capsule (1200×1800) costs 4×
+    /// the memory and decode time for pixels no card draws.
+    static let maxPixelSize = 900
+
+    static func urls(for game: Game) -> [URL] {
+        game.newCDNCapsuleURLs + [game.verticalCapsuleURL] + game.verticalCapsuleURLFallbacks
+    }
+
+    private static func key(for game: Game) -> String { "\(game.id)-\(game.libraryCapsuleHash ?? "")" }
+
+    /// The URL each game's art was found at, so a memory check is one lookup
+    /// instead of building and hashing ~15 candidate URLs (cards run it in
+    /// `init`, on every parent update).
+    @MainActor private static var resolved: [String: URL] = [:]
+    @MainActor private static var prefetching: Set<String> = []
+
+    /// Memory-tier hit only: safe in a view's init or body.
+    @MainActor static func cached(for game: Game) -> (image: NSImage, url: URL)? {
+        if let url = resolved[key(for: game)] {
+            return ImageCache.shared.memoryImage(for: url).map { ($0, url) }
+        }
+        for url in urls(for: game) {
+            if let image = ImageCache.shared.memoryImage(for: url) {
+                resolved[key(for: game)] = url
+                return (image, url)
+            }
+        }
+        return nil
+    }
+
+    /// Memory → disk → network, decoded off the main actor. Concurrent calls
+    /// for one game share a single load.
+    @MainActor static func load(for game: Game) async -> (image: NSImage, url: URL)? {
+        if let hit = cached(for: game) { return hit }
+        let key = key(for: game)
+        guard let loaded = await loads.load(key: key, urls: urls(for: game)) else { return nil }
+        resolved[key] = loaded.url
+        return (loaded.image, loaded.url)
+    }
+
+    /// Decodes art into memory ahead of the cards that will show it (the
+    /// Library calls this for the rows below the ones on screen).
+    @MainActor static func prefetch(_ games: some Sequence<Game>) {
+        for game in games {
+            let key = key(for: game)
+            guard cached(for: game) == nil, prefetching.insert(key).inserted else { continue }
+            Task(priority: .utility) {
+                _ = await load(for: game)
+                prefetching.remove(key)
+            }
+        }
+    }
+
+    /// Downloads art that isn't on disk yet (bytes only, nothing decoded or
+    /// held in memory), so scrolling the Library later is a disk read, never
+    /// a network wait. Four at a time, matching the image session.
+    static func warmDisk(_ games: [Game]) async {
+        let jobs = games.map { (key: key(for: $0), urls: urls(for: $0)) }
+        await withTaskGroup(of: Void.self) { group in
+            var running = 0
+            for job in jobs {
+                guard !Task.isCancelled else { break }
+                guard await loads.claimWarm(job.key) else { continue }
+                if running == 4 {
+                    _ = await group.next()
+                    running -= 1
+                }
+                group.addTask(priority: .utility) {
+                    let done = await fetchToDisk(job.urls)
+                    await loads.finishWarm(job.key, done: done)
+                }
+                running += 1
+            }
+        }
+    }
+
+    private static let loads = Loads()
+
+    /// A decoded capsule and where it came from. NSImage isn't Sendable; this
+    /// one is only ever read after decoding (same reasoning as
+    /// `ImageCache.EdgeColorsBox`).
+    private struct Loaded: @unchecked Sendable {
+        let image: NSImage
+        let url: URL
+    }
+
+    private actor Loads {
+        private var inFlight: [String: Task<Loaded?, Never>] = [:]
+        private var warming: Set<String> = []
+        private var warmed: Set<String> = []
+
+        func load(key: String, urls: [URL]) async -> Loaded? {
+            if let running = inFlight[key] { return await running.value }
+            let task = Task.detached(priority: .userInitiated) { await CapsuleArt.fetch(urls) }
+            inFlight[key] = task
+            let result = await task.value
+            inFlight[key] = nil
+            return result
+        }
+
+        func claimWarm(_ key: String) -> Bool {
+            guard !warmed.contains(key) else { return false }
+            return warming.insert(key).inserted
+        }
+
+        func finishWarm(_ key: String, done: Bool) {
+            warming.remove(key)
+            if done { warmed.insert(key) }
+        }
+    }
+
+    /// Same URL order as always: every cached candidate first, then the
+    /// network in priority order.
+    private static func fetch(_ urls: [URL]) async -> Loaded? {
+        for url in urls {
+            if let image = await ImageCache.shared.imageAsync(for: url, maxPixelSize: maxPixelSize) {
+                return Loaded(image: image, url: url)
+            }
+        }
+        for url in urls {
+            guard let (data, response) = try? await URLSession.imageSession.data(from: url) else { continue }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+            guard let image = await ImageCache.decode(data, maxPixelSize: maxPixelSize) else { continue }
+            ImageCache.shared.store(image, for: url, rawData: data)
+            return Loaded(image: image, url: url)
+        }
+        return nil
+    }
+
+    /// True once some candidate is on disk (already, or downloaded now).
+    private static func fetchToDisk(_ urls: [URL]) async -> Bool {
+        if urls.contains(where: { ImageCache.shared.isOnDisk($0) }) { return true }
+        for url in urls {
+            guard !Task.isCancelled else { return false }
+            guard let (data, response) = try? await URLSession.imageSession.data(from: url) else { continue }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  CGImageSourceGetCount(source) > 0 else { continue }
+            ImageCache.shared.storeOnDisk(data, for: url)
+            return true
+        }
+        return false
+    }
+}
+
+/// Whether the scroll view holding the cards is moving. Cards don't hover
+/// then: content sliding under a still pointer would lift, tilt and re-lay out
+/// each card's label in turn, every frame of the scroll. A plain reference,
+/// not view state: the phase flips several times per flick, and as `@State`
+/// each flip re-ran the whole Library body (filter, sort, grid, scroll view
+/// insets) or the Home row, plus every visible card. Cards read it from their
+/// hover handlers; the one hovered card leaves a closure to drop its lift.
+@MainActor
+final class CardHoverGate {
+    private(set) var isScrolling = false
+    private var dropHover: (() -> Void)?
+
+    func scrollPhaseChanged(to phase: ScrollPhase) {
+        let scrolling = phase != .idle
+        guard scrolling != isScrolling else { return }
+        isScrolling = scrolling
+        if scrolling {
+            dropHover?()
+            dropHover = nil
+        }
+    }
+
+    /// The card now under the pointer (replaces the previous one).
+    func cardHovered(drop: @escaping () -> Void) {
+        dropHover = drop
+    }
+}
+
+extension EnvironmentValues {
+    /// Set by the scroll view holding the cards (Home rows, Library and Search grids).
+    @Entry var cardHoverGate: CardHoverGate? = nil
 }
 
 // MARK: - Game Card State
@@ -71,6 +258,28 @@ struct GameGridView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.displayScale) private var displayScale
     @Environment(\.detailFlightSource) private var flightSource
+    @Environment(\.cardHoverGate) private var hoverGate
+
+    init(
+        game: Game,
+        isSelected: Bool,
+        isFavorite: Bool = false,
+        showFavoriteBadge: Bool = true,
+        gameState: GameCardState = .idle
+    ) {
+        self.game = game
+        self.isSelected = isSelected
+        self.isFavorite = isFavorite
+        self.showFavoriteBadge = showFavoriteBadge
+        self.gameState = gameState
+        // A card scrolled into view starts WITH its art when it's in memory
+        // (the Library prefetches the rows ahead): loading from `.task` alone
+        // drew the placeholder for at least a frame, every time.
+        if let hit = CapsuleArt.cached(for: game) {
+            _loadedImage = State(initialValue: hit.image)
+            _glowColors = State(initialValue: ImageCache.shared.cachedEdgeColors(for: hit.url))
+        }
+    }
 
     /// True while the detail zoom is departing from / returning to THIS card
     /// instance (matched by frame, so a duplicate in another row stays
@@ -86,6 +295,8 @@ struct GameGridView: View {
         let artFrame = art.frame
         return abs(s.artFrame.midX - artFrame.midX) < 2 && abs(s.artFrame.midY - artFrame.midY) < 2
     }
+
+    private var hoverSuppressed: Bool { hoverGate?.isScrolling == true }
 
     private var isRunning: Bool { gameState == .running }
     private var isLaunching: Bool { gameState == .launching || gameState == .stopping }
@@ -202,59 +413,18 @@ struct GameGridView: View {
         }
     }
 
-    /// Loads the card image from cache (synchronous) or network (async).
-    ///
-    /// URL priority:
-    ///  1. New hash-based CDN (shared.*.steamstatic.com/store_item_assets/…) — required
-    ///     for games published after ~2024. Only tried when libraryCapsuleHash is set.
-    ///  2. Legacy CDN (cdn.akamai.steamstatic.com/steam/apps/…) — covers older titles.
-    ///
-    /// When Phase 1 fails and libraryCapsuleHash is not yet available, loadFailed is set.
-    /// The .task(id:) will re-run once SteamLibraryStore populates the hash, automatically
-    /// retrying with the new-CDN URLs.
+    /// Loads the card art through `CapsuleArt` (memory → disk → network, URL
+    /// priority: new hash-based CDN when `libraryCapsuleHash` is known, then
+    /// the legacy CDN). With no hash yet and nothing found, `loadFailed` is
+    /// set; the `.task(id:)` re-runs once SteamLibraryStore fills in the hash.
     private func loadCardImage() async {
         loadFailed = false
-
-        // New-CDN URLs are prepended when a hash is available; otherwise only legacy URLs.
-        let urlsToTry = game.newCDNCapsuleURLs
-            + [game.verticalCapsuleURL]
-            + game.verticalCapsuleURLFallbacks
-
-        // Memory-tier check is synchronous — avoids a blank flash for previously
-        // loaded images. Disk reads + decodes below run off the main actor.
-        for url in urlsToTry {
-            if let cached = ImageCache.shared.memoryImage(for: url) {
-                if loadedImage == nil { loadedImage = cached }
-                await sampleGlow(cached, url: url)
-                return
-            }
+        guard let loaded = await CapsuleArt.load(for: game) else {
+            if !Task.isCancelled { loadFailed = true }
+            return
         }
-        for url in urlsToTry {
-            guard !Task.isCancelled else { return }
-            if let cached = await ImageCache.shared.imageAsync(for: url) {
-                if loadedImage == nil { loadedImage = cached }
-                await sampleGlow(cached, url: url)
-                return
-            }
-        }
-
-        // Network fetch — try each URL in priority order.
-        for url in urlsToTry {
-            guard !Task.isCancelled else { return }
-            do {
-                let (data, response) = try await URLSession.imageSession.data(from: url)
-                if let http = response as? HTTPURLResponse, http.statusCode != 200 { continue }
-                guard let nsImage = await ImageCache.decode(data) else { continue }
-                ImageCache.shared.store(nsImage, for: url, rawData: data)
-                loadedImage = nsImage
-                await sampleGlow(nsImage, url: url)
-                return
-            } catch {
-                continue
-            }
-        }
-
-        loadFailed = true
+        if loadedImage == nil { loadedImage = loaded.image }
+        await sampleGlow(loaded.image, url: loaded.url)
     }
 
     /// Cached corner-color lookup (sync hit for previously sampled art),
@@ -275,13 +445,17 @@ struct GameGridView: View {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
+                    .transition(.opacity)
             } else if loadFailed {
                 artPlaceholder
             } else {
+                // A quiet tile, no spinner: art is usually prefetched, and a
+                // ProgressView is an AppKit view built per card mid-scroll.
                 Color.primary.opacity(0.05)
-                    .overlay { ProgressView().scaleEffect(0.6) }
             }
         }
+        // Art that arrives after the card is on screen fades in.
+        .animation(.easeOut(duration: 0.2), value: loadedImage != nil)
         .aspectRatio(600.0 / 900.0, contentMode: .fit)
         .frame(maxWidth: .infinity)
         .clipped()
@@ -325,7 +499,8 @@ struct GameGridView: View {
             case .active(let point):
                 // Hit testing is off for the flight's target side only, so
                 // moves still arrive mid-close — ignore them until landed.
-                guard !isFlightSource else { return }
+                guard !isFlightSource, !hoverSuppressed else { return }
+                if !isHovered { hoverGate?.cardHovered(drop: dropHover) }
                 hoverEasesIn = false
                 hoverLocation = point
                 isHovered = true
@@ -339,22 +514,6 @@ struct GameGridView: View {
                 registerCard(hovered: false)
                 prefetch.cancel()
             }
-        }
-        // Recovery for the post-scroll "stuck at false" case: when proxy.scrollTo
-        // animates the scroll row, a card translates under the cursor. onContinuousHover
-        // only fires on pointer movement so a stationary cursor never triggers .active
-        // for the newly arrived card. onHover (NSTrackingArea) re-evaluates whenever
-        // the view's frame settles, catching this case.
-        // Only recover to true — false is handled exclusively by onContinuousHover
-        // .ended to avoid spurious clears from scroll view re-renders.
-        .onHover { hovered in
-            guard hovered, !isHovered, !isFlightSource else { return }
-            // Position to card center as a neutral default; onContinuousHover
-            // .active will correct it to the actual cursor location on first move.
-            hoverLocation = CGPoint(x: cardSize.width / 2, y: cardSize.height / 2)
-            isHovered = true
-            registerCard(hovered: true)
-            prefetch.begin(appID: game.id, auth: steamAuth)
         }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(DetailTransitionRegistry.stageSpace)) } action: { frame in
             // frame(in:) includes the card's own hover lift/tilt (verified), so
@@ -389,8 +548,18 @@ struct GameGridView: View {
                 hoverLocation = CGPoint(x: p.x - art.frame.minX, y: p.y - art.frame.minY)
                 isHovered = true
                 registerCard(hovered: true)
+                hoverGate?.cardHovered(drop: dropHover)
             }
         }
+    }
+
+    /// A scroll started under the pointer: settle the lift now.
+    private func dropHover() {
+        guard isHovered else { return }
+        isHovered = false
+        hoverLocation = .zero
+        registerCard(hovered: false)
+        prefetch.cancel()
     }
 
     private func registerCard(hovered: Bool) {
@@ -577,8 +746,9 @@ struct WindowsBadge: View {
 ///                  = (N+1)×spacing + (N + 2×peekFraction)×cardWidth
 ///   → cardWidth    = (containerWidth − (N+1)×spacing) / (N + 2×peekFraction)
 ///
-/// Using `leadingPadding` as both leading and trailing padding in the library
-/// grid produces exactly `containerWidth` total — no leftover space.
+/// The library grid does NOT use `leadingPadding`: it keeps one 20 pt margin
+/// all round so its corner cards sit evenly in the window corners (user,
+/// Oct 11 2026). It shares only the column count.
 struct CardLayoutMetrics {
     let cardWidth: CGFloat
     let visibleCount: Int
@@ -593,13 +763,13 @@ struct CardLayoutMetrics {
     static let peekFraction: CGFloat = 0.2
 
     /// The content-column width at the app's DEFAULT window size
-    /// (AppDelegate.fullFrameSize 1016 − sidebar ideal 168). The column-count
+    /// (AppDelegate.fullFrameSize 1040 − sidebar 208). The column-count
     /// step anchors to this so the default window always shows the canonical
     /// 5-columns + peek layout.
-    static let defaultContentWidth: CGFloat = 848
+    static let defaultContentWidth: CGFloat = 832
 
     /// The card size at the default window (5 columns + peek at
-    /// `defaultContentWidth`, ≈128 pt). This is the ANCHOR for the column
+    /// `defaultContentWidth`, ≈132 pt). This is the ANCHOR for the column
     /// step: a new column is added roughly every time another default-size
     /// card would fit — so the default layout is exactly reproduced and
     /// resizing feels proportional around it.
@@ -633,7 +803,7 @@ struct CardLayoutMetrics {
             return CardLayoutMetrics(cardWidth: w, visibleCount: 5, leadingPadding: s + p * w)
         }
 
-        // Column count anchored to the default card step: floor(810 / 147.8)
+        // Column count anchored to the default card step: floor(832 / 151.9)
         // = 5 at the default width, stepping down/up as the window shrinks
         // or grows.
         let rawN = Int(floor(containerWidth / (referenceCardWidth + s)))

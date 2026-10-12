@@ -226,12 +226,23 @@ final class SteamAuthService: NSObject {
     ///   otherwise leaves the session intact. Matches the ContentView gate
     ///   comment ("if the refresh_token is genuinely expired, the
     ///   install/launch path surfaces that").
+    /// Renew only when the refresh token expires within this window.
+    static let renewalWindow: TimeInterval = 30 * 24 * 3600
+
     func renewSessionIfNeeded() async {
         let settings = AppSettings.shared
         let sid   = settings.steamCredentialSteamID
         let token = settings.steamCredentialRefreshToken
         guard !sid.isEmpty, !token.isEmpty else {
             log.debug("[renewSession] no stored token — skipping")
+            return
+        }
+        // Refresh tokens live ~210 days. Exchanging one on every launch is the
+        // automated client-auth churn that trips Valve's anti-abuse lockout
+        // (Pattern 23), so only renew once expiry is near.
+        if let expiry = SteamCredentialAuth.refreshTokenExpiry(token),
+           expiry.timeIntervalSinceNow > Self.renewalWindow {
+            log.debug("[renewSession] token valid until \(expiry) — no renewal needed")
             return
         }
 

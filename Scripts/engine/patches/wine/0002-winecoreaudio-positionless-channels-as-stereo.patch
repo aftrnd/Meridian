@@ -1,0 +1,22 @@
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -1097,6 +1097,19 @@
+         params->fmt->dwChannelMask = get_channel_mask(params->fmt->Format.nChannels);
+     }
+ 
++    /* Meridian: channels without speaker positions are not a speaker setup.
++     * Pro audio interfaces label every channel Unknown (a 10-channel
++     * Universal Audio interface reported no positions and a preferred stereo
++     * pair of 1+2); reported as-is, a game spreads its mix over 10 outputs
++     * and the monitors on 1+2 play a mangled fraction of it. macOS apps play
++     * stereo on such devices, so present stereo; the AudioUnit maps it to the
++     * first two channels. */
++    if (params->flow == eRender && !params->fmt->dwChannelMask && params->fmt->Format.nChannels > 2){
++        TRACE("No speaker positions on %u channels, using stereo\n", params->fmt->Format.nChannels);
++        params->fmt->Format.nChannels = 2;
++        params->fmt->dwChannelMask = KSAUDIO_SPEAKER_STEREO;
++    }
++
+     addr.mSelector = kAudioDevicePropertyNominalSampleRate;
+     size = sizeof(Float64);
+     sc = AudioObjectGetPropertyData(dev_id, &addr, 0, NULL, &size, &rate);

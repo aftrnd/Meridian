@@ -145,23 +145,6 @@ final class OnlineFlowTests: XCTestCase {
                       "a non-42 exit must clear the stale .running state so the next launch does a full bring-up")
     }
 
-    /// Offline launches with a background Steam session alive must use
-    /// game-mode suppression (Steam windows hidden, game exempt) instead of
-    /// blanket-pausing — a full pause freed steamwebhelper to render windows
-    /// for the entire play session.
-    func testOfflineLaunch_usesGameModeWhenSteamAlive() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        guard let fn = src.range(of: "private func executePipeline(") else {
-            return XCTFail("executePipeline must exist")
-        }
-        let after = src[fn.lowerBound...]
-        let body = String(after.prefix(through: after.range(of: "// MARK:")?.lowerBound ?? after.endIndex))
-        XCTAssertTrue(body.contains("if session.isReady {"),
-                      "the offline launch must branch on whether Steam is running in the background")
-        XCTAssertTrue(body.contains("enterGameMode()"),
-                      "with Steam alive, offline launches must use game-mode suppression")
-    }
-
     func testCancelLaunch_stopsProcessMonitor() throws {
         let src = try readSource("Meridian/Launch/Launcher.swift")
         guard let fn = src.range(of: "func cancelLaunch(") else {

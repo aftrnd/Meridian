@@ -240,55 +240,8 @@ final class DepotDownloaderInstallTests: XCTestCase {
                        "the steam.exe-readiness install gate must be removed")
     }
 
-    func testLauncher_drmFreeLaunchDoesNotRequireSteamReady() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        // Only DRM games touch Steam. The Steam path must be gated on the
-        // game's DRM requirement (gameRequiresSteamAPI → needsDRM).
-        XCTAssertTrue(src.contains("let needsDRM = prefix.gameRequiresSteamAPI(appID: game.id)"),
-                      "the Steam path must be gated on gameRequiresSteamAPI (DRM-only)")
-        XCTAssertTrue(src.contains("if needsDRM {"),
-                      "DRM handling must be gated behind `if needsDRM`")
-        // DRM-free games must launch directly with NO Steam readiness gate.
-        XCTAssertFalse(src.contains("guard session.isReady"),
-                       "DRM-free launches must not gate on steam.exe readiness")
-        XCTAssertFalse(src.contains("Please sign in before launching games"),
-                       "the blanket launch gate must be removed")
-    }
-
-    /// Phase 4 (HANDOFF-2026-06-19): DRM games launch via a Steamworks API
-    /// shim, NOT steam.exe. The Launcher must install the gbe_fork emulator
-    /// over the game's Valve steam_api(64).dll (`prefix.installSteamEmulator`)
-    /// and then launch DIRECTLY via wine64 — no steam.exe, no `-applaunch`,
-    /// no silent-auth wall.
-    func testLauncher_drmLaunchUsesSteamworksShim() throws {
-        let src = try readSource("Meridian/Launch/Launcher.swift")
-        XCTAssertTrue(src.contains("prefix.installSteamEmulator("),
-                      "Launcher must install the Steamworks API shim for DRM games")
-        XCTAssertTrue(src.contains("result = try await launchDirect(game: game, engine: engine, session: session, drmShimActive: needsDRM)"),
-                      "DRM (shimmed) AND DRM-free games must both launch directly via wine64")
-        // The steam.exe -applaunch launch path must no longer be used in the Launcher.
-        XCTAssertFalse(src.contains("launchViaSteam"),
-                       "Launcher must not use the steam.exe -applaunch path for DRM games (replaced by the shim)")
-        // The old lazy-steam warm must be gone from the DEFAULT (Offline)
-        // launch path. `launchOnline` (explicit per-game Online opt-in,
-        // HANDOFF-2026-07-02-v2) legitimately brings steam.exe up via
-        // `ensureReadyForDRM` — so scope the ban to everything BEFORE
-        // launchOnline's definition (executePipeline + the offline pipeline).
-        if let onlineRange = src.range(of: "private func launchOnline") {
-            let offlinePath = String(src[src.startIndex..<onlineRange.lowerBound])
-            XCTAssertFalse(offlinePath.contains("session.ensureReadyForDRM"),
-                           "The default (Offline) launch path must not lazy-warm steam.exe (replaced by the shim); only launchOnline may call ensureReadyForDRM")
-        } else {
-            XCTAssertFalse(src.contains("session.ensureReadyForDRM"),
-                           "Launcher must not lazy-warm steam.exe for DRM launches (replaced by the shim)")
-        }
-    }
-
-    /// SteamSession still EXPOSES the steam.exe DRM bring-up
-    /// (`ensureReadyForDRM` / `launchGameViaSteam`) as a documented FALLBACK
-    /// for SteamStub exe-encrypted titles the API shim can't satisfy — even
-    /// though the default DRM launch path (Phase 4) is the shim. Guards against
-    /// these being deleted (they would need to be rebuilt for SteamStub games).
+    /// SteamSession's Steam bring-up (`ensureReadyForDRM`) and `-applaunch`
+    /// dispatch (`launchGameViaSteam`) are the launch path for every game.
     func testSteamSession_retainsSteamExeDRMFallback() throws {
         let src = try readSource("Meridian/Steam/SteamSession.swift")
         XCTAssertTrue(src.contains("func ensureReadyForDRM"),
@@ -324,13 +277,15 @@ final class DepotDownloaderInstallTests: XCTestCase {
                       "configs.user.ini must set the user's account_steamid for the emulator")
     }
 
-    /// release-engine.sh must stage the emulator into the engine tarball.
-    func testReleaseEngine_stagesSteamEmu() throws {
-        let src = try readSource("Scripts/release-engine.sh")
-        XCTAssertTrue(src.contains("build-steamemu.sh"),
-                      "release-engine.sh must run build-steamemu.sh")
-        XCTAssertTrue(src.contains("tools/steamemu"),
-                      "the emulator must stage into engine tools/steamemu")
+    /// The shipped engine must not carry the emulator, and the launcher never
+    /// installs it: every game launches through the real Steam client.
+    func testShippedEngine_omitsSteamEmu_andLauncherNeverShims() throws {
+        let pkg = try readSource("Scripts/engine/package-engine.sh")
+        XCTAssertFalse(pkg.contains("build-steamemu.sh"),
+                       "package-engine.sh must not stage the gbe_fork emulator")
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertFalse(launcher.contains("prefix.installSteamEmulator("),
+                       "Launcher must not install the gbe_fork shim")
     }
 
     /// build-steamemu.sh must pin a release tag (reproducible) and stage the
@@ -361,10 +316,10 @@ final class DepotDownloaderInstallTests: XCTestCase {
                       "installed manifest must write StateFlags=4 (fully installed)")
     }
 
-    func testReleaseEngine_stagesDepotDownloader() throws {
-        let src = try readSource("Scripts/release-engine.sh")
+    func testPackageEngine_stagesDepotDownloader() throws {
+        let src = try readSource("Scripts/engine/package-engine.sh")
         XCTAssertTrue(src.contains("build-depotdownloader.sh"),
-                      "release-engine.sh must build/stage the DepotDownloader fork")
+                      "package-engine.sh must build/stage the DepotDownloader fork")
         XCTAssertTrue(src.contains("tools/depotdownloader"),
                       "DepotDownloader must stage into engine tools/depotdownloader")
     }

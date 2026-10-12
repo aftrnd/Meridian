@@ -220,6 +220,21 @@ final class WindowClassificationTests: XCTestCase {
         XCTAssertTrue(src.contains("Timer.scheduledTimer(withTimeInterval:"))
     }
 
+    /// Told to quit, Steam shows its library with a "Shutdown" popup over it,
+    /// which flashed on screen when suppression stopped first (Oct 12 2026).
+    func testShutdown_keepsSteamHiddenUntilItHasExited() throws {
+        let src = try steamSessionSource()
+        guard let start = src.range(of: "func shutdown(engine: WineEngine) async {"),
+              let end = src.range(of: "\n    }\n", range: start.upperBound..<src.endIndex)
+        else { return XCTFail("SteamSession.shutdown must exist") }
+        let body = src[start.upperBound..<end.lowerBound]
+        guard let kill = body.range(of: "killAllWineProcesses(engine: engine)"),
+              let stop = body.range(of: "steamWindow?.stopSuppressing()")
+        else { return XCTFail("shutdown must kill Steam and then stop suppressing") }
+        XCTAssertLessThan(kill.lowerBound, stop.lowerBound,
+                          "Suppression stops only after Steam has exited")
+    }
+
     func testSteamWindowExposesCoreAPI() throws {
         let src = try steamWindowSource()
         XCTAssertTrue(src.contains("func startSuppressing()"),
@@ -260,8 +275,8 @@ final class WindowClassificationTests: XCTestCase {
             .deletingLastPathComponent()
         let url = root.appendingPathComponent("Meridian/Launch/Launcher.swift")
         let src = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(src.contains("steamWindow?.pauseForGame()"),
-                      "Launcher must pause window suppression before game launch so game window appears")
+        XCTAssertTrue(src.contains("steamWindow?.enterGameMode()"),
+                      "Launcher must switch to game-mode suppression (Steam hidden, game shown) before the game launches")
         XCTAssertTrue(src.contains("steamWindow?.resumeAfterGame("),
                       "Launcher must resume window suppression after game exits")
     }
@@ -303,5 +318,120 @@ final class WindowClassificationTests: XCTestCase {
             .deletingLastPathComponent()
         let url = root.appendingPathComponent("Meridian/Steam/SteamSession.swift")
         return try String(contentsOf: url, encoding: .utf8)
+    }
+
+    // MARK: - Sign-in presentation (Pattern 37)
+
+    /// Mirror of SteamWindow.isSignInWindow(title:size:)
+    private func isSignInWindow(title: String?, size: CGSize) -> Bool {
+        guard let title, !title.isEmpty else { return false }
+        return (300...900).contains(size.width) && (200...700).contains(size.height)
+    }
+
+    func testSignInWindowMatchedBySizeNotTitle() {
+        XCTAssertTrue(isSignInWindow(title: "Sign in to Steam", size: CGSize(width: 700, height: 440)))
+        XCTAssertTrue(isSignInWindow(title: "Bei Steam anmelden", size: CGSize(width: 700, height: 440)),
+                      "localized sign-in titles must still be presented")
+        XCTAssertFalse(isSignInWindow(title: "ANGLE Mock Window", size: CGSize(width: 1, height: 1)))
+        XCTAssertFalse(isSignInWindow(title: "", size: CGSize(width: 700, height: 440)))
+        XCTAssertFalse(isSignInWindow(title: nil, size: CGSize(width: 700, height: 440)))
+        XCTAssertFalse(isSignInWindow(title: "Steam", size: CGSize(width: 1280, height: 800)),
+                       "Steam's library window opens right after sign-in and must stay hidden")
+    }
+
+    /// Mirror of SteamWindow.isPromptWindow(title:size:)
+    private func isPromptWindow(title: String?, size: CGSize) -> Bool {
+        guard let title, !title.isEmpty else { return false }
+        return size.width >= 300 && size.height >= 200
+    }
+
+    /// Steam's EULA dialog is titled just "Steam" (1010×600, CGWindowList,
+    /// Oct 12 2026), so the title allowlist hid it. While Steam waits on the
+    /// player, any titled dialog-sized Steam window is shown, centred.
+    func testSteamPrompt_showsTheUntitledEulaWindow() throws {
+        XCTAssertTrue(isPromptWindow(title: "Steam", size: CGSize(width: 1010, height: 600)))
+        XCTAssertFalse(isPromptWindow(title: "ANGLE Mock Window", size: CGSize(width: 1, height: 1)))
+        XCTAssertFalse(isPromptWindow(title: "", size: CGSize(width: 1010, height: 600)))
+
+        let window = try steamWindowSource()
+        XCTAssertTrue(window.contains("return size.width >= 300 && size.height >= 200"),
+                      "mirror must match SteamWindow.isPromptWindow")
+        XCTAssertTrue(window.contains("present(window, pid: pid, once: &presentedPromptWindows)"),
+                      "a surfaced window must be moved back on screen, not only un-minimized (it was left at -32000)")
+        let launcher = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Meridian/Launch/Launcher.swift"), encoding: .utf8)
+        XCTAssertTrue(launcher.contains("steamWindow?.presentSteamPrompt()"),
+                      "Launcher must show Steam's window while Steam waits on the player")
+    }
+
+    func testInteractiveSignInPresentsInsteadOfPausingSuppression() throws {
+        let window = try steamWindowSource()
+        XCTAssertTrue(window.contains("static func isSignInWindow(title: String?, size: CGSize) -> Bool"))
+        XCTAssertTrue(window.contains("return (300...900).contains(size.width) && (200...700).contains(size.height)"),
+                      "mirror must match SteamWindow.isSignInWindow")
+        XCTAssertTrue(window.contains("func beginSignIn()"))
+        let session = try steamSessionSource()
+        XCTAssertTrue(session.contains("steamWindow?.beginSignIn()"),
+                      "signInInteractively must present only Steam's sign-in window, not pause all suppression")
+        XCTAssertTrue(session.contains("if interactive { env[\"MERIDIAN_STEAM_SIGNIN\"] = \"1\" }"),
+                      "the accessory dylib styles Steam's windows only for the interactive launch")
+    }
+
+    // MARK: - Wine process discovery
+
+    /// Mirror of SteamWindow.parseProcArgs.
+    private func parseProcArgs(_ buffer: [UInt8]) -> String? {
+        let header = MemoryLayout<Int32>.size
+        guard buffer.count > header else { return nil }
+        let argc = buffer.prefix(header).withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        var index = header
+        while index < buffer.count, buffer[index] != 0 { index += 1 }
+        while index < buffer.count, buffer[index] == 0 { index += 1 }
+        var args: [String] = []
+        while index < buffer.count, args.count < argc {
+            let start = index
+            while index < buffer.count, buffer[index] != 0 { index += 1 }
+            args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return args.isEmpty ? nil : args.joined(separator: " ")
+    }
+
+    func testProcArgsParsing_returnsWindowsCommandLine() {
+        // KERN_PROCARGS2 layout: argc, exec path, NUL padding, argv, then env.
+        var buffer = withUnsafeBytes(of: Int32(2).littleEndian) { Array($0) }
+        buffer += Array("/private/var/folders/x/winetemp-1/steamwebhelper.exe".utf8) + [0, 0, 0]
+        buffer += Array(#"C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe"#.utf8) + [0]
+        buffer += Array("--no-sandbox".utf8) + [0]
+        buffer += Array("WINEPREFIX=/tmp/p".utf8) + [0]
+        XCTAssertEqual(parseProcArgs(buffer),
+                       #"C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe --no-sandbox"#,
+                       "argv only: the environment after argc arguments must not be included")
+        XCTAssertNil(parseProcArgs([1, 0]))
+    }
+
+    /// winemac lists each Wine program under its Windows name with no bundle
+    /// identifier; `runningApplications(withBundleIdentifier: "")` matched
+    /// none, so Steam's windows were never hidden (Oct 7 2026).
+    func testWineProcessDiscovery_doesNotUseEmptyBundleIdentifier() throws {
+        let window = try steamWindowSource()
+        XCTAssertFalse(window.contains("runningApplications(withBundleIdentifier: \"\")"))
+        XCTAssertTrue(window.contains("path.contains(\"/winetemp-\")"))
+        XCTAssertTrue(window.contains("Self.commandLine(of: pid)?.lowercased().contains(\"steamwebhelper\")"),
+                      "steamwebhelper is identified by its command line; localizedName from outside is not reliable")
+    }
+
+    /// Every NSRunningApplication read is LaunchServices XPC, `processIdentifier`
+    /// included; walking all running apps per 250 ms tick dropped frames
+    /// (Instruments, Oct 11 2026). Wine PIDs come from KVO instead.
+    func testWineProcessDiscovery_followsRunningApplicationsByKVO() throws {
+        let window = try steamWindowSource()
+        XCTAssertTrue(window.contains("NSWorkspace.shared.observe(\\.runningApplications)"))
+        guard let tick = window.range(of: "private func pollingTick()"),
+              let end = window.range(of: "private func hideAllKnownWine()", range: tick.upperBound..<window.endIndex) else {
+            return XCTFail("SteamWindow must have pollingTick() followed by hideAllKnownWine()")
+        }
+        XCTAssertFalse(window[tick.lowerBound..<end.lowerBound].contains("runningApplications"),
+                       "the polling tick must not enumerate running apps")
     }
 }

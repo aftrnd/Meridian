@@ -61,16 +61,6 @@ struct GameDetailView: View {
     /// detection + PCGamingWiki + any explicit compat profile). Populated by
     /// `resolveStack()` when the game is installed; drives the compat popover.
     @State private var resolvedStack: ResolvedGameStack? = nil
-    /// UI mirror of the persisted per-game launch mode. AppSettings is not
-    /// Observable (UserDefaults-backed), so the split Play button reads this
-    /// state; `launchModeBinding.set` and the SteamStub probe keep it synced.
-    @State private var launchModeUI: AppSettings.LaunchMode = .offline
-    /// True when the installed exe is SteamStub-encrypted (`.bind` PE
-    /// section): the gbe_fork shim can't decrypt it, so Offline mode is
-    /// impossible. The mode menu disables Offline and the probe persists
-    /// Online — reflecting the constraint up-front instead of prompting
-    /// after the fact (HANDOFF-2026-07-03-v6 Goal 1).
-    @State private var steamStubRequiresOnline = false
     /// Flips as the open zoom is landing (timed from mount, not from the
     /// spring's `.removed` settle, which trails the visible motion by a good
     /// half second) so the achievements bar starts filling as the page arrives.
@@ -78,9 +68,6 @@ struct GameDetailView: View {
     /// Bleeds start on a timer partway through the open flight (see
     /// `bleedsVisible`); cleared the instant a close begins.
     @State private var ambientArmed = false
-    /// The chevron segment's launch-mode popover (the "teardrop" window —
-    /// same presentation as the Meridian Verified badge popover).
-    @State private var showLaunchModePopover = false
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
@@ -215,10 +202,6 @@ struct GameDetailView: View {
                     .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
 
                     Menu {
-                        // Launch mode moved out of this menu into the split Play
-                        // button (HANDOFF-2026-07-03-v6 Goal 1) — the mode is a
-                        // first-class control on the Play button itself, not a
-                        // buried setting.
                         Button {
                             openWindow(id: "launch-log")
                         } label: {
@@ -240,6 +223,18 @@ struct GameDetailView: View {
                         }
                         .disabled(!GameLogFile.engineLogExists(for: currentGame.id))
                         .help("The game engine's own log (Unity Player.log / Unreal) from the last launch")
+
+                        Button {
+                            Task {
+                                if let zip = try? await DiagnosticsBundle.collect(
+                                    prefix: .defaultPrefix, summary: DiagnosticsBundle.summary(engine: engine)) {
+                                    NSWorkspace.shared.activateFileViewerSelecting([zip])
+                                }
+                            }
+                        } label: {
+                            Label("Collect Diagnostics", systemImage: "archivebox")
+                        }
+                        .help("Zip every log, Steam's logs and recent crash reports to send for debugging")
 
                         if currentGame.isInstalled {
                             Divider()
@@ -269,16 +264,11 @@ struct GameDetailView: View {
             achievementsLoading = achievements.isEmpty
             achievementsUnavailable = false
             resolvedStack = nil
-            launchModeUI = AppSettings.shared.launchMode(appID: newID)
-            steamStubRequiresOnline = false
         }
         .task(id: game.id) {
             // Store data is static; a cache-seeded page already has it.
             guard appDetails == nil else { return }
             appDetails = try? await SteamAPIService.shared.fetchAppDetails(appID: game.id)
-        }
-        .task(id: game.id) {
-            await probeLaunchModeConstraints()
         }
         .task(id: game.id) {
             await loadBannerImage()
@@ -323,9 +313,23 @@ struct GameDetailView: View {
                     steamAuth: steamAuth, library: library
                 )
             }
-            Button("Cancel", role: .cancel) { launcher.dismissSteamPrompt() }
+            Button("Not Now", role: .cancel) { launcher.dismissSteamPrompt() }
         } message: { prompt in
             Text(steamPromptMessage(for: prompt))
+        }
+        // A game's license agreement, before Steam starts it (Pattern 47).
+        .sheet(item: Binding(
+            get: { launcher.eulaPrompt },
+            set: { if $0 == nil { launcher.declineEulas() } }
+        )) { prompt in
+            EulaSheet(
+                prompt: prompt,
+                onAccept: {
+                    launcher.acceptEulas(engine: engine, session: session,
+                                         steamAuth: steamAuth, library: library)
+                },
+                onCancel: { launcher.declineEulas() }
+            )
         }
     }
 
@@ -352,7 +356,7 @@ struct GameDetailView: View {
                         .aspectRatio(contentMode: .fill)
                         .blur(radius: 60)
                         .saturation(1.2)
-                        .opacity(0.25)
+                        .opacity(0.2)
                         .transition(.opacity)
                 }
             }
@@ -382,7 +386,7 @@ struct GameDetailView: View {
                 .ignoresSafeArea()
                 .blur(radius: 80)
                 .saturation(1.2)
-                .opacity(0.12)
+                .opacity(0.096)
                 .transition(.opacity)
         }
     }
@@ -443,25 +447,21 @@ private struct ScrollerVisibility: NSViewRepresentable {
 
     private var steamPromptTitle: String {
         switch launcher.steamPrompt {
-        case .steamRequired:  return "Steam Required"
-        case .signInRequired: return "One-Time Steam Sign-In"
+        case .signInRequired: return "Connect Steam"
         case nil:             return ""
         }
     }
 
     private func steamPromptConfirmLabel(for prompt: Launcher.SteamPrompt) -> String {
         switch prompt {
-        case .steamRequired:  return "Play via Steam"
-        case .signInRequired: return "Open Steam Sign-In"
+        case .signInRequired: return "Connect Steam"
         }
     }
 
     private func steamPromptMessage(for prompt: Launcher.SteamPrompt) -> String {
         switch prompt {
-        case .steamRequired(let game):
-            return "\(game.name) uses Steam DRM that can only run through the Steam client, so it can't use Meridian's seamless Offline mode. Switch it to Online mode? If you haven't signed in to Steam on this Mac yet, Steam will open once so you can sign in — after that, launches are automatic."
         case .signInRequired(let game):
-            return "Playing \(game.name) online needs a one-time Steam sign-in. Steam will open so you can sign in; Meridian handles everything after that — future Online launches are automatic and no Steam windows will appear."
+            return "\(game.name) runs through Steam. Sign in to Steam once on this Mac. After that it starts automatically and stays out of sight."
         }
     }
 
@@ -626,7 +626,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
             // Steam-boot progress (same look as the download flow); the Play
             // button above stays static.
             if isThisGameActive {
-                StatusCard(game: currentGame, launcher: launcher, openWindow: openWindow)
+                StatusCard(launcher: launcher, openWindow: openWindow)
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .animation(.smooth(duration: 0.2), value: isThisGameActive)
             }
@@ -965,7 +965,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
                             .frame(maxWidth: .infinity)
                             .frame(height: 20)
                         Text(unlocked.count == 0
-                             ? "None unlocked yet — keep playing!"
+                             ? "None unlocked yet. Keep playing!"
                              : "\(unlocked.count) of \(storeTotal) unlocked")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -974,7 +974,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
 
                 // Recent unlocked list
                 if recentUnlocked.isEmpty {
-                    Text("None unlocked yet — keep playing!")
+                    Text("None unlocked yet. Keep playing!")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1123,8 +1123,7 @@ private struct ScrollerVisibility: NSViewRepresentable {
             // matching the download flow's look.
             HStack(spacing: 8) {
                 Button {} label: {
-                    Label(launchModeUI == .online ? "Play Online" : "Play",
-                          systemImage: "play.fill")
+                    Label("Play", systemImage: "play.fill")
                         .font(.headline)
                         .frame(
                             minWidth: GameDetailMetrics.launchButtonMinWidth,
@@ -1206,46 +1205,16 @@ private struct ScrollerVisibility: NSViewRepresentable {
     @ViewBuilder
     private var idleButton: some View {
         if currentGame.isInstalled {
-            // Split Play button (HANDOFF-2026-07-03-v8, revised): the primary
-            // segment is a REAL Button — pixel-identical to the launching-
-            // state ProgressButton (same font, frame metrics, control size).
-            // Offline keeps the standard accent prominence; Online upgrades
-            // to the Liquid Glass prominent style on macOS 26+ so the mode
-            // switch reads instantly. The chevron opens a teardrop popover
-            // (same presentation as the Meridian Verified badge) with the
-            // cleaned-up mode picker. Spacing matches the Running/Stop and
-            // launching-state rows (8) so the split button reads as the same
-            // control family across all launch states.
-            HStack(spacing: 8) {
-                Button { handlePlayTapped() } label: {
-                    Label(launchModeUI == .online ? "Play Online" : "Play",
-                          systemImage: "play.fill")
-                        .font(.headline)
-                        .frame(
-                            minWidth: GameDetailMetrics.launchButtonMinWidth,
-                            minHeight: GameDetailMetrics.launchButtonHeight
-                        )
-                }
-                .inactiveAwareProminence(controlActiveState == .inactive)
-                .controlSize(.large)
-
-                // System-gray chevron (user direction: the primary stays
-                // accent blue, the chevron stays neutral).
-                Button {
-                    showLaunchModePopover.toggle()
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(minHeight: GameDetailMetrics.launchButtonHeight)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .fixedSize()
-                .help("Change launch mode")
-                .popover(isPresented: $showLaunchModePopover, arrowEdge: .bottom) {
-                    launchModePopover
-                }
+            Button { handlePlayTapped() } label: {
+                Label("Play", systemImage: "play.fill")
+                    .font(.headline)
+                    .frame(
+                        minWidth: GameDetailMetrics.launchButtonMinWidth,
+                        minHeight: GameDetailMetrics.launchButtonHeight
+                    )
             }
+            .inactiveAwareProminence(controlActiveState == .inactive)
+            .controlSize(.large)
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
             .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
         } else {
@@ -1262,48 +1231,6 @@ private struct ScrollerVisibility: NSViewRepresentable {
             .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
             .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "")
         }
-    }
-
-    /// The chevron's teardrop popover: two clean mode rows (icon, title,
-    /// one-line subtitle, checkmark on the current mode). Offline is
-    /// disabled for SteamStub-encrypted games with a footnote explaining why.
-    private var launchModePopover: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            LaunchModeRow(
-                icon: "bolt.fill",
-                title: "Local",
-                subtitle: "Fast & offline",
-                selected: launchModeUI == .offline,
-                disabled: steamStubRequiresOnline
-            ) {
-                launchModeBinding.wrappedValue = AppSettings.LaunchMode.offline
-                showLaunchModePopover = false
-            }
-
-            LaunchModeRow(
-                icon: "cloud.fill",
-                title: "Online",
-                subtitle: "Cloud saves & multiplayer",
-                selected: launchModeUI == .online,
-                disabled: false
-            ) {
-                launchModeBinding.wrappedValue = AppSettings.LaunchMode.online
-                showLaunchModePopover = false
-            }
-
-            if steamStubRequiresOnline {
-                Divider()
-                    .padding(.vertical, 4)
-                Text("This game's DRM needs the Steam client — Local isn't available.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 6)
-            }
-        }
-        .padding(8)
-        .frame(width: 250)
     }
 
     private var isLauncherBusyWithOtherGame: Bool {
@@ -1341,44 +1268,6 @@ private struct ScrollerVisibility: NSViewRepresentable {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
-    }
-
-    /// Binding for the per-game launch mode menu. Reads/writes the persisted
-    /// Offline/Online opt-in in AppSettings (default Offline) and mirrors the
-    /// choice into `launchModeUI` so the split Play button re-renders.
-    private var launchModeBinding: Binding<AppSettings.LaunchMode> {
-        Binding(
-            get: { AppSettings.shared.launchMode(appID: currentGame.id) },
-            set: { mode in
-                AppSettings.shared.setLaunchMode(mode, appID: currentGame.id)
-                launchModeUI = mode
-            }
-        )
-    }
-
-    /// Syncs `launchModeUI` from AppSettings and probes the installed exe for
-    /// SteamStub DRM off the main thread. SteamStub games can ONLY run through
-    /// the Steam client, so the probe persists Online mode (idempotent — the
-    /// same switch `confirmSteamPrompt` would make after the fact) and the
-    /// mode menu disables Offline with an explanation.
-    private func probeLaunchModeConstraints() async {
-        launchModeUI = AppSettings.shared.launchMode(appID: game.id)
-        steamStubRequiresOnline = false
-        guard currentGame.isInstalled else { return }
-
-        let appID = game.id
-        let prefix = WinePrefix.defaultPrefix
-        // PE-section scan touches disk — keep it off the main thread.
-        let stub = await Task.detached(priority: .utility) {
-            prefix.gameRequiresSteamAPI(appID: appID) && prefix.gameHasSteamStubDRM(appID: appID)
-        }.value
-
-        guard !Task.isCancelled, appID == game.id else { return }
-        steamStubRequiresOnline = stub
-        if stub, AppSettings.shared.launchMode(appID: appID) == .offline {
-            AppSettings.shared.setLaunchMode(.online, appID: appID)
-            launchModeUI = .online
-        }
     }
 
     private func handleInstallTapped() {
@@ -1509,58 +1398,6 @@ private extension View {
 
 // MARK: - Launch mode popover row
 
-/// One selectable row in the launch-mode popover: icon, title, one-line
-/// subtitle, checkmark when current. Hover highlight matches macOS menu
-/// affordances; disabled rows dim and don't respond.
-private struct LaunchModeRow: View {
-    let icon: String
-    let title: String
-    let subtitle: String
-    let selected: Bool
-    let disabled: Bool
-    let action: () -> Void
-
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.callout)
-                    .foregroundStyle(selected ? Color.accentColor : .secondary)
-                    .frame(width: 22)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer(minLength: 12)
-
-                Image(systemName: "checkmark")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .opacity(selected ? 1 : 0)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(
-                hovering && !disabled ? Color.primary.opacity(0.06) : .clear,
-                in: RoundedRectangle(cornerRadius: 7)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 7))
-        }
-        .buttonStyle(.plain)
-        .disabled(disabled)
-        .opacity(disabled ? 0.4 : 1)
-        .onHover { hovering = $0 }
-    }
-}
-
 // MARK: - Status Card
 
 /// Shared HStack metrics for `BannerCompatBadge` (.card) and `StatusCard` so
@@ -1575,7 +1412,6 @@ private enum CompatCardRowMetrics {
 }
 
 private struct StatusCard: View {
-    let game: Game
     let launcher: Launcher
     let openWindow: OpenWindowAction
 
@@ -1584,90 +1420,97 @@ private struct StatusCard: View {
     @State private var displayedLaunchFraction: Double = 0
     @State private var stageReachedAt = Date()
     @State private var lastStagedFraction: Double = 0
-    @State private var cardAppearedAt = Date()
+    @State private var isHovering = false
+
+    /// What the card says: a short headline, a second line only when the
+    /// player has something to do or to know, and a symbol. Steam's dozen
+    /// boot statuses stay in the launch log; the card names the beat.
+    private struct Beat: Equatable {
+        let title: String
+        var detail: String? = nil
+        let symbol: String
+    }
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            let progress = progressValue
-            VStack(alignment: .leading, spacing: 8) {
-                // Center-aligned so the text block shares the icon's centerline —
-                // matches BannerCompatBadge's card row (default .center HStack).
-                HStack(alignment: .center, spacing: CompatCardRowMetrics.hStackSpacing) {
-                    statusIcon
+        let beat = self.beat
+        let progress = progressValue
+        VStack(alignment: .leading, spacing: 8) {
+            // Center-aligned so the text block shares the icon's centerline —
+            // matches BannerCompatBadge's card row (default .center HStack).
+            HStack(alignment: .center, spacing: CompatCardRowMetrics.hStackSpacing) {
+                statusIcon(beat.symbol)
 
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(statusMessage(at: context.date))
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .id(statusMessage(at: context.date))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(beat.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .id(beat.title)
+                        .transition(.blurReplace)
+
+                    if let detail = beat.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .contentTransition(.opacity)
                             .transition(.blurReplace)
-                            .animation(.easeInOut(duration: 0.25), value: statusMessage(at: context.date))
-
-                        if let subtitle = statusSubtitle(at: context.date) {
-                            Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .id(subtitle)
-                                .transition(.blurReplace)
-                                .animation(.easeInOut(duration: 0.25), value: subtitle)
-                        } else if let elapsed = elapsedText(at: context.date) {
-                            Text(elapsed)
+                    } else if let progressText = launcher.downloadProgressText {
+                        // Updates in place on every tick: no transition, and
+                        // fixed-width digits so the line doesn't jiggle.
+                        Text(progressText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                    } else if launcher.isRunning, let since = launcher.runningSince {
+                        TimelineView(.everyMinute) { context in
+                            Text(Self.playTime(since: since, now: context.date))
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
                                 .monospacedDigit()
                         }
                     }
-
-                    Spacer(minLength: 6)
-
-                    Button {
-                        openWindow(id: "launch-log")
-                    } label: {
-                        Label("Logs", systemImage: "terminal")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Open launch log window")
                 }
+                .animation(.smooth(duration: 0.35), value: beat)
 
-                if let progress {
-                    HStack(spacing: 8) {
-                        CapsuleProgressBar(
-                            value: progress,
-                            label: launcher.isLaunching ? "Launch progress" : "Download progress"
-                        )
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 8)
+                Spacer(minLength: 6)
 
-                        if launcher.isLaunching {
-                            Text("\(Int((min(max(progress, 0), 1) * 100).rounded()))%")
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                                .contentTransition(.numericText(value: progress))
-                        }
-                    }
-                    // Align bar start with the text column; fill to the card's trailing inset.
-                    .padding(.leading, CompatCardRowMetrics.iconColumnWidth + CompatCardRowMetrics.hStackSpacing)
-                    // Lift the bar off the card's bottom edge so it sits
-                    // concentric with the rounded corner instead of hugging it.
-                    .padding(.bottom, 3)
+                if !launcher.isInstalling {
+                    logButton
                 }
             }
-            .padding(.horizontal, CompatCardRowMetrics.horizontalPadding)
-            .padding(.vertical, CompatCardRowMetrics.verticalPadding)
-            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+
+            if let progress {
+                CapsuleProgressBar(
+                    value: progress,
+                    label: launcher.isLaunching ? "Launch progress" : "Download progress"
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: 8)
+                // Align bar start with the text column; fill to the card's trailing inset.
+                .padding(.leading, CompatCardRowMetrics.iconColumnWidth + CompatCardRowMetrics.hStackSpacing)
+                // Lift the bar off the card's bottom edge so it sits
+                // concentric with the rounded corner instead of hugging it.
+                .padding(.bottom, 3)
+                .transition(.opacity)
+            }
         }
+        .padding(.horizontal, CompatCardRowMetrics.horizontalPadding)
+        .padding(.vertical, CompatCardRowMetrics.verticalPadding)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
+        .animation(.smooth(duration: 0.3), value: progress == nil)
+        .onHover { isHovering = $0 }
         .onAppear {
-            cardAppearedAt = Date()
             stageReachedAt = Date()
             lastStagedFraction = launcher.launchStageFraction
             easeLaunchFraction(to: effectiveLaunchTarget(at: Date()))
+        }
+        .onChange(of: launcher.steamSignIn == nil && launcher.steamWaitingOnPlayer == nil) {
+            // Creep restarts after the sign-in or EULA instead of jumping by its length.
+            stageReachedAt = Date()
         }
         .onChange(of: launcher.launchStageFraction) { _, newValue in
             if newValue > lastStagedFraction {
@@ -1685,11 +1528,81 @@ private struct StatusCard: View {
         }
     }
 
+    // MARK: Copy
+
+    private var beat: Beat {
+        switch launcher.launchState {
+        case .launching:
+            // Steam's sign-in is the one moment the launch waits on the
+            // player. A first-time Steam download inside it keeps its own beat.
+            if let signIn = launcher.steamSignIn, launcher.launchPhase != .settingUpSteam {
+                return Beat(
+                    title: "Sign in to Steam",
+                    detail: signIn == .signedOut
+                        ? "Steam signed you out. Scan the code in its window with the Steam Mobile App."
+                        : "Scan the code in Steam's window with the Steam Mobile App.",
+                    symbol: "qrcode.viewfinder"
+                )
+            }
+            // Steam is waiting on the player mid-launch (a game's EULA): its
+            // window is on screen, and the card says what it wants.
+            if let waiting = launcher.steamWaitingOnPlayer {
+                return waiting == "ShowEula"
+                    ? Beat(title: "Accept the license agreement",
+                           detail: "It's open in Steam's window. Steam only asks the first time.",
+                           symbol: "doc.text")
+                    : Beat(title: "Steam needs your answer",
+                           detail: "It's open in Steam's window.",
+                           symbol: "hand.tap")
+            }
+            return Self.beat(for: launcher.launchPhase, step: launcher.launchStep)
+        case .running:
+            return Beat(title: "Now playing", symbol: "play.circle.fill")
+        case .stopping:
+            return Beat(title: "Quitting…", symbol: "stop.circle")
+        case .installing, .downloading:
+            return Beat(title: launcher.currentActivity ?? "Preparing download…", symbol: "arrow.down.circle")
+        default:
+            return Beat(title: launcher.currentActivity ?? "Working…", symbol: "arrow.down.circle")
+        }
+    }
+
+    private static func beat(for phase: Launcher.LaunchPhase, step: String?) -> Beat {
+        // One glyph for the usual launch: the play circle breathes while it
+        // gets ready, then fills in green when the game is up.
+        switch phase {
+        case .gettingReady:
+            return Beat(title: "Getting ready…", symbol: "play.circle")
+        case .settingUpSteam:
+            return Beat(title: "Setting up Steam…", detail: "This only happens once.", symbol: "arrow.down.circle")
+        case .updatingSteam:
+            return Beat(title: "Updating Steam…", symbol: "arrow.triangle.2.circlepath")
+        case .startingGame:
+            // A glimpse of what Steam is doing, kept to the happy path.
+            return Beat(title: "Starting the game…", detail: step, symbol: "play.circle")
+        case .checkingFiles:
+            return Beat(title: "Checking game files…", symbol: "doc.text.magnifyingglass")
+        }
+    }
+
+    /// "Just started", then whole minutes: the card isn't a stopwatch.
+    private static func playTime(since start: Date, now: Date) -> String {
+        let minutes = Int(now.timeIntervalSince(start) / 60)
+        guard minutes >= 1 else { return "Just started" }
+        return Duration.seconds(minutes * 60)
+            .formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
+    }
+
+    // MARK: Progress
+
     /// Staged fraction plus a gentle creep while the current stage is in
     /// flight — keeps the bar moving during a 20 s Steam boot even when
     /// connection_log markers arrive in bursts.
     private func effectiveLaunchTarget(at date: Date) -> Double {
         let staged = launcher.launchStageFraction
+        // Waiting on the player (Steam's sign-in, a game's EULA): no creep,
+        // the bar holds.
+        guard launcher.steamSignIn == nil, launcher.steamWaitingOnPlayer == nil else { return staged }
         let stallSeconds = date.timeIntervalSince(stageReachedAt)
         let creep = min(stallSeconds * 0.005, 0.14)
         return min(staged + creep, 0.92)
@@ -1710,101 +1623,91 @@ private struct StatusCard: View {
         }
     }
 
-    @ViewBuilder
-    private var statusIcon: some View {
-        Group {
-            switch launcher.launchState {
-            case .running:
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            case .stopping:
-                Image(systemName: "stop.circle")
-                    .foregroundStyle(.secondary)
-            case .launching:
-                Image(systemName: launcher.launchStageIcon)
-                    .foregroundStyle(Color.accentColor)
-                    .symbolEffect(.pulse, options: .repeating.speed(0.35))
-                    .contentTransition(.symbolEffect(.replace))
-                    .animation(.snappy(duration: 0.35), value: launcher.launchStageIcon)
-            default:
-                Image(systemName: "arrow.down.circle")
-                    .foregroundStyle(Color.accentColor)
+    // MARK: Icon & log
+
+    /// One glyph that morphs between beats. It breathes while the launch
+    /// is in flight, its ring turns while the game starts, and it fills in
+    /// and bounces green the moment the game is up. The symbol stays in place
+    /// under the turning ring so that bounce still plays, and the ring
+    /// inherits its font so the two are the same size.
+    private func statusIcon(_ symbol: String) -> some View {
+        let turning = symbol == "play.circle" && launcher.isLaunching && launcher.launchPhase == .startingGame
+        return Image(systemName: symbol)
+            .foregroundStyle(iconTint)
+            .contentTransition(.symbolEffect(.replace))
+            .symbolEffect(.pulse, options: .repeating.speed(0.35), isActive: launcher.isLaunching && !turning)
+            .symbolEffect(.bounce, value: launcher.isRunning)
+            .animation(.snappy(duration: 0.35), value: symbol)
+            .opacity(turning ? 0 : 1)
+            .overlay {
+                if turning {
+                    TurningPlayGlyph(tint: iconTint)
+                        .transition(.opacity)
+                }
             }
-        }
-        .font(.title2.weight(.semibold))
-        .symbolRenderingMode(.hierarchical)
-        .frame(width: CompatCardRowMetrics.iconColumnWidth, alignment: .center)
+            .animation(.smooth(duration: 0.3), value: turning)
+            .font(.title2.weight(.semibold))
+            .symbolRenderingMode(.hierarchical)
+            .frame(width: CompatCardRowMetrics.iconColumnWidth, alignment: .center)
     }
 
-    private func statusMessage(at date: Date) -> String {
+    private var iconTint: Color {
         switch launcher.launchState {
-        case .installing, .downloading:
-            return launcher.currentActivity ?? "Preparing download…"
-        case .launching:
-            return launcher.currentActivity ?? "Getting Steam ready…"
-        case .running:
-            return "\(game.name) is running"
-        case .stopping:
-            return "Stopping…"
-        default:
-            return launcher.currentActivity ?? "Working…"
+        case .running:  return .green
+        case .stopping: return .secondary
+        default:        return .accentColor
         }
     }
 
-    /// One-line context under the primary status — makes the wait feel
-    /// purposeful rather than a generic spinner.
-    private func statusSubtitle(at date: Date) -> String? {
-        guard launcher.isLaunching else { return nil }
-        let activity = launcher.currentActivity ?? ""
-        let elapsed = Int(date.timeIntervalSince(cardAppearedAt))
-
-        if activity.contains("Steam is ready") {
-            return "Signed in — launching your game next"
+    /// The launch log stays one hover away: useful when something goes
+    /// wrong, noise when it doesn't.
+    private var logButton: some View {
+        Button {
+            openWindow(id: "launch-log")
+        } label: {
+            Image(systemName: "terminal")
+                .font(.caption)
         }
-        if activity.contains("Finishing sign-in") {
-            return "Valve confirmed your session"
-        }
-        if activity.contains("Signing in to your Steam account") {
-            return "Using your saved Steam session"
-        }
-        if activity.contains("Connected to Steam servers") {
-            return "Online with Valve — authenticating now"
-        }
-        if activity.contains("Connecting to Steam servers") {
-            return elapsed >= 8 ? "First launch can take up to 30 seconds" : "Looking for Valve login servers"
-        }
-        if activity.contains("Starting Steam client") || activity.contains("Starting Steam") {
-            return elapsed >= 6 ? "Waking Steam in the background — no windows will appear" : "Launching the Steam client silently"
-        }
-        if activity.contains("Steam is updating itself") {
-            return "Applying a quick client update, then continuing"
-        }
-        if activity.contains("Downloading Steam client") {
-            return "One-time setup — only needed for Play Online"
-        }
-        if activity.contains("through Steam") {
-            return "Steam is handing off to the game"
-        }
-        if activity.contains("validating") {
-            return "Steam is checking your install — this finishes on its own"
-        }
-        if activity.contains("Waiting for game") {
-            return "Almost there"
-        }
-        if activity.contains("Connecting to Steam") {
-            return "Preparing the online launch path"
-        }
-        return elapsed >= 10 ? "Still working — check Logs if this takes over a minute" : nil
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help("Show Launch Log")
+        .accessibilityLabel("Show Launch Log")
+        .opacity(isHovering ? 1 : 0)
+        .animation(.easeOut(duration: 0.15), value: isHovering)
     }
+}
 
-    private func elapsedText(at date: Date) -> String? {
-        let start: Date? = launcher.runningSince
-        guard let start else { return nil }
-        let secs = Int(date.timeIntervalSince(start))
-        guard secs >= 3 else { return nil }
-        let mins = secs / 60
-        let rem  = secs % 60
-        return mins > 0 ? "\(mins)m \(rem)s" : "\(rem)s"
+/// `play.circle` while the game starts: a stretch of the symbol's own ring
+/// turns over the dimmed ring. Built from the symbols themselves in the
+/// status icon's font, so it is exactly the still glyph's size. Drawn to
+/// the symbol's frame instead, the ring was 17% larger (user, Oct 12 2026).
+private struct TurningPlayGlyph: View {
+    let tint: Color
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var turning = false
+
+    var body: some View {
+        Image(systemName: "play.circle")
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(tint, tint.opacity(0.25))
+            .overlay {
+                // `circle` draws the same ring as `play.circle`; a wedge
+                // from the centre shows 28% of it.
+                Image(systemName: "circle")
+                    .foregroundStyle(tint)
+                    .mask {
+                        GeometryReader { proxy in
+                            Circle()
+                                .trim(from: 0, to: 0.28)
+                                .stroke(lineWidth: max(proxy.size.width, proxy.size.height))
+                                .rotationEffect(.degrees(turning ? 270 : -90))
+                                .animation(reduceMotion ? nil : .linear(duration: 1).repeatForever(autoreverses: false),
+                                           value: turning)
+                        }
+                    }
+            }
+            .onAppear { turning = true }
     }
 }
 
@@ -1917,9 +1820,11 @@ private struct AchievementRow: View {
                     .lineLimit(1)
 
                 if let date = achievement.unlockDate {
-                    Text(date, style: .relative)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    TimelineView(.everyMinute) { context in
+                        Text(Self.unlockedText(date, now: context.date))
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
 
@@ -1935,6 +1840,16 @@ private struct AchievementRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .contentShape(Rectangle())  // make the full row hit-test
+    }
+
+    /// "Just now", "12 min ago", "2 hr, 5 min ago" within a day, then the
+    /// date. Whole minutes: a live `.relative` Text counted the seconds.
+    private static func unlockedText(_ date: Date, now: Date) -> String {
+        let minutes = Int(now.timeIntervalSince(date) / 60)
+        guard minutes >= 1 else { return "Just now" }
+        guard minutes < 24 * 60 else { return date.formatted(date: .abbreviated, time: .omitted) }
+        return Duration.seconds(minutes * 60)
+            .formatted(.units(allowed: [.hours, .minutes], width: .abbreviated)) + " ago"
     }
 }
 
@@ -2160,7 +2075,7 @@ private struct BannerCompatBadge: View {
         case .playable: return "Verified, with a few known issues"
         case .launches: return "Runs, with some known issues"
         case .broken:   return "Not currently compatible"
-        case .untested: return "Not yet tested — give it a try"
+        case .untested: return "Not yet tested. Give it a try"
         }
     }
 

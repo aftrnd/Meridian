@@ -8,7 +8,7 @@
  * helper wraps it with CryptProtectData, and Meridian writes the result to
  * AppData/Local/Steam/local.vdf. At sign-in time, the same engine's steam.exe
  * calls CryptUnprotectData on the same bytes, which succeeds because:
- *   - The DPAPI key is salted with GetUserNameA() → always "crossover" in our bottles
+ *   - The DPAPI key is salted with GetUserNameA() → always "steamuser" in our prefixes
  *   - Wine's crypt32 protectdata_secret is a compile-time constant
  *   - The salt is embedded in the blob itself
  *   - Entropy (if any) is supplied by both sides

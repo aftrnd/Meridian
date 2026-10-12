@@ -139,6 +139,14 @@ struct ContentView: View {
                     .animation(.smooth(duration: 0.2), value: steamWindow.actionableDialogTitle)
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
+                        // Steam boots in the background so Play is instant. A
+                        // moment after the window settles, so Wine's start-up
+                        // never competes with the launch animation; only for
+                        // players (something installed) already signed in to Steam.
+                        try? await Task.sleep(for: .seconds(2))
+                        if !Task.isCancelled, library.games.contains(where: \.isInstalled) {
+                            session.warmUp(engine: engine)
+                        }
                     }
                     .onAppear {
                         guard !hasCheckedSetup else { return }
@@ -162,10 +170,30 @@ struct ContentView: View {
                             showSetupSheet = true
                         }
                     }
-                    .sheet(isPresented: $showSetupSheet) {
-                        SetupSheet()
-                            .interactiveDismissDisabled()
+                    // Onboarding is a card centred on the window (a sheet would
+                    // drop from the title bar), over a dimmed, click-blocking scrim.
+                    .overlay {
+                        if showSetupSheet {
+                            ZStack {
+                                Color.black.opacity(0.35)
+                                    .ignoresSafeArea()
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {}
+                                SetupSheet(onFinish: { showSetupSheet = false })
+                                    .background(Color(nsColor: .windowBackgroundColor))
+                                    .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                                    .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous)
+                                        .strokeBorder(.separator, lineWidth: 0.5))
+                                    .shadow(color: .black.opacity(0.35), radius: 40, y: 18)
+                                    .padding(24)
+                                    .transition(.scale(scale: 0.96).combined(with: .opacity))
+                            }
+                            // Centre on the whole window, not the area below the toolbar.
+                            .ignoresSafeArea()
+                            .transition(.opacity)
+                        }
                     }
+                    .animation(.smooth(duration: 0.35), value: showSetupSheet)
             }
         }
         .onChange(of: bootstrap.isReady) { _, ready in
@@ -215,9 +243,10 @@ struct ContentView: View {
     private var mainContent: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(selectedDestination: $sidebarDestination)
-                // Default AND minimum = 1/6 of the 1016 pt default window,
-                // rounded to the nearest 8 → 168.
-                .navigationSplitViewColumnWidth(min: 168, ideal: 168, max: .infinity)
+                // Fixed at exactly 1/5 of the 1040 pt default window. A
+                // resizable column let a dragged width (225.5 pt) persist in
+                // the split view's autosave and override the default.
+                .navigationSplitViewColumnWidth(208)
         } detail: {
             NavigationStack {
                 stage

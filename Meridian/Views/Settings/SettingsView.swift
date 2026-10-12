@@ -49,6 +49,10 @@ struct SettingsView: View {
 /// can be walked through enabling a flag without a debug build.
 private struct DeveloperSettingsTab: View {
     @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
+    @AppStorage("wineDebugChannels") private var wineDebugChannels = ""
+    @Environment(WineEngine.self) private var engine
+    @State private var collecting = false
+    @State private var diagnosticsError: String?
 
     var body: some View {
         Form {
@@ -74,8 +78,42 @@ private struct DeveloperSettingsTab: View {
                 Text("Work-in-progress features. Off by default; changes apply immediately.")
                     .font(.caption)
             }
+
+            Section {
+                TextField("Wine trace channels", text: $wineDebugChannels, prompt: Text("+mfplat,+loaddll"))
+                    .font(.system(.body, design: .monospaced))
+                    .autocorrectionDisabled()
+                HStack {
+                    Button(collecting ? "Collecting…" : "Collect Diagnostics") { collectDiagnostics() }
+                        .disabled(collecting)
+                    Button("Open Logs Folder") { NSWorkspace.shared.open(LogFileWriter.logsDir) }
+                }
+                if let diagnosticsError {
+                    Text(diagnosticsError).font(.caption).foregroundStyle(.red)
+                }
+            } header: {
+                Text("Game Debugging")
+            } footer: {
+                Text("Every game's Wine output is saved to its log (Open Game Log in the game's menu). Trace channels add detail, for example +mfplat for video or +loaddll for missing DLLs; Steam restarts at the next launch to apply them. Collect Diagnostics zips every log, Steam's logs and recent crash reports.")
+                    .font(.caption)
+            }
         }
         .formStyle(.grouped)
+    }
+
+    private func collectDiagnostics() {
+        collecting = true
+        diagnosticsError = nil
+        Task {
+            defer { collecting = false }
+            do {
+                let zip = try await DiagnosticsBundle.collect(prefix: .defaultPrefix,
+                                                              summary: DiagnosticsBundle.summary(engine: engine))
+                NSWorkspace.shared.activateFileViewerSelecting([zip])
+            } catch {
+                diagnosticsError = "Couldn't collect diagnostics: \(error.localizedDescription)"
+            }
+        }
     }
 }
 
@@ -127,7 +165,7 @@ private struct SteamSettingsTab: View {
             Section("Library") {
                 @Bindable var library = library
                 Toggle("Show Hidden Games", isOn: $library.showHiddenGames)
-                Text("Hidden games are still tracked — they just won't appear in your library.")
+                Text("Hidden games are still tracked. They just won't appear in your library.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -188,8 +226,11 @@ private struct SteamSettingsTab: View {
             )
             steamAuth.apiKey = key
             await steamAuth.refreshProfile(steamID: steamAuth.steamID)
+            // The key lives in the Keychain, which SwiftUI can't observe, so
+            // nothing else reloads the library (same call as AuthView's key step).
+            await library.refresh(steamID: steamAuth.steamID, apiKey: key)
             validationSuccess = true
-            validationMessage = "Key verified — library will refresh automatically."
+            validationMessage = "Key verified. Your library will refresh automatically."
         } catch {
             validationSuccess = false
             validationMessage = "Couldn't verify key. Check it's correct and your profile is public."
@@ -222,7 +263,7 @@ private struct EngineSettingsTab: View {
                     get: { settings.msyncEnabled },
                     set: { settings.msyncEnabled = $0 }
                 ))
-                Text("Native Mach-semaphore synchronization. Lower CPU overhead than the legacy path on Apple Silicon — leave on unless a specific game misbehaves. Restart any running game after changing.")
+                Text("Native Mach-semaphore synchronization. Lower CPU overhead than the legacy path on Apple Silicon. Leave on unless a specific game misbehaves. Restart any running game after changing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -325,8 +366,8 @@ private struct PermissionsSettingsTab: View {
                     iconColor: steamWindow.isPermissionGranted ? .green : .orange,
                     title: "Accessibility",
                     detail: steamWindow.isPermissionGranted
-                        ? "Granted — Steam windows will be suppressed automatically."
-                        : "Not granted — Steam UI may appear during installs and launches.",
+                        ? "Granted. Steam windows will be suppressed automatically."
+                        : "Not granted. Steam UI may appear during installs and launches.",
                     status: steamWindow.isPermissionGranted ? .granted : .notGranted,
                     onGrant: { steamWindow.requestPermission() },
                     onOpenSettings: {
@@ -401,11 +442,11 @@ private struct PermissionsSettingsTab: View {
     private var notificationsDetail: String {
         switch notificationsStatus {
         case .authorized, .provisional, .ephemeral:
-            return "Granted — you'll be notified when game downloads finish."
+            return "Granted. You'll be notified when game downloads finish."
         case .denied:
-            return "Blocked — open System Settings to re-enable notifications."
+            return "Blocked. Open System Settings to re-enable notifications."
         default:
-            return "Not granted — Meridian won't be able to notify you when installs complete."
+            return "Not granted. Meridian won't be able to notify you when installs complete."
         }
     }
 }
@@ -645,7 +686,7 @@ private struct UpdatesSettingsTab: View {
                 Image(systemName: "arrow.down.circle.fill")
                     .font(.title2)
                     .foregroundStyle(.blue)
-                Text("An update is available — see below.")
+                Text("An update is available. See below.")
                     .fontWeight(.medium)
                 Spacer()
             }

@@ -18,7 +18,7 @@ private let log = MeridianLog(category: "SteamClientBootstrap")
 /// `steam_client_win64` manifest's `steam_win64_steamrow` package contains the
 /// **64-bit** `steam.exe` (PE32+, 5.8 MB) which reports Windows 10, requests the
 /// correct `steam_client_win64` manifest, and downloads/authenticates correctly
-/// — byte-identical to a working CrossOver bottle's steam.exe. Both 32- and
+/// — byte-identical to a known-good Steam prefix's steam.exe. Both 32- and
 /// 64-bit binaries declare the Win10 manifest GUID, so this is NOT a manifest /
 /// version-clamp issue: it is purely the bootstrapper binary's bitness/networking.
 struct SteamClientBootstrap {
@@ -207,7 +207,10 @@ struct SteamClientBootstrap {
                 continue
             }
 
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let base = downloadedBytes
+            let (data, response) = try await ProgressDownload.fetch(url) { received in
+                progress(base + received, totalBytes)
+            }
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             guard status == 200 else {
                 log.error("[downloadAndInstall] \(pkg.name) download failed: HTTP \(status)")
@@ -465,5 +468,65 @@ with zipfile.ZipFile(src) as z:
                 return "steamui.dll not found after extracting all packages"
             }
         }
+    }
+}
+
+// MARK: - Progress download
+
+/// Downloads a URL into memory and reports received bytes as they arrive
+/// (about every 1 MB), so a 150 MB package doesn't freeze the progress ring.
+private final class ProgressDownload: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    // Delegate callbacks arrive on the session's serial delegate queue.
+    private var data = Data()
+    private var response: URLResponse?
+    private var lastReported: Int64 = 0
+    private let onBytes: @Sendable (Int64) -> Void
+    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+
+    private init(onBytes: @escaping @Sendable (Int64) -> Void) {
+        self.onBytes = onBytes
+    }
+
+    static func fetch(_ url: URL, onBytes: @escaping @Sendable (Int64) -> Void) async throws -> (Data, URLResponse) {
+        let download = ProgressDownload(onBytes: onBytes)
+        let session = URLSession(configuration: .default, delegate: download, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        let task = session.dataTask(with: url)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                download.continuation = continuation
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        self.response = response
+        if response.expectedContentLength > 0 { data.reserveCapacity(Int(response.expectedContentLength)) }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        data.append(chunk)
+        let received = Int64(data.count)
+        if received - lastReported >= 1_048_576 {
+            lastReported = received
+            onBytes(received)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            continuation?.resume(throwing: error)
+        } else if let response {
+            onBytes(Int64(data.count))
+            continuation?.resume(returning: (data, response))
+        } else {
+            continuation?.resume(throwing: URLError(.badServerResponse))
+        }
+        continuation = nil
     }
 }

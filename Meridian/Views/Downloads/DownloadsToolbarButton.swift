@@ -117,10 +117,11 @@ private struct DownloadsPopoverContent: View {
                         .font(.subheadline.weight(.medium))
                         .lineLimit(1)
 
-                    if let activity = launcher.currentActivity {
-                        Text(activity)
+                    if let status = launcher.downloadProgressText ?? launcher.currentActivity {
+                        Text(status)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .monospacedDigit()
                             .lineLimit(1)
                     }
                 }

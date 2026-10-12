@@ -1,5 +1,5 @@
 diff --git a/DepotDownloader/ContentDownloader.cs b/DepotDownloader/ContentDownloader.cs
-index a59a69f..c48f1d7 100644
+index a59a69f..85fb130 100644
 --- a/DepotDownloader/ContentDownloader.cs
 +++ b/DepotDownloader/ContentDownloader.cs
 @@ -29,6 +29,17 @@ namespace DepotDownloader
@@ -129,7 +129,23 @@ index a59a69f..c48f1d7 100644
          static uint GetSteam3AppBuildNumber(uint appId, string branch)
          {
              if (appId == INVALID_APP_ID)
-@@ -590,7 +703,39 @@ namespace DepotDownloader
+@@ -309,9 +422,13 @@ namespace DepotDownloader
+ 
+         public static bool InitializeSteam3(string username, string password)
+         {
+-            string loginToken = null;
++            // Meridian: log on with the refresh token the caller passed (-refreshtoken),
++            // never a token remembered in account.config. Upstream only ever read the
++            // stored one, so -refreshtoken was silently ignored and every token logon
++            // failed with "LogOn requires ... access token" once the store was empty.
++            string loginToken = Config.RefreshToken;
+ 
+-            if (username != null && Config.RememberPassword)
++            if (loginToken == null && username != null && Config.RememberPassword)
+             {
+                 _ = AccountSettingsStore.Instance.LoginTokens.TryGetValue(username, out loginToken);
+             }
+@@ -590,7 +707,39 @@ namespace DepotDownloader
  
              try
              {
@@ -169,7 +185,7 @@ index a59a69f..c48f1d7 100644
              }
              catch (OperationCanceledException)
              {
-@@ -941,6 +1086,12 @@ namespace DepotDownloader
+@@ -941,6 +1090,12 @@ namespace DepotDownloader
                  }
              });
  
@@ -182,7 +198,7 @@ index a59a69f..c48f1d7 100644
              return new DepotFilesData
              {
                  depotDownloadInfo = depot,
-@@ -1369,6 +1520,15 @@ namespace DepotDownloader
+@@ -1369,6 +1524,15 @@ namespace DepotDownloader
                  downloadCounter.totalBytesUncompressed += chunk.UncompressedLength;
  
                  Ansi.Progress(downloadCounter.totalBytesUncompressed, downloadCounter.completeDownloadSize);

@@ -101,8 +101,8 @@ final class CardLayoutMetricsTests: XCTestCase {
         )
         XCTAssertTrue(grid.contains("static var referenceCardWidth"),
                       "The column step must anchor to the default-window card size.")
-        XCTAssertTrue(grid.contains("static let defaultContentWidth: CGFloat = 848"),
-                      "The anchor must match AppDelegate.fullFrameSize (1016) minus the sidebar ideal (168).")
+        XCTAssertTrue(grid.contains("static let defaultContentWidth: CGFloat = 832"),
+                      "The anchor must match AppDelegate.fullFrameSize (1040) minus the sidebar (208).")
         XCTAssertTrue(grid.contains("floor(containerWidth / (referenceCardWidth + s))"),
                       "Column count must step on the reference card size, not the old 155pt target.")
 
@@ -112,5 +112,25 @@ final class CardLayoutMetricsTests: XCTestCase {
         )
         XCTAssertTrue(home.contains("maxCards: 5"),
                       "Home rows clamp to 5 columns max (user direction July 12 2026).")
+    }
+
+    /// The scroll phase flips several times per flick. As view state it
+    /// re-ran the Library body (filter, sort, grid, scroll insets), the Home
+    /// row and every visible card each time (Instruments, Oct 11 2026).
+    func testScrollPhase_reachesCardsWithoutViewState() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        func source(_ path: String) throws -> String {
+            try String(contentsOf: root.appending(path: path), encoding: .utf8)
+        }
+        let grid = try source("Meridian/Views/Library/GameGridView.swift")
+        XCTAssertTrue(grid.contains("final class CardHoverGate"))
+        XCTAssertFalse(grid.contains(".onHover {"),
+                       "one hover responder per card: the onHover recovery only ever fired mid-scroll, where hover is off")
+        for path in ["Meridian/Views/Library/LibraryView.swift", "Meridian/Views/HomeView.swift",
+                     "Meridian/Views/Library/SearchView.swift"] {
+            let view = try source(path)
+            XCTAssertTrue(view.contains("hoverGate.scrollPhaseChanged(to:"), path)
+            XCTAssertFalse(view.contains("isScrolling"), "\(path) must not keep the scroll phase in view state")
+        }
     }
 }

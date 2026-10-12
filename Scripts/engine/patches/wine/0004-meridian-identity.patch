@@ -1,0 +1,290 @@
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -7,13 +7,13 @@
+     <key>CFBundleDevelopmentRegion</key>
+     <string>English</string>
+     <key>CFBundleExecutable</key>
+-    <string>wineloader</string><!-- CrossOver Hack 10913 -->
++    <string>wineloader</string>
+     <key>CFBundleIdentifier</key>
+-    <string>com.codeweavers.CrossOver.wineloader</string><!-- CrossOver Hack 10913 -->
++    <string>com.meridian.app.wineloader</string>
+     <key>CFBundleInfoDictionaryVersion</key>
+     <string>6.0</string>
+     <key>CFBundleName</key>
+-    <string>CrossOver-Hosted Application</string><!-- CrossOver Hack 10913 -->
++    <string>Meridian Game</string>
+     <key>CFBundlePackageType</key>
+     <string>APPL</string>
+     <key>CFBundleShortVersionString</key>
+--- a/dlls/advapi32/advapi.c
++++ b/dlls/advapi32/advapi.c
+@@ -48,11 +48,12 @@
+     DWORD len = GetEnvironmentVariableA( "WINEUSERNAME", name, *size );
+     BOOL ret;
+ 
+-    /* CrossOver Hack 12735: Use a consistent username */
+-    if (!getenv( "CX_REPORT_REAL_USERNAME" ))
++    /* Meridian: one fixed user name in every prefix (Proton's), so paths and
++     * Steam's saved sign-in do not depend on the Mac account. */
++    if (!getenv( "MERIDIAN_REPORT_REAL_USERNAME" ))
+     {
+-        len = sizeof("crossover");
+-        if ((ret = (len <= *size))) strcpy( name, "crossover" );
++        len = sizeof("steamuser");
++        if ((ret = (len <= *size))) strcpy( name, "steamuser" );
+         else SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         *size = len;
+         return ret;
+@@ -73,11 +74,11 @@
+     DWORD len = GetEnvironmentVariableW( L"WINEUSERNAME", name, *size );
+     BOOL ret;
+ 
+-    /* CrossOver Hack 12735: Use a consistent username */
+-    if (!getenv( "CX_REPORT_REAL_USERNAME" ))
++    /* Meridian: one fixed user name in every prefix (see GetUserNameA). */
++    if (!getenv( "MERIDIAN_REPORT_REAL_USERNAME" ))
+     {
+-        len = ARRAY_SIZE( L"crossover" );
+-        if ((ret = (len <= *size))) wcscpy( name, L"crossover" );
++        len = ARRAY_SIZE( L"steamuser" );
++        if ((ret = (len <= *size))) wcscpy( name, L"steamuser" );
+         else SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         *size = len;
+         return ret;
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -2632,8 +2632,8 @@
+         }
+         else if (!wcsnicmp(szTemp, L"%USERPROFILE%", lstrlenW(L"%USERPROFILE%")))
+         {
+-            /* CrossOver Hack 12735 */
+-            static const WCHAR userName[] = {'c','r','o','s','s','o','v','e','r',0};
++            /* Meridian: the fixed user name GetUserNameW reports. */
++            static const WCHAR userName[] = L"steamuser";
+ 
+             lstrcpyW(szDest, szProfilesPrefix);
+             PathAppendW(szDest, userName);
+--- a/dlls/shell32/shlexec.c
++++ b/dlls/shell32/shlexec.c
+@@ -1182,32 +1182,31 @@
+     return retval;
+ }
+ 
+-static UINT_PTR SHELL_CrossOverFallback(const WCHAR* lpFile, const WCHAR* lpVerb, WCHAR* cmdFormat, int cmdFormatSize, UINT_PTR retval)
++static UINT_PTR SHELL_NativeFallback(const WCHAR* lpFile, const WCHAR* lpVerb, WCHAR* cmdFormat, int cmdFormatSize, UINT_PTR retval)
+ {
+     /* See if there is a native association for this file.
+-     * CrossOver Hack 2412.
+      *
+      * But before that, check that this is not the file we just opened
+      * in order to avoid native -> wine -> native association loops.
+      */
+     WCHAR* nofallback=NULL;
+-    int size=GetEnvironmentVariableW(L"NOCROSSOVERFALLBACK", NULL, 0);
++    int size=GetEnvironmentVariableW(L"NONATIVEFALLBACK", NULL, 0);
+     if (size)
+     {
+         nofallback=HeapAlloc(GetProcessHeap(), 0, size*sizeof(*nofallback));
+-        GetEnvironmentVariableW(L"NOCROSSOVERFALLBACK", nofallback, size);
+-        TRACE("NoCrossOverFallback=%s\n", debugstr_w(nofallback));
++        GetEnvironmentVariableW(L"NONATIVEFALLBACK", nofallback, size);
++        TRACE("NoNativeFallback=%s\n", debugstr_w(nofallback));
+     }
+     if (!nofallback || wcscmp(nofallback, lpFile) != 0)
+     {
+-        WCHAR szFallback[MAX_PATH] = L"CrossOverFallback";
++        WCHAR szFallback[MAX_PATH] = L"NativeFallback";
+ 
+-        TRACE("Trying CrossOverFallback, verb=%s\n", debugstr_w(lpVerb));
++        TRACE("Trying NativeFallback, verb=%s\n", debugstr_w(lpVerb));
+         retval=SHELL_FindExecutableByVerb(lpVerb, NULL, szFallback, cmdFormat, cmdFormatSize);
+     }
+     if (nofallback)
+         HeapFree(GetProcessHeap(), 0, nofallback);
+-    TRACE("CrossOverFallback returning %Id\n", retval);
++    TRACE("NativeFallback returning %Id\n", retval);
+     return retval;
+ }
+ 
+@@ -1261,7 +1260,7 @@
+ 
+     if (retval <= 32)
+     {
+-        retval=SHELL_CrossOverFallback(lpFile, L"open", lpResult, MAX_PATH*sizeof(*lpResult), retval);
++        retval=SHELL_NativeFallback(lpFile, L"open", lpResult, MAX_PATH*sizeof(*lpResult), retval);
+         if (retval > 32)
+         {
+             /* Remove double quotation marks and command line arguments */
+@@ -2050,7 +2049,7 @@
+     else
+     {
+         WCHAR wCmdFormat[1024];
+-        retval=SHELL_CrossOverFallback(lpFile, sei_tmp.lpVerb, wCmdFormat, sizeof(wCmdFormat), retval);
++        retval=SHELL_NativeFallback(lpFile, sei_tmp.lpVerb, wCmdFormat, sizeof(wCmdFormat), retval);
+         if (retval > 32)
+         {
+ 
+@@ -2068,7 +2067,7 @@
+                 GetExitCodeProcess(sei->hProcess, &retcode);
+                 CloseHandle(sei->hProcess);
+                 sei->hProcess=NULL;
+-                TRACE("CrossOverFallback returned %ld\n", retcode);
++                TRACE("NativeFallback returned %ld\n", retcode);
+                 retval=(retcode == 0 ? 33 : 31);
+             }
+         }
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -1195,7 +1195,7 @@
+ 
+         if (is_halo_mcc)
+         {
+-            TRACE("CrossOver hack: faking success\n");
++            TRACE("Halo MCC: faking success\n");
+             return NtCurrentTeb()->Tib.FiberData;
+         }
+ 
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -2052,11 +2052,11 @@
+         return FALSE;
+     }
+ 
+-    /* CrossOver hack for bug 21116 */
++    /* progeCAD virtual printers hang when opened */
+     if (name && (!wcsncmp(name, L"progeCAD PDF Virtual Printer", 28) ||
+                 !wcsncmp(name, L"progeCAD Image Virtual Printer", 30)))
+     {
+-        TRACE("Crossover hack: Return error for %s printer\n", debugstr_w(name));
++        TRACE("Returning an error for the %s printer\n", debugstr_w(name));
+         *printer = NULL;
+         return FALSE;
+     }
+--- a/dlls/ieframe/iexplore.c
++++ b/dlls/ieframe/iexplore.c
+@@ -50,8 +50,7 @@
+ #define WM_UPDATEADDRBAR    (WM_APP+1)
+ 
+ /* Windows uses "Microsoft Internet Explorer" */
+-/* CrossOver: We use "CrossOver Web Browser" */
+-static const WCHAR wszWineInternetExplorer[] = L"CrossOver Web Browser";
++static const WCHAR wszWineInternetExplorer[] = L"Wine Internet Explorer";
+ 
+ static LONG obj_cnt;
+ static DWORD dde_inst;
+--- a/programs/iexplore/iexplore.inf
++++ b/programs/iexplore/iexplore.inf
+@@ -40,8 +40,8 @@
+ HKLM,"Software\Microsoft\Internet Explorer","Version",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","W2kVersion",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","svcVersion",,"11.0.9600.18376"
+-HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","DisplayName",,"CrossOver HTML engine"
+-HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","UninstallString",,"iexplore -unregserver"
++HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\WineHTML","DisplayName",,"Wine HTML engine"
++HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\WineHTML","UninstallString",,"iexplore -unregserver"
+ 
+ 
+ [Strings]
+--- a/dlls/mshtml/mshtml.inf
++++ b/dlls/mshtml/mshtml.inf
+@@ -116,7 +116,7 @@
+ HKCR,".gif","Content Type",,"image/gif"
+ HKCR,"giffile",,,"GIF Image"
+ HKCR,"giffile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"giffile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"giffile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"giffile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -164,7 +164,7 @@
+ HKCR,".jpe","Content Type",,"image/jpeg"
+ HKCR,"jpegfile",,,"JPEG Image"
+ HKCR,"jpegfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"jpegfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"jpegfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"jpegfile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -180,7 +180,7 @@
+ HKCR,".jpeg","Content Type",,"image/jpeg"
+ HKCR,"jpegfile",,,"JPEG Image"
+ HKCR,"jpegfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"jpegfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"jpegfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"jpegfile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -192,7 +192,7 @@
+ HKCR,".jpg","Content Type",,"image/jpeg"
+ HKCR,"jpegfile",,,"JPEG Image"
+ HKCR,"jpegfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"jpegfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"jpegfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"jpegfile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -234,7 +234,7 @@
+ HKCR,".jfif","Content Type",,"image/jpeg"
+ HKCR,"pjpegfile",,,"JPEG Image"
+ HKCR,"pjpegfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"pjpegfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"pjpegfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"pjpegfile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -248,7 +248,7 @@
+ HKCR,".png","Content Type",,"image/png"
+ HKCR,"pngfile",,,"PNG Image"
+ HKCR,"pngfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"pngfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"pngfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"pngfile\shell\open\ddeexec\Application",,,"IExplore"
+@@ -299,7 +299,7 @@
+ HKCR,".xbm","Content Type",,"image/x-xbitmap"
+ HKCR,"xbmfile",,,"XBM Image"
+ HKCR,"xbmfile\CLSID",,,"%CLSID_HTMLDocument%"
+-; CrossOver hack, bug 7778
++; Opens in the Mac browser (winebrowser)
+ HKCR,"xbmfile\shell\open\command",,,"%11%\winebrowser.exe -nohome"
+ HKCR,"xbmfile\shell\open\ddeexec",,,"""file:%%1"",,-1,,,,,"
+ HKCR,"xbmfile\shell\open\ddeexec\Application",,,"IExplore"
+--- a/programs/winedbg/winedbg.rc
++++ b/programs/winedbg/winedbg.rc
+@@ -54,9 +54,7 @@
+     LTEXT           "The program %s has encountered a serious problem and needs \
+                     to close. We are sorry for the inconvenience.",
+                     IDC_STATIC_TXT1,27,10,224,30
+-    CONTROL         "This can be caused by a problem in the program or a deficiency in Wine. \
+-                    You may want to check <a href=\"https://www.codeweavers.com/compatibility/\">https://www.codeweavers.com/compatibility/</a> \
+-                    for tips about running this application.",
++    CONTROL         "This can be caused by a problem in the program or a deficiency in Wine.",
+                     IDC_STATIC_TXT2,"SysLink",0,27,60,224,100
+     DEFPUSHBUTTON   "Close", IDOK, 205, 151, 60, 16, WS_TABSTOP
+     PUSHBUTTON      "Show &Details", ID_DETAILS, 140, 151, 60, 16, WS_TABSTOP
+@@ -68,10 +66,8 @@
+ FONT 8, "MS Shell Dlg"
+ BEGIN
+     EDITTEXT        IDC_CRASH_TXT, 4, 4, 392, 272, ES_MULTILINE | ES_READONLY | WS_HSCROLL | WS_VSCROLL, WS_TABSTOP
+-    CONTROL         "If this problem is not present under Windows and has not been reported yet, \
+-                     you can save the detailed information to a file using the \"Save As\" button, \
+-                     then <a href=\"https://www.codeweavers.com/support/tickets/enter/\">file a bug report</a> \
+-                     and attach that file to the report.",
++    CONTROL         "If this problem is not present under Windows, you can save the detailed \
++                     information to a file using the \"Save As\" button.",
+                     IDC_STATIC_TXT2,"SysLink",0,6,285,388,32
+     DEFPUSHBUTTON   "Close", IDOK, 326, 320, 70, 16, WS_TABSTOP
+     PUSHBUTTON      "&Save As...", ID_SAVEAS, 252, 320, 70, 16, WS_TABSTOP
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1320,7 +1320,7 @@
+ 
+ static void init_non_native_support(void)
+ {
+-    char *libd3dshared_path = getenv( "CX_APPLEGPTK_LIBD3DSHARED_PATH" );
++    char *libd3dshared_path = getenv( "MERIDIAN_GPTK_LIBD3DSHARED_PATH" );
+ 
+     register_non_native_code_region = NULL;
+     supports_non_native_code_regions = NULL;

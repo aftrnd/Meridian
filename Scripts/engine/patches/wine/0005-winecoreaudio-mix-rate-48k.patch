@@ -1,0 +1,17 @@
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -1218,6 +1218,14 @@
+         params->result = osstatus_to_hresult(sc);
+         return STATUS_SUCCESS;
+     }
++    /* Meridian: games never need more than 48 kHz. At a pro interface's 96
++     * or 192 kHz a game mixes and resamples two to four times the audio, under
++     * Rosetta, on its own audio thread: Endacopia's SDL2 spent 20% of a core
++     * just converting one stream to 96 kHz and fell behind in busy rooms.
++     * Report 48 kHz (44.1 kHz for its multiples); the AudioUnit converts to
++     * the device rate natively. */
++    if (params->flow == eRender && rate > 48000)
++        rate = ((UINT)rate % 44100) ? 48000 : 44100;
+     params->fmt->Format.nSamplesPerSec = rate;
+ 
+     params->fmt->Format.wBitsPerSample = 32;

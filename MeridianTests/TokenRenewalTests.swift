@@ -177,6 +177,52 @@ final class TokenRenewalTests: XCTestCase {
                       "restoreSession must kick off renewSessionIfNeeded() so the token is validated every cold start.")
     }
 
+    // MARK: - Renewal only near expiry
+
+    /// Mirror of `SteamCredentialAuth.refreshTokenExpiry`. Keep in sync.
+    private func expiry(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count == 3 else { return nil }
+        var payload = parts[1].replacingOccurrences(of: "-", with: "+")
+                              .replacingOccurrences(of: "_", with: "/")
+        while payload.count % 4 != 0 { payload += "=" }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = json["exp"] as? Double
+        else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    private func jwt(payload: String) -> String {
+        let b64 = Data(payload.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "eyJhbGciOiJFZERTQSJ9.\(b64).c2ln"
+    }
+
+    func testRefreshTokenExpiry_readsExpClaim() {
+        // Shape of a real Meridian QR token (Pattern 6 decode), exp = 1795205532.
+        let token = jwt(payload: #"{"iss":"steam","sub":"76561198047018335","aud":["client","web","renew","derive"],"exp":1795205532,"per":1}"#)
+        XCTAssertEqual(expiry(token), Date(timeIntervalSince1970: 1795205532))
+    }
+
+    func testRefreshTokenExpiry_nilForNonJWT() {
+        XCTAssertNil(expiry("not-a-jwt"), "Undecodable tokens must fall through to a renewal attempt, not skip it.")
+        XCTAssertNil(expiry(jwt(payload: #"{"sub":"1"}"#)), "No exp claim → unknown expiry → renew.")
+    }
+
+    func testRenewSession_skipsWhileTokenHasTimeLeft() throws {
+        let auth = try readSource("Meridian/Steam/SteamCredentialAuth.swift")
+        XCTAssertTrue(auth.contains("nonisolated static func refreshTokenExpiry("),
+                      "SteamCredentialAuth must expose refreshTokenExpiry (mirrored above).")
+        let svc = try readSource("Meridian/Steam/SteamAuthService.swift")
+        XCTAssertTrue(svc.contains("SteamCredentialAuth.refreshTokenExpiry(token)"),
+                      "renewSessionIfNeeded must check expiry before calling Valve — per-launch exchanges feed the anti-abuse lockout (Pattern 23).")
+        XCTAssertTrue(svc.contains("expiry.timeIntervalSinceNow > Self.renewalWindow"),
+                      "Renewal must be skipped while the token is outside the renewal window.")
+    }
+
     func testInstallExit3_routesToReauth() throws {
         let src = try readSource("Meridian/Launch/Launcher.swift")
         XCTAssertTrue(src.contains("refreshTokenInvalid"),

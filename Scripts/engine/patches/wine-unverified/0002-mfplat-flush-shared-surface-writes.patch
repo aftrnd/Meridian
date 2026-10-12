@@ -1,0 +1,21 @@
+--- a/dlls/mfplat/buffer.c
++++ b/dlls/mfplat/buffer.c
+@@ -1004,6 +1004,18 @@
+     {
+         ID3D11DeviceContext_CopySubresourceRegion(immediate_context, (ID3D11Resource *)buffer->dxgi_surface.texture,
+                 buffer->dxgi_surface.sub_resource_idx, 0, 0, 0, (ID3D11Resource *)buffer->dxgi_surface.rb_texture, 0, NULL);
++
++        /* Meridian: a shared texture is read on another device (Unity's
++         * VideoPlayer opens the decoded frames on its render device). Submit
++         * the copy, or the other device never sees the frame: DXMT records
++         * work until Flush/Present, and this device never presents. */
++        {
++            D3D11_TEXTURE2D_DESC desc;
++            ID3D11Texture2D_GetDesc(buffer->dxgi_surface.texture, &desc);
++            if (desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
++                    | D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
++                ID3D11DeviceContext_Flush(immediate_context);
++        }
+     }
+ 
+     ID3D11DeviceContext_Release(immediate_context);

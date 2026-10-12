@@ -9,6 +9,7 @@ struct SearchView: View {
     @Environment(\.detailPresented) private var detailPresented
 
     @State private var searchText = ""
+    @State private var hoverGate = CardHoverGate()
 
     private static let gridSpacing: CGFloat = 16
     private let columns = [
@@ -98,6 +99,8 @@ struct SearchView: View {
         }
         .ignoresSafeArea(edges: [.top, .bottom])
         .scrollIndicators(.hidden)
+        .onScrollPhaseChange { _, phase in hoverGate.scrollPhaseChanged(to: phase) }
+        .environment(\.cardHoverGate, hoverGate)
     }
 
     private func gameState(for game: Game) -> GameCardState {

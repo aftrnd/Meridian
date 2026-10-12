@@ -12,7 +12,7 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 
 **It is your real Steam library.** Meridian signs in to your Steam account, installs games from Steam's own content servers, and shows your playtime and achievements. Every game you own on Steam is right there.
 
-**Fast, quiet launches.** By default a game starts directly through the engine in a few seconds, with no Steam client window and nothing else on screen. When a game needs the Steam client (Steam DRM, online multiplayer, cloud saves), switch it to Online with one click and Meridian runs it through the real Steam client instead.
+**Fast, quiet launches.** DRM-free games start directly through the engine in a few seconds, with no Steam client window and nothing else on screen. Games built on Steamworks (Steam DRM, online multiplayer, cloud saves) run through the real Steam client, which Meridian keeps in the background.
 
 **Sign in once.** Steam authentication uses the same refresh-token flow as Steam's own clients, including QR sign-in from the Steam mobile app. After the first sign-in, everything is silent.
 
@@ -38,7 +38,7 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 
 - **One-click installs** using a native arm64 build of DepotDownloader, with live progress based on real bytes on disk
 - **Compatibility database** of per-game fixes (launch arguments, DLL overrides, renderer choice, engine quirks) applied automatically at launch
-- **Two launch modes per game.** Play runs the game directly through the engine. Play Online runs it through the real Steam client for cloud saves, multiplayer, and Steam DRM. Games that require the Steam client are detected and prompt for Online automatically.
+- **Two launch paths.** DRM-free games run directly through the engine. Games that use Steamworks are detected and run through the real Steam client, for cloud saves, multiplayer, and Steam DRM.
 - **Launch loader** that shows exactly what Meridian is doing, from preparing the engine to handing off to the game
 - **Metal Performance HUD** and a forced virtual desktop for games that need a fixed resolution
 
@@ -53,7 +53,8 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 Windows game (.exe)
   -> Wine 11 with the CodeWeavers patch set   Win32 API translation
      -> DXMT                                   Direct3D 10/11 to Metal
-     -> DXVK + MoltenVK                        Direct3D 9 and Vulkan to Metal
+     -> wined3d                                Direct3D 9 (OpenGL) and fallback
+     -> MoltenVK                               Vulkan to Metal
      -> Metal                                  native GPU rendering
 ```
 
@@ -61,10 +62,10 @@ When you press Play:
 
 1. Meridian confirms the engine is installed and healthy.
 2. It looks up the game in its compatibility database and prepares the launch: renderer, launch arguments, and any per-title fixes.
-3. The game starts directly through the engine. No Steam client window appears.
+3. A DRM-free game starts directly through the engine. No Steam client window appears.
 4. Meridian watches the game process and returns you to your library when it exits.
 
-When you press Play Online, Meridian instead brings the real Steam client up silently in the background using your saved sign-in and launches the game through it, so Steam handles ownership, DRM, cloud saves, and overlays.
+For a game that uses Steamworks, Meridian instead brings the real Steam client up silently in the background using your saved sign-in and launches the game through it, so Steam handles ownership, DRM, cloud saves, and overlays. The first time, Meridian asks before showing Steam's own sign-in window once.
 
 ## Requirements
 
@@ -98,18 +99,17 @@ License keys are verified entirely offline against a public key embedded in the 
 
 ## The engine
 
-Meridian's runtime is assembled from open-source projects and installed to `~/Library/Application Support/com.meridian.app/engine/`.
+Meridian's runtime is built from source (`Scripts/engine/`) from the open-source projects below and installed to `~/Library/Application Support/com.meridian.app/engine/`. No CrossOver install is involved, and nothing closed-source ships in it.
 
 | Component | Role | License |
 |-----------|------|---------|
-| [Wine 11](https://www.winehq.org/) with the [CodeWeavers](https://www.codeweavers.com/crossover/source) patch set | Win32 API translation, msync, Steam IPC | LGPL |
-| [DXMT](https://github.com/3Shain/dxmt) | Direct3D 10/11 to Metal | MIT / LGPL |
-| [DXVK](https://github.com/doitsujin/dxvk) | Direct3D 9 to Vulkan | Zlib |
+| [Wine 11](https://www.winehq.org/) from [CodeWeavers' published CrossOver source](https://www.codeweavers.com/crossover/source) | Win32 API translation, msync, Steam IPC | LGPL |
+| [DXMT](https://github.com/3Shain/dxmt) | Direct3D 10/11 to Metal | MIT |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan to Metal | Apache 2.0 |
+| [GnuTLS](https://gnutls.org), [GStreamer](https://gstreamer.freedesktop.org) | TLS, video decode (VideoToolbox) | LGPL |
 | [DepotDownloader](https://github.com/SteamRE/DepotDownloader) (Meridian arm64 fork) | Game installs from Steam's CDN | GPL-2.0 |
-| [gbe_fork](https://github.com/Detanup01/gbe_fork) | Steamworks runtime for direct launches | LGPL |
 
-Direct3D 12 titles currently use Apple's D3DMetal, which Apple distributes under its Game Porting Toolkit terms. Before the 1.0 release, Meridian will either ship Direct3D 12 support under an appropriate redistribution arrangement or leave it out of the default engine. See the roadmap below.
+License texts ship inside the engine in `licenses/`. Direct3D 12 games are not supported by the default engine; see the roadmap below.
 
 ## Compatibility
 
@@ -125,8 +125,8 @@ Each game's detail page shows its current rating: Verified, Playable, Launches, 
 
 Meridian is in active development. The items below are what stands between the current builds and a general release.
 
-- **Reproducible engine builds.** Build Wine, DXMT, DXVK, and MoltenVK from source in CI, and ship license texts and a software bill of materials with every engine release.
-- **Direct3D 12 decision.** Ship D3DMetal under a redistribution agreement, offer a bring-your-own Game Porting Toolkit import, or ship DXMT and DXVK only.
+- **Engine builds in CI.** The engine already builds from source with `Scripts/engine/`; move that into CI and attach a software bill of materials to every engine release.
+- **Direct3D 12.** Offer a bring-your-own Game Porting Toolkit import, or ship D3DMetal under a redistribution agreement.
 - **Signed, notarized releases from CI.** The tag-driven release pipeline is in place; it needs the Developer ID certificate and notarization credentials configured.
 - **Legal copy.** End-user license agreement, privacy policy, and a support channel.
 - **Friends panel.** A Steam friends sidebar is built and currently behind a feature flag while it is finished.
@@ -148,7 +148,7 @@ Everything lives under `~/Library/Application Support/com.meridian.app/`:
 
 ```
 com.meridian.app/
-  engine/            Wine runtime, DXMT, DXVK, MoltenVK
+  engine/            Wine runtime, DXMT, MoltenVK
   bottles/steam/     The Wine prefix that holds the Steam client and installed games
   logs/              meridian.log (current session) and meridian-previous.log
 ```
@@ -199,4 +199,4 @@ Branching, versioning, and the release pipeline are documented in [CONTRIBUTING.
 
 ## Acknowledgements
 
-Meridian stands on the work of the Wine project and CodeWeavers, the DXMT, DXVK, and MoltenVK teams, and the maintainers of DepotDownloader. Thank you.
+Meridian stands on the work of the Wine project and CodeWeavers, the DXMT and MoltenVK teams, the GnuTLS and GStreamer projects, and the maintainers of DepotDownloader. Thank you.

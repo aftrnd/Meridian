@@ -6,8 +6,8 @@ private let log = MeridianLog(category: "SteamSessionBackup")
 ///
 /// Steam writes `local.vdf` after a successful `-login` auth handshake. This file
 /// is the DPAPI-encrypted refresh token that lets `steam.exe -silent` auto-login on
-/// subsequent cold starts. CrossOver inspection confirms this is the canonical
-/// persistent auth mechanism — CrossOver has NO `ssfn*` files, only `local.vdf`.
+/// subsequent cold starts. Inspecting a long-signed-in Steam prefix confirms this
+/// is the canonical persistent auth mechanism: it has NO `ssfn*` files, only `local.vdf`.
 ///
 /// ## Lifecycle
 ///  1. After `signIn()` succeeds, `snapshot()` copies `local.vdf` from the prefix
@@ -19,8 +19,8 @@ private let log = MeridianLog(category: "SteamSessionBackup")
 ///     calls it every launch, which covers the post-reset case).
 ///
 /// ## Why not ssfn?
-///  Previous code chased `ssfn*` files. The April 2026 CrossOver bottle inspection
-///  (May 2026) proves that wrong: CrossOver has zero ssfn files and stays persistently
+///  Previous code chased `ssfn*` files. Inspecting a working Steam prefix (May 2026)
+///  proved that wrong: it has zero ssfn files and stays persistently
 ///  logged in via `local.vdf` alone. Valve controls whether `persistence: 1` is granted
 ///  in the JWT it issues; `local.vdf` is what Steam actually uses to cache that token.
 ///
@@ -56,7 +56,7 @@ enum SteamSessionBackup {
             log.warning(
                 "[snapshot] local.vdf NOT WRITTEN by Steam at \(sourcePath). " +
                 "Steam returned persistence: 0 or has not yet flushed. " +
-                "PHASE 3 MAY BE REQUIRED — check if DPAPI helper exe is needed."
+                "PHASE 3 MAY BE REQUIRED: check if DPAPI helper exe is needed."
             )
             return
         }
