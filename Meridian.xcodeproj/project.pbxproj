@@ -438,11 +438,11 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-dpapi.exe",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-dpapi.exe",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "# Build meridian-dpapi.exe (Wine CryptProtectData wrapper) into the app bundle\n# Resources so the app can copy it into the engine at runtime if it's missing.\n# This protects the DPAPI-based auto-login path from engine auto-refreshes that\n# wipe wine/share/meridian/ before a new engine tarball has been published.\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-dpapi.sh\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-dpapi.exe\"\n";
+			shellScript = "# Build meridian-dpapi.exe (Wine CryptProtectData wrapper) into the app bundle\n# Resources so the app can copy it into the engine at runtime if it's missing.\n# This protects the DPAPI-based auto-login path from engine auto-refreshes that\n# wipe wine/share/meridian/ before a new engine tarball has been published.\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\nmkdir -p \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-dpapi.sh\" \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-dpapi.exe\"\n";
 		};
 		B001DDA2 /* Build meridian-wine-accessory.dylib */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -460,11 +460,11 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-wine-accessory.dylib",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/meridian-wine-accessory.dylib",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "# Build meridian-wine-accessory.dylib — DYLD_INSERT_LIBRARIES payload that\n# demotes every Wine subprocess to NSApplicationActivationPolicyAccessory,\n# preventing Dock tiles and self-activation for download-complete toasts.\n# See Scripts/wine-accessory/meridian_wine_accessory.m for the full rationale.\nmkdir -p \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-wine-accessory.sh\" \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-wine-accessory.dylib\"\n";
+			shellScript = "# Build meridian-wine-accessory.dylib — DYLD_INSERT_LIBRARIES payload that\n# demotes every Wine subprocess to NSApplicationActivationPolicyAccessory,\n# preventing Dock tiles and self-activation for download-complete toasts.\n# See Scripts/wine-accessory/meridian_wine_accessory.m for the full rationale.\nmkdir -p \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nbash \"${SRCROOT}/Scripts/build-wine-accessory.sh\" \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Resources/meridian-wine-accessory.dylib\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
