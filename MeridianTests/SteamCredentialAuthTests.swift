@@ -324,12 +324,9 @@ final class SteamCredentialAuthTests: XCTestCase {
     // The sign-in path must:
     //   1. Drive `SteamCredentialAuth.authenticate()` (REST OAuth — never `session.signIn`,
     //      never `steam.exe -login USER PASS`, never SteamCMD `+login`).
-    //   2. Write loginusers.vdf with AllowAutoLogin=1 + RememberPassword=1 so Steam's
-    //      own UI (if it ever appears) also auto-logs in.
-    //   3. DPAPI-inject local.vdf via `WinePrefix.writeSteamSessionLocalVdf` so
-    //      `steam.exe -silent` reads the encrypted refresh_token on next launch.
-    //   4. Snapshot local.vdf via `SteamSessionBackup.snapshot` for prefix-reset survival.
-    //   5. Start `steam.exe -silent` (via `session.start`) — never `-login`.
+    //   2. Write nothing into Steam's own files: Steam's session comes only from
+    //      its own sign-in (onboarding Online Play / first Steam launch).
+    //   3. Never start steam.exe at sign-in.
 
     func testSignInFlowInvariants() throws {
         let authView = try readSource("Meridian/Views/Auth/AuthView.swift")
@@ -341,17 +338,16 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertTrue(authView.contains("credentialAuth.authenticate("),
                       "AuthView must call credentialAuth.authenticate to begin the OAuth flow.")
 
-        // loginusers.vdf must be written after successful auth so Steam's own UI
-        // (if it ever appears) also auto-logs in.
-        XCTAssertTrue(authView.contains("writeLoginUsers"),
-                      "Sign-in must write loginusers.vdf after auth so Steam UI auto-login works.")
-
-        // DPAPI-inject local.vdf — this is the canonical persistent-auth mechanism
-        // (Pattern 12 in engine-research-findings: local.vdf is what CrossOver uses).
-        XCTAssertTrue(authView.contains("writeSteamSessionLocalVdf"),
-                      "Sign-in must DPAPI-inject local.vdf so steam.exe -silent auto-logs in on next launch.")
-        XCTAssertTrue(authView.contains("SteamSessionBackup.snapshot"),
-                      "Sign-in must snapshot local.vdf to AppSupport so prefix resets / engine upgrades survive without re-auth.")
+        // Meridian's sign-in must NOT write Steam's own session files. Steam
+        // rejects a Meridian-created session (Pattern 36), and a Meridian-written
+        // loginusers.vdf made hasSteamLoginSession() true, so onboarding skipped
+        // Steam's own sign-in (user-reported Oct 7 2026).
+        XCTAssertFalse(authView.contains("writeLoginUsers("),
+                       "Meridian sign-in must not write loginusers.vdf; only Steam's own sign-in creates a Steam session.")
+        XCTAssertFalse(authView.contains("writeSteamSessionLocalVdf("),
+                       "Meridian sign-in must not inject a token into local.vdf; Steam rejects it.")
+        XCTAssertFalse(authView.contains("SteamSessionBackup.snapshot("),
+                       "Only Steam's own session (signInInteractively) is snapshotted.")
 
         // Sign-in must NOT start steam.exe. CLI-verified Jun 20 2026
         // (HANDOFF-2026-06-20): `session.start` at sign-in popped the Steam
@@ -389,7 +385,7 @@ final class SteamCredentialAuthTests: XCTestCase {
     // MARK: - ConnectCache key derivation (CRC32 mirror, Pattern 6/12)
     //
     // The ConnectCache map key in local.vdf is `(crc32(accountName) << 4) | 1`.
-    // CLI-verified April 23 2026 against CX Preview's working bottle:
+    // CLI-verified April 23 2026 against a working Steam prefix:
     //   crc32("nickjack876") = 0x07a611aa → key 0x7a611aa1
     // Any other CRC variant produces a different key and Steam's lookup silently fails.
 
@@ -414,11 +410,11 @@ final class SteamCredentialAuthTests: XCTestCase {
         return String(format: "%08x", key)
     }
 
-    func testConnectCacheKey_matchesCrossOverReferenceVector() {
-        // CLI-verified vector from CX Preview's working local.vdf:
+    func testConnectCacheKey_matchesReferenceVector() {
+        // CLI-verified vector from a working local.vdf:
         //   accountName "nickjack876" → CRC32 0x07a611aa → key 0x7a611aa1
         XCTAssertEqual(ieeeCRC32(bytes: Array("nickjack876".utf8)), 0x07a611aa,
-                       "CRC32 of 'nickjack876' must equal 0x07a611aa to match CrossOver's working local.vdf")
+                       "CRC32 of 'nickjack876' must equal 0x07a611aa to match a working local.vdf")
         XCTAssertEqual(connectCacheKey(for: "nickjack876"), "7a611aa1",
                        "ConnectCache key for 'nickjack876' must be 0x7a611aa1 (matches CX reference).")
     }
@@ -489,17 +485,39 @@ final class SteamCredentialAuthTests: XCTestCase {
         XCTAssertTrue(authView.contains("QRCodeRenderer"),
                       "AuthView must render the challenge_url as a QR image.")
 
-        // QR platform_type must be SteamClient (1) so it yields persistence:1
-        // (the same requirement as the password path). Anchor on the endpoint
-        // URL — doc comments mention "BeginAuthSessionViaQR" long before the
-        // actual request-building code.
+        // The QR request is protobuf (device_details is a nested message).
+        // Anchor on the endpoint URL — doc comments mention
+        // "BeginAuthSessionViaQR" long before the request-building code.
         if let qrRange = auth.range(of: "BeginAuthSessionViaQR/v1/") {
             let after = String(auth[qrRange.lowerBound...].prefix(800))
-            XCTAssertTrue(after.contains("platform_type"),
-                          "QR begin-session must send platform_type=1 (SteamClient) for a persistence:1 token.")
+            XCTAssertTrue(after.contains("input_protobuf_encoded") && after.contains("qrSessionRequest("),
+                          "QR begin-session must send the protobuf request built by qrSessionRequest (carries device_details).")
         } else {
             XCTFail("SteamCredentialAuth must call the BeginAuthSessionViaQR/v1/ endpoint")
         }
+        XCTAssertTrue(auth.contains("int(2, 1) + int(3, 16) + int(4, 1)"),
+                      "device_details must carry platform_type 1 (SteamClient), os_type 16 (Windows 10), gaming_device_type 1.")
+    }
+
+    /// Exact bytes of the QR request, CLI-verified accepted by Valve
+    /// (x-eresult 1, Oct 7 2026). Mirror of `qrSessionRequest`; keep in sync.
+    func testQRSessionRequest_carriesDeviceDetails() {
+        func varint(_ value: UInt64) -> [UInt8] {
+            var v = value, out: [UInt8] = []
+            while v >= 0x80 { out.append(UInt8(v & 0x7F) | 0x80); v >>= 7 }
+            return out + [UInt8(v)]
+        }
+        func int(_ field: UInt64, _ value: UInt64) -> [UInt8] { varint(field << 3) + varint(value) }
+        func bytes(_ field: UInt64, _ value: [UInt8]) -> [UInt8] {
+            varint(field << 3 | 2) + varint(UInt64(value.count)) + value
+        }
+        func string(_ field: UInt64, _ value: String) -> [UInt8] { bytes(field, Array(value.utf8)) }
+
+        let name = "Meridian on Mac"
+        let deviceDetails = string(1, name) + int(2, 1) + int(3, 16) + int(4, 1)
+        let request = Data(string(1, name) + int(2, 1) + bytes(3, deviceDetails) + string(4, "Client"))
+        XCTAssertEqual(request.base64EncodedString(),
+                       "Cg9NZXJpZGlhbiBvbiBNYWMQARoXCg9NZXJpZGlhbiBvbiBNYWMQARgQIAEiBkNsaWVudA==")
     }
 
     private var repoRoot: URL {

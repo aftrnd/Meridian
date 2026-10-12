@@ -48,7 +48,7 @@ struct LicenseStatusView: View {
                 } header: {
                     Text("License Key")
                 } footer: {
-                    Text("Your key was emailed to you after purchase. Activation is verified on this Mac — no account or internet connection is required.")
+                    Text("Your key was emailed to you after purchase. Activation is verified on this Mac. No account or internet connection is required.")
                         .font(.caption)
                 }
             }

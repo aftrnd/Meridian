@@ -32,6 +32,7 @@
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
+		B0A10001 /* OnboardingViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0A10002 /* OnboardingViews.swift */; };
 		B0010034 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035 /* AppSettings.swift */; };
 		B0010035A /* AppDetails.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035B /* AppDetails.swift */; };
 		B0010036 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0010037 /* Assets.xcassets */; };
@@ -96,6 +97,7 @@
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
+		B0A10002 /* OnboardingViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingViews.swift; sourceTree = "<group>"; };
 		B0010035 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		B0010035B /* AppDetails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDetails.swift; sourceTree = "<group>"; };
 		B0010036B /* GameAchievement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameAchievement.swift; sourceTree = "<group>"; };
@@ -292,6 +294,7 @@
 			isa = PBXGroup;
 			children = (
 				B0010033 /* AuthView.swift */,
+				B0A10002 /* OnboardingViews.swift */,
 			);
 			path = Auth;
 			sourceTree = "<group>";
@@ -494,6 +497,7 @@
 				B0DE0003 /* DetailZoomTuning.swift in Sources */,
 				B0010030 /* SettingsView.swift in Sources */,
 				B0010032 /* AuthView.swift in Sources */,
+				B0A10001 /* OnboardingViews.swift in Sources */,
 				B0010034 /* AppSettings.swift in Sources */,
 				B0010035A /* AppDetails.swift in Sources */,
 				B0010036A /* GameAchievement.swift in Sources */,
