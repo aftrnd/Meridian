@@ -17,7 +17,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MeridianTests",
-            dependencies: [],
+            dependencies: ["Meridian"],
             path: "MeridianTests"
         ),
     ]
