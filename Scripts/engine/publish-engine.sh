@@ -9,7 +9,7 @@
 # leaves the tarball at $BUILD_ROOT/meridian-engine-arm64.tar.gz.
 #
 #   1. build-deps.sh      x86_64 libraries (stamped; finished packages skip)
-#   2. build-wine.sh      Wine from CodeWeavers' published source
+#   2. build-wine.sh      Wine from its published LGPL source
 #   3. package-engine.sh  stage, relink, sign, prefix template, tarball
 #   4. smoke/smoke-test.sh  DXMT + wined3d (32/64-bit) and HTTPS, headless
 #   5. gh release create  vX.Y.Z-engine with the tarball attached
@@ -41,14 +41,14 @@ bash "$HERE/smoke/smoke-test.sh"
 
 say "Publishing $TAG to $REPO"
 gh release create "$TAG" --repo "$REPO" --title "Engine $TAG" "$ARCHIVE" --notes "$(cat <<EOF
-Meridian engine, built from source by Scripts/engine/ (no CrossOver install involved).
+Meridian engine, built from source by Scripts/engine/.
 
-- Wine $(cat "$SRC/wine/VERSION" | sed 's/Wine version //') from CodeWeavers' published CrossOver ${CX_SOURCE_VERSION} source (LGPL-2.1)
+- Wine $(cat "$SRC/wine/VERSION" | sed 's/Wine version //') from its published ${WINE_SOURCE_VERSION} source (LGPL-2.1) plus the Meridian patches
 - DXMT $(sed 's/DXMT //' "$STAGE/wine/meridian-dxmt-version.txt") (D3D10/11 → Metal), selected per launch via WINEDLLPATH
 - MoltenVK 1.4.2, GnuTLS, GStreamer (VideoToolbox decode)
 - x86_64 under Rosetta 2, WoW64 for 32-bit games
 
-Not included: Apple D3DMetal, CodeWeavers' cxcompatdb.so, the gbe_fork Steamworks emulator, Valve binaries.
+Not included: Apple D3DMetal, any closed-source component, the gbe_fork Steamworks emulator, Valve binaries.
 License texts are in licenses/ inside the archive.
 EOF
 )"

@@ -30,25 +30,45 @@
  *
  * macOS's hardened runtime strips `DYLD_INSERT_LIBRARIES` unless the target
  * binary has the `com.apple.security.cs.allow-dyld-environment-variables`
- * entitlement. CrossOver's `wine64` ships with hardened runtime + library
- * validation disabled, but NOT the allow-dyld entitlement. Meridian adds
+ * entitlement. If the engine's `wine64` was signed without it, Meridian adds
  * it at engine-install time via `WineEngine.ensureDyldEntitlement()` —
  * re-signs `wine64` ad-hoc with the combined entitlement set (preserving
- * CrossOver's existing entitlements + adding the dyld-env permission).
+ * its existing entitlements + adding the dyld-env permission).
  *
  * ## Where this is injected
  *
  * Only from `WineEngine.steamCMDEnvironment(for:)` — the env used for
  * every Steam-related Wine call (bootstrap, persistent steam.exe, IPC
- * forwarders, registry writes). NOT injected from `environment(for:)`
- * which is used for actual game launches, where the game's window DOES
- * want to appear normally in the Dock + menu bar.
+ * forwarders, registry writes). Games launch through that steam.exe and
+ * inherit its environment, so the dylib loads into them too; it leaves a
+ * game alone (`meridian_is_game_process`), which keeps its Dock icon, menu
+ * bar and Cmd-Tab.
  */
 
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <crt_externs.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <string.h>
 #import <unistd.h>
+
+/*
+ * A game: its Windows executable sits in a Steam library (`…\steamapps\…`).
+ * Wine starts every process with that path as argv[1], already in place when
+ * this dylib loads (CLI-verified Oct 12 2026: `C:\windows\system32\services.exe`,
+ * `C:\Program Files (x86)\Steam\steamapps\common\<game>\<game>.exe`).
+ * Steam itself, its helpers and Wine's services are not.
+ */
+static BOOL meridian_is_game_process(void) {
+    static BOOL is_game;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *exe = *_NSGetArgc() > 1 ? (*_NSGetArgv())[1] : NULL;
+        is_game = exe && (strcasestr(exe, "\\steamapps\\") || strcasestr(exe, "/steamapps/"));
+    });
+    return is_game;
+}
 
 /*
  * Category that swizzles `-[NSApplication setActivationPolicy:]` to force
@@ -58,8 +78,8 @@
  * `.accessory` call we make at load time. Swizzling means even winemac.drv's
  * call gets rewritten to `.accessory`, so the Dock tile never appears.
  *
- * Applied unconditionally — any Wine subprocess this dylib loads into wants
- * to be Dock-less (we only inject into Steam admin paths, never into games).
+ * Applied to every Wine subprocess this dylib loads into except games, which
+ * keep winemac.drv's regular policy.
  */
 @interface NSApplication (MeridianAccessoryOverride)
 @end
@@ -75,6 +95,7 @@
 }
 
 + (void)load {
+    if (meridian_is_game_process()) return;
     Method original  = class_getInstanceMethod(self, @selector(setActivationPolicy:));
     Method swizzled  = class_getInstanceMethod(self, @selector(meridian_forceAccessorySetActivationPolicy:));
     if (original && swizzled) {
@@ -99,6 +120,222 @@ static os_log_t accessory_log(void) {
     return log;
 }
 
+/*
+ * ## Sign-in presentation
+ *
+ * When Meridian opens Steam's own sign-in (`MERIDIAN_STEAM_SIGNIN=1`, set only
+ * for the interactive launch and inherited by steamwebhelper), Steam's sign-in
+ * window gets macOS window chrome: continuous rounded corners, the system
+ * shadow and a fade-in. winemac otherwise draws it as a square, shadowless
+ * rectangle.
+ *
+ * - The rounding is a mask on the content layer, not `cornerRadius`: winemac
+ *   keeps a window non-opaque only while `contentView.layer.mask` is set
+ *   (`-needsTransparency`); `-checkTransparency` would otherwise make it opaque
+ *   again and fill the corners. The mask is inset past the 1 pt frame Steam
+ *   draws around its window, so the corners round through plain background.
+ * - Steam's own ✕ is covered with its background colour, sampled live from the
+ *   window's pixels (winemac sets the surface as `layer.contents`). Meridian
+ *   offers Cancel instead.
+ */
+static const CGFloat kSignInCornerRadius = 16;
+static const CGFloat kSteamFrameInset = 2;        // Steam's 1 pt border + 1 pt top highlight
+static const NSRect kSteamCloseButtonCover = { { 34, 2 }, { 32, 30 } };  // from top-right; ✕ spans 12–23 × 10–21 pt
+static const NSSize kSteamSignInSize = { 700, 440 };  // the cover is only for this window
+static char kStyledKey;
+static char kChromeKey;
+
+/*
+ * winemac re-applies `hasShadow` from the Win32 style on every feature update
+ * (`-setWindowFeatures:`), and Steam's frameless popup maps to "no shadow".
+ * Windows this dylib styled keep the system shadow.
+ */
+@interface NSWindow (MeridianSignInShadow)
+@end
+
+@implementation NSWindow (MeridianSignInShadow)
+
+- (void)meridian_setHasShadow:(BOOL)hasShadow {
+    // Swizzled: this calls the original -setHasShadow:.
+    [self meridian_setHasShadow:(hasShadow || objc_getAssociatedObject(self, &kStyledKey) != nil)];
+}
+
++ (void)load {
+    if (meridian_is_game_process()) return;
+    Method original = class_getInstanceMethod(self, @selector(setHasShadow:));
+    Method swizzled = class_getInstanceMethod(self, @selector(meridian_setHasShadow:));
+    if (original && swizzled) {
+        method_exchangeImplementations(original, swizzled);
+    }
+}
+
+@end
+
+/// sRGB colour of one pixel (top-left based, in pixels) of winemac's surface
+/// image. Sampled and returned in the same space so the cover matches exactly.
+static CGColorRef meridian_copy_pixel_color(CGImageRef image, size_t x, size_t y) {
+    if (!image || x >= CGImageGetWidth(image) || y >= CGImageGetHeight(image)) return NULL;
+    uint8_t rgba[4] = { 0 };
+    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(rgba, 1, 1, 8, 4, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorRef color = NULL;
+    if (context) {
+        CGFloat height = CGImageGetHeight(image);
+        CGContextDrawImage(context, CGRectMake(-(CGFloat)x, -(height - 1 - y), CGImageGetWidth(image), height), image);
+        CGContextRelease(context);
+        const CGFloat components[4] = { rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0, 1 };
+        color = CGColorCreate(space, components);
+    }
+    CGColorSpaceRelease(space);
+    return color;
+}
+
+/// Owns the sign-in window's chrome on its content layer: the rounded mask
+/// and the ✕ cover. KVO keeps both in place — winemac replaces `layer.mask`
+/// in `-setShape:` and republishes `layer.contents` on every draw, and the
+/// cover is re-coloured from each new surface image.
+@interface MeridianSignInChrome : NSObject
+@property (nonatomic, weak) NSWindow *window;
+@property (nonatomic, strong) CALayer *host;   // strong: observers are removed in -dealloc
+@property (nonatomic, strong) CAShapeLayer *mask;
+@property (nonatomic, strong) CALayer *cover;
+@end
+
+@implementation MeridianSignInChrome
+
+- (instancetype)initWithWindow:(NSWindow *)window host:(CALayer *)host {
+    if ((self = [super init])) {
+        _window = window;
+        _host = host;
+        _mask = [CAShapeLayer layer];
+        _cover = [CALayer layer];
+        _cover.cornerRadius = 4;
+        [host addSublayer:_cover];
+        [host addObserver:self forKeyPath:@"mask" options:0 context:NULL];
+        [host addObserver:self forKeyPath:@"bounds" options:0 context:NULL];
+        [host addObserver:self forKeyPath:@"contents" options:NSKeyValueObservingOptionInitial context:NULL];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [_host removeObserver:self forKeyPath:@"mask"];
+    [_host removeObserver:self forKeyPath:@"bounds"];
+    [_host removeObserver:self forKeyPath:@"contents"];
+}
+
+- (void)apply {
+    CALayer *host = self.host;
+    CGRect bounds = host.bounds;
+    CGRect clip = CGRectInset(bounds, kSteamFrameInset, kSteamFrameInset);
+    CGPathRef path = CGPathCreateWithRoundedRect(clip, kSignInCornerRadius, kSignInCornerRadius, NULL);
+
+    CGRect cover = kSteamCloseButtonCover;
+    cover.origin.x = CGRectGetMaxX(bounds) - cover.origin.x;
+    if (!host.geometryFlipped) cover.origin.y = CGRectGetMaxY(bounds) - cover.origin.y - cover.size.height;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.mask.frame = bounds;
+    self.mask.path = path;
+    if (host.mask != self.mask) host.mask = self.mask;
+    self.cover.frame = cover;
+    // Rounded corners suit any Steam window this process later surfaces
+    // (EULA, purchase); the ✕ cover is only correct on the sign-in window.
+    self.cover.hidden = fabs(bounds.size.width - kSteamSignInSize.width) > 2
+                     || fabs(bounds.size.height - kSteamSignInSize.height) > 2;
+    [CATransaction commit];
+    CGPathRelease(path);
+
+    NSWindow *window = self.window;
+    window.opaque = NO;
+    window.backgroundColor = NSColor.clearColor;
+    window.hasShadow = YES;
+    [window invalidateShadow];
+}
+
+- (void)recolorCover {
+    CALayer *host = self.host;
+    id contents = host.contents;
+    if (!contents || CFGetTypeID((__bridge CFTypeRef)contents) != CGImageGetTypeID()) return;
+    CGFloat scale = host.contentsScale;
+    CGFloat x = CGRectGetMaxX(host.bounds) - kSteamCloseButtonCover.origin.x - 6;  // just left of the cover
+    CGColorRef color = meridian_copy_pixel_color((__bridge CGImageRef)contents, x * scale, 8 * scale);
+    if (!color) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.cover.backgroundColor = color;
+    [CATransaction commit];
+    CGColorRelease(color);
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqualToString:@"contents"]) {
+        [self recolorCover];
+    } else if (![keyPath isEqualToString:@"mask"] || self.host.mask != self.mask) {
+        [self apply];
+    }
+}
+
+@end
+
+static void meridian_style_window_layer(NSWindow *window) {
+    CALayer *layer = window.contentView.layer;
+    if (!layer) return;
+    MeridianSignInChrome *chrome = objc_getAssociatedObject(window, &kChromeKey);
+    if (!chrome || chrome.host != layer) {
+        chrome = [[MeridianSignInChrome alloc] initWithWindow:window host:layer];
+        objc_setAssociatedObject(window, &kChromeKey, chrome, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [chrome apply];
+}
+
+/// Steam's sign-in: a titled, visible window of dialog size (same rule as
+/// `SteamWindow.isSignInWindow`). Helper windows are untitled, hidden or tiny;
+/// the library window that follows sign-in is larger than 900×700.
+static BOOL meridian_is_signin_window(NSWindow *window) {
+    NSSize size = window.frame.size;
+    return window.isVisible && window.title.length > 0
+        && size.width >= 300 && size.width <= 900 && size.height >= 200 && size.height <= 700;
+}
+
+static void meridian_style_signin_window(NSWindow *window) {
+    if (!meridian_is_signin_window(window)) return;
+    BOOL first = objc_getAssociatedObject(window, &kStyledKey) == nil;
+    objc_setAssociatedObject(window, &kStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    meridian_style_window_layer(window);  // re-applied: mask and cover track the window size
+    if (!first) return;
+
+    window.alphaValue = 0;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.3;
+        context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        window.animator.alphaValue = 1;
+    }];
+    os_log_info(accessory_log(), "[meridian-wine-accessory] styled sign-in window '%{public}@'", window.title);
+}
+
+static void meridian_observe_signin_windows(void) {
+    // Only Steam's browser process draws the sign-in window; steam.exe's own
+    // windows (updater) stay as Meridian's suppressor leaves them.
+    if (![NSProcessInfo.processInfo.processName.lowercaseString containsString:@"steamwebhelper"]) return;
+
+    NSArray<NSNotificationName> *names = @[
+        NSWindowDidChangeOcclusionStateNotification,  // ordered on screen
+        NSWindowDidBecomeKeyNotification,
+        NSWindowDidResizeNotification,
+    ];
+    for (NSNotificationName name in names) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:name
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            meridian_style_signin_window(note.object);
+        }];
+    }
+}
+
 __attribute__((constructor))
 static void meridian_wine_accessory_init(void) {
     // Diagnostic: confirm the dylib actually loaded into a Wine subprocess.
@@ -114,6 +351,11 @@ static void meridian_wine_accessory_init(void) {
         pid, ppid);
     NSLog(@"[meridian-wine-accessory] dylib loaded pid=%d ppid=%d",
           pid, ppid);
+
+    if (meridian_is_game_process()) {
+        NSLog(@"[meridian-wine-accessory] game process, activation policy left alone");
+        return;
+    }
 
     // Do NOT touch `NSApp` here. winemac.drv creates its own NSApplication
     // subclass only when `NSApp` is still nil (`run_cocoa_app`: `if (!NSApp)
@@ -137,4 +379,6 @@ static void meridian_wine_accessory_init(void) {
             "[meridian-wine-accessory] re-assert .accessory after launch = %{public}s",
             ok ? "YES" : "NO");
     }];
+
+    if (getenv("MERIDIAN_STEAM_SIGNIN")) meridian_observe_signin_windows();
 }

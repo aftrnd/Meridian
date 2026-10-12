@@ -1,0 +1,40 @@
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -554,6 +554,37 @@
+         startup_info->lpDesktop = winsta0_defaultW;
+     }
+ 
++    /* Meridian: append MERIDIAN_STEAMWEBHELPER_ARGS to the command line of
++     * Steam's CEF browser process (steamwebhelper.exe without --type=).
++     * Out-of-process GPU compositing draws into a window owned by another
++     * process, which winemac cannot present, so the app passes
++     * --in-process-gpu here (plus the display scale factor). */
++    if (cmd_line && !wcsstr( cmd_line, L"--type=" ))
++    {
++        const WCHAR *base = wcsrchr( app_name, '\\' );
++        DWORD extra_len;
++
++        if (!wcsicmp( base ? base + 1 : app_name, L"steamwebhelper.exe" ) &&
++            (extra_len = GetEnvironmentVariableW( L"MERIDIAN_STEAMWEBHELPER_ARGS", NULL, 0 )))
++        {
++            SIZE_T len = lstrlenW( tidy_cmdline );
++            WCHAR *new_cmdline;
++
++            if (!(new_cmdline = RtlAllocateHeap( GetProcessHeap(), 0, (len + 1 + extra_len) * sizeof(WCHAR) )))
++            {
++                if (tidy_cmdline != cmd_line) RtlFreeHeap( GetProcessHeap(), 0, tidy_cmdline );
++                SetLastError( ERROR_NOT_ENOUGH_MEMORY );
++                return FALSE;
++            }
++            memcpy( new_cmdline, tidy_cmdline, len * sizeof(WCHAR) );
++            new_cmdline[len] = ' ';
++            GetEnvironmentVariableW( L"MERIDIAN_STEAMWEBHELPER_ARGS", new_cmdline + len + 1, extra_len );
++            if (tidy_cmdline != cmd_line) RtlFreeHeap( GetProcessHeap(), 0, tidy_cmdline );
++            tidy_cmdline = new_cmdline;
++            TRACE( "steamwebhelper command line %s\n", debugstr_w(tidy_cmdline) );
++        }
++    }
++
+     /* CW Hack 24920, 24557 */
+     {
+         char sgi[64];

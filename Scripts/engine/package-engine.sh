@@ -8,13 +8,13 @@
 #   installs into ~/Library/Application Support/com.meridian.app/engine/).
 #   Publishing is a separate step: Scripts/engine/publish-engine.sh.
 #
-# Nothing here is taken from a CrossOver install. Components:
-#   Wine        CodeWeavers' published CrossOver source (LGPL-2.1)   build-wine.sh
+# Nothing here is taken from an installed product. Components:
+#   Wine        published LGPL-2.1 source + Meridian's patches       build-wine.sh
 #   libraries   GnuTLS, nettle, gmp, freetype, SDL2, GLib, GStreamer   build-deps.sh
 #   MoltenVK    Khronos release (Apache-2.0)                           build-deps.sh
 #   DXMT        3Shain/dxmt release (MIT)                              fetched here
 #
-# Renderer selection (replaces CrossOver's closed cxcompatdb.so):
+# Renderer selection (no closed renderer switch):
 #   Wine searches its own lib/wine before any WINEDLLPATH entry, so a DLL that
 #   exists there can never be overridden per launch. The D3D front-end DLLs that
 #   Meridian switches between are therefore moved OUT of lib/wine into one
@@ -135,6 +135,22 @@ stage_libraries() {
     for bin in "$W"/lib64/gstreamer-1.0/*.dylib; do
         add_rpath "$bin" "@loader_path/.."
     done
+    # Absolute rpaths point into the build tree. winegstreamer.so kept
+    # $DEPS/lib ahead of lib64, so on the build Mac the game loaded a second
+    # GStreamer/GLib next to the bundled one: plugins registered in one copy,
+    # Wine queried the other, and videos rendered black (Oct 8 2026).
+    say "Removing absolute rpaths"
+    local rp
+    while IFS= read -r bin; do
+        file "$bin" | grep -q 'Mach-O' || continue
+        while IFS= read -r rp; do
+            install_name_tool -delete_rpath "$rp" "$bin"
+        done < <(otool -l "$bin" | awk '/LC_RPATH/{getline;getline;print $2}' | grep '^/')
+    done < <(find "$W" -type f \( -name '*.dylib' -o -name '*.so' \) ; echo "$W/bin/wine"; echo "$W/bin/wine64"; echo "$W/bin/wineserver")
+    if find "$W" -type f \( -name '*.dylib' -o -name '*.so' \) -exec otool -l {} + 2>/dev/null \
+        | awk '/LC_RPATH/{getline;getline;print $2}' | grep -q '^/'; then
+        die "absolute rpath left in the engine"
+    fi
 }
 
 relink() {
@@ -208,9 +224,15 @@ EOF
 # MARK: - Prefix template
 
 engine_env() {
+    # Same search path as the app's default (WineEngine.dllSearchPath):
+    # wineboot only puts system32 placeholders in for DLLs it finds here, and
+    # Wine never loads a DLL that has neither a placeholder nor a file in the
+    # game folder. Without lib/wined3d, d3d12/d3d12core had no placeholder and
+    # every Unity 6 game crashed on UnityPlayer's delay-load of d3d12.dll
+    # (0xc06d007e, status c0000135; No, I'm not a Human, Oct 7 2026).
     env -i HOME="$HOME" PATH="/usr/bin:/bin" \
         WINEPREFIX="$1" WINEDEBUG=-all WINEMSYNC=1 MVK_CONFIG_LOG_LEVEL=0 \
-        WINEDLLPATH="$W/lib/dxmt:$W/lib/wine" \
+        WINEDLLPATH="$W/lib/dxmt:$W/lib/wined3d:$W/lib/wine" \
         WINEDLLOVERRIDES="mscoree,mshtml=" \
         "${@:2}"
 }
@@ -233,6 +255,7 @@ build_prefix_template() {
     grep -q Winsock2 "$tpl/system.reg" || die "prefix template missing Winsock2 registration"
     grep -q Dnscache "$tpl/system.reg" || die "prefix template missing Dnscache registration"
     [ "$services" -ge 15 ] || die "prefix template has only $services services"
+    [ -f "$tpl/drive_c/windows/system32/d3d12.dll" ] || die "prefix template missing d3d12.dll (Unity 6 delay-loads it)"
     echo "    template: $dlls DLLs, $services services"
 
     rm -rf "$tpl/dosdevices"; mkdir -p "$tpl/dosdevices" "$tpl/drive_c/windows/syswow64"
@@ -250,8 +273,9 @@ stage_licenses() {
     cat > "$d/README.txt" <<EOF
 Meridian engine $TAG — third-party components
 
-Wine 11.0 (CodeWeavers CrossOver ${CX_SOURCE_VERSION} source)  LGPL-2.1
-  Source: ${CX_SOURCE_URL}
+Wine 11.0 (source ${WINE_SOURCE_VERSION} as published by CodeWeavers)  LGPL-2.1
+  Source: ${WINE_SOURCE_URL}
+  Meridian's changes: Scripts/engine/patches/wine/ in the Meridian repository
 DXMT ${DXMT_VERSION}                                MIT        https://github.com/3Shain/dxmt
 MoltenVK 1.4.2                                     Apache-2.0 https://github.com/KhronosGroup/MoltenVK
 GnuTLS, nettle, GMP                                LGPL       https://gnutls.org
@@ -260,8 +284,9 @@ SDL2                                               zlib       https://libsdl.org
 GLib, GStreamer                                    LGPL-2.1   https://gstreamer.freedesktop.org
 DepotDownloader (Meridian fork)                    GPL-2.0    https://github.com/SteamRE/DepotDownloader
 
-The LGPL components are dynamically loaded and unmodified from the cited
-sources; build scripts are in the Meridian repository under Scripts/engine/.
+Wine is built from the cited source with Meridian's patches applied; the
+other LGPL components are unmodified. All are dynamically loaded. Build
+scripts and patches are in the Meridian repository under Scripts/engine/.
 EOF
 }
 

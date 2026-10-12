@@ -10,7 +10,7 @@
 #
 # ## Architecture
 #
-# x86_64 is REQUIRED because CrossOver's wine64 is x86_64-only (runs under
+# x86_64 is REQUIRED because the engine's wine64 is x86_64-only (runs under
 # Rosetta 2 on Apple Silicon). The dylib must match the loader's arch.
 #
 # arm64 is included for future-proofing: if a future CX release ships
@@ -61,6 +61,8 @@ clang -dynamiclib \
     -arch arm64 -arch x86_64 \
     -framework AppKit \
     -framework Foundation \
+    -framework QuartzCore \
+    -fobjc-arc \
     -O2 -Wall \
     -o "${SCRATCH_OUT}" \
     "${SOURCE}"

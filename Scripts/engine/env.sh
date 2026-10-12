@@ -6,22 +6,22 @@
 # needed. Native build tools (meson, ninja, cmake, bison, mingw-w64) come from
 # the host's arm64 Homebrew.
 #
-# Nothing in this build reads from a CrossOver install. Sources come from
-# CodeWeavers' published LGPL source tarball and upstream project releases.
+# Nothing in this build reads from an installed product. Sources come from a
+# published LGPL Wine source tarball and upstream project releases.
 
 set -euo pipefail
 
 : "${BUILD_ROOT:=$HOME/meridian-engine-build}"   # outside Dropbox: large, churny
 export BUILD_ROOT
-export SRC="$BUILD_ROOT/sources"                  # unpacked crossover-sources tarball
+export SRC="$BUILD_ROOT/sources"                  # unpacked Wine source tarball
 export DL="$BUILD_ROOT/downloads"
 export WORK="$BUILD_ROOT/work"
 export DEPS="$BUILD_ROOT/deps"                    # x86_64 install prefix for libraries
 export STAGE="$BUILD_ROOT/stage"                  # assembled engine (becomes engine/)
 
-# CrossOver's published source (Wine 11.0 + CodeWeavers patches, LGPL).
-export CX_SOURCE_VERSION="26.3.0"
-export CX_SOURCE_URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-${CX_SOURCE_VERSION}.tar.gz"
+# Wine 11.0 with its publisher's patches (LGPL), as published by CodeWeavers.
+export WINE_SOURCE_VERSION="26.3.0"
+export WINE_SOURCE_URL="https://media.codeweavers.com/pub/crossover/source/crossover-sources-${WINE_SOURCE_VERSION}.tar.gz"
 
 export MACOSX_DEPLOYMENT_TARGET="15.0"            # matches the app's minimum
 export ARCH_FLAGS="-arch x86_64 -mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET}"

@@ -7,7 +7,7 @@
 # local.vdf ConnectCache blob from outside the Wine bottle — the resulting
 # blob is byte-for-byte compatible with what Steam writes itself, because
 # Wine's CryptProtectData is deterministic from:
-#   - GetUserNameA() — always "crossover" in our bottles
+#   - GetUserNameA() — always "steamuser" in our prefixes
 #   - crypt32_protectdata_secret — Wine compile-time constant
 #   - random salt — stored inside the blob itself
 #   - optional entropy — supplied explicitly by both sides

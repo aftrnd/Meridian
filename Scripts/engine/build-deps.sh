@@ -15,11 +15,12 @@ source "$(dirname "$0")/env.sh"
 STAMPS="$WORK/stamps"
 mkdir -p "$DL" "$WORK" "$DEPS" "$STAMPS"
 
-fetch_cx_sources() {
+fetch_wine_sources() {
     [ -d "$SRC/wine" ] && return
-    say "Fetching CrossOver ${CX_SOURCE_VERSION} source"
-    curl -fL -o "$DL/crossover-sources-${CX_SOURCE_VERSION}.tar.gz" "$CX_SOURCE_URL"
-    tar -C "$BUILD_ROOT" -xzf "$DL/crossover-sources-${CX_SOURCE_VERSION}.tar.gz"
+    local tarball="$DL/$(basename "$WINE_SOURCE_URL")"
+    say "Fetching Wine source ${WINE_SOURCE_VERSION}"
+    curl -fL -o "$tarball" "$WINE_SOURCE_URL"
+    tar -C "$BUILD_ROOT" -xzf "$tarball"
 }
 
 # Fetch an upstream tarball into $DL and unpack it into $WORK; echoes the dir.
@@ -59,7 +60,7 @@ build_gmp() {
 }
 
 build_nettle() {
-    # CodeWeavers' tree ships nettle without Makefile.in; use the GNU release
+    # The source tarball ships nettle without Makefile.in; use the GNU release
     # of the same 3.10 line.
     local src; src="$(fetch_tar https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz)"
     autotools "$src" --enable-shared --disable-static --enable-fat \
@@ -108,7 +109,7 @@ build_moltenvk() {
 }
 
 build_glib() {
-    # CodeWeavers' glib 2.78 tree lacks the gvdb submodule, and 2.78's
+    # The tarball's glib 2.78 tree lacks the gvdb submodule, and 2.78's
     # gdbus-codegen needs Python's removed distutils. Upstream 2.82 has
     # neither problem and satisfies GStreamer 1.24 (>= 2.64). libffi, pcre2
     # and libintl come from glib's own meson wraps.
@@ -151,7 +152,7 @@ ALL=(gmp nettle gnutls freetype sdl2 moltenvk glib gstreamer)
 
 main() {
     command -v meson >/dev/null || die "meson missing: brew install meson ninja cmake bison flex"
-    fetch_cx_sources
+    fetch_wine_sources
     write_meson_cross
     local pkgs=("$@"); [ ${#pkgs[@]} -gt 0 ] || pkgs=("${ALL[@]}")
     for p in "${pkgs[@]}"; do

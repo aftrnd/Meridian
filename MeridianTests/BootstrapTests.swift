@@ -427,6 +427,24 @@ final class BootstrapTests: XCTestCase {
                       "The setActivationPolicy: swizzle must install in +load (no NSApp needed)")
     }
 
+    /// Games launch through Steam and inherit its environment, so the
+    /// accessory dylib loads into them too. Demoted to `.accessory`, a game
+    /// had no Dock icon, menu bar or Cmd-Tab entry and could not be brought
+    /// back after switching away (user, Oct 12 2026, Endacopia). A process
+    /// whose Windows executable is in a Steam library must be left alone:
+    /// macOS classed such a process "Foreground" and a Steam-folder one
+    /// "UIElement" with the fixed dylib (lsappinfo, Oct 12 2026).
+    func testWineAccessory_leavesGamesInTheDock() throws {
+        let src = try readSource("Scripts/wine-accessory/meridian_wine_accessory.m")
+        XCTAssertTrue(src.contains(#"strcasestr(exe, "\\steamapps\\")"#),
+                      "A game is a process whose executable (argv[1]) is under a Steam library's steamapps folder")
+        XCTAssertEqual(src.components(separatedBy: "if (meridian_is_game_process()) return;").count - 1, 2,
+                       "Both +load swizzles must skip game processes")
+        let ctor = src.components(separatedBy: "__attribute__((constructor))").last ?? ""
+        XCTAssertTrue(ctor.contains("if (meridian_is_game_process()) {"),
+                      "The constructor must not demote a game process")
+    }
+
     /// Mirror of `WineEngine.isSupportedEngineTag`.
     private func isSupportedEngineTag(_ tag: String, major: Int = 4) -> Bool {
         tag.hasPrefix("v\(major).") && tag.hasSuffix("-engine")

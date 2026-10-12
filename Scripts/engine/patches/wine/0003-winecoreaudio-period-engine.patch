@@ -1,0 +1,240 @@
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -102,6 +102,20 @@
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
++
++    /* Render: a FIFO between the client buffer and the AudioUnit. The period
++     * timer moves exactly one period into it per tick, so the padding a client
++     * sees drops by one period per event, as with the Windows audio engine;
++     * the device drains it in its own IO-buffer-sized pulls. Without it the
++     * device pulled straight from the client buffer, and clients that refill
++     * only when one period is left (SDL2) ran dry between ticks. */
++    BYTE *dev_buffer;
++    UINT32 dev_bufsize_frames, dev_offs_frames, dev_held_frames;
++    UINT32 dev_pull_frames; /* largest render pull seen (or expected) */
++    UINT32 dev_underruns;
++    BOOL dev_starved; /* starting, or the device found the FIFO short */
++    UINT64 last_pos;
++    double dev_level_err; /* smoothed FIFO level above target, in frames */
+ };
+ 
+ static const REFERENCE_TIME def_period = 100000;
+@@ -388,6 +402,61 @@
+         memset(buffer, 128, frames * stream->fmt->nBlockAlign);
+     else
+         memset(buffer, 0, frames * stream->fmt->nBlockAlign);
++}
++
++/* Render FIFO level the period timer keeps ahead of the device: one device
++ * pull, one period, and a quarter period for timer jitter. */
++static UINT32 render_target_frames(const struct coreaudio_stream *stream)
++{
++    UINT32 target = stream->dev_pull_frames + stream->period_frames + stream->period_frames / 4;
++    return min(target, stream->dev_bufsize_frames - stream->period_frames);
++}
++
++/* Appends frames to the render FIFO from src (NULL for silence). */
++static void render_fifo_append(struct coreaudio_stream *stream, const BYTE *src, UINT32 frames)
++{
++    UINT32 block = stream->fmt->nBlockAlign;
++    UINT32 tail = (stream->dev_offs_frames + stream->dev_held_frames) % stream->dev_bufsize_frames;
++    UINT32 chunk = min(frames, stream->dev_bufsize_frames - tail);
++
++    if(src){
++        memcpy(stream->dev_buffer + tail * block, src, chunk * block);
++        memcpy(stream->dev_buffer, src + chunk * block, (frames - chunk) * block);
++    }else{
++        silence_buffer(stream, stream->dev_buffer + tail * block, chunk);
++        silence_buffer(stream, stream->dev_buffer, frames - chunk);
++    }
++    stream->dev_held_frames += frames;
++}
++
++/* One period timer tick for a playing render stream: lead with silence when
++ * starting or after the device found the FIFO short (never otherwise, as that
++ * would be a gap of its own), then move exactly one period (or what the
++ * client has) out of the client buffer. */
++static void render_tick_nolock(struct coreaudio_stream *stream)
++{
++    UINT32 target = render_target_frames(stream), frames, chunk;
++
++    if(stream->flow != eRender || !stream->playing)
++        return;
++
++    if(stream->dev_starved){
++        if(stream->dev_underruns && stream->held_frames)
++            WARN("render FIFO ran dry while the client had data (%u times)\n", stream->dev_underruns);
++        if(stream->dev_held_frames < target)
++            render_fifo_append(stream, NULL, target - stream->dev_held_frames);
++        stream->dev_starved = FALSE;
++    }
++
++    frames = min(stream->held_frames, stream->period_frames);
++    frames = min(frames, stream->dev_bufsize_frames - stream->dev_held_frames);
++    chunk = min(frames, stream->bufsize_frames - stream->lcl_offs_frames);
++    render_fifo_append(stream, stream->local_buffer + stream->lcl_offs_frames * stream->fmt->nBlockAlign, chunk);
++    render_fifo_append(stream, stream->local_buffer, frames - chunk);
++    stream->lcl_offs_frames = (stream->lcl_offs_frames + frames) % stream->bufsize_frames;
++    stream->held_frames -= frames;
++
++    stream->dev_level_err += ((double)stream->dev_held_frames - target - stream->dev_level_err) / 32;
+ }
+ 
+ /* CA is pulling data from us */
+@@ -401,21 +470,29 @@
+     os_unfair_lock_lock(&stream->lock);
+ 
+     if(stream->playing){
+-        lcl_offs_bytes = stream->lcl_offs_frames * stream->fmt->nBlockAlign;
+-        to_copy_frames = min(nframes, stream->held_frames);
+-        to_copy_bytes = to_copy_frames * stream->fmt->nBlockAlign;
++        if(nframes > stream->dev_pull_frames)
++            stream->dev_pull_frames = nframes;
+ 
+-        chunk_bytes = (stream->bufsize_frames - stream->lcl_offs_frames) * stream->fmt->nBlockAlign;
++        lcl_offs_bytes = stream->dev_offs_frames * stream->fmt->nBlockAlign;
++        to_copy_frames = min(nframes, stream->dev_held_frames);
++        to_copy_bytes = to_copy_frames * stream->fmt->nBlockAlign;
+ 
++        chunk_bytes = (stream->dev_bufsize_frames - stream->dev_offs_frames) * stream->fmt->nBlockAlign;
++
+         if(to_copy_bytes > chunk_bytes){
+-            memcpy(data->mBuffers[0].mData, stream->local_buffer + lcl_offs_bytes, chunk_bytes);
+-            memcpy(((BYTE *)data->mBuffers[0].mData) + chunk_bytes, stream->local_buffer, to_copy_bytes - chunk_bytes);
++            memcpy(data->mBuffers[0].mData, stream->dev_buffer + lcl_offs_bytes, chunk_bytes);
++            memcpy(((BYTE *)data->mBuffers[0].mData) + chunk_bytes, stream->dev_buffer, to_copy_bytes - chunk_bytes);
+         }else
+-            memcpy(data->mBuffers[0].mData, stream->local_buffer + lcl_offs_bytes, to_copy_bytes);
++            memcpy(data->mBuffers[0].mData, stream->dev_buffer + lcl_offs_bytes, to_copy_bytes);
+ 
+-        stream->lcl_offs_frames += to_copy_frames;
+-        stream->lcl_offs_frames %= stream->bufsize_frames;
+-        stream->held_frames -= to_copy_frames;
++        stream->dev_offs_frames += to_copy_frames;
++        stream->dev_offs_frames %= stream->dev_bufsize_frames;
++        stream->dev_held_frames -= to_copy_frames;
++
++        if(to_copy_frames < nframes && !stream->dev_starved){
++            stream->dev_starved = TRUE;
++            stream->dev_underruns++;
++        }
+     }else
+         to_copy_bytes = to_copy_frames = 0;
+ 
+@@ -820,6 +897,27 @@
+     if(stream->flow == eCapture){
+         stream->cap_bufsize_frames = muldiv(params->duration, stream->dev_desc.mSampleRate, 10000000);
+         stream->cap_buffer = malloc(stream->cap_bufsize_frames * stream->fmt->nBlockAlign);
++    }else{
++        AudioObjectPropertyAddress addr = { kAudioDevicePropertyBufferFrameSize,
++                                            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
++        UInt32 io_frames = 0, prop_size = sizeof(io_frames);
++        Float64 dev_rate = 0;
++
++        /* The device's IO buffer, in client frames, until real pulls are seen. */
++        if(AudioObjectGetPropertyData(stream->dev_id, &addr, 0, NULL, &prop_size, &io_frames) != noErr || !io_frames)
++            io_frames = 512;
++        addr.mSelector = kAudioDevicePropertyNominalSampleRate;
++        prop_size = sizeof(dev_rate);
++        if(AudioObjectGetPropertyData(stream->dev_id, &addr, 0, NULL, &prop_size, &dev_rate) == noErr && dev_rate > 0)
++            io_frames = (UINT32)((double)io_frames * stream->fmt->nSamplesPerSec / dev_rate + 0.5);
++        stream->dev_pull_frames = io_frames;
++        stream->dev_starved = TRUE;
++
++        stream->dev_bufsize_frames = 4 * stream->period_frames + 2 * max(io_frames, 4096);
++        if(!(stream->dev_buffer = malloc(stream->dev_bufsize_frames * stream->fmt->nBlockAlign))){
++            params->result = E_OUTOFMEMORY;
++            goto end;
++        }
+     }
+     params->result = S_OK;
+ 
+@@ -827,6 +925,7 @@
+     if(FAILED(params->result)){
+         if(stream->converter) AudioConverterDispose(stream->converter);
+         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
++        free(stream->dev_buffer);
+         free(stream->fmt);
+         free(stream);
+     } else {
+@@ -858,6 +957,7 @@
+     free(stream->resamp_buffer);
+     free(stream->wrap_buffer);
+     free(stream->cap_buffer);
++    free(stream->dev_buffer);
+     if(stream->local_buffer){
+         size = 0;
+         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
+@@ -1360,6 +1460,8 @@
+     }
+ 
+     latency += stream_latency;
++    if(stream->flow == eRender)
++        latency += render_target_frames(stream);
+     /* pretend we process audio in Period chunks, so max latency includes
+      * the period time */
+     *params->latency = muldiv(latency, 10000000, stream->fmt->nSamplesPerSec) + stream->period;
+@@ -1400,6 +1502,7 @@
+         params->result = AUDCLNT_E_NOT_STOPPED;
+     else{
+         stream->playing = TRUE;
++        stream->dev_starved = TRUE;
+         params->result = S_OK;
+     }
+ 
+@@ -1448,6 +1551,11 @@
+         stream->wri_offs_frames = 0;
+         stream->cap_offs_frames = 0;
+         stream->cap_held_frames = 0;
++        stream->dev_offs_frames = 0;
++        stream->dev_held_frames = 0;
++        stream->dev_level_err = 0;
++        stream->dev_starved = TRUE;
++        stream->last_pos = 0;
+         params->result = S_OK;
+     }
+ 
+@@ -1467,6 +1575,19 @@
+     next.QuadPart = last.QuadPart + stream->period;
+ 
+     while(!stream->please_quit){
++        LONGLONG drift = 0;
++
++        os_unfair_lock_lock(&stream->lock);
++        if(stream->flow == eRender && stream->playing){
++            render_tick_nolock(stream);
++            /* The device clock is not the timer's: a FIFO that settles above
++             * target means the device runs slower, so lengthen the ticks a
++             * little (and the reverse), at most 0.5%. */
++            drift = (LONGLONG)(stream->dev_level_err * 10000000.0 / stream->fmt->nSamplesPerSec / 64);
++            drift = max(-stream->period / 200, min(stream->period / 200, drift));
++        }
++        os_unfair_lock_unlock(&stream->lock);
++
+         NtSetEvent(stream->event, NULL);
+         NtDelayExecution(FALSE, &delay);
+         NtQueryPerformanceCounter(&last, NULL);
+@@ -1478,7 +1599,7 @@
+             adjust = -stream->period / 2;
+ 
+         delay.QuadPart = -(stream->period + adjust);
+-        next.QuadPart += stream->period;
++        next.QuadPart += stream->period + drift;
+     }
+ 
+     return STATUS_SUCCESS;
+@@ -1704,6 +1825,12 @@
+     os_unfair_lock_lock(&stream->lock);
+ 
+     *params->pos = stream->written_frames - stream->held_frames;
++    if(stream->flow == eRender){
++        /* Frames still in the FIFO have not played yet. */
++        *params->pos = *params->pos > stream->dev_held_frames ? *params->pos - stream->dev_held_frames : 0;
++        if(*params->pos < stream->last_pos) *params->pos = stream->last_pos;
++        stream->last_pos = *params->pos;
++    }
+ 
+     if(stream->share == AUDCLNT_SHAREMODE_SHARED)
+         *params->pos *= stream->fmt->nBlockAlign;

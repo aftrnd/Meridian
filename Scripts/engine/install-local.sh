@@ -32,6 +32,9 @@ if [ -d "$ENGINE" ]; then
     say "Backed up $(cat "$BACKUP/wine/meridian-engine-version.txt" 2>/dev/null || echo engine) to $BACKUP"
 fi
 mkdir -p "$ENGINE"
-cp -R "$STAGE"/. "$ENGINE"/
+# -p keeps modification times: Wine compares share/wine/wine.inf's mtime with a
+# prefix's .update-timestamp, and a mismatch runs a full wineboot --init on every
+# new bottle (which prompts for Wine Mono).
+cp -Rp "$STAGE"/. "$ENGINE"/
 xattr -rd com.apple.quarantine "$ENGINE" 2>/dev/null || true
 say "Installed $(cat "$ENGINE/wine/meridian-engine-version.txt") — launch Meridian from Xcode"

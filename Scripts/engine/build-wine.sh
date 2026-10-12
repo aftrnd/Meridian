@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-wine.sh — build Wine from CodeWeavers' published CrossOver source.
+# build-wine.sh — build Wine from its published LGPL source (env.sh).
 #
 # Usage: bash Scripts/engine/build-wine.sh
 #   Requires build-deps.sh to have populated $DEPS.
@@ -12,8 +12,8 @@
 # x86_64 binaries that Rosetta runs transparently. That keeps the compiler
 # native (fast) without a separate tools build.
 #
-# CodeWeavers' closed `cxcompatdb.so` is not part of the source and is not
-# built; Meridian selects D3D implementations itself (see package-engine.sh).
+# No closed component is part of the source or built; Meridian selects D3D
+# implementations itself (see package-engine.sh).
 #
 # Output: $WORK/wine-install (a `make install` tree under prefix /).
 
@@ -21,11 +21,28 @@ source "$(dirname "$0")/env.sh"
 
 BUILD="$WORK/build-wine"
 INSTALL="$WORK/wine-install"
+PATCHES="$(cd "$(dirname "$0")" && pwd)/patches/wine"
+
+# Meridian's own changes on top of the source. Idempotent: a patch
+# that already reverse-applies is in the tree from an earlier run.
+apply_patches() {
+    local p
+    for p in "$PATCHES"/*.patch; do
+        [ -e "$p" ] || continue
+        if patch -d "$SRC/wine" -p1 -R -s -f --dry-run < "$p" >/dev/null 2>&1; then
+            continue
+        fi
+        say "Applying $(basename "$p")"
+        patch -d "$SRC/wine" -p1 -N -s < "$p" || die "patch failed: $p"
+    done
+}
 
 main() {
     [ -f "$DEPS/lib/libgnutls.30.dylib" ] || die "run build-deps.sh first"
     command -v x86_64-w64-mingw32-gcc >/dev/null || die "brew install mingw-w64"
     command -v i686-w64-mingw32-gcc   >/dev/null || die "brew install mingw-w64"
+
+    apply_patches
 
     local gst="--without-gstreamer"
     [ -f "$DEPS/lib/pkgconfig/gstreamer-1.0.pc" ] && gst="--with-gstreamer"
