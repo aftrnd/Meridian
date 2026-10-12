@@ -45,6 +45,13 @@ jobs:
       - name: Verify tag matches project version
         run: bash Scripts/check-version.sh "${GITHUB_REF_NAME}"
 
+      - name: Install build tools
+        # The "Build meridian-dpapi.exe" phase cross-compiles a Windows helper
+        # with MinGW (Scripts/build-dpapi.sh); runners don't ship it.
+        run: |
+          command -v x86_64-w64-mingw32-gcc >/dev/null || brew install mingw-w64
+          x86_64-w64-mingw32-gcc --version | head -1
+
       - name: Require signing secrets
         env:
           P12: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
