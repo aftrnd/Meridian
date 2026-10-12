@@ -261,8 +261,8 @@ final class LaunchStageTests: XCTestCase {
                        "The launch bar is staged, so it must not show a percentage.")
         XCTAssertTrue(src.contains("launcher.steamSignIn"),
                       "StatusCard must say when the launch is waiting on Steam's sign-in.")
-        XCTAssertTrue(src.contains("guard launcher.steamSignIn == nil else { return staged }"),
-                      "The bar must hold still while the launch waits on the player.")
+        XCTAssertTrue(src.contains("guard launcher.steamSignIn == nil, launcher.steamWaitingOnPlayer == nil else { return staged }"),
+                      "The bar must hold still while the launch waits on the player (Steam's sign-in or a game's EULA).")
         XCTAssertTrue(src.contains("effectiveLaunchTarget"),
                       "StatusCard must creep the bar forward during long Steam-boot stalls.")
         XCTAssertFalse(src.contains("LaunchCardHighlightRing"),
