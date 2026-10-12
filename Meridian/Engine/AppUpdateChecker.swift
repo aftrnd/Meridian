@@ -408,7 +408,7 @@ final class AppUpdateChecker {
 
         for release in releases {
             guard let tagName = release["tag_name"] as? String else { continue }
-            guard tagName.hasSuffix("-engine") else { continue }
+            guard WineEngine.isSupportedEngineTag(tagName) else { continue }
             if let isDraft = release["draft"] as? Bool, isDraft { continue }
             if let isPre = release["prerelease"] as? Bool, isPre { continue }
             log.info("[check] latest engine release: \(tagName)")

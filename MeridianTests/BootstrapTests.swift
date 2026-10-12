@@ -571,4 +571,28 @@ final class BootstrapTests: XCTestCase {
             }
         }
     }
+
+    /// Mirror of `WineEngine.isSupportedEngineTag`.
+    private func isSupportedEngineTag(_ tag: String, major: Int = 3) -> Bool {
+        tag.hasPrefix("v\(major).") && tag.hasSuffix("-engine")
+    }
+
+    /// Engine updates must never cross a major version: v4 is source-built
+    /// and selects renderers by search path, which this app can't drive, so
+    /// it must not pick up v4, and both update paths must apply the same filter.
+    func testEngineUpdates_stayWithinSupportedMajor() throws {
+        XCTAssertTrue(isSupportedEngineTag("v3.1.0-engine"))
+        XCTAssertTrue(isSupportedEngineTag("v3.0.6-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v4.1.0-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v30.0.0-engine"))
+        XCTAssertFalse(isSupportedEngineTag("v3.1.0"))
+
+        let engine = try readSource("Meridian/Engine/WineEngine.swift")
+        XCTAssertTrue(engine.contains(#"tag.hasPrefix("v\(supportedEngineMajor).") && tag.hasSuffix("-engine")"#),
+                      "WineEngine.isSupportedEngineTag must match the mirror above")
+        for file in ["Meridian/Engine/EngineDownloader.swift", "Meridian/Engine/AppUpdateChecker.swift"] {
+            XCTAssertTrue(try readSource(file).contains("WineEngine.isSupportedEngineTag(tagName)"),
+                          "\(file) must filter engine releases with isSupportedEngineTag")
+        }
+    }
 }

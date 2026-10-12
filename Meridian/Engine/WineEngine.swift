@@ -152,6 +152,17 @@ final class WineEngine {
 
     // MARK: - Known Paths
 
+    /// Engine major version this app understands. A major bump marks a layout
+    /// change the app must be updated for (v4: source-built, renderers selected
+    /// by search path, no cxcompatdb), so engine updates never cross majors: an
+    /// older app stays on the newest engine it can drive.
+    nonisolated static let supportedEngineMajor = 3
+
+    /// Whether a release tag (e.g. `v3.1.0-engine`) is an engine this app can run.
+    nonisolated static func isSupportedEngineTag(_ tag: String) -> Bool {
+        tag.hasPrefix("v\(supportedEngineMajor).") && tag.hasSuffix("-engine")
+    }
+
     nonisolated static let engineDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appending(path: "com.meridian.app/engine", directoryHint: .isDirectory)
