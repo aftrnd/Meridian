@@ -725,7 +725,6 @@ final class SteamSession {
         healthGeneration &+= 1
         healthMonitorTask?.cancel()
         healthMonitorTask = nil
-        steamWindow?.stopSuppressing()
 
         // Send steam.exe -shutdown via a second process instance. Steam's IPC
         // dispatches this as a graceful shutdown request to the running
@@ -752,6 +751,10 @@ final class SteamSession {
 
         // Always kill — orphan processes can exist outside our tracking.
         killAllWineProcesses(engine: engine)
+        // Only now: on -shutdown Steam shows its library window with a
+        // "Shutdown" popup over it, which flashed on screen while it exited
+        // (webhelper.txt `SP Desktop_uid0-'Steam': WasHidden 0`, Oct 12 2026).
+        steamWindow?.stopSuppressing()
         persistentProcess = nil
         state = .idle
     }

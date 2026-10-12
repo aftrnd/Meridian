@@ -220,6 +220,21 @@ final class WindowClassificationTests: XCTestCase {
         XCTAssertTrue(src.contains("Timer.scheduledTimer(withTimeInterval:"))
     }
 
+    /// Told to quit, Steam shows its library with a "Shutdown" popup over it,
+    /// which flashed on screen when suppression stopped first (Oct 12 2026).
+    func testShutdown_keepsSteamHiddenUntilItHasExited() throws {
+        let src = try steamSessionSource()
+        guard let start = src.range(of: "func shutdown(engine: WineEngine) async {"),
+              let end = src.range(of: "\n    }\n", range: start.upperBound..<src.endIndex)
+        else { return XCTFail("SteamSession.shutdown must exist") }
+        let body = src[start.upperBound..<end.lowerBound]
+        guard let kill = body.range(of: "killAllWineProcesses(engine: engine)"),
+              let stop = body.range(of: "steamWindow?.stopSuppressing()")
+        else { return XCTFail("shutdown must kill Steam and then stop suppressing") }
+        XCTAssertLessThan(kill.lowerBound, stop.lowerBound,
+                          "Suppression stops only after Steam has exited")
+    }
+
     func testSteamWindowExposesCoreAPI() throws {
         let src = try steamWindowSource()
         XCTAssertTrue(src.contains("func startSuppressing()"),
