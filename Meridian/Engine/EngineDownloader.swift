@@ -177,14 +177,14 @@ final class EngineDownloader {
 
         log.info("[fetchLatestAsset] fetched \(releases.count) release(s)")
 
-        // Walk releases in order (newest first) and find the latest -engine tagged release
-        // that has a .tar.gz or .tar.xz asset attached.
+        // Walk releases in order (newest first) and find the latest engine release
+        // this app supports (same major) that has a .tar.gz or .tar.xz asset attached.
         for release in releases {
             let tagName = release["tag_name"] as? String ?? ""
             let isDraft = release["draft"] as? Bool ?? false
             let isPrerelease = release["prerelease"] as? Bool ?? false
 
-            guard tagName.hasSuffix("-engine"), !isDraft, !isPrerelease else { continue }
+            guard WineEngine.isSupportedEngineTag(tagName), !isDraft, !isPrerelease else { continue }
             guard let assets = release["assets"] as? [[String: Any]] else { continue }
 
             log.info("[fetchLatestAsset] checking engine release: \(tagName), \(assets.count) asset(s)")
@@ -203,7 +203,7 @@ final class EngineDownloader {
             log.warning("[fetchLatestAsset] engine release \(tagName) has no .tar.gz asset — skipping")
         }
 
-        throw DownloadError.noAssetFound("No engine release with a .tar.gz asset found in \(repoSlug)")
+        throw DownloadError.noAssetFound("No v\(WineEngine.supportedEngineMajor).x engine release with a .tar.gz asset found in \(repoSlug)")
     }
 
     // MARK: - Download
