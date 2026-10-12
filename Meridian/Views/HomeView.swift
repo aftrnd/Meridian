@@ -767,6 +767,7 @@ private struct GameScrollRow<MenuContent: View>: View {
     /// that fires a second idle, which was overwriting currentIndex with the
     /// wrong card on rapid taps.
     @State private var programmaticScrollTime: Date = .distantPast
+    @State private var hoverGate = CardHoverGate()
 
     private var metrics: CardLayoutMetrics {
         // Home rows step 3…5 columns (user direction July 12 2026): cards
@@ -828,6 +829,7 @@ private struct GameScrollRow<MenuContent: View>: View {
                 .scrollClipDisabled()
                 .scrollIndicators(.hidden)
                 .scrollPosition($scrollPosition)
+                .environment(\.cardHoverGate, hoverGate)
                 // Only sync currentIndex from user drags once the scroll is
                 // fully at rest AND outside the debounce window. The 0.5 s
                 // guard covers both the primary animation (0.3 s) and the
@@ -835,6 +837,7 @@ private struct GameScrollRow<MenuContent: View>: View {
                 // the old boolean flag cleared on that first idle, letting the
                 // second idle overwrite currentIndex with the wrong card.
                 .onScrollPhaseChange { _, new in
+                    hoverGate.scrollPhaseChanged(to: new)
                     guard new == .idle else { return }
                     guard Date().timeIntervalSince(programmaticScrollTime) > 0.5 else { return }
                     if let id = scrollPosition.viewID(type: Int.self),

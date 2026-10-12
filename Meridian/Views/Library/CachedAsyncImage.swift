@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import ImageIO
 
 // MARK: - CachedAsyncImage
 
@@ -101,7 +102,8 @@ struct ArtGlowBackground: View {
                 .padding(-8)
                 .blur(radius: 32)
                 .saturation(colorScheme == .dark ? 1.0 : 1.3)
-                .opacity(colorScheme == .dark ? 0.47 : 0.6)
+                // 20% under the original 0.47 / 0.6 (user, Oct 11 2026).
+                .opacity(colorScheme == .dark ? 0.376 : 0.48)
                 .allowsHitTesting(false)
         }
     }
@@ -130,8 +132,13 @@ final class ImageCache: @unchecked Sendable {
     private static let maxDiskBytes    = 500 * 1024 * 1024  // 500 MB
     private static let targetDiskBytes = 400 * 1024 * 1024  // 400 MB post-eviction target
 
+    /// Decoded bytes the memory tier may hold. Every entry is a fully
+    /// decoded bitmap (see `decodeNow`), so cost = width × height × 4.
+    private static let memoryCostLimit = 384 * 1024 * 1024
+
     private init() {
         memory.countLimit = 500
+        memory.totalCostLimit = Self.memoryCostLimit
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         diskCacheDirectory = caches.appendingPathComponent("com.meridian.app/images", isDirectory: true)
         try? FileManager.default.createDirectory(at: diskCacheDirectory,
@@ -156,18 +163,63 @@ final class ImageCache: @unchecked Sendable {
 
     /// Two-tier lookup whose disk read + decode run off the caller's actor
     /// (nonisolated async), keeping the main thread free of file I/O.
-    func imageAsync(for url: URL) async -> NSImage? {
+    /// `maxPixelSize` downsamples a disk hit (see `decodeNow`).
+    func imageAsync(for url: URL, maxPixelSize: Int? = nil) async -> NSImage? {
         if let cached = memory.object(forKey: url as NSURL) { return cached }
-        return readFromDisk(url: url)
+        return readFromDisk(url: url, maxPixelSize: maxPixelSize)
     }
 
     /// Decodes raw image bytes off the caller's actor (nonisolated async).
     /// Use instead of `NSImage(data:)` in @MainActor code.
-    static func decode(_ data: Data) async -> NSImage? {
-        guard let image = NSImage(data: data) else { return nil }
-        // Force bitmap decompression now, off-main, so first draw is cheap.
-        _ = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        return image
+    static func decode(_ data: Data, maxPixelSize: Int? = nil) async -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return decodeNow(source, maxPixelSize: maxPixelSize)
+    }
+
+    /// Decodes on the calling thread, now. ImageIO is lazy: `NSImage(data:)`
+    /// and `NSImage(contentsOf:)` keep the JPEG compressed until its first
+    /// draw, which happens in Core Animation's commit on the MAIN thread,
+    /// mid-scroll or mid-zoom (`cgImage(forProposedRect:)` doesn't change
+    /// that). `kCGImageSourceShouldCacheImmediately` decodes here instead.
+    /// `maxPixelSize` caps the long side: card art is drawn ~250-500 px wide
+    /// while the 2x capsule is 1200×1800. Point size = pixel size, as
+    /// `NSImage(data:)` gave for Steam's 72 dpi art.
+    static func decodeNow(_ source: CGImageSource, maxPixelSize: Int?) -> NSImage? {
+        let image: CGImage?
+        if let maxPixelSize {
+            image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            ] as CFDictionary)
+        } else {
+            image = CGImageSourceCreateImageAtIndex(source, 0, [
+                kCGImageSourceShouldCacheImmediately: true,
+            ] as CFDictionary)
+        }
+        guard let image else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
+    /// Memory-tier cost of a decoded image (`decodeNow` sizes in pixels).
+    private static func cost(of image: NSImage) -> Int {
+        Int(image.size.width * image.size.height * 4)
+    }
+
+    /// True when `url`'s bytes are already in the disk tier (no read, no decode).
+    func isOnDisk(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: diskFileURL(for: url).path(percentEncoded: false))
+    }
+
+    /// Writes downloaded bytes to the disk tier only: for warming art that
+    /// isn't on screen yet, without holding a decoded bitmap for it.
+    func storeOnDisk(_ data: Data, for url: URL) {
+        let fileURL = diskFileURL(for: url)
+        ioQueue.async {
+            guard !FileManager.default.fileExists(atPath: fileURL.path) else { return }
+            try? data.write(to: fileURL, options: .atomic)
+        }
     }
 
     // MARK: - Edge color sampling (ambient art glow)
@@ -241,7 +293,7 @@ final class ImageCache: @unchecked Sendable {
     ///   - rawData: Raw HTTP response bytes. When provided these are written
     ///              directly (no re-encoding). Pass `nil` to re-encode from NSImage.
     func store(_ image: NSImage, for url: URL, rawData: Data? = nil) {
-        memory.setObject(image, forKey: url as NSURL)
+        memory.setObject(image, forKey: url as NSURL, cost: Self.cost(of: image))
         let fileURL = diskFileURL(for: url)
         let sourceURL = url
         ioQueue.async { [weak self] in
@@ -258,13 +310,12 @@ final class ImageCache: @unchecked Sendable {
         return diskCacheDirectory.appendingPathComponent("\(hex).\(ext)")
     }
 
-    private func readFromDisk(url: URL) -> NSImage? {
+    private func readFromDisk(url: URL, maxPixelSize: Int? = nil) -> NSImage? {
         let fileURL = diskFileURL(for: url)
-        // NSImage(contentsOf:) returns nil for missing files — no fileExists pre-check needed.
-        guard let image = NSImage(contentsOf: fileURL) else { return nil }
-        // Force bitmap decompression here (callers are off-main) so first draw is cheap.
-        _ = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        memory.setObject(image, forKey: url as NSURL)
+        guard FileManager.default.fileExists(atPath: fileURL.path(percentEncoded: false)),
+              let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+              let image = Self.decodeNow(source, maxPixelSize: maxPixelSize) else { return nil }
+        memory.setObject(image, forKey: url as NSURL, cost: Self.cost(of: image))
         return image
     }
 

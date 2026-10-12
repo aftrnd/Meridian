@@ -28,13 +28,16 @@ struct LibraryView: View {
     /// any grid content influences the layout — prevents the feedback loop that
     /// caused fixed columns to push the sidebar off screen.
     @State private var containerWidth: CGFloat = 0
+    @State private var hoverGate = CardHoverGate()
 
     private var metrics: CardLayoutMetrics {
         CardLayoutMetrics.compute(for: containerWidth)
     }
 
-    /// Horizontal inset for the library grid — 27 pt = 54 px at 2× Retina.
-    private static let gridInset: CGFloat = 27
+    /// One margin all round: the sides and the gap below the toolbar match
+    /// the gutters. Home's peek inset (~45 pt) left the side gap twice the
+    /// top one; the old fixed 27 pt was close but uneven.
+    private var gridInset: CGFloat { CardLayoutMetrics.spacing }
 
     private var gridColumns: [GridItem] {
         Array(
@@ -47,15 +50,18 @@ struct LibraryView: View {
 
     var body: some View {
         @Bindable var library = library
+        // Filters + sorts the whole library: once per body pass, shared by
+        // the grid, its art prefetch and the disk warm-up.
+        let games = displayGames
         Group {
             if library.isLoading && library.games.isEmpty {
                 loadingView
             } else if let error = library.loadError, !isInCategoryMode {
                 errorView(error)
-            } else if displayGames.isEmpty {
+            } else if games.isEmpty {
                 emptyView
             } else {
-                gameGrid
+                gameGrid(games)
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { containerWidth = $0 }
@@ -63,10 +69,10 @@ struct LibraryView: View {
 
     // MARK: - Game grid
 
-    private var gameGrid: some View {
+    private func gameGrid(_ games: [Game]) -> some View {
         ScrollView {
             LazyVGrid(columns: gridColumns, spacing: CardLayoutMetrics.spacing) {
-                ForEach(displayGames) { game in
+                ForEach(games) { game in
                     GameGridView(
                         game: game,
                         isSelected: selectedGame?.id == game.id,
@@ -76,12 +82,39 @@ struct LibraryView: View {
                     )
                     .onTapGesture { selectedGame = game }
                     .contextMenu { gameContextMenu(for: game) }
+                    .onAppear { prefetchArt(around: game, in: games) }
                 }
             }
-            .padding(.horizontal, Self.gridInset)
+            .padding(.horizontal, gridInset)
             .padding(.vertical, CardLayoutMetrics.spacing)
         }
         .ignoresSafeArea(edges: [.top, .bottom])
+        .onScrollPhaseChange { _, phase in hoverGate.scrollPhaseChanged(to: phase) }
+        .environment(\.cardHoverGate, hoverGate)
+        // Every capsule onto disk in the background (bytes only), so no card
+        // ever waits on the network. Re-runs as capsule hashes arrive.
+        .task(id: artWarmKey(games)) { await CapsuleArt.warmDisk(games) }
+    }
+
+    // MARK: - Art prefetch
+
+    /// Rows of art kept decoded ahead of the scroll, and behind it.
+    private static let prefetchRowsAhead = 4
+    private static let prefetchRowsBehind = 1
+
+    /// A card coming on screen decodes the art for the rows around it, so
+    /// cards arrive with their art (`GameGridView.init` reads it from memory).
+    private func prefetchArt(around game: Game, in games: [Game]) {
+        guard let index = games.firstIndex(where: { $0.id == game.id }) else { return }
+        let columns = metrics.visibleCount
+        let lower = max(0, index - columns * Self.prefetchRowsBehind)
+        let upper = min(games.count, index + 1 + columns * Self.prefetchRowsAhead)
+        CapsuleArt.prefetch(games[lower..<upper])
+    }
+
+    /// Changes when the shown games change or their new-CDN hashes arrive.
+    private func artWarmKey(_ games: [Game]) -> String {
+        "\(games.count)-\(games.reduce(0) { $0 + ($1.libraryCapsuleHash == nil ? 0 : 1) })"
     }
 
     // MARK: - Context menu
@@ -207,7 +240,7 @@ struct LibraryView: View {
                     GameGridPlaceholder()
                 }
             }
-            .padding(.horizontal, Self.gridInset)
+            .padding(.horizontal, gridInset)
             .padding(.vertical, CardLayoutMetrics.spacing)
         }
         .ignoresSafeArea(edges: [.top, .bottom])
