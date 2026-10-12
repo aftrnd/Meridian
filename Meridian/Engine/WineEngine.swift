@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Observation
 
 private let log = MeridianLog(category: "WineEngine")
@@ -13,9 +13,9 @@ private let log = MeridianLog(category: "WineEngine")
 /// If the engine is absent or incomplete, state is `.notInstalled` or `.error` and
 /// the bootstrap pipeline will auto-download the correct release from GitHub.
 ///
-/// The engine is built from source by `Scripts/engine/` — Wine from CodeWeavers'
-/// published CrossOver source (LGPL), DXMT (MIT), MoltenVK (Apache 2.0), GnuTLS
-/// and GStreamer (LGPL). No CrossOver install or closed-source component.
+/// The engine is built from source by `Scripts/engine/` — Wine (LGPL), DXMT
+/// (MIT), MoltenVK (Apache 2.0), GnuTLS and GStreamer (LGPL). No closed-source
+/// component.
 ///
 /// ## D3D12 Support
 ///
@@ -44,8 +44,7 @@ final class WineEngine {
     /// Read from `wine/meridian-engine-version.txt` written by `release-engine.sh`.
     private(set) var engineVersion: String?
 
-    /// The staged D3DMetal version (e.g. GPTK 4's "4.x" or the CX-sourced
-    /// D3DMetal 3.x), read from `wine/meridian-d3dmetal-version.txt` written by
+    /// The staged D3DMetal version (e.g. GPTK 4's "4.x"), read from `wine/meridian-d3dmetal-version.txt` written by
     /// `release-engine.sh`. nil for engines built before B2 (no version file).
     /// Surfaced in diagnostics so "which D3DMetal is this bottle running?" is
     /// answerable without inspecting the framework Info.plist by hand.
@@ -200,7 +199,7 @@ final class WineEngine {
 
         guard missingNLS.isEmpty else {
             log.error("[detect] Engine incomplete — missing NLS files: \(missingNLS.joined(separator: ", "))")
-            state = .error("Engine incomplete — NLS data files missing (\(missingNLS.joined(separator: ", "))). Re-download the engine from Settings.")
+            state = .error("Engine incomplete: NLS data files missing (\(missingNLS.joined(separator: ", "))). Re-download the engine from Settings.")
             backendName = "None"
             engineVersion = nil
             wineExecutableURL = nil
@@ -244,22 +243,22 @@ final class WineEngine {
             : nil
 
         // GPTK: D3D12 → D3DMetal.framework → Metal
-        // REQUIRES CX Wine ABI: ntdll.__wine_unix_call must be present as a PE export.
+        // REQUIRES the unix-call ABI: ntdll.__wine_unix_call must be present as a PE export.
         // GPTK's d3d12.dll AND dxgi.dll both import ntdll.__wine_unix_call.
         // Loading them on Gcenx Wine (which lacks this export) causes:
         //   "wine: Call from ... to unimplemented function ntdll.dll.__wine_unix_call, aborting"
-        // With CX Wine (current engine base): __wine_unix_call IS exported → gptkPath is set
+        // With the engine's Wine: __wine_unix_call IS exported → gptkPath is set
         // and GPTK env vars are injected for game launches → D3D12 → D3DMetal → Metal works.
-        // CLI-verified April 2026: CX Wine steam.exe bootstrap downloads successfully
+        // CLI-verified April 2026: the engine's steam.exe bootstrap downloads successfully
         // (confirmed 130 MB/s download). Gcenx Wine 11.6 fails with HTTP error 0 on macOS 26.
         //
         // DETECTION: Search the Windows PE ntdll.dll (not ntdll.so) for the null-terminated
         // string "__wine_unix_call\0". The PE export table embeds the export name as a C string.
         // CLI-verified April 2026: ntdll.dll contains "__wine_unix_call\0" at byte offset 673776.
         // ntdll.so does NOT contain this string — the .so has only __wine_unix_call_dispatcher
-        // and __wine_unix_call_funcs. Searching ntdll.so was the original bug causing cxABI=false.
+        // and __wine_unix_call_funcs. Searching ntdll.so was the original bug causing unixCallABI=false.
         let ntdllDll = Self.engineDir.appending(path: "wine/lib/wine/x86_64-windows/ntdll.dll")
-        let hasCXWineABI: Bool = {
+        let hasUnixCallABI: Bool = {
             guard let data = try? Data(contentsOf: ntdllDll, options: .mappedIfSafe),
                   let base = "__wine_unix_call".data(using: .utf8) else { return false }
             // Append null byte to match the exact export name, not __wine_unix_call_dispatcher
@@ -268,7 +267,7 @@ final class WineEngine {
             return data.range(of: marker) != nil
         }()
         let gptkD3DMetal = Self.engineDir.appending(path: "wine/lib/gptk/external/D3DMetal.framework/D3DMetal").path(percentEncoded: false)
-        gptkPath = (hasCXWineABI && fm.fileExists(atPath: gptkD3DMetal))
+        gptkPath = (hasUnixCallABI && fm.fileExists(atPath: gptkD3DMetal))
             ? Self.engineDir.appending(path: "wine/lib/gptk").path(percentEncoded: false)
             : nil
 
@@ -286,7 +285,7 @@ final class WineEngine {
         log.info("[detect]   wined3d=\(self.wined3dPath ?? "none")")
         log.info("[detect]   dxvk=\(self.dxvkPath ?? "none")")
         log.info("[detect]   d3d12=\(self.d3d12Path ?? "none")")
-        log.info("[detect]   gptk=\(self.gptkPath ?? "none") cxABI=\(hasCXWineABI)")
+        log.info("[detect]   gptk=\(self.gptkPath ?? "none") unixCallABI=\(hasUnixCallABI)")
         log.info("[detect]   d3dmetal=\(self.d3dMetalVersion ?? "unknown") dxmt=\(self.dxmtVersion ?? "unknown")")
         log.info("[detect]   engineVersion=\(self.engineVersion ?? "unknown")")
         log.info("[detect] backend=\(backendName) ✓")
@@ -391,14 +390,25 @@ final class WineEngine {
             "WINEPREFIX":                prefix.path.path(percentEncoded: false),
             "WINESERVER":                server,
             "WINELOADER":                wine64,
-            // Steam's own processes (and games it launches, which inherit
-            // this) get Wine's D3D: the webhelper runs with --disable-gpu.
+            // Admin processes get Wine's D3D. steam.exe itself runs with
+            // `steamClientEnvironment`, which games inherit.
             "WINEDLLPATH":               dllSearchPath(preferring: nil),
+            // The engine's kernelbase appends this to steamwebhelper.exe's
+            // browser-process command line (Scripts/engine/patches/wine).
+            // Out-of-process GPU compositing paints into a window winemac
+            // cannot present, so Steam's windows (its sign-in) render black
+            // without --in-process-gpu. The prefix reports 96 DPI (raising it
+            // would scale every game), so the Retina scale is passed
+            // explicitly. Pattern 37.
+            "MERIDIAN_STEAMWEBHELPER_ARGS": "--no-sandbox --in-process-gpu --disable-gpu"
+                + " --force-device-scale-factor=\(Self.mainScreenScale)",
             "DYLD_FALLBACK_LIBRARY_PATH": dyld,
             "WINE_LARGE_ADDRESS_AWARE":  "1",
-            // Disable the Windows audio API for all non-game Wine processes
-            // (steam.exe, wineboot, reg, etc.) so Steam sounds never leak
-            // through. Games use environment(for:) which does not set this.
+            // Disable the Windows audio API for admin Wine processes
+            // (wineboot, reg, -shutdown, IPC forwarders). steam.exe's own
+            // sounds are disabled per executable in the registry instead
+            // (`SteamSession.configureSteamRegistry`), since games inherit
+            // steam.exe's environment.
             "WINEDLLOVERRIDES":          "mmdevapi=d",
         ]
         // msync MUST be set identically on EVERY Wine process attaching to the
@@ -412,6 +422,35 @@ final class WineEngine {
             env["DYLD_INSERT_LIBRARIES"] = accessoryPath
         }
         return env
+    }
+
+    /// Environment for steam.exe itself. Every game Steam launches inherits
+    /// it, so it carries the default game setup from `environment(for:)`
+    /// (DXMT for D3D10/11, GStreamer plugins for video, audio on) on top of
+    /// `steamCMDEnvironment`. With admin's Wine D3D and `mmdevapi=d`, Unity
+    /// 6 games failed InitializeEngineGraphics and had no sound (No, I'm not
+    /// a Human, Oct 7 2026). Per-game routing (`SteamSession.gameEnvironment`)
+    /// does not reach games Steam launches.
+    func steamClientEnvironment(for prefix: WinePrefix) -> [String: String] {
+        var env = steamCMDEnvironment(for: prefix)
+        let game = environment(for: prefix)
+        for key in ["WINEDLLPATH", "WINEDLLOVERRIDES", "GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_PATH_1_0",
+                    "ROSETTA_ADVERTISE_AVX", "DOTNET_EnableWriteXorExecute", "MTL_HUD_ENABLED"] {
+            env[key] = game[key]
+        }
+        // Every line in the Steam/game output file says when and which
+        // process wrote it (GameLogFile.steamOutputURL), plus any trace
+        // channels chosen in Settings. GStreamer warnings cover video.
+        let channels = settings.wineDebugChannels
+        env["WINEDEBUG"] = "+timestamp,+pid" + (channels.isEmpty ? "" : "," + channels)
+        env["GST_DEBUG"] = "2"
+        return env
+    }
+
+    /// Backing scale of the main display ("2" on Retina), for Chromium's
+    /// `--force-device-scale-factor` in Steam's webhelper.
+    static var mainScreenScale: String {
+        String(format: "%g", NSScreen.main?.backingScaleFactor ?? 1)
     }
 
     /// Path to `meridian-wine-accessory.dylib` on disk, or `nil` if it's
@@ -437,18 +476,17 @@ final class WineEngine {
     /// Ensures `wine64` is signed with the
     /// `com.apple.security.cs.allow-dyld-environment-variables` entitlement,
     /// required for `DYLD_INSERT_LIBRARIES` to take effect under hardened
-    /// runtime. CrossOver's stock wine64 doesn't include it; this method
-    /// re-signs ad-hoc with the full entitlement set (preserving CX's
-    /// existing entitlements + adding the dyld-env permission).
+    /// runtime. An engine wine64 signed without it is re-signed ad-hoc with
+    /// the full entitlement set (its existing entitlements + the dyld-env
+    /// permission).
     ///
     /// Idempotent — checks current entitlements first and returns early if
     /// already present. Safe to call on every app launch.
     ///
-    /// Note on ad-hoc signing: we lose CrossOver's Developer ID signature,
+    /// Note on ad-hoc signing: any previous Developer ID signature is lost,
     /// but `wine64` is launched as a subprocess of the Developer-ID-signed
     /// Meridian app, not directly by the user, so Gatekeeper is not
-    /// consulted. The re-sign preserves all functionality. Meridian owns
-    /// the engine; CX's signature was never a trust anchor in our flow.
+    /// consulted. The re-sign preserves all functionality.
     ///
     /// Also seeds `meridian-wine-accessory.dylib` into the engine if the
     /// engine tarball didn't ship one (same pattern as `meridian-dpapi.exe`).
@@ -498,10 +536,9 @@ final class WineEngine {
 
         log.info("[ensureDyld] wine64 missing allow-dyld-environment-variables — re-signing ad-hoc with augmented entitlements")
 
-        // Write the combined entitlements plist. Keys match what CrossOver's
-        // wine64 ships with, plus our dyld-env addition. Keeping CX's set
-        // verbatim is important — stripping any of them (e.g. disable-
-        // library-validation) would break legitimate Wine functionality.
+        // Write the combined entitlements plist: the set Wine needs, plus our
+        // dyld-env addition. Stripping any of them (e.g. disable-library-
+        // validation) would break legitimate Wine functionality.
         let entitlements = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -534,9 +571,9 @@ final class WineEngine {
 
         let codesign = Process()
         codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        // CRITICAL: do NOT preserve `team-identifier` from CrossOver's original
-        // signature. Ad-hoc signing (`--sign -`) produces a signature with no
-        // team identifier by design; keeping CW's "9C6B7X7Z8E" leaves the
+        // CRITICAL: do NOT preserve `team-identifier` from a previous Developer
+        // ID signature. Ad-hoc signing (`--sign -`) produces a signature with no
+        // team identifier by design; keeping the old one leaves the
         // binary with a contradictory `Signature=adhoc` + `TeamIdentifier=…`
         // state. The kernel SIGKILLs such binaries at exec time with
         // exit 137 (= 128 + 9). CLI-verified April 23 2026.
@@ -638,7 +675,7 @@ final class WineEngine {
                 // WINEDLLPATH routes through gptk/wine.
                 env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(gptk)/external:\(gptk)/wine/x86_64-unix:\(lib):\(unixDir)\(l64Suffix)"
                 env["DYLD_FALLBACK_FRAMEWORK_PATH"] = "\(gptk)/external"
-                env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
+                env["MERIDIAN_GPTK_LIBD3DSHARED_PATH"] = "\(gptk)/external/libd3dshared.dylib"
             } else {
                 env["DYLD_FALLBACK_LIBRARY_PATH"] = "\(lib):\(unixDir)\(l64Suffix)"
             }
@@ -663,8 +700,8 @@ final class WineEngine {
         // still draws over them. CLI-diagnosed June 2026 from
         // logs/games/3180070.log (No I'm not a Human): the video path reached
         // winegstreamer but failed caps negotiation ("gst_video_info_from_caps:
-        // caps not fixed") because no decoder plugin was discovered. CrossOver
-        // ships the identical plugin set (applemedia/VideoToolbox is the H.264
+        // caps not fixed") because no decoder plugin was discovered. The bundled
+        // plugin set is complete (applemedia/VideoToolbox is the H.264
         // decoder) — the only missing piece was telling GStreamer where to look.
         if let l64 = lib64Path {
             let pluginDir = "\(l64)/gstreamer-1.0"

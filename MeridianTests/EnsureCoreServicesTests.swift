@@ -102,8 +102,8 @@ final class EnsureCoreServicesTests: XCTestCase {
     /// LocalSystem with `validate_service_config: ... interactive but has the
     /// disallowed account name` → the service is skipped → RPC endpoint mapper
     /// absent → EventLog (RPC-dependent) fails to start (1053). CLI-verified
-    /// from steam.exe stderr on a fresh Meridian prefix. CrossOver's working
-    /// bottle uses LocalSystem + Type 0x20 (share-process, no interactive bit).
+    /// from steam.exe stderr on a fresh Meridian prefix. A working Steam
+    /// prefix uses LocalSystem + Type 0x20 (share-process, no interactive bit).
     func testRpcSsIsNotInteractiveWithNetworkService() throws {
         let src = try readSource("Meridian/Engine/WinePrefix.swift")
         // Scope strictly to the RpcSs tuple block: from `"RpcSs",` to the
@@ -128,11 +128,11 @@ final class EnsureCoreServicesTests: XCTestCase {
         )
         XCTAssertFalse(
             rpcBlock.contains("NetworkService"),
-            "RpcSs must not run as NT AUTHORITY\\NetworkService — combined with the interactive bit Wine rejects it. Use LocalSystem (matches CrossOver)."
+            "RpcSs must not run as NT AUTHORITY\\NetworkService — combined with the interactive bit Wine rejects it. Use LocalSystem (matches a working Steam prefix)."
         )
         XCTAssertTrue(
             rpcBlock.contains("LocalSystem"),
-            "RpcSs must run as LocalSystem (CrossOver's working configuration)"
+            "RpcSs must run as LocalSystem (a working Steam prefix's configuration)"
         )
     }
 

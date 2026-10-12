@@ -84,14 +84,31 @@ struct WinePrefix: Sendable {
         steamInstallDir.appending(path: "config")
     }
 
-    /// `drive_c/users/crossover/AppData/Local/Steam` — where Steam's client writes
+    /// The Windows user every prefix runs as. The engine reports it from
+    /// `GetUserName` and names the profile folder after it (engine patch
+    /// 0004); Proton uses the same name.
+    static let windowsUserName = "steamuser"
+
+    /// `drive_c/users/<user>`: game saves and settings (AppData, Documents,
+    /// Saved Games) and Steam's sign-in. A prefix made by an engine that named
+    /// the user differently keeps its own folder until the next engine reset
+    /// moves it (`resetToEngineTemplate`), so this reads the folder that exists.
+    var userProfileDir: URL {
+        let users = driveC.appending(path: "users")
+        let current = users.appending(path: Self.windowsUserName)
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: current.path(percentEncoded: false)) else { return current }
+        let others = (try? fm.contentsOfDirectory(atPath: users.path(percentEncoded: false))) ?? []
+        return others.first { $0 != "Public" && !$0.hasPrefix(".") }
+            .map { users.appending(path: $0) } ?? current
+    }
+
+    /// `<user profile>/AppData/Local/Steam` — where Steam's client writes
     /// its persistent auth token (the DPAPI-encrypted `local.vdf` consumed on auto-login).
-    ///
-    /// Wine's default prefix user is always `crossover` for Meridian bottles (same name
-    /// CrossOver uses). This path matches the value `steamclient64.dll` looks up via
+    /// This path matches the value `steamclient64.dll` looks up via
     /// `SHGetFolderPath(CSIDL_LOCAL_APPDATA)`, CLI-verified April 2026.
     var localAppDataSteamDir: URL {
-        driveC.appending(path: "users/crossover/AppData/Local/Steam")
+        userProfileDir.appending(path: "AppData/Local/Steam")
     }
 
     // MARK: - State Checks
@@ -294,9 +311,12 @@ struct WinePrefix: Sendable {
     /// already has all the correct DLLs for the new Wine version, so no Wine process
     /// needs to run during the reset. The operation is a file copy — instant and atomic.
     ///
-    /// Files preserved across the reset (saved before, restored after):
+    /// Preserved across the reset (saved before, restored after):
     ///   - `drive_c/Program Files/Steam/config/loginusers.vdf` (or `Program Files (x86)/Steam` on older installs)
     ///   - `drive_c/Program Files/Steam/config/config.vdf`
+    ///   - `steamapps/` (installed games)
+    ///   - the Windows user profile (game saves, settings, Steam's `local.vdf`),
+    ///     restored under `windowsUserName` whatever the old engine called it
     func resetToEngineTemplate(engine: WineEngine) async throws {
         let fm = FileManager.default
         let templateURL = WineEngine.engineDir.appending(path: "prefix-template")
@@ -322,13 +342,26 @@ struct WinePrefix: Sendable {
             return (dest: url, data: data)
         }
 
-        // Save local.vdf (DPAPI-encrypted refresh token) separately because its
-        // path is outside steamInstallDir (it lives in AppData/Local/Steam).
-        let localVdfURL = localAppDataSteamDir.appending(path: "local.vdf")
-        let savedLocalVdf: Data? = try? Data(contentsOf: localVdfURL)
+        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)")
 
-        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)" +
-            (savedLocalVdf != nil ? " + local.vdf" : ""))
+        // Preserve the Windows user profile the same way: games keep saves and
+        // settings there (AppData, Documents, Saved Games), and Steam its
+        // sign-in (AppData/Local/Steam/local.vdf). Without this every engine
+        // update deleted local saves. It comes back under the current user
+        // name, so a prefix whose engine used another name keeps its data.
+        let profileURL = userProfileDir
+        let profileHold = path.deletingLastPathComponent()
+            .appending(path: "profile-preserve-\(UUID().uuidString)")
+        var profileMoved = false
+        if fm.fileExists(atPath: profileURL.path(percentEncoded: false)) {
+            do {
+                try fm.moveItem(at: profileURL, to: profileHold)
+                profileMoved = true
+                log.info("[resetToTemplate] moved user profile \(profileURL.lastPathComponent) aside")
+            } catch {
+                log.warning("[resetToTemplate] could not move the user profile aside — saves will be lost: \(error.localizedDescription)")
+            }
+        }
 
         // Preserve installed games across the reset. steamapps/ (game files +
         // appmanifest ACFs) is multi-GB, so move it aside with a same-volume
@@ -401,11 +434,17 @@ struct WinePrefix: Sendable {
             try? data.write(to: dest)
         }
 
-        // Restore local.vdf so steam.exe -silent can auto-login without credentials.
-        if let data = savedLocalVdf, !data.isEmpty {
-            try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
-            try? data.write(to: localVdfURL)
-            log.info("[resetToTemplate] restored local.vdf (\(data.count) bytes)")
+        // Restore the user profile over the template's empty one.
+        if profileMoved {
+            let profileDest = driveC.appending(path: "users/\(Self.windowsUserName)")
+            do {
+                try? fm.removeItem(at: profileDest)
+                try fm.createDirectory(at: profileDest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.moveItem(at: profileHold, to: profileDest)
+                log.info("[resetToTemplate] restored user profile as \(Self.windowsUserName) (saves preserved)")
+            } catch {
+                log.error("[resetToTemplate] failed to restore the user profile from \(profileHold.lastPathComponent): \(error.localizedDescription)")
+            }
         }
 
         // Restore steamapps/ (installed games + ACF manifests).
@@ -503,7 +542,7 @@ struct WinePrefix: Sendable {
 
         // Each tuple: (HKLM key path, [(value name, type, value as string)])
         // Values match what `wine.inf` [<Svc>Service] sections install on a
-        // working CX Preview bottle. Order: nsiproxy first so that even if a
+        // working Steam prefix. Order: nsiproxy first so that even if a
         // later registration fails the network-enumeration assertion path is
         // unblocked.
         let services: [(name: String, key: String, vals: [(String, String, String)])] = [
@@ -522,14 +561,14 @@ struct WinePrefix: Sendable {
                 ]
             ),
             (
-                // Values copied verbatim from a working CrossOver Steam bottle
+                // Values copied verbatim from a working Steam prefix
                 // (CLI-verified 2026-06-18). The previous config registered
                 // RpcSs as INTERACTIVE (Type 0x110) with ObjectName
                 // "NT AUTHORITY\NetworkService" — Wine's service controller
                 // rejects that combination ("interactive but has the disallowed
                 // account name") so RpcSs was never created, the RPC endpoint
                 // mapper was absent, and EventLog (RPC-dependent) failed to
-                // start (1053). CrossOver runs RpcSs as LocalSystem, Type 0x20
+                // start (1053). The working prefix runs RpcSs as LocalSystem, Type 0x20
                 // (SERVICE_WIN32_SHARE_PROCESS, no interactive bit), demand-start.
                 "RpcSs",
                 #"HKLM\System\CurrentControlSet\Services\RpcSs"#,
@@ -544,7 +583,7 @@ struct WinePrefix: Sendable {
                 ]
             ),
             (
-                // Values copied verbatim from a working CrossOver Steam bottle.
+                // Values copied verbatim from a working Steam prefix.
                 // EventLog is an svchost-hosted service (Type 0x20, LocalSystem,
                 // group "LocalServiceNetworkRestricted"). For svchost to host it,
                 // TWO extra registry artefacts are required (added after this
@@ -617,7 +656,7 @@ struct WinePrefix: Sendable {
         // template ships without them (the release-engine wineboot was killed
         // before completing). Without them svchost logs `LoadGroup cannot open
         // key ...Svchost` and EventLog fails to start (1053). Values verbatim
-        // from a working CrossOver Steam bottle (CLI-verified 2026-06-18).
+        // from a working Steam prefix (CLI-verified 2026-06-18).
         let extraKeys: [(key: String, valname: String, valtype: String, val: String)] = [
             (#"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Svchost"#,
              "LocalServiceNetworkRestricted", "REG_MULTI_SZ", "EventLog"),
@@ -725,7 +764,7 @@ struct WinePrefix: Sendable {
     //   MD5 of SteamSetup-installed stub: b97ff5ac… (4.72 MB, built Jan 29)
     //     → reports Windows 6.2.9200.0, exits code 255 on launch
     //
-    //   MD5 of CX Preview 27's stub:      4f2ad574… (5.77 MB, built Mar 12)
+    //   MD5 of the working 64-bit stub:   4f2ad574… (5.77 MB, built Mar 12)
     //     → reports Windows 10.0.19045.0, runs cleanly to "Suppressing Steam update"
     //
     // The normal self-update path `steam.exe` follows on launch would pull
@@ -893,8 +932,8 @@ struct WinePrefix: Sendable {
     /// user as "known but don't auto-login" — it connects to the CM
     /// network and then sits there with `[U:1:0]` (no user context) waiting
     /// for an explicit user action. The steamwebhelper renders the QR /
-    /// login picker. CLI-verified against CX Preview's working
-    /// `loginusers.vdf`: CX writes `AllowAutoLogin "1"` + `WantsOfflineMode
+    /// login picker. CLI-verified against a working signed-in
+    /// `loginusers.vdf`: it has `AllowAutoLogin "1"` + `WantsOfflineMode
     /// "0"` + `SkipOfflineModeWarning "0"` — all three are needed to
     /// unconditionally trigger ConnectCache auto-login with the matching
     /// JWT in `config.vdf`.
@@ -929,11 +968,11 @@ struct WinePrefix: Sendable {
     // MARK: - Steam local.vdf DPAPI injection
     //
     // Steam's persistent auto-login token lives at
-    //   <prefix>/drive_c/users/crossover/AppData/Local/Steam/local.vdf
+    //   <prefix>/drive_c/users/<user>/AppData/Local/Steam/local.vdf
     // The token is a JWT refresh_token embedded inside Steam's "ConnectCache"
     // VDF dictionary, DPAPI-encrypted with these inputs (verified against
-    // CX Preview's working bottle April 23 2026):
-    //   • GetUserNameA()  → always "crossover" in Meridian bottles
+    // a working Steam prefix April 23 2026):
+    //   • GetUserNameA()  → the fixed `WinePrefix.windowsUserName`
     //   • crypt32_protectdata_secret → Wine compile-time constant
     //   • pOptionalEntropy → ASCII account name
     //   • L"BObfuscateBuffer" → szDataDescr embedded in the blob (Steam validates this)
@@ -949,7 +988,7 @@ struct WinePrefix: Sendable {
     //      written to local.vdf.
     //   4. steam.exe -silent on next launch reads local.vdf, calls
     //      CryptUnprotectData (same Wine binary, same compile-time secret,
-    //      same user name "crossover", same accountName entropy → succeeds),
+    //      same user name, same accountName entropy → succeeds),
     //      sends the refresh_token to Valve, gets a fresh access_token.
     //      Connection log shows `[Logging On] Using JWT <id>, persistence: 1
     //      → RecvMsgClientLogOnResponse() : 'OK'` within ~4s. Zero UI.
@@ -1077,8 +1116,8 @@ struct WinePrefix: Sendable {
     /// Steam's ConnectCache map key format: `(crc32(accountName) << 4) | slot_number`.
     /// Slot is always `1` — Meridian never signs two accounts into the same bottle.
     ///
-    /// CLI-verified April 23 2026 against CX Preview's working `local.vdf`:
-    /// `crc32("nickjack876") = 0x07a611aa`, CX key = `0x7a611aa1`
+    /// CLI-verified April 23 2026 against a working `local.vdf`:
+    /// `crc32("nickjack876") = 0x07a611aa`, key = `0x7a611aa1`
     /// → `(0x07a611aa << 4) | 0x1 = 0x7a611aa1` ✓
     static func connectCacheKey(for accountName: String) -> String {
         let bytes = Array(accountName.utf8)
@@ -1164,6 +1203,7 @@ struct WinePrefix: Sendable {
         try vdf.write(toFile: cfgPath, atomically: true, encoding: .utf8)
         log.info("[writeUserNotificationPrefs] merged into \(cfgPath) (accountID=\(accountID), existing=\(existing.count) bytes)")
     }
+
 
     /// The Notifications / Sounds suppression blocks, as depth-1 children of
     /// `UserLocalConfigStore`. Used by `mergeNotificationPreferences`.
@@ -1474,7 +1514,7 @@ struct WinePrefix: Sendable {
     /// Golf (AppID 4069520) + restarting `steam.exe -silent` downloaded the
     /// full 1.8 GB game in 25 seconds with zero UI rendered. The resulting
     /// ACF was updated with the correct `SizeOnDisk`, `InstalledDepots`, and
-    /// build ID — identical in structure to what CX Preview's Steam writes
+    /// build ID — identical in structure to what Steam itself writes
     /// after a GUI-triggered install.
     ///
     /// **Steam does NOT re-scan ACFs while running.** Writing a fresh manifest
@@ -1774,16 +1814,54 @@ struct WinePrefix: Sendable {
     /// only when every depot has been staged and verified — i.e. the game is playable.
     /// Use this instead of `isGameInstalled` when you must not launch a partial download.
     func isGameFullyInstalled(appID: Int) -> Bool {
-        guard let manifest = acfURL(for: appID),
-              let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8)
-        else { return false }
-        for line in contents.components(separatedBy: "\n") {
-            guard let (key, value) = Self.vdfKeyValue(from: line), key == "StateFlags" else { continue }
-            let fullyInstalled = value == "4"
-            log.debug("[isGameFullyInstalled] appID=\(appID) StateFlags=\(value) → \(fullyInstalled)")
-            return fullyInstalled
+        guard let manifest = acfURL(for: appID), let value = Self.stateFlags(in: manifest) else { return false }
+        let fullyInstalled = value == "4"
+        log.debug("[isGameFullyInstalled] appID=\(appID) StateFlags=\(value) → \(fullyInstalled)")
+        return fullyInstalled
+    }
+
+    /// `isGameFullyInstalled` for a whole library at once: libraryfolders.vdf
+    /// is read once and each `steamapps` folder listed once, instead of both
+    /// per game (the 5 s install poll did that for every owned game). Same
+    /// rule: the FIRST library holding a game's ACF decides, StateFlags "4".
+    func fullyInstalledAppIDs(among appIDs: [Int]) -> Set<Int> {
+        let wanted = Set(appIDs)
+        var seen = Set<Int>()
+        var installed = Set<Int>()
+        for library in steamLibraryFolders {
+            let steamapps = library.appending(path: "steamapps")
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: steamapps.path(percentEncoded: false)) else { continue }
+            for name in names where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
+                guard let appID = Int(name.dropFirst("appmanifest_".count).dropLast(".acf".count)),
+                      wanted.contains(appID), seen.insert(appID).inserted else { continue }
+                if Self.stateFlags(in: steamapps.appending(path: name)) == "4" { installed.insert(appID) }
+            }
         }
-        return false
+        return installed
+    }
+
+    /// Every app with an `appmanifest_*.acf` in any Steam library, whatever
+    /// its state: the set Steam loads when it starts.
+    func appManifestIDs() -> Set<Int> {
+        var ids = Set<Int>()
+        for library in steamLibraryFolders {
+            let steamapps = library.appending(path: "steamapps")
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: steamapps.path(percentEncoded: false)) else { continue }
+            for name in names where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
+                if let appID = Int(name.dropFirst("appmanifest_".count).dropLast(".acf".count)) { ids.insert(appID) }
+            }
+        }
+        return ids
+    }
+
+    /// The `StateFlags` value of an appmanifest ACF, or nil if unreadable.
+    private static func stateFlags(in manifest: URL) -> String? {
+        guard let contents = try? String(contentsOfFile: manifest.path(percentEncoded: false), encoding: .utf8) else { return nil }
+        for line in contents.components(separatedBy: "\n") {
+            guard let (key, value) = vdfKeyValue(from: line), key == "StateFlags" else { continue }
+            return value
+        }
+        return nil
     }
 
     /// Reads download progress from the ACF manifest.
@@ -2715,7 +2793,7 @@ struct WinePrefix: Sendable {
     ///
     /// Backs up the DPAPI `local.vdf` (Steam's auto-login token) before wiping
     /// so the user doesn't have to re-authenticate on the next launch. The blob
-    /// is keyed to deterministic inputs (Wine user name `"crossover"` + account
+    /// is keyed to deterministic inputs (the fixed Windows user name + account
     /// name as entropy), so it decrypts fine inside the freshly-rebuilt prefix.
     /// `SteamSessionBridge.prepare` re-writes it from persisted AppSettings;
     /// the `backupSteamSession` call here is belt-and-suspenders for the case

@@ -1015,10 +1015,23 @@ final class WinePrefixTests: XCTestCase {
             return (dest: url, data: data)
         }
 
-        // MIRROR CONTRACT: Must mirror WinePrefix.resetToEngineTemplate local.vdf preservation.
-        let localAppDataSteamDir = prefix.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
-        let localVdfURL = localAppDataSteamDir.appending(path: "local.vdf")
-        let savedLocalVdf: Data? = try? Data(contentsOf: localVdfURL)
+        // MIRROR CONTRACT: Preserve the Windows user profile (saves, settings,
+        // local.vdf) and bring it back under the current user name — mirrors
+        // WinePrefix.userProfileDir + resetToEngineTemplate.
+        let users = prefix.appending(path: "drive_c/users")
+        let currentProfile = users.appending(path: "steamuser")
+        let existingProfile: URL? = fm.fileExists(atPath: currentProfile.path(percentEncoded: false))
+            ? currentProfile
+            : ((try? fm.contentsOfDirectory(atPath: users.path(percentEncoded: false))) ?? [])
+                .first { $0 != "Public" && !$0.hasPrefix(".") }
+                .map { users.appending(path: $0) }
+        let profileHold = prefix.deletingLastPathComponent()
+            .appending(path: "profile-preserve-\(UUID().uuidString)")
+        var profileMoved = false
+        if let existingProfile {
+            try? fm.moveItem(at: existingProfile, to: profileHold)
+            profileMoved = fm.fileExists(atPath: profileHold.path(percentEncoded: false))
+        }
 
         // MIRROR CONTRACT: Preserve steamapps/ (installed games + ACFs) via a
         // same-volume move-aside — mirrors WinePrefix.resetToEngineTemplate.
@@ -1077,10 +1090,11 @@ final class WinePrefixTests: XCTestCase {
             restoredPaths.append(dest.path(percentEncoded: false))
         }
 
-        // MIRROR CONTRACT: Restore local.vdf — mirrors WinePrefix.resetToEngineTemplate.
-        if let data = savedLocalVdf, !data.isEmpty {
-            try? fm.createDirectory(at: localAppDataSteamDir, withIntermediateDirectories: true)
-            try? data.write(to: localVdfURL)
+        // MIRROR CONTRACT: Restore the user profile — mirrors WinePrefix.resetToEngineTemplate.
+        if profileMoved {
+            try? fm.removeItem(at: currentProfile)
+            try? fm.createDirectory(at: users, withIntermediateDirectories: true)
+            try? fm.moveItem(at: profileHold, to: currentProfile)
         }
 
         // MIRROR CONTRACT: Restore steamapps/ — mirrors WinePrefix.resetToEngineTemplate.
@@ -1817,7 +1831,7 @@ final class WinePrefixTests: XCTestCase {
 
         // Build a fake prefix with local.vdf in the right location.
         let prefixA = tempDir.appending(path: "prefixA")
-        let steamLocalDir = prefixA.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        let steamLocalDir = prefixA.appending(path: "drive_c/users/steamuser/AppData/Local/Steam")
         try fm.createDirectory(at: steamLocalDir, withIntermediateDirectories: true)
 
         let sourceContent = Data("fake-dpapi-encrypted-token-\(UUID().uuidString)".utf8)
@@ -1831,7 +1845,7 @@ final class WinePrefixTests: XCTestCase {
 
         // Simulate prefix reset: new prefix with no local.vdf.
         let prefixB = tempDir.appending(path: "prefixB")
-        let steamLocalDirB = prefixB.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        let steamLocalDirB = prefixB.appending(path: "drive_c/users/steamuser/AppData/Local/Steam")
         try fm.createDirectory(at: prefixB, withIntermediateDirectories: true)
 
         // Simulate restoreIfNeeded: backup exists, prefix lacks local.vdf → copy it in.
@@ -1855,7 +1869,7 @@ final class WinePrefixTests: XCTestCase {
         // Build a prefix with local.vdf in AppData/Local/Steam.
         let prefix = tempDir.appending(path: "prefix_localvdf")
         let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
-        let steamLocalDir = prefix.appending(path: "drive_c/users/crossover/AppData/Local/Steam")
+        let steamLocalDir = prefix.appending(path: "drive_c/users/steamuser/AppData/Local/Steam")
         try fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: steamLocalDir, withIntermediateDirectories: true)
         try "".write(to: prefix.appending(path: "system.reg"), atomically: true, encoding: .utf8)
@@ -1877,7 +1891,7 @@ final class WinePrefixTests: XCTestCase {
 
         // local.vdf must survive the reset.
         let restoredLocalVdfPath = prefix
-            .appending(path: "drive_c/users/crossover/AppData/Local/Steam/local.vdf")
+            .appending(path: "drive_c/users/steamuser/AppData/Local/Steam/local.vdf")
             .path(percentEncoded: false)
         XCTAssertTrue(
             fm.fileExists(atPath: restoredLocalVdfPath),
@@ -1886,6 +1900,44 @@ final class WinePrefixTests: XCTestCase {
         let restoredContent = try String(contentsOfFile: restoredLocalVdfPath, encoding: .utf8)
         XCTAssertEqual(restoredContent, originalToken,
                        "Restored local.vdf must contain the original token")
+    }
+
+    /// A prefix whose engine named the Windows user differently keeps its
+    /// profile (game saves, Steam's sign-in) across the reset, under the
+    /// engine's current name. Before, every engine update deleted local saves.
+    func testResetToEngineTemplate_movesAnOlderProfileToTheCurrentUser() throws {
+        let fm = FileManager.default
+        let (tmplDir, i386Dir) = try makeEngineTemplate()
+
+        let prefix = tempDir.appending(path: "prefix_oldprofile")
+        let steamDir = prefix.appending(path: "drive_c/Program Files (x86)/Steam")
+        let oldProfile = prefix.appending(path: "drive_c/users/olduser")
+        let save = oldProfile.appending(path: "AppData/LocalLow/Studio/Game/save.dat")
+        try fm.createDirectory(at: steamDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: save.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: prefix.appending(path: "drive_c/users/Public"), withIntermediateDirectories: true)
+        try "".write(to: prefix.appending(path: "system.reg"), atomically: true, encoding: .utf8)
+        try "slot-1".write(to: save, atomically: true, encoding: .utf8)
+
+        _ = try simulateResetToEngineTemplate(
+            prefix: prefix,
+            templateDir: tmplDir,
+            steamInstallDir: steamDir,
+            engineI386Dir: i386Dir
+        )
+
+        let moved = prefix.appending(path: "drive_c/users/steamuser/AppData/LocalLow/Studio/Game/save.dat")
+        XCTAssertEqual(try? String(contentsOf: moved, encoding: .utf8), "slot-1",
+                       "The game save must come back under the current Windows user")
+        XCTAssertFalse(fm.fileExists(atPath: prefix.appending(path: "drive_c/users/olduser").path(percentEncoded: false)),
+                       "The old profile folder must not be left behind")
+
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Meridian/Engine/WinePrefix.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("static let windowsUserName = \"steamuser\""),
+                      "The mirror assumes the engine's user name (patch 0004)")
+        XCTAssertTrue(source.contains("let profileURL = userProfileDir"),
+                      "resetToEngineTemplate must move the existing profile, whatever its name")
     }
 
     /// Installed games (steamapps/) must survive an engine-version prefix reset.

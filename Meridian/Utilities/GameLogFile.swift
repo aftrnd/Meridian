@@ -66,7 +66,7 @@ enum GameLogFile {
         "DYLD_FALLBACK_LIBRARY_PATH",
         "DYLD_FALLBACK_FRAMEWORK_PATH",
         "DYLD_INSERT_LIBRARIES",
-        "CX_APPLEGPTK_LIBD3DSHARED_PATH",
+        "MERIDIAN_GPTK_LIBD3DSHARED_PATH",
         "WINEMSYNC",
         "MTL_HUD_ENABLED",
         "ROSETTA_ADVERTISE_AVX",
@@ -145,6 +145,58 @@ enum GameLogFile {
         }
         try? handle.close()
         log.info("[endSession] appID=\(appID) reason=\(reason) exit=\(exitCode.map(String.init) ?? "?")")
+    }
+
+    // MARK: - Steam client output
+
+    /// Wine output of steam.exe and everything it launches, games included
+    /// (they inherit its stderr). Handed to steam.exe as a file for the same
+    /// reason as the per-game log; a pipe drained at Steam's exit kept 80
+    /// lines and dropped the rest (5.5 MB in one session, Oct 8 2026). Lines
+    /// carry `+timestamp,+pid` prefixes (`WineEngine.steamClientEnvironment`).
+    /// One generation is kept, rotated each time Steam starts.
+    static let steamOutputURL = LogFileWriter.logsDir.appending(path: "wine-steam.log")
+    static let steamOutputPreviousURL = LogFileWriter.logsDir.appending(path: "wine-steam-previous.log")
+
+    /// Rotates and opens the Steam output file for a new steam.exe.
+    static func beginSteamOutput(arguments: [String]) -> FileHandle? {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: LogFileWriter.logsDir, withIntermediateDirectories: true)
+        let current = steamOutputURL.path(percentEncoded: false)
+        let previous = steamOutputPreviousURL.path(percentEncoded: false)
+        if fm.fileExists(atPath: current) {
+            try? fm.removeItem(atPath: previous)
+            try? fm.moveItem(atPath: current, toPath: previous)
+        }
+        fm.createFile(atPath: current, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: steamOutputURL) else {
+            log.warning("[beginSteamOutput] could not open \(current)")
+            return nil
+        }
+        let header = "==== steam.exe \(arguments.joined(separator: " ")) | \(dateFormatter.string(from: Date())) ====\n"
+        try? handle.write(contentsOf: Data(header.utf8))
+        return handle
+    }
+
+    /// Current size of the Steam output file: a game session's start offset.
+    static func steamOutputSize() -> UInt64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: steamOutputURL.path(percentEncoded: false))
+        return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// Appends what Steam and the game wrote since `offset` to a game's log,
+    /// up to `limit` bytes (trace channels can produce hundreds of MB).
+    static func appendSteamOutput(since offset: UInt64, to handle: FileHandle?, limit: Int = 64 << 20) {
+        guard let handle, let reader = try? FileHandle(forReadingFrom: steamOutputURL) else { return }
+        defer { try? reader.close() }
+        let end = (try? reader.seekToEnd()) ?? 0
+        // Steam restarted mid-session (file rotated): the new file is all of it.
+        let start = offset <= end ? offset : 0
+        try? reader.seek(toOffset: start)
+        let data = (try? reader.read(upToCount: limit)) ?? Data()
+        let header = "\n==== Wine output (steam.exe + game), \(data.count) bytes\(end - start > UInt64(limit) ? ", truncated" : "") ====\n"
+        try? handle.write(contentsOf: Data(header.utf8))
+        try? handle.write(contentsOf: data)
     }
 
     // MARK: - Engine-log collection (Unity / Unreal)
@@ -321,7 +373,7 @@ enum GameLogFile {
         if let code = exitCode {
             exitStr = "Exit code: \(code)"
         } else {
-            exitStr = "Exit code: (unknown — process was still running when session ended)"
+            exitStr = "Exit code: (unknown: process was still running when session ended)"
         }
         return """
 
@@ -372,7 +424,7 @@ struct GameStackReport {
             case .dxvk:      return "DXVK → MoltenVK → Metal"
             case .wined3d:   return "Wine builtin (wined3d) → MoltenVK → Metal"
             case .wined3dGL: return "Wine builtin (wined3d) → OpenGL → Metal"
-            case .unknown:   return "Wine default (no D3D override — OpenGL/Vulkan or unconfigured)"
+            case .unknown:   return "Wine default (no D3D override: OpenGL/Vulkan or unconfigured)"
             }
         }
     }
@@ -527,7 +579,7 @@ struct GameStackReport {
         }()
         let statusStr: String = {
             guard let status else { return "untested" }
-            let v = verifiedWith.map { " — verified with \($0)" } ?? ""
+            let v = verifiedWith.map { " (verified with \($0))" } ?? ""
             return "\(status.rawValue)\(v)"
         }()
         let argsStr = launchArgs.isEmpty ? "(none)" : launchArgs.joined(separator: " ")
@@ -538,7 +590,7 @@ struct GameStackReport {
           Graphics API:    \(apiStr)
           Active renderer: \(renderer.translationLayer)
           Bitness:         \(bitnessStr)
-          DRM:             \(drmShimActive ? "Steamworks shim (gbe_fork) — no steam.exe" : "none (DRM-free)")
+          DRM:             \(drmShimActive ? "Steamworks shim (gbe_fork), no steam.exe" : "none (DRM-free)")
           Metal HUD:       \(metalHUD ? "on" : "off")
           Compat status:   \(statusStr)
           Launch args:     \(argsStr)
@@ -566,5 +618,112 @@ struct GameStackReport {
         case .vulkan:  return "Vulkan"
         case .unknown: return "Unknown"
         }
+    }
+}
+
+// MARK: - Diagnostics bundle
+
+/// "Collect Diagnostics": everything needed to debug a game or Steam problem,
+/// zipped into `logs/diagnostics/` (inside Application Support, so no folder
+/// permission prompt) for the user to send:
+/// - Meridian's logs: meridian.log, the Steam/game Wine output, per-game and
+///   engine logs (`logs/`)
+/// - Steam's own logs (connection, content, webhelper, bootstrap)
+/// - the games' own logs under LocalLow (Unity Player.log)
+/// - macOS crash reports from the last 7 days for Wine processes and Meridian
+/// - summary.txt: versions and the settings that change how games run
+/// Contains the Steam account name and IDs, never passwords or tokens.
+enum DiagnosticsBundle {
+    static let outputDir = LogFileWriter.logsDir.appending(path: "diagnostics", directoryHint: .isDirectory)
+
+    /// Builds the zip off the main actor and returns its URL.
+    static func collect(prefix: WinePrefix, summary: String) async throws -> URL {
+        try await Task.detached(priority: .userInitiated) {
+            try build(prefix: prefix, summary: summary)
+        }.value
+    }
+
+    private static func build(prefix: WinePrefix, summary: String) throws -> URL {
+        let fm = FileManager.default
+        let stamp = Date().formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false))
+            .replacingOccurrences(of: ":", with: ".")
+        let name = "Meridian Diagnostics \(stamp)"
+        let staging = fm.temporaryDirectory.appending(path: name, directoryHint: .isDirectory)
+        try? fm.removeItem(at: staging)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
+
+        func copy(_ source: URL, into folder: String, as fileName: String? = nil) {
+            guard fm.fileExists(atPath: source.path(percentEncoded: false)) else { return }
+            let dir = staging.appending(path: folder, directoryHint: .isDirectory)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? fm.copyItem(at: source, to: dir.appending(path: fileName ?? source.lastPathComponent))
+        }
+
+        // Meridian's logs, minus earlier diagnostics bundles.
+        for item in (try? fm.contentsOfDirectory(at: LogFileWriter.logsDir, includingPropertiesForKeys: nil)) ?? []
+        where item.lastPathComponent != outputDir.lastPathComponent {
+            copy(item, into: "meridian")
+        }
+
+        // Steam's own logs.
+        for item in (try? fm.contentsOfDirectory(at: prefix.steamInstallDir.appending(path: "logs"),
+                                                  includingPropertiesForKeys: nil)) ?? [] {
+            copy(item, into: "steam")
+        }
+
+        // Games' own logs (Unity writes Player.log under LocalLow/<company>/<game>).
+        let localLow = prefix.userProfileDir.appending(path: "AppData/LocalLow")
+        if let walker = fm.enumerator(at: localLow, includingPropertiesForKeys: nil) {
+            for case let file as URL in walker
+            where file.lastPathComponent.hasPrefix("Player") && file.pathExtension == "log" {
+                let game = file.deletingLastPathComponent().lastPathComponent
+                copy(file, into: "games", as: "\(game) \(file.lastPathComponent)")
+            }
+        }
+
+        // macOS crash reports for Wine processes (named after the .exe) and Meridian.
+        let reports = fm.homeDirectoryForCurrentUser.appending(path: "Library/Logs/DiagnosticReports")
+        let weekAgo = Date().addingTimeInterval(-7 * 24 * 3600)
+        for report in (try? fm.contentsOfDirectory(at: reports, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+            let lower = report.lastPathComponent.lowercased()
+            let modified = (try? report.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            guard let modified, modified > weekAgo,
+                  lower.contains("wine") || lower.contains(".exe") || lower.contains("meridian") else { continue }
+            copy(report, into: "crash-reports")
+        }
+
+        try summary.write(to: staging.appending(path: "summary.txt"), atomically: true, encoding: .utf8)
+
+        try fm.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let zip = outputDir.appending(path: "\(name).zip")
+        let ditto = Process()
+        ditto.executableURL = URL(filePath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", staging.path(percentEncoded: false), zip.path(percentEncoded: false)]
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "ditto exited \(ditto.terminationStatus)"])
+        }
+        log.info("[diagnostics] wrote \(zip.path(percentEncoded: false))")
+        return zip
+    }
+
+    /// Versions and the settings that change how games run.
+    @MainActor
+    static func summary(engine: WineEngine) -> String {
+        let info = Bundle.main.infoDictionary
+        let settings = AppSettings.shared
+        return """
+        Meridian \(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))
+        macOS \(ProcessInfo.processInfo.operatingSystemVersionString)
+        Engine \(engine.engineVersion ?? "unknown")
+        Collected \(Date().formatted(date: .complete, time: .complete))
+
+        msync: \(settings.msyncEnabled)
+        Metal HUD: \(settings.metalHUD)
+        Wine trace channels: \(settings.wineDebugChannels.isEmpty ? "(none)" : settings.wineDebugChannels)
+        Steam client signed in: \(settings.steamClientSignedIn)
+        """
     }
 }
