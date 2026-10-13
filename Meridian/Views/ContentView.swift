@@ -409,7 +409,7 @@ struct ContentView: View {
 
     /// Leading room the pages leave for the floating panel; 0 with the column.
     private var floatingSidebarInset: CGFloat {
-        floatingSidebarEnabled && floatingSidebarShown && FloatingSidebar.isAvailable ? FloatingSidebar.width : 0
+        floatingSidebarEnabled && floatingSidebarShown && FloatingSidebar.isAvailable ? FloatingSidebar.edge : 0
     }
 
     /// The detail column's content: the root page (always mounted, so its
