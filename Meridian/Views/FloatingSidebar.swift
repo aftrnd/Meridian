@@ -8,18 +8,24 @@ import SwiftUI
 /// to inset it), so this replaces the split view instead of styling it.
 ///
 /// The pages run the full window underneath. Their leading safe area ends at
-/// the glass (`edge`, applied by ContentView), so everything sits as far from
+/// the glass (`edge(width:)`, applied by ContentView), so everything sits as far from
 /// the panel as it does from the classic column, and Home's banner meets the
 /// glass exactly: its background extension mirrors the art under the panel,
 /// as macOS 26 did.
 enum FloatingSidebar {
-    /// The panel's frame: the classic column's width.
-    static let width: CGFloat = 215
+    /// The glass's width: the classic column's, until its edge is dragged.
+    static let defaultWidth: Double = 215
+    static let widthRange: ClosedRange<Double> = 180...360
+    /// UserDefaults key for the dragged width.
+    static let widthKey = "floatingSidebar.width"
     /// Gap between the glass and the window's edges. The corners follow the
     /// window's (16 pt on macOS 27), concentric, never under 12 pt.
     static let inset: CGFloat = 8
-    /// Where the glass ends; the pages start here.
-    static var edge: CGFloat { width - inset }
+
+    /// Where glass this wide ends; the pages start here.
+    static func edge(width: Double) -> CGFloat {
+        inset + min(max(width, widthRange.lowerBound), widthRange.upperBound)
+    }
     /// UserDefaults key for View › Show/Hide Sidebar (⌃⌘S). There is no
     /// toolbar button: the system's is too large for the panel's top band.
     static let shownKey = "floatingSidebar.shown"
@@ -34,8 +40,13 @@ enum FloatingSidebar {
 @available(macOS 26.0, *)
 struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
     var isPresented: Bool
+    /// The glass's width (`FloatingSidebar.widthKey`); its edge drags it.
+    @Binding var width: Double
     @ViewBuilder var sidebar: Sidebar
     @ViewBuilder var content: Content
+
+    /// The width when the current drag began.
+    @State private var dragStartWidth: Double?
 
     var body: some View {
         content
@@ -62,8 +73,32 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
                     .padding(FloatingSidebar.inset)
                     .ignoresSafeArea()
             }
-            .frame(width: FloatingSidebar.width)
+            .frame(width: FloatingSidebar.edge(width: width) + FloatingSidebar.inset)
             .ignoresSafeArea(edges: .top)
+            // Centred on the glass's edge, half over the pages, like a split
+            // view's divider.
+            .overlay(alignment: .trailing) {
+                resizeHandle.padding(.trailing, FloatingSidebar.inset - 5)
+            }
+    }
+
+    /// Drag the glass's edge to resize it, as the classic column did; the
+    /// pages reflow live. The width is kept across launches.
+    private var resizeHandle: some View {
+        Color.clear
+            .frame(width: 10)
+            .contentShape(Rectangle())
+            .pointerStyle(.columnResize)
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { drag in
+                        let start = dragStartWidth ?? width
+                        dragStartWidth = start
+                        let range = FloatingSidebar.widthRange
+                        width = min(max(start + drag.translation.width, range.lowerBound), range.upperBound)
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
     }
 }
 

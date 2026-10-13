@@ -43,6 +43,8 @@ struct ContentView: View {
     @AppStorage(wrappedValue: false, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
     /// View › Show/Hide Sidebar for the floating panel.
     @AppStorage(wrappedValue: true, FloatingSidebar.shownKey) private var floatingSidebarShown
+    /// The floating panel's width, set by dragging its edge.
+    @AppStorage(wrappedValue: FloatingSidebar.defaultWidth, FloatingSidebar.widthKey) private var floatingSidebarWidth
     /// Developer › Show Layout Sizes. Only the readout observes `layoutSizes`,
     /// so measuring never invalidates this view.
     @AppStorage(wrappedValue: false, AppSettings.layoutSizesKey) private var showLayoutSizes
@@ -276,7 +278,7 @@ struct ContentView: View {
     private var mainContent: some View {
         Group {
             if floatingSidebarEnabled, #available(macOS 26.0, *) {
-                FloatingSidebarLayout(isPresented: floatingSidebarShown) {
+                FloatingSidebarLayout(isPresented: floatingSidebarShown, width: $floatingSidebarWidth) {
                     SidebarView(selectedDestination: $sidebarDestination)
                         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { layoutSizes.sidebar = $0 }
                 } content: {
@@ -409,7 +411,8 @@ struct ContentView: View {
 
     /// Leading room the pages leave for the floating panel; 0 with the column.
     private var floatingSidebarInset: CGFloat {
-        floatingSidebarEnabled && floatingSidebarShown && FloatingSidebar.isAvailable ? FloatingSidebar.edge : 0
+        floatingSidebarEnabled && floatingSidebarShown && FloatingSidebar.isAvailable
+            ? FloatingSidebar.edge(width: floatingSidebarWidth) : 0
     }
 
     /// The detail column's content: the root page (always mounted, so its
