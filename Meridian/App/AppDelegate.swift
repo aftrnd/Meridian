@@ -15,8 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // Floating sidebar: 1038×625, the glass's 8 pt inset + 215 pt glass +
     // 815 pt content (user, Oct 13 2026); still 5 columns + peek.
     private static var fullFrameSize: NSSize {
-        let floating = FloatingSidebar.isAvailable
-            && UserDefaults.standard.bool(forKey: FeatureFlag.floatingSidebar.defaultsKey)
+        let floating = FloatingSidebar.isAvailable && FeatureFlag.floatingSidebar.isEnabled
         return NSSize(width: floating ? 1038 : 1040, height: 625)
     }
     /// Splash → full-size resize. ContentView swaps the splash for the main

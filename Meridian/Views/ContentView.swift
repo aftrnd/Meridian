@@ -38,9 +38,10 @@ struct ContentView: View {
     /// inspector can never open. Everything else about the panel stays wired
     /// so flipping it on needs no relaunch.
     @AppStorage(wrappedValue: false, FeatureFlag.friendsPanel.defaultsKey) private var friendsPanelEnabled
-    /// Feature flag (Developer › Feature Flags): the sidebar as a glass panel
-    /// floating over the pages (FloatingSidebarLayout) instead of a column.
-    @AppStorage(wrappedValue: false, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
+    /// Feature flag (Developer › Feature Flags, on by default): the sidebar as
+    /// a glass panel floating over the pages (FloatingSidebarLayout) instead
+    /// of a column.
+    @AppStorage(wrappedValue: FeatureFlag.floatingSidebar.defaultValue, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
     /// View › Show/Hide Sidebar for the floating panel.
     @AppStorage(wrappedValue: true, FloatingSidebar.shownKey) private var floatingSidebarShown
     /// The floating panel's width, set by dragging its edge.

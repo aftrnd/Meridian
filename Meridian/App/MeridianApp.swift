@@ -20,7 +20,7 @@ struct MeridianApp: App {
     /// Debug builds get the Developer menu out of the box; release builds
     /// switch it on in Settings › Developer.
     @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
-    @AppStorage(wrappedValue: false, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
+    @AppStorage(wrappedValue: FeatureFlag.floatingSidebar.defaultValue, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
     @AppStorage(wrappedValue: true, FloatingSidebar.shownKey) private var floatingSidebarShown
 
     private let settings = AppSettings.shared
@@ -182,7 +182,7 @@ struct FeatureFlagToggle: View {
 
     init(flag: FeatureFlag) {
         self.flag = flag
-        _isOn = AppStorage(wrappedValue: false, flag.defaultsKey)
+        _isOn = AppStorage(wrappedValue: flag.defaultValue, flag.defaultsKey)
     }
 
     var body: some View {

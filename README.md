@@ -27,6 +27,7 @@ Meridian is a native macOS app that runs Windows Steam games on Apple Silicon. I
 ### Home and Library
 
 - **Home** with a swipeable hero carousel of your recently played games, plus Recently Played and Favorites rows
+- **Floating sidebar** on macOS 26 and later: macOS 27's sidebar glass in macOS 26's floating shape, with Home's banner mirrored underneath. Drag its edge to resize; View › Hide Sidebar (⌃⌘S) hides it. Settings › Developer › Floating Sidebar switches back to the standard sidebar
 - **Library grid** with filters (All, Recent, Installed, Favorites) and sort orders (name, most played, recently played)
 - **Collections** for organizing games into named groups in the sidebar
 - **Search** across your whole library
