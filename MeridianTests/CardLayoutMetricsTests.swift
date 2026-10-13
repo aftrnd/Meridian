@@ -15,7 +15,7 @@ final class CardLayoutMetricsTests: XCTestCase {
 
     private let spacing: CGFloat = 20
     private let peek: CGFloat = 0.2
-    private let defaultContentWidth: CGFloat = 810
+    private let defaultContentWidth: CGFloat = 805
 
     /// Mirror of CardLayoutMetrics.referenceCardWidth
     private var referenceCardWidth: CGFloat {
@@ -55,7 +55,7 @@ final class CardLayoutMetricsTests: XCTestCase {
                        "Narrow windows drop to 3 columns.")
         XCTAssertEqual(compute(for: 640, maxCards: 5).visibleCount, 4,
                        "Mid widths show 4 columns.")
-        XCTAssertEqual(compute(for: 810, maxCards: 5).visibleCount, 5,
+        XCTAssertEqual(compute(for: 805, maxCards: 5).visibleCount, 5,
                        "The default width shows 5 columns.")
     }
 
@@ -101,8 +101,8 @@ final class CardLayoutMetricsTests: XCTestCase {
         )
         XCTAssertTrue(grid.contains("static var referenceCardWidth"),
                       "The column step must anchor to the default-window card size.")
-        XCTAssertTrue(grid.contains("static let defaultContentWidth: CGFloat = 825"),
-                      "The anchor must match AppDelegate.fullFrameSize (1040) minus the sidebar (215).")
+        XCTAssertTrue(grid.contains("static let defaultContentWidth: CGFloat = 805"),
+                      "The anchor must match AppDelegate.fullFrameSize (1028) minus the sidebar (215).")
         XCTAssertTrue(grid.contains("floor(containerWidth / (referenceCardWidth + s))"),
                       "Column count must step on the reference card size, not the old 155pt target.")
 

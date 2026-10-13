@@ -288,7 +288,7 @@ struct ContentView: View {
             } else {
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     SidebarView(selectedDestination: $sidebarDestination)
-                        // Fixed at 215 pt in the 1040 pt default window (user, Oct 12
+                        // Fixed at 215 pt in the 1028 pt default window (user, Oct 12
                         // 2026). A resizable column (min 180, ideal 215) opened at
                         // 144 pt, under its own minimum (the split view's saved
                         // frames), and a dragged width (225.5 pt) persisted in the
