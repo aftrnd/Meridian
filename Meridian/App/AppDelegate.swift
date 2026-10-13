@@ -192,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // The reply and its timeout go through the main RUN LOOP, not the main
         // dispatch queue: while AppKit waits for the reply it doesn't drain the
         // main queue if `terminate(_:)` was itself called from it (a @MainActor
-        // Task, `DispatchQueue.main.async`). Sign Out's relaunch waited forever
+        // Task, or an async block on the main queue). Sign Out's relaunch waited forever
         // (sample, Oct 12 2026: main thread in `-[NSApplication _shouldTerminate]`,
         // cleanup "done" 20:44:34, no reply, no timeout).
         let timeout = Timer(timeInterval: 5, repeats: false) { _ in
