@@ -233,12 +233,21 @@ final class SteamSession {
     /// this Mac (no sign-in window can appear from here), and a sign-out
     /// Valve has made is found here rather than mid-launch (`state ==
     /// .signedOut`, which `Launcher` checks before it starts).
-    func warmUp(engine: WineEngine) {
-        guard warmUpTask == nil, state == .idle, AppSettings.shared.steamClientSignedIn else { return }
-        log.info("[warmUp] starting Steam in the background")
+    ///
+    /// With `appID` (a game that just finished installing) a running Steam
+    /// that started before the install is restarted now, in the background,
+    /// instead of when the player presses Play: Steam reads install
+    /// manifests only when it starts (Pattern 43).
+    func warmUp(engine: WineEngine, appID: Int? = nil) {
+        guard warmUpTask == nil, AppSettings.shared.steamClientSignedIn else { return }
+        let missingGame = isReady && appID.map { !appsSteamLoaded.contains($0) } == true
+        guard state == .idle || missingGame else { return }
+        log.info(missingGame
+                 ? "[warmUp] restarting Steam in the background so it loads appID=\(appID ?? 0)"
+                 : "[warmUp] starting Steam in the background")
         warmUpTask = Task {
             do {
-                try await bringUpForDRM(engine: engine, appID: nil, onStatus: nil)
+                try await bringUpForDRM(engine: engine, appID: appID, onStatus: nil)
             } catch {
                 log.info("[warmUp] Steam isn't ready (\(error.localizedDescription)); Play will handle it")
             }
@@ -526,7 +535,7 @@ final class SteamSession {
         prefix.stripBootStrapperInhibit()
 
         let installDir = prefix.steamInstallDir
-        let progress: @Sendable (Int64, Int64) -> Void = { downloaded, total in
+        let progress: @Sendable (Int64, Int64) -> Void = { [weak self] downloaded, total in
             Task { @MainActor [weak self] in
                 if total > 0, downloaded < total {
                     self?.clientDownload = DownloadProgress(received: downloaded, total: total)
@@ -757,6 +766,17 @@ final class SteamSession {
         steamWindow?.stopSuppressing()
         persistentProcess = nil
         state = .idle
+    }
+
+    /// Settings › Sign Out, Steam's half: quit Steam before
+    /// `SteamAuthService.signOut()` deletes its session file (local.vdf).
+    /// Steam writes that file as it quits, and a running Steam stayed signed
+    /// in to the old account.
+    func signOut(engine: WineEngine) async {
+        log.info("[signOut] quitting Steam before its sign-in is deleted")
+        warmUpTask?.cancel()
+        await shutdown(engine: engine)
+        pendingEulaAcceptances = []
     }
 
     /// Aggressive kill of all Wine processes in the prefix. Used before starting
@@ -1137,6 +1157,11 @@ final class SteamSession {
         // The accessory dylib gives Steam's sign-in window macOS chrome
         // (rounded corners, shadow, fade-in) — only for this launch.
         if interactive { env["MERIDIAN_STEAM_SIGNIN"] = "1" }
+        // With Accessibility access, SteamWindow hides Steam's windows and
+        // brings back the ones the player needs; the dylib then keeps a hidden
+        // window off-screen when Steam shows it again (its library flashed at
+        // the top-left as Steam quit). Without access, Steam places them.
+        if steamWindow?.isPermissionGranted == true { env["MERIDIAN_HIDE_STEAM_WINDOWS"] = "1" }
         // Diagnostic: confirm the DYLD_INSERT_LIBRARIES dock-suppression payload
         // is in the env Steam will see. If this is missing or the dylib path
         // is broken, the Wine subprocess won't get demoted to .accessory and

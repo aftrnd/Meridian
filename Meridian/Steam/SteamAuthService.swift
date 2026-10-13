@@ -133,6 +133,9 @@ final class SteamAuthService: NSObject {
         WinePrefix.clearSteamSessionBackup()   // cleans legacy backup dirs
         let liveLocalVdf = WinePrefix.defaultPrefix.localAppDataSteamDir.appending(path: "local.vdf")
         try? FileManager.default.removeItem(at: liveLocalVdf)
+        // Steam's own sign-in goes with its session file, so setup opens
+        // Steam's sign-in again instead of skipping that step.
+        AppSettings.shared.steamClientSignedIn = false
         log.info("[signOut] Keychain cleared, account data + session backup reset")
     }
 

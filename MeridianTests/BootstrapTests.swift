@@ -438,8 +438,8 @@ final class BootstrapTests: XCTestCase {
         let src = try readSource("Scripts/wine-accessory/meridian_wine_accessory.m")
         XCTAssertTrue(src.contains(#"strcasestr(exe, "\\steamapps\\")"#),
                       "A game is a process whose executable (argv[1]) is under a Steam library's steamapps folder")
-        XCTAssertEqual(src.components(separatedBy: "if (meridian_is_game_process()) return;").count - 1, 2,
-                       "Both +load swizzles must skip game processes")
+        XCTAssertEqual(src.components(separatedBy: "if (meridian_is_game_process()) return;").count - 1, 3,
+                       "Every +load swizzle must skip game processes")
         let ctor = src.components(separatedBy: "__attribute__((constructor))").last ?? ""
         XCTAssertTrue(ctor.contains("if (meridian_is_game_process()) {"),
                       "The constructor must not demote a game process")

@@ -29,16 +29,21 @@ struct SettingsView: View {
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
                 .tag("updates")
 
-            LicenseStatusView()
-                .tabItem { Label("License", systemImage: "checkmark.seal") }
-                .tag("license")
-
             DeveloperSettingsTab()
                 .tabItem { Label("Developer", systemImage: "hammer") }
                 .tag("developer")
         }
-        .frame(width: 520)
-        .padding(24)
+        // Grouped forms fill the window and scroll, as in System Settings.
+        // An outer padding boxed them in a gray area that cut content off
+        // (user, Oct 12 2026). No License tab until licensing is settled; a
+        // key can still be entered where the trial ends (LicenseRequiredSheet).
+        .frame(width: 520, height: 460)
+        .onAppear {
+            // A tab that no longer exists (License) would show an empty pane.
+            if !["steam", "engine", "permissions", "updates", "developer"].contains(selectedTab) {
+                selectedTab = "steam"
+            }
+        }
     }
 }
 
@@ -50,6 +55,7 @@ struct SettingsView: View {
 private struct DeveloperSettingsTab: View {
     @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
     @AppStorage("wineDebugChannels") private var wineDebugChannels = ""
+    @AppStorage("msyncEnabled") private var msyncEnabled = true
     @Environment(WineEngine.self) private var engine
     @State private var collecting = false
     @State private var diagnosticsError: String?
@@ -76,6 +82,13 @@ private struct DeveloperSettingsTab: View {
                 Text("Feature Flags")
             } footer: {
                 Text("Work-in-progress features. Off by default; changes apply immediately.")
+                    .font(.caption)
+            }
+
+            Section {
+                Toggle("Use msync", isOn: $msyncEnabled)
+            } footer: {
+                Text("Native Mach-semaphore synchronization, lower CPU overhead on Apple Silicon. Leave on unless a game misbehaves; restart a running game after changing.")
                     .font(.caption)
             }
 
@@ -123,10 +136,13 @@ private struct SteamSettingsTab: View {
     @Environment(SteamAuthService.self) private var steamAuth
     @Environment(SteamSession.self) private var session
     @Environment(SteamLibraryStore.self) private var library
+    @Environment(WineEngine.self) private var engine
     @State private var apiKeyInput: String = ""
     @State private var isValidating = false
     @State private var validationMessage: String?
     @State private var validationSuccess = false
+    @State private var showSignOutConfirm = false
+    @State private var isSigningOut = false
 
     var body: some View {
         Form {
@@ -151,10 +167,11 @@ private struct SteamSettingsTab: View {
 
                         Spacer()
 
-                        Button("Sign Out", role: .destructive) {
-                            steamAuth.signOut()
+                        Button(isSigningOut ? "Signing Out…" : "Sign Out…", role: .destructive) {
+                            showSignOutConfirm = true
                         }
                         .buttonStyle(.bordered)
+                        .disabled(isSigningOut)
                     }
                 } else {
                     Text("Not signed in.")
@@ -210,6 +227,26 @@ private struct SteamSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+        .confirmationDialog(
+            "Sign out of Steam on this Mac?",
+            isPresented: $showSignOutConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Sign Out", role: .destructive) { signOut() }
+        } message: {
+            Text("Meridian and Steam both sign out, and Meridian restarts with setup from the beginning. Installed games stay on this Mac.")
+        }
+    }
+
+    /// Steam quits first (`SteamSession.signOut`), then Meridian forgets the
+    /// account and restarts, so setup opens on a clean launch.
+    private func signOut() {
+        isSigningOut = true
+        Task {
+            await session.signOut(engine: engine)
+            steamAuth.signOut()
+            AppDelegate.relaunch()
+        }
     }
 
     private func validateAndSave() async {
@@ -243,8 +280,8 @@ private struct SteamSettingsTab: View {
 private struct EngineSettingsTab: View {
     @Environment(WineEngine.self) private var engine
     @Environment(SteamSession.self) private var session
+    @Environment(SteamAuthService.self) private var steamAuth
     private let settings = AppSettings.shared
-    @State private var showAdvanced = false
     @State private var showResetConfirm = false
 
     var body: some View {
@@ -258,62 +295,14 @@ private struct EngineSettingsTab: View {
                     .font(.caption)
             }
 
-            Section("Performance") {
-                Toggle("Use msync (recommended)", isOn: Binding(
-                    get: { settings.msyncEnabled },
-                    set: { settings.msyncEnabled = $0 }
-                ))
-                Text("Native Mach-semaphore synchronization. Lower CPU overhead than the legacy path on Apple Silicon. Leave on unless a specific game misbehaves. Restart any running game after changing.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section("Display") {
+            Section {
                 Toggle("Metal Performance HUD", isOn: Binding(
                     get: { settings.metalHUD },
                     set: { settings.metalHUD = $0 }
                 ))
-                Text("Shows GPU frame rate and statistics overlay during gameplay.")
-                    .font(.caption).foregroundStyle(.secondary)
-
-                Toggle("Force Virtual Desktop", isOn: Binding(
-                    get: { settings.useVirtualDesktop },
-                    set: { settings.useVirtualDesktop = $0 }
-                ))
-                Text("Run games inside a Wine virtual desktop at a fixed resolution instead of native windowed mode.")
-                    .font(.caption).foregroundStyle(.secondary)
-
-                if settings.useVirtualDesktop {
-                    HStack {
-                        TextField("Width", value: Binding(
-                            get: { settings.virtualDesktopWidth },
-                            set: { settings.virtualDesktopWidth = $0 }
-                        ), format: .number)
-                        .frame(width: 80)
-                        Text("x")
-                        TextField("Height", value: Binding(
-                            get: { settings.virtualDesktopHeight },
-                            set: { settings.virtualDesktopHeight = $0 }
-                        ), format: .number)
-                        .frame(width: 80)
-                    }
-                    .textFieldStyle(.roundedBorder)
-                }
-            }
-
-            Section {
-                DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Engine repo slug", text: Binding(
-                            get: { settings.engineRepoSlug },
-                            set: { settings.engineRepoSlug = $0 }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        Text("Format: owner/repo. GitHub repository for Wine runtime releases.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.top, 4)
-                }
+            } footer: {
+                Text("Shows the frame rate and GPU statistics over a game while it runs.")
+                    .font(.caption)
             }
 
             Section {
@@ -324,7 +313,7 @@ private struct EngineSettingsTab: View {
             } header: {
                 Text("Troubleshooting")
             } footer: {
-                Text("Removes the Wine engine and Steam prefix. The next launch will download a fresh engine and reinstall Steam automatically.")
+                Text("Removes the Wine engine, Steam and your installed games, and signs you out. Meridian restarts, downloads a fresh engine and starts setup again.")
                     .font(.caption)
             }
         }
@@ -339,13 +328,16 @@ private struct EngineSettingsTab: View {
                 session.killAllWineProcesses(engine: engine)
                 prefix.reset()
                 engine.resetEngine()
+                // The account too: kept, it signed the next launch straight
+                // back in and setup never showed (user, Oct 12 2026).
+                steamAuth.signOut()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    NSApplication.shared.terminate(nil)
+                    AppDelegate.relaunch()
                 }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will delete the Wine engine and Steam installation. All settings are preserved. The next app launch will download a fresh engine and reinstall Steam.")
+            Text("This deletes the Wine engine, Steam and your installed games, and signs you out of Meridian and Steam. Meridian then restarts with setup from the beginning. Your preferences are kept.")
         }
     }
 }
@@ -589,37 +581,6 @@ private struct UpdatesSettingsTab: View {
                 )
             }
 
-            Section {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Diagnostic Log")
-                            .fontWeight(.medium)
-                        Text(LogFileWriter.currentLogURL.path(percentEncoded: false))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Spacer()
-                    Button("Open Log") {
-                        NSWorkspace.shared.open(LogFileWriter.currentLogURL)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-                Button("Open Previous Session Log") {
-                    NSWorkspace.shared.open(LogFileWriter.previousLogURL)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .font(.caption)
-                .disabled(!FileManager.default.fileExists(atPath: LogFileWriter.previousLogURL.path(percentEncoded: false)))
-            } header: {
-                Text("Diagnostics")
-            } footer: {
-                Text("Logs are written to Application Support and rotate each launch. Share these files when reporting issues.")
-                    .font(.caption)
-            }
         }
         .formStyle(.grouped)
     }

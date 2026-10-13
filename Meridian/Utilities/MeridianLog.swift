@@ -70,12 +70,24 @@ final class LogFileWriter: @unchecked Sendable {
         }
 
         // 3. Create fresh log file
-        fm.createFile(atPath: current.path(percentEncoded: false), contents: nil)
-        fileHandle = try? FileHandle(forWritingTo: current)
-        fileHandle?.seekToEndOfFile()
+        fileHandle = Self.openLogFile()
 
         // 4. Write startup header
         writeHeader()
+    }
+
+    /// Opens `meridian.log` for appending, recreating it (and `logs/`) when
+    /// it is gone.
+    private static func openLogFile() -> FileHandle? {
+        let fm = FileManager.default
+        let path = currentLogURL.path(percentEncoded: false)
+        if !fm.fileExists(atPath: path) {
+            try? fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
+            fm.createFile(atPath: path, contents: nil)
+        }
+        let handle = try? FileHandle(forWritingTo: currentLogURL)
+        _ = try? handle?.seekToEnd()
+        return handle
     }
 
     private func writeHeader() {
@@ -117,12 +129,27 @@ final class LogFileWriter: @unchecked Sendable {
     }
 
     /// Write a pre-formed line without a timestamp (used for the header).
+    ///
+    /// Uses the throwing `write(contentsOf:)`. The legacy `write(_:)` raises an
+    /// Objective-C exception on any I/O error (disk full, file descriptor
+    /// gone), which Swift cannot catch: one failed log line aborted the app
+    /// right after "Verifying Wine environment…" (crash report, Oct 12 2026).
+    /// A failed write reopens the file once; if that fails too, the line is
+    /// dropped (the unified log still has it, along with the error).
     private func appendRaw(_ line: String) {
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        fileHandle?.write(data)
+        let data = Data((line + "\n").utf8)
+        do {
+            try fileHandle?.write(contentsOf: data)
+        } catch {
+            Self.writeFailureLog.error("meridian.log write failed: \(error.localizedDescription, privacy: .public)")
+            fileHandle = Self.openLogFile()
+            try? fileHandle?.write(contentsOf: data)
+        }
         // Synchronous flush on every write so the file is crash-safe.
         try? fileHandle?.synchronize()
     }
+
+    private static let writeFailureLog = Logger(subsystem: "com.meridian.app", category: "LogFileWriter")
 }
 
 // MARK: - MeridianLog

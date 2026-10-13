@@ -71,6 +71,8 @@ struct HomeView: View {
         Group {
             if library.isLoading && library.games.isEmpty {
                 loadingView
+            } else if library.games.isEmpty {
+                LibraryEmptyState()
             } else {
                 homeContent
             }

@@ -137,6 +137,8 @@ private struct DeveloperCommands: Commands {
                 openWindow(id: "launch-log")
             }
 
+            LayoutSizesToggle()
+
             Divider()
 
             Button("Reveal Logs in Finder") {
@@ -174,5 +176,14 @@ struct FeatureFlagToggle: View {
 
     var body: some View {
         Toggle(flag.title, isOn: $isOn)
+    }
+}
+
+/// Developer › Show Layout Sizes (`LayoutSizesReadout` in ContentView).
+private struct LayoutSizesToggle: View {
+    @AppStorage(wrappedValue: false, AppSettings.layoutSizesKey) private var isOn
+
+    var body: some View {
+        Toggle("Show Layout Sizes", isOn: $isOn)
     }
 }

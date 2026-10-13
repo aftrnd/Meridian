@@ -235,6 +235,24 @@ final class WindowClassificationTests: XCTestCase {
                           "Suppression stops only after Steam has exited")
     }
 
+    /// Shown again, a window Meridian hid off-screen was carried to the
+    /// top-left by Cocoa and stayed there until the next hide (Steam's library
+    /// as it quit, Oct 12 2026). The dylib keeps it off-screen, but only when
+    /// Meridian can bring the windows the player needs back itself.
+    func testHiddenSteamWindowsStayOffScreenWhenShown() throws {
+        let session = try steamSessionSource()
+        XCTAssertTrue(session.contains(#"if steamWindow?.isPermissionGranted == true { env["MERIDIAN_HIDE_STEAM_WINDOWS"] = "1" }"#),
+                      "Steam keeps hidden windows off-screen only while SteamWindow can present windows")
+        let dylib = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appending(path: "Scripts/wine-accessory/meridian_wine_accessory.m"), encoding: .utf8)
+        XCTAssertTrue(dylib.contains(#"getenv("MERIDIAN_HIDE_STEAM_WINDOWS")"#))
+        for selector in ["@selector(orderFront:)", "@selector(orderWindow:relativeTo:)", "@selector(makeKeyWindow)"] {
+            XCTAssertTrue(dylib.contains(selector), "winemac shows and focuses windows through \(selector)")
+        }
+        XCTAssertTrue(dylib.contains("if (meridian_is_on_screen(before)) {"),
+                      "A window already on screen (one Meridian presented) is left alone")
+    }
+
     func testSteamWindowExposesCoreAPI() throws {
         let src = try steamWindowSource()
         XCTAssertTrue(src.contains("func startSuppressing()"),

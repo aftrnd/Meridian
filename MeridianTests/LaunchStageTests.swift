@@ -322,4 +322,51 @@ final class LaunchStageTests: XCTestCase {
         XCTAssertTrue(src?.contains("if task == \"Failed\" { steamFailed = true }") == true,
                       "A launch Steam gave up on must end at once, not at the startup timeout")
     }
+
+    /// Meridian's EULA sheet reads Steam's app cache, which Steam writes only
+    /// once it runs. Right after an engine update reset Steam there was none,
+    /// and Steam's own window asked (meridian.log Oct 12 19:44:17; cache
+    /// written 19:45:24, ShowEula 19:45:26). When Steam waits on ShowEula the
+    /// cache is there: Meridian's sheet asks, and Steam restarts with the answer.
+    func testEulaMissedBeforeSteamRan_isAskedInMeridiansSheet() throws {
+        let src = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(src.contains("if pendingWait.step == \"ShowEula\", let localConfigURL {"),
+                      "Steam's EULA wait must re-read the agreements before showing Steam's window")
+        XCTAssertTrue(src.contains("eulaPrompt = EulaPrompt(game: game, eulas: eulas)"),
+                      "Agreements found then are asked in Meridian's sheet")
+        XCTAssertTrue(src.contains("await session.shutdown(engine: engine)\n            steamWindow?.resumeAfterGame(steamPID: 0)\n            eulaPrompt"),
+                      "Steam is quit first, closing its own dialog, so Accept restarts it with the answer written")
+    }
+
+    /// The line under "Getting ready…" while Steam starts from cold (~20 s):
+    /// three plain beats for SteamSession's start-up statuses, in order, and
+    /// nothing for the rest (user, Oct 12 2026: "it doesn't give much
+    /// feedback"; Oct 11: the card names beats, it doesn't narrate).
+    func testGettingReadySteps_nameSteamsStartUpInPlainWords() {
+        let statuses = ["Connecting to Steam…", "Starting Steam…", "Starting Steam client…",
+                        "Connecting to Steam servers…", "Connected to Steam servers",
+                        "Signing in to your Steam account…", "Finishing sign-in…", "Steam is ready"]
+        XCTAssertEqual(statuses.map(Launcher.gettingReadyStepText(for:)),
+                       [nil, "Starting Steam in the background", "Starting Steam in the background",
+                        "Connecting to Steam", "Connecting to Steam",
+                        "Signing in to your account", "Signing in to your account", "Steam is ready"])
+    }
+
+    // MARK: - Game detection
+
+    /// Steam's install script runs the game's Visual C++ redistributable from
+    /// inside the game's folder, so it matches the game's pgrep pattern
+    /// (The Baby in Yellow, Oct 12 2026). It must not count as the game.
+    /// Command lines built from the paths in that session's game log.
+    func testGameDetection_skipsRedistributableInstallers() {
+        let game = #"C:\Program Files (x86)\Steam\steamapps\common\The Baby in Yellow"#
+        let output = """
+        37459 \(game)\\_CommonRedist\\vcredist\\2022\\VC_redist.x64.exe /q /norestart
+        37460 C:\\windows\\system32\\cmd.exe /c "\(game)\\_CommonRedist\\vcredist\\2022\\Microsoft Visual C++ 2022 x64.cmd"
+        37501 \(game)\\TheBabyInYellow.exe
+        99999 \(game)\\TheBabyInYellow.exe
+        """
+        XCTAssertEqual(GameProcess.gameProcessLines(in: output, ourPID: 99999),
+                       ["37501 \(game)\\TheBabyInYellow.exe"])
+    }
 }

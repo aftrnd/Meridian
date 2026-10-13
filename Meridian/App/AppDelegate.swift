@@ -7,11 +7,11 @@ private let log = MeridianLog(category: "AppDelegate")
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
 
     private static let splashSize     = NSSize(width: 480, height: 300)
-    // 1040×625, whole points throughout. Width: the sidebar is exactly 1/5
-    // (208, ContentView) and the content column 832
+    // 1040×625, whole points throughout. Width: the sidebar is 215
+    // (ContentView) and the content column 825
     // (`CardLayoutMetrics.defaultContentWidth`). Height: Home's first row sits
-    // centred under the hero, 62.5 pt from the hero to the card art and 62.5
-    // from the art to the window bottom (hero 302 + 62.5 + art 198 + 62.5).
+    // centred under the hero, 63.6 pt from the hero to the card art and 63.6
+    // from the art to the window bottom (hero 302 + 63.6 + art 195.8 + 63.6).
     private static let fullFrameSize  = NSSize(width: 1040, height: 625)
     /// Splash → full-size resize. ContentView swaps the splash for the main
     /// content only after this has elapsed (`ContentView.splashHandoffDelay`),
@@ -171,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NotificationCenter.default.removeObserver(observer)
             readyObserver = nil
         }
+        if Self.relaunchesOnTerminate { Self.openNewInstance() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -184,10 +185,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // before the cleanup kills them — prevents race conditions with partial state.
         bootstrap?.cancelForTermination()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            log.warning("[AppDelegate] cleanup timed out — forcing quit")
-            sender.reply(toApplicationShouldTerminate: true)
+        // The reply and its timeout go through the main RUN LOOP, not the main
+        // dispatch queue: while AppKit waits for the reply it doesn't drain the
+        // main queue if `terminate(_:)` was itself called from it (a @MainActor
+        // Task, `DispatchQueue.main.async`). Sign Out's relaunch waited forever
+        // (sample, Oct 12 2026: main thread in `-[NSApplication _shouldTerminate]`,
+        // cleanup "done" 20:44:34, no reply, no timeout).
+        let timeout = Timer(timeInterval: 5, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                log.warning("[AppDelegate] cleanup timed out — forcing quit")
+                // Its kill sweeps may still be running: a new instance now
+                // could lose its Wine processes to them.
+                AppDelegate.relaunchesOnTerminate = false
+                sender.reply(toApplicationShouldTerminate: true)
+            }
         }
+        RunLoop.main.add(timeout, forMode: .common)
 
         // Flip the flag on the main actor before dispatching — `cleanupDone` is
         // a @MainActor-isolated property and the actual cleanup work runs off
@@ -200,12 +213,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         DispatchQueue.global(qos: .userInitiated).async {
             TerminationCleanup.killAllWineProcesses()
-            DispatchQueue.main.async {
+            Self.onMainRunLoop {
                 sender.reply(toApplicationShouldTerminate: true)
             }
         }
 
         return .terminateLater
+    }
+
+    /// Runs `body` on the main run loop in its common modes, which include the
+    /// one AppKit spins while a `.terminateLater` reply is pending.
+    nonisolated private static func onMainRunLoop(_ body: @escaping @Sendable @MainActor () -> Void) {
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) {
+            MainActor.assumeIsolated { body() }
+        }
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
+    // MARK: - Relaunch
+
+    /// Set by `relaunch()`: a new Meridian opens as this one exits.
+    private static var relaunchesOnTerminate = false
+
+    /// Quits and opens Meridian again, for a sign-out or reset that should
+    /// leave nothing of the old account on screen (user, Oct 12 2026: the
+    /// library stayed behind setup until a restart). Meridian hides at once;
+    /// the new instance opens from `applicationWillTerminate`, after the quit
+    /// cleanup (`TerminationCleanup.killAllWineProcesses`) has finished, so
+    /// that cleanup can't kill the new instance's Wine processes.
+    static func relaunch() {
+        log.info("[relaunch] quitting; a new Meridian opens once the quit cleanup is done")
+        relaunchesOnTerminate = true
+        NSApp.hide(nil)
+        NSApp.terminate(nil)
+    }
+
+    /// `open -n`: a new instance while this one is still exiting. A separate
+    /// process, so the launch doesn't depend on this one living on.
+    private static func openNewInstance() {
+        let open = Process()
+        open.executableURL = URL(filePath: "/usr/bin/open")
+        open.arguments = ["-n", Bundle.main.bundleURL.path(percentEncoded: false)]
+        do {
+            try open.run()
+            log.info("[relaunch] opening a new Meridian")
+        } catch {
+            log.error("[relaunch] couldn't open a new Meridian: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - UNUserNotificationCenterDelegate

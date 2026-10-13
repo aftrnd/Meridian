@@ -497,18 +497,27 @@ final class GameProcess {
         try? t.run(); t.waitUntilExit()
 
         let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let ourPID = String(ProcessInfo.processInfo.processIdentifier)
+        let lines = gameProcessLines(in: output, ourPID: ProcessInfo.processInfo.processIdentifier)
+        return ProcessCheckResult(count: lines.count, lines: lines)
+    }
 
-        let lines = output
+    /// The `pgrep -l -f` lines (`<pid> <command line>`) that are game
+    /// processes: not Meridian, not pgrep, and not the redistributables
+    /// Steam's install scripts run from inside the game's folder
+    /// (`<game>\_CommonRedist\vcredist\…\VC_redist.x64.exe`, The Baby in
+    /// Yellow, Oct 12 2026). Those match the game's pattern but are not the
+    /// game: counted, an installer could confirm the game "running", and its
+    /// exit end the session.
+    nonisolated static func gameProcessLines(in output: String, ourPID: Int32) -> [String] {
+        output
             .components(separatedBy: "\n")
             .filter { !$0.isEmpty }
             .filter { line in
                 let pid = line.split(separator: " ").first.map(String.init) ?? ""
-                return pid != ourPID
+                return pid != String(ourPID)
             }
             .filter { !$0.lowercased().contains("pgrep") }
-
-        return ProcessCheckResult(count: lines.count, lines: lines)
+            .filter { !$0.localizedCaseInsensitiveContains("_CommonRedist") }
     }
 
     /// Force-kills all processes whose command line matches the pattern.
