@@ -115,7 +115,9 @@ struct ContentView: View {
     /// the content ever moves or resizes; the panel is sized to make the
     /// covered state look native (user direction July 12 2026).
     private var friendsPanelWidth: CGFloat {
-        let w = detailFullWidth
+        // The measured width includes the floating panel's room (the
+        // pages' leading safe area); the rows lay out in what's left.
+        let w = detailFullWidth - floatingSidebarInset
         guard w > 400 else { return 280 }
         // Same 3…5 clamp as the Home rows so the panel edge math matches
         // the actual row layout.
@@ -400,7 +402,7 @@ struct ContentView: View {
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
                     // Only track while closed — this is the width the
                     // frozen layout (and thus the panel size) is based on.
-                    if !showFriendsPanel { detailFullWidth = newWidth - floatingSidebarInset }
+                    if !showFriendsPanel { detailFullWidth = newWidth }
                 }
                 .onChange(of: friendsPanelEnabled) { _, enabled in
                     if !enabled, showFriendsPanel {

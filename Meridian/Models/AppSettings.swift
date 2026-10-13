@@ -416,11 +416,6 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The current value, for code outside SwiftUI views.
-    var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? defaultValue
-    }
-
     var title: String {
         switch self {
         case .friendsPanel: "Friends Panel"

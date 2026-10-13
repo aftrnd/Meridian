@@ -40,7 +40,11 @@ final class MsyncEnvironmentTests: XCTestCase {
 
     func testSettingsUI_exposesMsyncToggle() throws {
         let src = try readSource("Meridian/Views/Settings/SettingsView.swift")
-        XCTAssertTrue(src.contains("settings.msyncEnabled"),
+        // Bound through @AppStorage on AppSettings.msyncEnabled's key, with
+        // the same default (on).
+        XCTAssertTrue(src.contains("@AppStorage(\"msyncEnabled\") private var msyncEnabled = true"),
+                      "SettingsView must bind AppSettings.msyncEnabled's key, defaulting on.")
+        XCTAssertTrue(src.contains("Toggle(\"Use msync\", isOn: $msyncEnabled)"),
                       "SettingsView must expose the msync toggle.")
     }
 }
