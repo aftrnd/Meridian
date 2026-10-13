@@ -68,8 +68,7 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
             .padding(.horizontal, FloatingSidebar.inset)
             .padding(.bottom, FloatingSidebar.inset)
             .background {
-                Color.clear
-                    .glassEffect(.regular, in: ConcentricRectangle(corners: .concentric(minimum: .fixed(12)), isUniform: true))
+                glass
                     .padding(FloatingSidebar.inset)
                     .ignoresSafeArea()
             }
@@ -80,6 +79,16 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
             .overlay(alignment: .trailing) {
                 resizeHandle.padding(.trailing, FloatingSidebar.inset - 5)
             }
+    }
+
+    /// macOS 27's own sidebar glass where this macOS has it, else SwiftUI's.
+    @ViewBuilder private var glass: some View {
+        if SidebarGlass.isSupported {
+            SidebarGlass(cornerRadius: 12)
+        } else {
+            Color.clear
+                .glassEffect(.regular, in: ConcentricRectangle(corners: .concentric(minimum: .fixed(12)), isUniform: true))
+        }
     }
 
     /// Drag the glass's edge to resize it, as the classic column did; the
@@ -99,6 +108,33 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
                     }
                     .onEnded { _ in dragStartWidth = nil }
             )
+    }
+}
+
+/// The glass macOS 27 puts behind NavigationSplitView's sidebar:
+/// NSGlassEffectView in its sidebar variant (`_variant` 17, read off a native
+/// sidebar on 27.0.1; toolbar buttons are 0). There's no public way to pick a
+/// variant, and SwiftUI's `.glassEffect` draws far lighter (#3b3b39 against
+/// the native #2b2a28 over the dark window background; the variant matches it
+/// exactly). Private, so it's only used while the setter exists; a macOS
+/// without it gets SwiftUI's glass instead.
+@available(macOS 26.0, *)
+private struct SidebarGlass: NSViewRepresentable {
+    let cornerRadius: CGFloat
+
+    static var isSupported: Bool {
+        NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:"))
+    }
+
+    func makeNSView(context: Context) -> NSGlassEffectView {
+        let view = NSGlassEffectView()
+        view.cornerRadius = cornerRadius
+        view.setValue(17, forKey: "_variant")
+        return view
+    }
+
+    func updateNSView(_ view: NSGlassEffectView, context: Context) {
+        view.cornerRadius = cornerRadius
     }
 }
 
