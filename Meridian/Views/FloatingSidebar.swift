@@ -2,8 +2,8 @@ import SwiftUI
 
 // MARK: - Floating sidebar
 
-/// Developer › Feature Flags › Floating Sidebar: the sidebar as a glass panel
-/// floating over the pages, as macOS 26 drew it. macOS 27 dropped that style
+/// Developer › Feature Flags › Floating Sidebar (on by default): the sidebar
+/// as a glass panel floating over the pages, as macOS 26 drew it. macOS 27 dropped that style
 /// (NavigationSplitView's sidebar is a full-height glass column with no API
 /// to inset it), so this replaces the split view instead of styling it.
 ///
@@ -25,6 +25,21 @@ enum FloatingSidebar {
     /// Where glass this wide ends; the pages start here.
     static func edge(width: Double) -> CGFloat {
         inset + min(max(width, widthRange.lowerBound), widthRange.upperBound)
+    }
+
+    /// Without a column the toolbar puts its first leading item just past
+    /// the traffic lights (x 96) and spaces leading items 8 pt apart;
+    /// beside the classic column, the game page's Back sits 8 pt past the
+    /// column's edge (x 223 for 215). Measured from the toolbar's glass
+    /// frames on macOS 27.0.1.
+    private static let toolbarLeadingStart: CGFloat = 96
+    private static let toolbarItemSpacing: CGFloat = 8
+    private static let backInsetFromEdge: CGFloat = 8
+
+    /// Width of an invisible leading toolbar item that puts Back where the
+    /// classic column puts it: 8 pt past the glass.
+    static func toolbarLeadingInset(width: Double) -> CGFloat {
+        edge(width: width) + backInsetFromEdge - toolbarLeadingStart - toolbarItemSpacing
     }
     /// UserDefaults key for View › Show/Hide Sidebar (⌃⌘S). There is no
     /// toolbar button: the system's is too large for the panel's top band.
@@ -50,6 +65,7 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
 
     var body: some View {
         content
+            .environment(\.toolbarLeadingInset, isPresented ? FloatingSidebar.toolbarLeadingInset(width: width) : nil)
             .overlay(alignment: .leading) {
                 if isPresented {
                     panel.transition(.move(edge: .leading).combined(with: .opacity))
@@ -108,6 +124,13 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
                     .onEnded { _ in dragStartWidth = nil }
             )
     }
+}
+
+extension EnvironmentValues {
+    /// Set while the floating panel shows: the room the toolbar's leading
+    /// items leave (an invisible item) so they start beside the pages, as
+    /// beside the classic column. nil: no panel, the toolbar's own layout.
+    @Entry var toolbarLeadingInset: CGFloat? = nil
 }
 
 /// The glass macOS 27 puts behind NavigationSplitView's sidebar:
