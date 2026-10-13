@@ -8,10 +8,10 @@ import SwiftUI
 /// to inset it), so this replaces the split view instead of styling it.
 ///
 /// The pages run the full window underneath. Their leading safe area ends at
-/// the glass (`edge(width:)`, applied by ContentView), so everything sits as far from
-/// the panel as it does from the classic column, and Home's banner meets the
-/// glass exactly: its background extension mirrors the art under the panel,
-/// as macOS 26 did.
+/// the glass (`edge(width:)`, applied by ContentView), so everything sits as
+/// far from the panel as it does from the classic column, and Home's banner
+/// meets the glass exactly: its background extension mirrors the art into
+/// that safe area, under the panel, unshaded, as macOS 26 and 27 draw it.
 enum FloatingSidebar {
     /// The glass's width: the classic column's, until its edge is dragged.
     static let defaultWidth: Double = 215
@@ -50,7 +50,6 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
 
     var body: some View {
         content
-            .environment(\.floatingSidebarActive, true)
             .overlay(alignment: .leading) {
                 if isPresented {
                     panel.transition(.move(edge: .leading).combined(with: .opacity))
@@ -136,11 +135,4 @@ private struct SidebarGlass: NSViewRepresentable {
     func updateNSView(_ view: NSGlassEffectView, context: Context) {
         view.cornerRadius = cornerRadius
     }
-}
-
-extension EnvironmentValues {
-    /// True under FloatingSidebarLayout: Home's banner shade runs under the
-    /// panel with its mirrored art. False (the classic column) leaves every
-    /// layout exactly as it was.
-    @Entry var floatingSidebarActive: Bool = false
 }

@@ -321,10 +321,6 @@ private struct HeroCarousel: View {
 
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(SteamAuthService.self) private var steamAuth
-    /// Under the floating sidebar the art keeps the frame it has beside the
-    /// column (same crop) and its background extension mirrors it under the
-    /// panel, as macOS 26 drew it; only the shade runs under the panel too.
-    @Environment(\.floatingSidebarActive) private var floatingSidebarActive
 
     /// Continuous page position. Whole numbers are resting pages.
     @State private var position: CGFloat = 0
@@ -359,9 +355,6 @@ private struct HeroCarousel: View {
     private var mountedPages: [Int] { count > 1 ? [current - 1, current, current + 1] : [current] }
 
     private func wrapped(_ page: Int) -> Int { ((page % count) + count) % count }
-
-    /// The edge the shade runs past: the floating panel's, or none.
-    private var underPanel: Edge.Set { floatingSidebarActive ? .leading : [] }
     private func game(at page: Int) -> Game { games[wrapped(page)] }
 
     var body: some View {
@@ -379,7 +372,6 @@ private struct HeroCarousel: View {
                 startPoint: .init(x: 0.5, y: 0.3),
                 endPoint: .bottom
             )
-            .ignoresSafeArea(edges: underPanel)
 
             ForEach(mountedPages, id: \.self) { page in
                 caption(for: game(at: page), page: page)
