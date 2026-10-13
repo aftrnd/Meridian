@@ -20,6 +20,8 @@ struct MeridianApp: App {
     /// Debug builds get the Developer menu out of the box; release builds
     /// switch it on in Settings › Developer.
     @AppStorage(AppSettings.developerMenuKey) private var developerMenuEnabled = AppSettings.isDebugBuild
+    @AppStorage(wrappedValue: FeatureFlag.floatingSidebar.defaultValue, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
+    @AppStorage(wrappedValue: true, FloatingSidebar.shownKey) private var floatingSidebarShown
 
     private let settings = AppSettings.shared
 
@@ -83,6 +85,15 @@ struct MeridianApp: App {
                 }
             }
             CommandGroup(replacing: .newItem) {}
+            // The floating panel has no toolbar button (FloatingSidebar).
+            if floatingSidebarEnabled && FloatingSidebar.isAvailable {
+                CommandGroup(before: .sidebar) {
+                    Button(floatingSidebarShown ? "Hide Sidebar" : "Show Sidebar") {
+                        floatingSidebarShown.toggle()
+                    }
+                    .keyboardShortcut("s", modifiers: [.control, .command])
+                }
+            }
             // Sign-out lives in Settings › Steam, as on macOS generally; the
             // old second "Meridian" menu next to the app menu is gone.
             if developerMenuEnabled {
@@ -171,7 +182,7 @@ struct FeatureFlagToggle: View {
 
     init(flag: FeatureFlag) {
         self.flag = flag
-        _isOn = AppStorage(wrappedValue: false, flag.defaultsKey)
+        _isOn = AppStorage(wrappedValue: flag.defaultValue, flag.defaultsKey)
     }
 
     var body: some View {

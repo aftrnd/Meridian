@@ -36,6 +36,8 @@ struct GameDetailView: View {
     @Environment(LicenseManager.self)     private var licenseManager
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
+    /// Room before Back while the floating sidebar shows (FloatingSidebar).
+    @Environment(\.toolbarLeadingInset)   private var toolbarLeadingInset
 
     @State private var showEngineSetup = false
     @State private var showLicenseRequired = false
@@ -177,6 +179,14 @@ struct GameDetailView: View {
             // `showsToolbar`) so the toolbar hands back to the library page
             // at the same moment the page begins to shrink.
             if showsToolbar {
+                // Beside the floating panel, Back keeps its classic spot: an
+                // invisible item first, sized to the panel's edge.
+                if let toolbarLeadingInset, #available(macOS 26.0, *) {
+                    ToolbarItem(placement: .navigation) {
+                        Color.clear.frame(width: toolbarLeadingInset, height: 1)
+                    }
+                    .sharedBackgroundVisibility(.hidden)
+                }
                 ToolbarItem(placement: .navigation) {
                     Button(action: onDismiss) {
                         Image(systemName: "chevron.backward")

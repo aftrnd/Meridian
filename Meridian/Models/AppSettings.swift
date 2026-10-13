@@ -396,18 +396,35 @@ final class AppSettings: @unchecked Sendable {
     private init() {}
 }
 
-/// Work-in-progress surfaces, OFF by default in every build. Toggled from the
-/// Developer menu or Settings › Developer; views read them with
-/// `@AppStorage(wrappedValue: false, flag.defaultsKey)` so a flip applies live.
+/// Surfaces switched on and off from the Developer menu or Settings ›
+/// Developer. Each has its own default (`defaultValue`); views read them with
+/// `@AppStorage(wrappedValue: flag.defaultValue, flag.defaultsKey)` so a flip
+/// applies live.
 enum FeatureFlag: String, CaseIterable, Identifiable {
     case friendsPanel
+    case floatingSidebar
 
     var id: String { rawValue }
     var defaultsKey: String { "feature.\(rawValue)" }
 
+    /// The floating sidebar is the look (user, Oct 13 2026); the friends
+    /// panel is still work in progress.
+    var defaultValue: Bool {
+        switch self {
+        case .friendsPanel: false
+        case .floatingSidebar: true
+        }
+    }
+
+    /// The current value, for code outside SwiftUI views.
+    var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? defaultValue
+    }
+
     var title: String {
         switch self {
         case .friendsPanel: "Friends Panel"
+        case .floatingSidebar: "Floating Sidebar"
         }
     }
 
@@ -415,6 +432,8 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
         switch self {
         case .friendsPanel:
             "Toolbar button and trailing inspector listing Steam friends by status."
+        case .floatingSidebar:
+            "The sidebar as a glass panel over the pages, with Home's banner running underneath (macOS 26+). Off: the standard macOS sidebar. View › Hide Sidebar (⌃⌘S)."
         }
     }
 }

@@ -38,6 +38,14 @@ struct ContentView: View {
     /// inspector can never open. Everything else about the panel stays wired
     /// so flipping it on needs no relaunch.
     @AppStorage(wrappedValue: false, FeatureFlag.friendsPanel.defaultsKey) private var friendsPanelEnabled
+    /// Feature flag (Developer › Feature Flags, on by default): the sidebar as
+    /// a glass panel floating over the pages (FloatingSidebarLayout) instead
+    /// of a column.
+    @AppStorage(wrappedValue: FeatureFlag.floatingSidebar.defaultValue, FeatureFlag.floatingSidebar.defaultsKey) private var floatingSidebarEnabled
+    /// View › Show/Hide Sidebar for the floating panel.
+    @AppStorage(wrappedValue: true, FloatingSidebar.shownKey) private var floatingSidebarShown
+    /// The floating panel's width, set by dragging its edge.
+    @AppStorage(wrappedValue: FloatingSidebar.defaultWidth, FloatingSidebar.widthKey) private var floatingSidebarWidth
     /// Developer › Show Layout Sizes. Only the readout observes `layoutSizes`,
     /// so measuring never invalidates this view.
     @AppStorage(wrappedValue: false, AppSettings.layoutSizesKey) private var showLayoutSizes
@@ -265,102 +273,31 @@ struct ContentView: View {
         // token that turns out to be expired (fail-fast at the point of use).
     }
 
+    /// The sidebar and the pages: the standard split view, or (Developer ›
+    /// Feature Flags › Floating Sidebar, macOS 26+) a glass panel over them.
     @ViewBuilder
     private var mainContent: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(selectedDestination: $sidebarDestination)
-                // Fixed at 215 pt in the 1040 pt default window (user, Oct 12
-                // 2026). A resizable column (min 180, ideal 215) opened at
-                // 144 pt, under its own minimum (the split view's saved
-                // frames), and a dragged width (225.5 pt) persisted in the
-                // split view's autosave and overrode the default.
-                .navigationSplitViewColumnWidth(215)
-                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { layoutSizes.sidebar = $0 }
-        } detail: {
-            NavigationStack {
-                stage
-                    .navigationTitle(stageTitle)
-                    .environment(\.detailFlightSource, zoom?.source(landing: landing))
-                    .environment(\.detailPresented, detailChrome)
-                    .toolbar {
-                        // Root-page chrome only; the detail page brings its own
-                        // (back, favourite, more) via its own `.toolbar`.
-                        // Items are added/removed by NSToolbar, which draws the
-                        // glass bezels itself and doesn't animate them — content
-                        // transitions inside stable items were tried (2026-09-10)
-                        // and looked half-animated: glyph fading under a bezel
-                        // that popped. The system morph needs a NavigationStack
-                        // push, which the zoom stage deliberately doesn't do.
-                        if !detailChrome {
-                            // Flexible space pushes everything after it to the
-                            // trailing end — same pattern as GameDetailView.
-                            ToolbarItem(placement: .automatic) { Spacer() }
-                            ToolbarItem(placement: .automatic) {
-                                DownloadsToolbarButton(
-                                    launcher: launcher,
-                                    library: library,
-                                    isPresented: $showingDownloadsPopover,
-                                    onSelectGame: { openDetail($0) }
-                                )
-                            }
-                            ToolbarItem(placement: .automatic) {
-                                if friendsPanelEnabled {
-                                    Button {
-                                        // One transaction for the inspector slide AND
-                                        // the friendsPanelOpen-driven row re-layout —
-                                        // without this the cards snap to their new
-                                        // metrics instantly while the panel is still
-                                        // sliding, which reads as jank. No bounce:
-                                        // a click carries no momentum to overshoot.
-                                        if !showFriendsPanel {
-                                            friendsPanelOpenWidth = friendsPanelWidth
-                                        }
-                                        withAnimation(.smooth(duration: 0.28)) {
-                                            showFriendsPanel.toggle()
-                                        }
-                                    } label: {
-                                        // Square label frame → macOS renders a perfect
-                                        // circle regardless of the glyph's aspect ratio
-                                        // (person.2 is wide; without this the pill
-                                        // stretches). Plural glyph; outline, no fill.
-                                        Image(systemName: "person.2")
-                                            .frame(width: 24, height: 24)
-                                    }
-                                    // No buttonStyle override — macOS supplies the
-                                    // toolbar circle / liquid glass, same as Downloads.
-                                    .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
-                                }
-                            }
-                        }
-                    }
-                    // Discord-style trailing friends panel. Standard macOS
-                    // inspector behaviour: the window frame never changes —
-                    // content compresses in place (Apple Music lyrics-style).
-                    // Home's scroll rows read \.friendsPanelOpen and drop to
-                    // fewer, full-size cards instead of squeezing all five.
-                    .inspector(isPresented: $showFriendsPanel) {
-                        FriendsPanel()
-                            // Pinned to the computed cover width so the panel
-                            // edge lands exactly on the row's natural
-                            // 3-cards + peek boundary.
-                            .inspectorColumnWidth(
-                                min: friendsPanelOpenWidth,
-                                ideal: friendsPanelOpenWidth,
-                                max: friendsPanelOpenWidth
-                            )
-                    }
-                    .environment(\.friendsPanelOpen, showFriendsPanel)
-                    .environment(\.friendsPanelCoverWidth, showFriendsPanel ? friendsPanelOpenWidth : 0)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
-                        // Only track while closed — this is the width the
-                        // frozen layout (and thus the panel size) is based on.
-                        if !showFriendsPanel { detailFullWidth = newWidth }
-                    }
-                    .onChange(of: friendsPanelEnabled) { _, enabled in
-                        if !enabled, showFriendsPanel {
-                            withAnimation(.smooth(duration: 0.28)) { showFriendsPanel = false }
-                        }
-                    }
+        Group {
+            if floatingSidebarEnabled, #available(macOS 26.0, *) {
+                FloatingSidebarLayout(isPresented: floatingSidebarShown, width: $floatingSidebarWidth) {
+                    SidebarView(selectedDestination: $sidebarDestination)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { layoutSizes.sidebar = $0 }
+                } content: {
+                    detailColumn
+                }
+            } else {
+                NavigationSplitView(columnVisibility: $columnVisibility) {
+                    SidebarView(selectedDestination: $sidebarDestination)
+                        // Fixed at 215 pt in the 1040 pt default window (user, Oct 12
+                        // 2026). A resizable column (min 180, ideal 215) opened at
+                        // 144 pt, under its own minimum (the split view's saved
+                        // frames), and a dragged width (225.5 pt) persisted in the
+                        // split view's autosave and overrode the default.
+                        .navigationSplitViewColumnWidth(215)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { layoutSizes.sidebar = $0 }
+                } detail: {
+                    detailColumn
+                }
             }
         }
         .onChange(of: sidebarDestination) { _, newValue in
@@ -380,6 +317,103 @@ struct ContentView: View {
             navButtons.onBack = { goBack() }
             navButtons.onForward = { goForward() }
         }
+    }
+
+    /// The pages: the stage with its title, toolbar and friends inspector.
+    private var detailColumn: some View {
+        NavigationStack {
+            stage
+                // Room for the floating panel (FloatingSidebar); 0 beside the column.
+                .safeAreaPadding(.leading, floatingSidebarInset)
+                .navigationTitle(stageTitle)
+                .environment(\.detailFlightSource, zoom?.source(landing: landing))
+                .environment(\.detailPresented, detailChrome)
+                .toolbar {
+                    // Root-page chrome only; the detail page brings its own
+                    // (back, favourite, more) via its own `.toolbar`.
+                    // Items are added/removed by NSToolbar, which draws the
+                    // glass bezels itself and doesn't animate them — content
+                    // transitions inside stable items were tried (2026-09-10)
+                    // and looked half-animated: glyph fading under a bezel
+                    // that popped. The system morph needs a NavigationStack
+                    // push, which the zoom stage deliberately doesn't do.
+                    if !detailChrome {
+                        // Flexible space pushes everything after it to the
+                        // trailing end — same pattern as GameDetailView.
+                        ToolbarItem(placement: .automatic) { Spacer() }
+                        ToolbarItem(placement: .automatic) {
+                            DownloadsToolbarButton(
+                                launcher: launcher,
+                                library: library,
+                                isPresented: $showingDownloadsPopover,
+                                onSelectGame: { openDetail($0) }
+                            )
+                        }
+                        ToolbarItem(placement: .automatic) {
+                            if friendsPanelEnabled {
+                                Button {
+                                    // One transaction for the inspector slide AND
+                                    // the friendsPanelOpen-driven row re-layout —
+                                    // without this the cards snap to their new
+                                    // metrics instantly while the panel is still
+                                    // sliding, which reads as jank. No bounce:
+                                    // a click carries no momentum to overshoot.
+                                    if !showFriendsPanel {
+                                        friendsPanelOpenWidth = friendsPanelWidth
+                                    }
+                                    withAnimation(.smooth(duration: 0.28)) {
+                                        showFriendsPanel.toggle()
+                                    }
+                                } label: {
+                                    // Square label frame → macOS renders a perfect
+                                    // circle regardless of the glyph's aspect ratio
+                                    // (person.2 is wide; without this the pill
+                                    // stretches). Plural glyph; outline, no fill.
+                                    Image(systemName: "person.2")
+                                        .frame(width: 24, height: 24)
+                                }
+                                // No buttonStyle override — macOS supplies the
+                                // toolbar circle / liquid glass, same as Downloads.
+                                .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
+                            }
+                        }
+                    }
+                }
+                // Discord-style trailing friends panel. Standard macOS
+                // inspector behaviour: the window frame never changes —
+                // content compresses in place (Apple Music lyrics-style).
+                // Home's scroll rows read \.friendsPanelOpen and drop to
+                // fewer, full-size cards instead of squeezing all five.
+                .inspector(isPresented: $showFriendsPanel) {
+                    FriendsPanel()
+                        // Pinned to the computed cover width so the panel
+                        // edge lands exactly on the row's natural
+                        // 3-cards + peek boundary.
+                        .inspectorColumnWidth(
+                            min: friendsPanelOpenWidth,
+                            ideal: friendsPanelOpenWidth,
+                            max: friendsPanelOpenWidth
+                        )
+                }
+                .environment(\.friendsPanelOpen, showFriendsPanel)
+                .environment(\.friendsPanelCoverWidth, showFriendsPanel ? friendsPanelOpenWidth : 0)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { newWidth in
+                    // Only track while closed — this is the width the
+                    // frozen layout (and thus the panel size) is based on.
+                    if !showFriendsPanel { detailFullWidth = newWidth - floatingSidebarInset }
+                }
+                .onChange(of: friendsPanelEnabled) { _, enabled in
+                    if !enabled, showFriendsPanel {
+                        withAnimation(.smooth(duration: 0.28)) { showFriendsPanel = false }
+                    }
+                }
+        }
+    }
+
+    /// Leading room the pages leave for the floating panel; 0 with the column.
+    private var floatingSidebarInset: CGFloat {
+        floatingSidebarEnabled && floatingSidebarShown && FloatingSidebar.isAvailable
+            ? FloatingSidebar.edge(width: floatingSidebarWidth) : 0
     }
 
     /// The detail column's content: the root page (always mounted, so its
@@ -895,11 +929,36 @@ extension Color {
     static let meridianAccent = Color(.displayP3, red: 0.78809, green: 0.60742, blue: 1.0)
 }
 
-/// Sidebar icon tint: monochrome (white in dark mode) at rest, brand purple
-/// when the row is selected. `.fixed` so the selection highlight can't
-/// override it back to the system accent.
-private func sidebarTint(selected: Bool) -> ListItemTint {
-    .fixed(selected ? .meridianAccent : .primary)
+private extension View {
+    /// Sidebar icon tint: monochrome (white in dark mode) at rest, brand
+    /// purple when the row is selected. `.fixed` so the selection highlight
+    /// can't override it back to the system accent; the selected row's icon
+    /// is also coloured outright (`SidebarIcon`), because the row's selection
+    /// styling still whitened it (user, Oct 13 2026).
+    func sidebarTint(selected: Bool) -> some View {
+        listItemTint(.fixed(selected ? .meridianAccent : .primary))
+            .environment(\.sidebarRowSelected, selected)
+    }
+}
+
+extension EnvironmentValues {
+    /// Set by `sidebarTint(selected:)` for `SidebarIcon`.
+    @Entry var sidebarRowSelected: Bool = false
+}
+
+/// A sidebar row's icon: Meridian's purple while its row is selected, in
+/// every window state; otherwise as the row's tint draws it.
+private struct SidebarIcon<Icon: View>: View {
+    let icon: Icon
+    @Environment(\.sidebarRowSelected) private var selected
+
+    var body: some View {
+        if selected {
+            icon.foregroundStyle(Color.meridianAccent)
+        } else {
+            icon
+        }
+    }
 }
 
 /// Shrinks only the glyph to a clean fraction of the row's text size
@@ -913,8 +972,7 @@ private struct SidebarLabelStyle: LabelStyle {
         Label {
             configuration.title
         } icon: {
-            configuration.icon
-                .font(.system(size: Self.iconSize))
+            SidebarIcon(icon: configuration.icon.font(.system(size: Self.iconSize)))
         }
     }
 }
@@ -928,17 +986,17 @@ private struct SidebarView: View {
         List(selection: $selectedDestination) {
             Label("Search", systemImage: "magnifyingglass")
                 .tag(SidebarDestination.search)
-                .listItemTint(sidebarTint(selected: selectedDestination == .search))
+                .sidebarTint(selected: selectedDestination == .search)
 
             Label("Home", systemImage: "house")
                 .tag(SidebarDestination.home)
-                .listItemTint(sidebarTint(selected: selectedDestination == .home))
+                .sidebarTint(selected: selectedDestination == .home)
 
             Section("Library") {
                 ForEach(SteamLibraryStore.LibraryFilter.allCases) { filter in
                     Label(filter.rawValue, systemImage: filterIcon(filter))
                         .tag(SidebarDestination.library(filter))
-                        .listItemTint(sidebarTint(selected: selectedDestination == .library(filter)))
+                        .sidebarTint(selected: selectedDestination == .library(filter))
                 }
             }
 
@@ -950,10 +1008,10 @@ private struct SidebarView: View {
             Section("Steam") {
                 Label("Store", systemImage: "cart")
                     .tag(SidebarDestination.steamStore)
-                    .listItemTint(sidebarTint(selected: selectedDestination == .steamStore))
+                    .sidebarTint(selected: selectedDestination == .steamStore)
                 Label("Profile", systemImage: "person.crop.circle")
                     .tag(SidebarDestination.steamProfile)
-                    .listItemTint(sidebarTint(selected: selectedDestination == .steamProfile))
+                    .sidebarTint(selected: selectedDestination == .steamProfile)
             }
         }
         .labelStyle(SidebarLabelStyle())
@@ -1037,7 +1095,7 @@ private struct CategoriesSidebarSection: View {
             }
         }
         .tag(SidebarDestination.category(cat.id))
-        .listItemTint(sidebarTint(selected: selectedDestination == .category(cat.id)))
+        .sidebarTint(selected: selectedDestination == .category(cat.id))
         .contextMenu { categoryContextMenu(cat) }
     }
 
@@ -1067,7 +1125,7 @@ private struct CategoriesSidebarSection: View {
             }
             .contextMenu { folderContextMenu(folder) }
         }
-        .listItemTint(sidebarTint(selected: false))
+        .sidebarTint(selected: false)
     }
 
     // MARK: Context menus
