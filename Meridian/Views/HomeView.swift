@@ -321,6 +321,9 @@ private struct HeroCarousel: View {
 
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(SteamAuthService.self) private var steamAuth
+    /// Under the floating sidebar the art and its shade run under the panel
+    /// to the window's edge; the caption stays beside it.
+    @Environment(\.floatingSidebarActive) private var floatingSidebarActive
 
     /// Continuous page position. Whole numbers are resting pages.
     @State private var position: CGFloat = 0
@@ -355,6 +358,9 @@ private struct HeroCarousel: View {
     private var mountedPages: [Int] { count > 1 ? [current - 1, current, current + 1] : [current] }
 
     private func wrapped(_ page: Int) -> Int { ((page % count) + count) % count }
+
+    /// The edge the art bleeds past: the floating panel's, or none.
+    private var underPanel: Edge.Set { floatingSidebarActive ? .leading : [] }
     private func game(at page: Int) -> Game { games[wrapped(page)] }
 
     var body: some View {
@@ -365,6 +371,7 @@ private struct HeroCarousel: View {
                     .id(g.id)
                     .applyBackgroundExtension()
                     .modifier(HeroPageLayer(position: position, page: page, width: frame.width, dissolve: true))
+                    .ignoresSafeArea(edges: underPanel)
             }
 
             LinearGradient(
@@ -372,6 +379,7 @@ private struct HeroCarousel: View {
                 startPoint: .init(x: 0.5, y: 0.3),
                 endPoint: .bottom
             )
+            .ignoresSafeArea(edges: underPanel)
 
             ForEach(mountedPages, id: \.self) { page in
                 caption(for: game(at: page), page: page)

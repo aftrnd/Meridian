@@ -401,6 +401,7 @@ final class AppSettings: @unchecked Sendable {
 /// `@AppStorage(wrappedValue: false, flag.defaultsKey)` so a flip applies live.
 enum FeatureFlag: String, CaseIterable, Identifiable {
     case friendsPanel
+    case floatingSidebar
 
     var id: String { rawValue }
     var defaultsKey: String { "feature.\(rawValue)" }
@@ -408,6 +409,7 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .friendsPanel: "Friends Panel"
+        case .floatingSidebar: "Floating Sidebar"
         }
     }
 
@@ -415,6 +417,8 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
         switch self {
         case .friendsPanel:
             "Toolbar button and trailing inspector listing Steam friends by status."
+        case .floatingSidebar:
+            "The sidebar as a glass panel over the pages, with Home's banner running underneath (macOS 26+). View › Hide Sidebar (⌃⌘S)."
         }
     }
 }
