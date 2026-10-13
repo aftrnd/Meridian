@@ -58,14 +58,19 @@
  * Wine starts every process with that path as argv[1], already in place when
  * this dylib loads (CLI-verified Oct 12 2026: `C:\windows\system32\services.exe`,
  * `C:\Program Files (x86)\Steam\steamapps\common\<game>\<game>.exe`).
- * Steam itself, its helpers and Wine's services are not.
+ * Steam itself, its helpers and Wine's services are not, and neither are the
+ * redistributables Steam's install scripts run from a game's folder
+ * (`…\<game>\_CommonRedist\vcredist\2022\VC_redist.x64.exe`), which the
+ * steamapps match alone took for the game ("game process, activation policy
+ * left alone", The Baby in Yellow, Oct 12 2026).
  */
 static BOOL meridian_is_game_process(void) {
     static BOOL is_game;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *exe = *_NSGetArgc() > 1 ? (*_NSGetArgv())[1] : NULL;
-        is_game = exe && (strcasestr(exe, "\\steamapps\\") || strcasestr(exe, "/steamapps/"));
+        is_game = exe && (strcasestr(exe, "\\steamapps\\") || strcasestr(exe, "/steamapps/"))
+            && !strcasestr(exe, "\\_CommonRedist\\") && !strcasestr(exe, "/_CommonRedist/");
     });
     return is_game;
 }
@@ -119,6 +124,108 @@ static os_log_t accessory_log(void) {
     });
     return log;
 }
+
+/*
+ * ## Hidden Steam windows stay hidden
+ *
+ * While Meridian manages Steam's windows (`MERIDIAN_HIDE_STEAM_WINDOWS=1`, set
+ * when it has Accessibility access), it hides them by moving them off every
+ * display (`SteamWindow`) and is the only one that brings one back, centred
+ * over its own window, through Accessibility.
+ *
+ * Showing or focusing a window that is off every display makes Cocoa carry it
+ * to the top-left of the main display (winemac `macdrv_give_cocoa_window_focus`:
+ * "Cocoa will typically move it on-screen"), where it stayed until Meridian's
+ * next pass moved it away. Told to quit, Steam shows its hidden library: on
+ * screen at 0,30 for about half a second (webhelper.txt `SP Desktop_uid0-'Steam':
+ * WasHidden 0`, meridian.log `hid … 'Steam' 1010×600 from 0,30`, Oct 12 2026).
+ * Steam's own positions were still off-screen: it centred its Shutdown popup on
+ * the library at -16000,-16000 px, and placed "Special Offers" at -15343,-15815,
+ * which also showed at 0,30.
+ *
+ * So a window that was off every display before Wine orders or focuses it is
+ * put back, with screen updates held so no frame shows it on screen.
+ */
+static BOOL meridian_hides_steam_windows(void) {
+    static BOOL hides;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        hides = getenv("MERIDIAN_HIDE_STEAM_WINDOWS") != NULL;
+    });
+    return hides;
+}
+
+static BOOL meridian_is_on_screen(NSRect frame) {
+    for (NSScreen *screen in NSScreen.screens) {
+        if (NSIntersectsRect(frame, screen.frame)) return YES;
+    }
+    return NO;
+}
+
+/// Runs `show` (Wine ordering or focusing `window`) and keeps a hidden window
+/// where it was.
+static void meridian_keep_hidden(NSWindow *window, void (^show)(void)) {
+    NSRect before = window.frame;
+    if (meridian_is_on_screen(before)) {
+        show();
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSDisableScreenUpdates();  // as winemac's own -orderBelow:orAbove:activate:
+    show();
+    if (meridian_is_on_screen(window.frame)) {
+        [window setFrameOrigin:before.origin];
+        os_log_info(accessory_log(), "[meridian-wine-accessory] kept hidden window '%{public}@' off-screen", window.title);
+        NSLog(@"[meridian-wine-accessory] kept hidden window '%@' off-screen", window.title);
+    }
+    NSEnableScreenUpdates();
+#pragma clang diagnostic pop
+}
+
+@interface NSWindow (MeridianKeepHidden)
+@end
+
+@implementation NSWindow (MeridianKeepHidden)
+
+// Swizzled: each calls the original method. winemac shows a window with
+// -orderFront: or -orderWindow:relativeTo: and focuses it with -makeKeyWindow,
+// and its WineWindow overrides none of them.
+
+- (void)meridian_orderFront:(id)sender {
+    meridian_keep_hidden(self, ^{ [self meridian_orderFront:sender]; });
+}
+
+- (void)meridian_orderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)otherWindowNumber {
+    if (place == NSWindowOut) {
+        [self meridian_orderWindow:place relativeTo:otherWindowNumber];
+        return;
+    }
+    meridian_keep_hidden(self, ^{ [self meridian_orderWindow:place relativeTo:otherWindowNumber]; });
+}
+
+- (void)meridian_makeKeyWindow {
+    meridian_keep_hidden(self, ^{ [self meridian_makeKeyWindow]; });
+}
+
++ (void)load {
+    if (meridian_is_game_process()) return;
+    if (!meridian_hides_steam_windows()) return;
+    const SEL pairs[][2] = {
+        { @selector(orderFront:), @selector(meridian_orderFront:) },
+        { @selector(orderWindow:relativeTo:), @selector(meridian_orderWindow:relativeTo:) },
+        { @selector(makeKeyWindow), @selector(meridian_makeKeyWindow) },
+    };
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        Method original = class_getInstanceMethod(self, pairs[i][0]);
+        Method swizzled = class_getInstanceMethod(self, pairs[i][1]);
+        if (original && swizzled) {
+            method_exchangeImplementations(original, swizzled);
+        }
+    }
+}
+
+@end
 
 /*
  * ## Sign-in presentation

@@ -44,11 +44,11 @@ enum QRCodeRenderer {
 
 /// Multi-step onboarding card that appears after bootstrap.
 ///
-/// Steps: Welcome → Connect your library (Meridian's QR) → Sign in to Steam
+/// Steps: Welcome → Connect Meridian to Steam (Meridian's QR) → Sign in to Steam
 /// (Steam's own sign-in, once; `OnlinePlayStepContent`) → API Key (if
 /// needed) → Complete
 ///
-/// "Connect your library" drives `SteamCredentialAuth`, Meridian's own
+/// "Connect Meridian to Steam" drives `SteamCredentialAuth`, Meridian's own
 /// IAuthenticationService client: Valve returns a `persistence: 1`
 /// refresh_token that DepotDownloader installs and the library use. Nothing
 /// is written into Steam's own files (`makeSignInHandler`).
@@ -61,7 +61,7 @@ struct SetupSheet: View {
     @Environment(WineEngine.self) private var engine
 
     /// Meridian's QR session, started on Welcome so the code is ready before
-    /// "Connect your library" slides in.
+    /// "Connect Meridian to Steam" slides in.
     @State private var credentialAuth = SteamCredentialAuth()
 
     /// Closes the onboarding card (ContentView owns its presentation).
@@ -179,7 +179,8 @@ struct SetupSheet: View {
     // MARK: - Welcome
 
     private var welcomeStep: some View {
-        OnboardingPage("Welcome to Meridian", subtitle: "Your Steam games, on your Mac.") {
+        OnboardingPage("Welcome to Meridian",
+                       subtitle: "Your Steam games, on your Mac. Setup takes three steps: two quick scans with the Steam Mobile App, then a Web API key.") {
             OnboardingLogoHero()
         } content: {
             EmptyView()
@@ -250,14 +251,14 @@ private struct SteamLoginStepContent: View {
             if qrEnded, let error = credentialAuth.errorMessage { return error }
             return credentialAuth.qrScanned
                 ? "Approve the sign-in in the Steam Mobile App."
-                : "Use the Steam Mobile App to scan the code."
+                : "Meridian downloads your games straight from Steam. Scan the code with the Steam Mobile App."
         case .password:
             return "Your password is encrypted for Steam before it leaves your Mac, and kept in your Keychain."
         }
     }
 
     var body: some View {
-        OnboardingPage("Connect your library", subtitle: instruction) {
+        OnboardingPage("Connect Meridian to Steam", subtitle: instruction) {
             EmptyView()
         } content: {
             if mode == .qr {
@@ -492,7 +493,7 @@ struct APIKeyStepContent: View {
 
     var body: some View {
         OnboardingPage("Add your Web API key",
-                       subtitle: "Meridian uses your Steam Web API key to load your games. It's free, takes about 30 seconds to get, and stays in your Keychain.") {
+                       subtitle: "Your library, friends and achievements come from Steam's Web API, which needs a key from your account. It's free, takes about 30 seconds to get, and stays in your Keychain.") {
             EmptyView()
         } content: {
             VStack(alignment: .leading, spacing: 8) {

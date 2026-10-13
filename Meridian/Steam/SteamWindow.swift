@@ -246,6 +246,16 @@ final class SteamWindow {
         log.info("[SteamWindow] Steam is waiting on the player — showing its window")
     }
 
+    /// Re-centre the windows Steam is waiting on and bring them forward, its
+    /// dialog on top. Steam's windows have no Dock icon, so one that fell
+    /// behind (a click on the library window behind Steam's controller
+    /// dialog, user Oct 12 2026) could not be reached any other way.
+    func bringPromptForward() {
+        guard promptMode else { return }
+        presentedPromptWindows = []
+        hideAllKnownWine()
+    }
+
     /// Steam has its answer: hide its windows again.
     func endSteamPrompt() {
         guard promptMode else { return }
@@ -390,7 +400,10 @@ final class SteamWindow {
         }
 
         let appElement = AXUIElementCreateApplication(pid)
-        for notif in [kAXWindowCreatedNotification, kAXApplicationShownNotification] as [CFString] {
+        // Moved: Steam reuses some windows (its toasts) and moves them back on
+        // screen to show them; hiding on the move beats the next poll.
+        for notif in [kAXWindowCreatedNotification, kAXWindowMovedNotification,
+                      kAXApplicationShownNotification] as [CFString] {
             AXObserverAddNotification(observer, appElement, notif, boxPtr)
         }
 
@@ -424,6 +437,7 @@ final class SteamWindow {
             && Self.commandLine(of: pid)?.lowercased().contains("steamwebhelper") == true
 
         var surfacedTitle: String?
+        var prompts: [(window: AXUIElement, size: CGSize)] = []
         for window in windows {
             // Read the title so EULA / agreement / purchase dialogs are
             // surfaced (the user MUST act on them) instead of hidden. Anything
@@ -431,28 +445,39 @@ final class SteamWindow {
             var titleRef: AnyObject?
             AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
             let title = titleRef as? String
+            let size = Self.size(of: window)
 
-            if isWebhelper, Self.isSignInWindow(title: title, size: Self.size(of: window)) {
+            if isWebhelper, Self.isSignInWindow(title: title, size: size) {
                 presentSignInWindow(window, pid: pid)
                 continue
             }
 
             // Steam waiting on the player, or a dialog the allowlist names:
             // bring it back from off-screen so the user can act.
-            if (promptMode && gameMode && Self.isPromptWindow(title: title, size: Self.size(of: window)))
+            if (promptMode && gameMode && Self.isPromptWindow(title: title, size: size))
                 || Self.policy(forTitle: title) == .surface {
-                present(window, pid: pid, once: &presentedPromptWindows)
+                prompts.append((window, size))
                 surfacedTitle = title
                 continue
             }
 
-            // Move off-screen immediately (no animation, instant).
-            var pos = CGPoint(x: -32000, y: -32000)
+            // Move off-screen (no animation, instant). Not minimized: every
+            // minimized window gets a Dock thumbnail, even from an accessory
+            // process, and clicking it restored a blank "Steam" window at
+            // -32000 during onboarding (user, Oct 12 2026).
+            let origin = Self.position(of: window)
+            guard Self.isOnScreen(origin: origin, size: size) else { continue }
+            log.info("[SteamWindow] hid pid=\(pid) '\(title ?? "")' \(Int(size.width))×\(Int(size.height)) from \(Int(origin.x)),\(Int(origin.y))")
+            var pos = Self.offScreen
             if let posValue = AXValueCreate(.cgPoint, &pos) {
                 AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, posValue)
             }
-            // Minimize for belt-and-suspenders.
-            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, true as CFTypeRef)
+        }
+
+        // Largest first, so a dialog lands on top of the library window Steam
+        // opens behind it.
+        for (window, _) in prompts.sorted(by: { $0.size.width * $0.size.height > $1.size.width * $1.size.height }) {
+            present(window, pid: pid, once: &presentedPromptWindows)
         }
 
         // Publish/clear the actionable-dialog banner state. Only updates when
@@ -494,6 +519,33 @@ final class SteamWindow {
             AXValueGetValue(value as! AXValue, .cgSize, &size)
         }
         return size
+    }
+
+    /// Where hidden windows go. macOS clamps it: they read back at -8000,-8000
+    /// (meridian.log, Oct 12 2026), so "hidden" is tested against the
+    /// displays (`isOnScreen`), not this point.
+    private static let offScreen = CGPoint(x: -32000, y: -32000)
+
+    /// Whether any part of a window is on a display. AX frames are top-left
+    /// based on the primary display, y down; NSScreen frames are y up.
+    private static func isOnScreen(origin: CGPoint, size: CGSize) -> Bool {
+        guard let primary = NSScreen.screens.first else { return true }
+        let window = CGRect(origin: origin, size: CGSize(width: max(size.width, 1), height: max(size.height, 1)))
+        return NSScreen.screens.contains { screen in
+            let f = screen.frame
+            return CGRect(x: f.minX, y: primary.frame.maxY - f.maxY, width: f.width, height: f.height)
+                .intersects(window)
+        }
+    }
+
+    private static func position(of window: AXUIElement) -> CGPoint {
+        var positionRef: AnyObject?
+        var position = CGPoint.zero
+        if AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionRef) == .success,
+           let value = positionRef, CFGetTypeID(value) == AXValueGetTypeID() {
+            AXValueGetValue(value as! AXValue, .cgPoint, &position)
+        }
+        return position
     }
 
     private func presentSignInWindow(_ window: AXUIElement, pid: pid_t) {

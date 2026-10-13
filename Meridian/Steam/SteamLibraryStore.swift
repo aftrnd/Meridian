@@ -146,6 +146,24 @@ final class SteamLibraryStore {
         Task { await prefetchLibraryCapsuleHashes(apiKey: apiKey) }
     }
 
+    /// Empties everything the signed-out account loaded. The art cache stays:
+    /// it holds public CDN art per app, not account data.
+    func signOut() {
+        log.info("[signOut] clearing \(self.games.count) games, \(self.friendSummaries.count) friends")
+        installPollTask?.cancel()
+        installPollTask = nil
+        games = []
+        recentGames = []
+        friendSummaries = []
+        ownSummary = nil
+        friendsSince = [:]
+        loadError = nil
+        lastRefreshed = nil
+        searchQuery = ""
+        filter = .all
+        hiddenAppIDs = settings.hiddenAppIDs
+    }
+
     /// Fetches library capsule content hashes for all owned games and stores them on
     /// game objects. Processed in batches of 50, then individually retries any games
     /// that the batch pass missed, to handle API inconsistencies.

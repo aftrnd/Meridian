@@ -54,24 +54,6 @@ final class AppSettings: @unchecked Sendable {
         set { UserDefaults.standard.set(newValue, forKey: "steamClientSignedIn") }
     }
 
-    /// Force Wine virtual desktop at a fixed resolution instead of windowed mode.
-    var useVirtualDesktop: Bool {
-        get { UserDefaults.standard.bool(forKey: "useVirtualDesktop") }
-        set { UserDefaults.standard.set(newValue, forKey: "useVirtualDesktop") }
-    }
-
-    /// Virtual desktop width in pixels (used when useVirtualDesktop is enabled).
-    var virtualDesktopWidth: Int {
-        get { UserDefaults.standard.integer(forKey: "virtualDesktopWidth").nonZero ?? 1920 }
-        set { UserDefaults.standard.set(newValue, forKey: "virtualDesktopWidth") }
-    }
-
-    /// Virtual desktop height in pixels (used when useVirtualDesktop is enabled).
-    var virtualDesktopHeight: Int {
-        get { UserDefaults.standard.integer(forKey: "virtualDesktopHeight").nonZero ?? 1080 }
-        set { UserDefaults.standard.set(newValue, forKey: "virtualDesktopHeight") }
-    }
-
     // MARK: - Library
 
     /// Locally cached set of Steam app IDs that are known to be installed.
@@ -405,6 +387,11 @@ final class AppSettings: @unchecked Sendable {
     /// menu bar and settings stay in sync.
     static let developerMenuKey = "developerMenuEnabled"
 
+    /// UserDefaults key for Developer › Show Layout Sizes: the window,
+    /// sidebar and content column sizes, live over the main window, for
+    /// choosing default sizes.
+    static let layoutSizesKey = "developer.showLayoutSizes"
+
 
     private init() {}
 }
@@ -432,6 +419,3 @@ enum FeatureFlag: String, CaseIterable, Identifiable {
     }
 }
 
-private extension Int {
-    var nonZero: Int? { self == 0 ? nil : self }
-}

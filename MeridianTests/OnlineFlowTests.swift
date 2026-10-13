@@ -368,4 +368,90 @@ final class OnlineFlowTests: XCTestCase {
         XCTAssertTrue(body.contains("String(contentsOfFile: cfgPath"),
                       "the existing localconfig.vdf must be read before writing")
     }
+
+    // MARK: - Sign out
+
+    /// Sign Out left Steam's own client signed in: a running Steam kept the
+    /// old account, rewrote local.vdf as it later quit, and setup's "Sign in
+    /// to Steam" step skipped itself (`steamClientSignedIn` stayed true).
+    func testSignOut_quitsSteamBeforeForgettingTheAccount() throws {
+        let settings = try readSource("Meridian/Views/Settings/SettingsView.swift")
+        guard let start = settings.range(of: "private func signOut() {"),
+              let quit = settings.range(of: "await session.signOut(engine: engine)", range: start.upperBound..<settings.endIndex),
+              let forget = settings.range(of: "steamAuth.signOut()", range: start.upperBound..<settings.endIndex)
+        else { return XCTFail("Settings › Sign Out must sign out of Steam and of Meridian") }
+        XCTAssertLessThan(quit.lowerBound, forget.lowerBound,
+                          "Steam quits first: it writes local.vdf on the way out")
+        guard let relaunch = settings.range(of: "AppDelegate.relaunch()", range: forget.upperBound..<settings.endIndex)
+        else { return XCTFail("Sign Out must restart Meridian") }
+        XCTAssertLessThan(forget.lowerBound, relaunch.lowerBound,
+                          "The old library stayed behind setup until a restart")
+
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        guard let body = session.range(of: "func signOut(engine: WineEngine) async {") else {
+            return XCTFail("SteamSession.signOut(engine:) must exist")
+        }
+        XCTAssertTrue(session[body.upperBound...].prefix(400).contains("await shutdown(engine: engine)"))
+
+        let auth = try readSource("Meridian/Steam/SteamAuthService.swift")
+        guard let signOut = auth.range(of: "func signOut() {"),
+              let end = auth.range(of: "\n    }\n", range: signOut.upperBound..<auth.endIndex)
+        else { return XCTFail("SteamAuthService.signOut() must exist") }
+        XCTAssertTrue(auth[signOut.upperBound..<end.lowerBound].contains("AppSettings.shared.steamClientSignedIn = false"),
+                      "setup must open Steam's own sign-in again")
+    }
+
+    /// After Sign Out the old account's library stayed on screen until the
+    /// app was restarted (user, Oct 12 2026).
+    func testSignOut_emptiesTheLibraryAtOnce() throws {
+        let content = try readSource("Meridian/Views/ContentView.swift")
+        guard let change = content.range(of: "onChange(of: steamAuth.isAuthenticated)"),
+              let signedOut = content.range(of: "} else {", range: change.upperBound..<content.endIndex),
+              let sheet = content.range(of: "showSetupSheet = true", range: signedOut.upperBound..<content.endIndex)
+        else { return XCTFail("ContentView must react to signing out") }
+        XCTAssertTrue(content[signedOut.upperBound..<sheet.lowerBound].contains("library.signOut()"))
+        let store = try readSource("Meridian/Steam/SteamLibraryStore.swift")
+        XCTAssertTrue(store.contains("func signOut() {"))
+    }
+
+    /// Skipping setup left a blank window: Home and Library had nothing to
+    /// show and no way forward (user, Oct 12 2026).
+    func testEmptyLibrary_explainsAndOffersSetup() throws {
+        for path in ["Meridian/Views/HomeView.swift", "Meridian/Views/Library/LibraryView.swift"] {
+            let src = try readSource(path)
+            XCTAssertTrue(src.contains("LibraryEmptyState()"), "\(path) must show the empty library state")
+        }
+        let library = try readSource("Meridian/Views/Library/LibraryView.swift")
+        XCTAssertTrue(library.contains("NotificationCenter.default.post(name: .meridianShowSetup, object: nil)"))
+        let content = try readSource("Meridian/Views/ContentView.swift")
+        XCTAssertTrue(content.contains("publisher(for: .meridianShowSetup)"),
+                      "ContentView must reopen setup for the empty state's button")
+    }
+
+    /// Sign Out's relaunch hung: `terminate(_:)` called from a @MainActor
+    /// Task waited forever for a `.terminateLater` reply queued on the main
+    /// dispatch queue, which AppKit doesn't drain there (sample, Oct 12 2026).
+    func testTermination_repliesThroughTheRunLoop() throws {
+        let app = try readSource("Meridian/App/AppDelegate.swift")
+        guard let start = app.range(of: "func applicationShouldTerminate(_ sender: NSApplication)"),
+              let end = app.range(of: "return .terminateLater", range: start.upperBound..<app.endIndex)
+        else { return XCTFail("applicationShouldTerminate must reply later") }
+        let body = app[start.upperBound..<end.lowerBound]
+        XCTAssertFalse(body.contains("DispatchQueue.main"),
+                       "the reply and its timeout must not wait on the main dispatch queue")
+        XCTAssertTrue(body.contains("Self.onMainRunLoop"))
+        XCTAssertTrue(body.contains("RunLoop.main.add(timeout, forMode: .common)"))
+    }
+
+    /// Reset Meridian deleted the engine and Steam but kept the account, so
+    /// the next launch signed straight back in with no setup (user, Oct 12
+    /// 2026, meridian.log 20:25:52 reset, 20:27:11 bootstrap, no onboarding).
+    func testResetMeridian_signsOutSoSetupStartsAgain() throws {
+        let settings = try readSource("Meridian/Views/Settings/SettingsView.swift")
+        guard let start = settings.range(of: "Button(\"Reset Everything\", role: .destructive) {"),
+              let quit = settings.range(of: "AppDelegate.relaunch()", range: start.upperBound..<settings.endIndex)
+        else { return XCTFail("Reset Meridian must exist and restart the app") }
+        XCTAssertTrue(settings[start.upperBound..<quit.lowerBound].contains("steamAuth.signOut()"),
+                      "Reset must sign out, so the next launch starts setup")
+    }
 }

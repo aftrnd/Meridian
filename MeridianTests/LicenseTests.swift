@@ -227,9 +227,11 @@ final class LicenseTests: XCTestCase {
         let src = try readSource("Meridian/App/MeridianApp.swift")
         XCTAssertEqual(src.components(separatedBy: ".environment(licenseManager)").count - 1, 2,
                        "LicenseManager must be injected into both the main window and Settings.")
-        let settings = try readSource("Meridian/Views/Settings/SettingsView.swift")
-        XCTAssertTrue(settings.contains("LicenseStatusView()") && settings.contains(".tag(\"license\")"),
-                      "Settings must have a License tab.")
+        // No License tab in Settings until licensing is settled (user, Oct 12
+        // 2026); a key is entered where the trial ends.
+        let sheet = try readSource("Meridian/Views/Settings/LicenseSettingsView.swift")
+        XCTAssertTrue(sheet.contains("LicenseStatusView()"),
+                      "The trial-ended sheet must still take a license key.")
     }
 
     // MARK: - Licensing must not alter the launch path

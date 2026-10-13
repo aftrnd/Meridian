@@ -38,6 +38,10 @@ struct ContentView: View {
     /// inspector can never open. Everything else about the panel stays wired
     /// so flipping it on needs no relaunch.
     @AppStorage(wrappedValue: false, FeatureFlag.friendsPanel.defaultsKey) private var friendsPanelEnabled
+    /// Developer › Show Layout Sizes. Only the readout observes `layoutSizes`,
+    /// so measuring never invalidates this view.
+    @AppStorage(wrappedValue: false, AppSettings.layoutSizesKey) private var showLayoutSizes
+    @State private var layoutSizes = LayoutSizes()
     /// Detail-column width measured while the panel is CLOSED (the frozen
     /// full-width layout the panel will cover).
     @State private var detailFullWidth: CGFloat = 0
@@ -137,6 +141,18 @@ struct ContentView: View {
                         }
                     }
                     .animation(.smooth(duration: 0.2), value: steamWindow.actionableDialogTitle)
+                    .onGeometryChange(for: CGSize.self) { proxy in
+                        // The whole content area, toolbar included (what
+                        // AppDelegate sizes the window by).
+                        CGSize(width: proxy.size.width + proxy.safeAreaInsets.leading + proxy.safeAreaInsets.trailing,
+                               height: proxy.size.height + proxy.safeAreaInsets.top + proxy.safeAreaInsets.bottom)
+                    } action: { layoutSizes.window = $0 }
+                    .overlay(alignment: .bottomTrailing) {
+                        if showLayoutSizes {
+                            LayoutSizesReadout(sizes: layoutSizes)
+                                .padding(12)
+                        }
+                    }
                     .task {
                         await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                         // Steam boots in the background so Play is instant. A
@@ -214,6 +230,11 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .meridianOpenSettings)) { _ in
             openSettings()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .meridianShowSetup)) { _ in
+            // A skipped key step is asked again (`SetupSheet` opens on it).
+            steamAuth.apiKeyPromptDismissed = false
+            showSetupSheet = true
+        }
         // Re-show the setup sheet whenever the user signs out — the .onAppear
         // check on mainContent only fires once at bootstrap. Without this,
         // signing out in Settings leaves the app with no way to sign back in
@@ -228,6 +249,11 @@ struct ContentView: View {
             if authenticated {
                 Task { await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey) }
             } else {
+                // Signed out: the old account's library, friends and open
+                // page go now, not at the next app launch (user, Oct 12 2026).
+                library.signOut()
+                resetDetailTransition()
+                sidebarDestination = .home
                 showSetupSheet = true
             }
         }
@@ -243,10 +269,13 @@ struct ContentView: View {
     private var mainContent: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(selectedDestination: $sidebarDestination)
-                // Fixed at exactly 1/5 of the 1040 pt default window. A
-                // resizable column let a dragged width (225.5 pt) persist in
-                // the split view's autosave and override the default.
-                .navigationSplitViewColumnWidth(208)
+                // Fixed at 215 pt in the 1040 pt default window (user, Oct 12
+                // 2026). A resizable column (min 180, ideal 215) opened at
+                // 144 pt, under its own minimum (the split view's saved
+                // frames), and a dragged width (225.5 pt) persisted in the
+                // split view's autosave and overrode the default.
+                .navigationSplitViewColumnWidth(215)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { layoutSizes.sidebar = $0 }
         } detail: {
             NavigationStack {
                 stage
@@ -401,7 +430,10 @@ struct ContentView: View {
                 .id(openGeneration)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { stageSize = $0 }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: {
+            stageSize = $0
+            layoutSizes.content = $0.width
+        }
         // Plain registry write — never invalidates a view.
         .onContinuousHover(coordinateSpace: .local) { phase in
             switch phase {
@@ -846,6 +878,9 @@ final class NavButtonMonitor {
 extension Notification.Name {
     static let meridianBootstrapReady = Notification.Name("meridianBootstrapReady")
     static let meridianOpenSettings   = Notification.Name("meridianOpenSettings")
+    /// Reopens setup (`LibraryEmptyState`): Welcome when signed out, the Web
+    /// API key step when signed in without one.
+    static let meridianShowSetup      = Notification.Name("meridianShowSetup")
     /// Posted when an OAuth refresh token is found to be genuinely dead
     /// (DepotDownloader exit 3 at install time). SteamAuthService observes
     /// this and calls `markSessionExpired()`, which flips `isAuthenticated`
@@ -1152,6 +1187,43 @@ private struct SteamConfirmationBanner: View {
         .modifier(GlassRoundedBackground(cornerRadius: 10))
         .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
         .frame(maxWidth: 420)
+    }
+}
+
+// MARK: - Layout Sizes (Developer)
+
+/// The main window's measured sizes, written by ContentView's geometry
+/// readers and read only by `LayoutSizesReadout`.
+@Observable
+@MainActor
+final class LayoutSizes {
+    var window: CGSize = .zero
+    var sidebar: CGFloat = 0
+    var content: CGFloat = 0
+}
+
+/// Developer › Show Layout Sizes: live sizes in points, bottom-trailing, for
+/// choosing the window's default sizes (AppDelegate `fullFrameSize`, the
+/// sidebar's column width).
+private struct LayoutSizesReadout: View {
+    let sizes: LayoutSizes
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text("Window \(Self.points(sizes.window.width)) × \(Self.points(sizes.window.height))")
+            Text("Sidebar \(Self.points(sizes.sidebar))")
+            Text("Content \(Self.points(sizes.content))")
+        }
+        .font(.caption.monospacedDigit())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .modifier(GlassRoundedBackground(cornerRadius: 8))
+        .allowsHitTesting(false)
+    }
+
+    /// Whole points as integers, half points kept (a dragged sidebar was 225.5).
+    private static func points(_ value: CGFloat) -> String {
+        Double(value).formatted(.number.precision(.fractionLength(0...1)).grouping(.never))
     }
 }
 

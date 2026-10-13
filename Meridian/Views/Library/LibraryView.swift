@@ -4,7 +4,6 @@ struct LibraryView: View {
     @Environment(SteamLibraryStore.self)  private var library
     @Environment(Launcher.self)           private var launcher
     @Environment(CategoryStore.self)      private var categoryStore
-    @Environment(WineEngine.self)         private var engine
     @Environment(SteamSession.self)        private var session
     @Binding var selectedGame: Game?
 
@@ -56,6 +55,8 @@ struct LibraryView: View {
         Group {
             if library.isLoading && library.games.isEmpty {
                 loadingView
+            } else if library.games.isEmpty, !isInCategoryMode {
+                LibraryEmptyState()
             } else if let error = library.loadError, !isInCategoryMode {
                 errorView(error)
             } else if games.isEmpty {
@@ -83,10 +84,17 @@ struct LibraryView: View {
                     .onTapGesture { selectedGame = game }
                     .contextMenu { gameContextMenu(for: game) }
                     .onAppear { prefetchArt(around: game, in: games) }
+                    .transition(.blurReplace)
                 }
             }
             .padding(.horizontal, gridInset)
             .padding(.vertical, CardLayoutMetrics.spacing)
+            // An uninstall or a finished download: the card blurs out of (or
+            // into) Installed and the grid closes up, where it used to wait
+            // for the page to be left and reopened (user, Oct 12 2026).
+            // Filter, sort and search changes don't move this, so they stay
+            // instant.
+            .animation(.smooth(duration: 0.4), value: games.filter(\.isInstalled).map(\.id))
         }
         .ignoresSafeArea(edges: [.top, .bottom])
         .onScrollPhaseChange { _, phase in hoverGate.scrollPhaseChanged(to: phase) }
@@ -156,7 +164,7 @@ struct LibraryView: View {
         if game.isInstalled {
             Divider()
             Button(role: .destructive) {
-                launcher.uninstall(game: game, engine: engine)
+                launcher.uninstall(game: game, library: library)
             } label: {
                 Label("Uninstall", systemImage: "trash")
             }
@@ -278,6 +286,98 @@ struct LibraryView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Empty library
+
+/// Home and Library with no games to show: not signed in, no Web API key, a
+/// failed load, or an account without games, each with its way forward.
+/// Skipping setup used to leave a blank window (user, Oct 12 2026).
+struct LibraryEmptyState: View {
+    @Environment(SteamAuthService.self) private var steamAuth
+    @Environment(SteamLibraryStore.self) private var library
+
+    private enum Reason: Equatable {
+        case signedOut, noAPIKey, failed(String), noGames
+    }
+
+    /// nil while signed in with a key before the first load has run.
+    private var reason: Reason? {
+        if !steamAuth.isAuthenticated { return .signedOut }
+        if steamAuth.apiKey.isEmpty { return .noAPIKey }
+        if let error = library.loadError { return .failed(error) }
+        return library.lastRefreshed == nil ? nil : .noGames
+    }
+
+    var body: some View {
+        Group {
+            if let reason {
+                VStack(spacing: 12) {
+                    Image(systemName: symbol(for: reason))
+                        .font(.system(size: 40, weight: .thin))
+                        .foregroundStyle(.tertiary)
+                    Text(title(for: reason))
+                        .font(.headline)
+                    Text(message(for: reason))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                    if let action = actionTitle(for: reason) {
+                        Button(action) { perform(reason) }
+                            .buttonStyle(.borderedProminent)
+                            .padding(.top, 4)
+                    }
+                }
+                .padding(.horizontal, 40)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func symbol(for reason: Reason) -> String {
+        switch reason {
+        case .signedOut: "person.crop.circle"
+        case .noAPIKey:  "key"
+        case .failed:    "exclamationmark.triangle"
+        case .noGames:   "tray"
+        }
+    }
+
+    private func title(for reason: Reason) -> String {
+        if case .failed = reason { return "Couldn't load your library" }
+        return "Your library is empty"
+    }
+
+    private func message(for reason: Reason) -> String {
+        switch reason {
+        case .signedOut:
+            "Sign in with Steam to see your games here."
+        case .noAPIKey:
+            "Meridian needs a Steam Web API key to load your games. It's free and takes about 30 seconds to get."
+        case .failed(let error):
+            error
+        case .noGames:
+            "Games you own on Steam show up here."
+        }
+    }
+
+    private func actionTitle(for reason: Reason) -> String? {
+        switch reason {
+        case .signedOut: "Sign In…"
+        case .noAPIKey:  "Add API Key…"
+        case .failed:    "Try Again"
+        case .noGames:   nil
+        }
+    }
+
+    private func perform(_ reason: Reason) {
+        if case .failed = reason {
+            Task { await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey) }
+        } else {
+            NotificationCenter.default.post(name: .meridianShowSetup, object: nil)
+        }
     }
 }
 

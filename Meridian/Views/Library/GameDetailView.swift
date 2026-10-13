@@ -239,7 +239,7 @@ struct GameDetailView: View {
                         if currentGame.isInstalled {
                             Divider()
                             Button(role: .destructive) {
-                                launcher.uninstall(game: currentGame, engine: engine)
+                                launcher.uninstall(game: currentGame, library: library)
                             } label: {
                                 Label("Uninstall", systemImage: "trash")
                             }
@@ -291,7 +291,7 @@ struct GameDetailView: View {
         .alert("Reset Game Install?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Reset", role: .destructive) {
-                launcher.uninstall(game: currentGame, engine: engine)
+                launcher.uninstall(game: currentGame, library: library)
             }
         } message: {
             Text("This removes this game's local manifest and downloaded files only. It does not reset the Wine engine, Steam, or other installed games.")
@@ -1205,32 +1205,36 @@ private struct ScrollerVisibility: NSViewRepresentable {
     @ViewBuilder
     private var idleButton: some View {
         if currentGame.isInstalled {
-            Button { handlePlayTapped() } label: {
-                Label("Play", systemImage: "play.fill")
-                    .font(.headline)
-                    .frame(
-                        minWidth: GameDetailMetrics.launchButtonMinWidth,
-                        minHeight: GameDetailMetrics.launchButtonHeight
-                    )
-            }
-            .inactiveAwareProminence(controlActiveState == .inactive)
-            .controlSize(.large)
-            .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
-            .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
+            let label = launchButtonLabel("Play", systemImage: "play.fill")
+            Button { handlePlayTapped() } label: { label }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+                .modifier(settledLaunchButton { label })
+                .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+                .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
         } else {
-            Button { handleInstallTapped() } label: {
-                Label("Install", systemImage: "arrow.down.circle.fill")
-                    .font(.headline)
-                    .frame(
-                        minWidth: GameDetailMetrics.launchButtonMinWidth,
-                        minHeight: GameDetailMetrics.launchButtonHeight
-                    )
-            }
-            .inactiveAwareProminence(controlActiveState == .inactive)
-            .controlSize(.large)
-            .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
-            .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "")
+            let label = launchButtonLabel("Install", systemImage: "arrow.down.circle.fill")
+            Button { handleInstallTapped() } label: { label }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+                .modifier(settledLaunchButton { label })
+                .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+                .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "")
         }
+    }
+
+    private func launchButtonLabel(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.headline)
+            .frame(
+                minWidth: GameDetailMetrics.launchButtonMinWidth,
+                minHeight: GameDetailMetrics.launchButtonHeight
+            )
+    }
+
+    private func settledLaunchButton<L: View>(@ViewBuilder label: () -> L) -> SettledLaunchButton<L> {
+        SettledLaunchButton(settled: showsAmbient, prominent: controlActiveState != .inactive,
+                            fade: Self.ambientFade, label: label)
     }
 
     private var isLauncherBusyWithOtherGame: Bool {
@@ -1316,6 +1320,81 @@ private struct SettledGlassBackground: ViewModifier {
                 .overlay(RoundedRectangle(cornerRadius: cornerRadius).strokeBorder(.separator, lineWidth: 0.5))
                 .transition(.asymmetric(insertion: .identity, removal: .opacity))
         }
+    }
+}
+
+/// The Play / Install button inside the zoomed page. A bordered button is an
+/// AppKit control with a glass bezel; under the flight's fractional scale its
+/// label jittered against the page around it (user, Oct 12 2026: "usually the
+/// play/download text"), the button's version of the glass rows' shimmer
+/// above. Mid-flight the real button keeps its place in the layout but isn't
+/// shown: a SwiftUI capsule with the same label, in the button's exact frame,
+/// stands in. Same timing as the rows: the real button fades in once the page
+/// has landed, and is cut at once when a close begins.
+///
+/// The stand-in stays solid under the real button until its fade is done.
+/// Crossfading the two dimmed the button to about 75% halfway (two layers at
+/// half opacity don't add up to one) and doubled its slightly offset label:
+/// "the install text and arrow fade and then go solid again" (user, Oct 12
+/// 2026).
+private struct SettledLaunchButton<StandInLabel: View>: ViewModifier {
+    var settled: Bool
+    /// `.borderedProminent` (accent fill) rather than `.bordered`.
+    var prominent: Bool
+    var fade: Animation
+    @ViewBuilder var label: StandInLabel
+
+    @Environment(\.isEnabled) private var isEnabled
+    /// The real button is shown (fading in once the page lands).
+    @State private var shown = false
+    /// The stand-in under it is gone: only once that fade has finished.
+    @State private var standInGone = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .background {
+                if !standInGone {
+                    label
+                        .foregroundStyle(labelStyle)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(fillStyle, in: Self.bezel)
+                        .allowsHitTesting(false)
+                }
+            }
+            .onAppear {
+                shown = settled
+                standInGone = settled
+            }
+            .onChange(of: settled) { _, settled in
+                guard settled else {
+                    shown = false
+                    standInGone = false
+                    return
+                }
+                withAnimation(fade) {
+                    shown = true
+                } completion: {
+                    // Still settled: a close may have begun mid-fade.
+                    if shown { standInGone = true }
+                }
+            }
+    }
+
+    private var labelStyle: AnyShapeStyle {
+        guard isEnabled else { return AnyShapeStyle(HierarchicalShapeStyle.tertiary) }
+        return prominent ? AnyShapeStyle(Color.white) : AnyShapeStyle(HierarchicalShapeStyle.primary)
+    }
+
+    private var fillStyle: AnyShapeStyle {
+        prominent && isEnabled ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(HierarchicalShapeStyle.quaternary)
+    }
+
+    private static var bezel: AnyShape {
+        if #available(macOS 26.0, *) {
+            return AnyShape(Capsule())
+        }
+        return AnyShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -1414,6 +1493,7 @@ private enum CompatCardRowMetrics {
 private struct StatusCard: View {
     let launcher: Launcher
     let openWindow: OpenWindowAction
+    @Environment(SteamWindow.self) private var steamWindow
 
     /// Displayed launch fraction, eased toward the effective target (staged
     /// fraction + gentle creep while a stage is in flight).
@@ -1456,6 +1536,14 @@ private struct StatusCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .contentTransition(.opacity)
                             .transition(.blurReplace)
+                        if let showSteamWindow {
+                            // Steam's windows have no Dock icon: one that fell
+                            // behind another window is only reachable from here.
+                            Button("Show Steam's Window", action: showSteamWindow)
+                                .buttonStyle(.link)
+                                .font(.caption)
+                                .transition(.blurReplace)
+                        }
                     } else if let progressText = launcher.downloadProgressText {
                         // Updates in place on every tick: no transition, and
                         // fixed-width digits so the line doesn't jiggle.
@@ -1530,6 +1618,19 @@ private struct StatusCard: View {
 
     // MARK: Copy
 
+    /// Brings Steam's window back while the launch waits on it: its sign-in,
+    /// or a dialog it raised (a EULA, "this game recommends a controller").
+    private var showSteamWindow: (() -> Void)? {
+        guard launcher.isLaunching else { return nil }
+        if launcher.steamWaitingOnPlayer != nil {
+            return { steamWindow.bringPromptForward() }
+        }
+        if launcher.steamSignIn != nil, steamWindow.isSignInWindowShown {
+            return { steamWindow.bringSignInForward() }
+        }
+        return nil
+    }
+
     private var beat: Beat {
         switch launcher.launchState {
         case .launching:
@@ -1572,7 +1673,8 @@ private struct StatusCard: View {
         // gets ready, then fills in green when the game is up.
         switch phase {
         case .gettingReady:
-            return Beat(title: "Getting ready…", symbol: "play.circle")
+            // What Steam is doing on its way up (it can take 20 s from cold).
+            return Beat(title: "Getting ready…", detail: step, symbol: "play.circle")
         case .settingUpSteam:
             return Beat(title: "Setting up Steam…", detail: "This only happens once.", symbol: "arrow.down.circle")
         case .updatingSteam:

@@ -326,19 +326,29 @@ final class Launcher {
         }
     }
 
-    func uninstall(game: Game, engine: WineEngine) {
+    func uninstall(game: Game, library: SteamLibraryStore) {
         launchTask?.cancel()
         launchTask = Task { [weak self] in
             guard let self else { return }
+            // This game's page shows the progress, and a failure with Reset.
+            activeAppID = game.id
             launchState = .uninstalling
             currentActivity = "Uninstalling \(game.name)…"
+            let prefix = self.prefix
             do {
-                try await uninstallGame(game: game, engine: engine)
-                AppSettings.shared.markNotInstalled(appID: game.id)
+                // Gigabytes of files: deleted off the main actor, which this
+                // used to block until the whole folder was gone.
+                try await Task.detached(priority: .userInitiated) {
+                    try Self.uninstallGame(game: game, prefix: prefix)
+                }.value
+                // The library follows at once, not at its next disk poll
+                // (LibraryView animates the change).
+                library.setInstalled(false, for: game.id)
+                launchState = .idle
+                activeAppID = nil
             } catch {
                 launchState = .failed(error.localizedDescription)
             }
-            launchState = .idle
             currentActivity = nil
         }
     }
@@ -408,6 +418,9 @@ final class Launcher {
         guard launchAfterInstall else {
             launchState = .idle
             currentActivity = nil
+            // Steam up (or restarted) with the new game now, so its first
+            // Play doesn't wait on Steam.
+            session.warmUp(engine: engine, appID: game.id)
             return
         }
 
@@ -601,6 +614,7 @@ final class Launcher {
         var stepShownAt = ContinuousClock.now
         var openedAt: ContinuousClock.Instant?
         var pendingWait: (step: String, since: ContinuousClock.Instant)?
+        var eulaHandOff: [SteamEula]?
         var steamFailed = false
         // Steam-side failure/progress signal (fail-fast rule): if Steam
         // decided the app needs an update/validation instead of launching, the
@@ -632,9 +646,32 @@ final class Launcher {
             // Steam answers some prompts itself within a second (no
             // interstitials to show); one still open is the player's to answer.
             if let pendingWait, steamWaitingOnPlayer == nil, ContinuousClock.now - pendingWait.since >= .seconds(1) {
+                // The check before Steam started reads Steam's app cache,
+                // which Steam writes only once it runs: after an engine update
+                // reset Steam, there was none and Steam's own window asked
+                // (meridian.log Oct 12 19:44:17 "no app info cache"; cache
+                // written 19:45:24, ShowEula 19:45:26). By now it is there.
+                if pendingWait.step == "ShowEula", let localConfigURL {
+                    let eulas = await Task.detached(priority: .userInitiated) {
+                        SteamEula.unaccepted(appID: appID, appInfo: appInfoURL, localConfig: localConfigURL, pending: pending)
+                    }.value
+                    if !eulas.isEmpty {
+                        eulaHandOff = eulas
+                        break
+                    }
+                }
                 showSteamPrompt(pendingWait.step)
             }
-            if let openedAt, ContinuousClock.now - openedAt > .seconds(5) { latestStep = "Almost there" }
+            // Some games sit a long while before their first window; past
+            // "Almost there" the card says that's normal instead of going quiet.
+            if let openedAt {
+                let waited = ContinuousClock.now - openedAt
+                if waited > .seconds(25) {
+                    latestStep = "Some games take a minute to open"
+                } else if waited > .seconds(5) {
+                    latestStep = "Almost there"
+                }
+            }
             if let latestStep, latestStep != launchStep, ContinuousClock.now - stepShownAt >= .milliseconds(1200) {
                 launchStep = latestStep
                 stepShownAt = .now
@@ -653,6 +690,21 @@ final class Launcher {
 
         launchStep = nil
         if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
+
+        if let eulas = eulaHandOff {
+            // Ask in Meridian's sheet. Quitting Steam closes its own dialog
+            // (and a Decline leaves nothing waiting); Accept starts Steam again
+            // with the answer written, as when it is accepted before Steam runs.
+            log.info("[launchOnline] Steam asked for \(eulas.map(\.id).joined(separator: ", ")); asking in Meridian")
+            gameProcess.cancelMonitoring()
+            closeActiveGameLog(reason: "license agreement asked in Meridian", exitCode: nil)
+            await session.shutdown(engine: engine)
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            eulaPrompt = EulaPrompt(game: game, eulas: eulas)
+            launchState = .idle
+            currentActivity = nil
+            return
+        }
 
         if steamFailed {
             // Steam gave up on the launch itself (a declined EULA, an
@@ -942,7 +994,7 @@ final class Launcher {
 
     // MARK: - Private: uninstall
 
-    private func uninstallGame(game: Game, engine: WineEngine) async throws {
+    private nonisolated static func uninstallGame(game: Game, prefix: WinePrefix) throws {
         log.info("[uninstall] appID=\(game.id)")
         let fm = FileManager.default
 
@@ -1065,6 +1117,24 @@ final class Launcher {
             launchPhase = stage.phase
             launchStageFraction = max(launchStageFraction, stage.fraction)
         }
+        if launchPhase == .gettingReady, let step = Self.gettingReadyStepText(for: status) {
+            launchStep = step
+        }
+    }
+
+    /// The line under "Getting ready…" while Steam starts and signs in, which
+    /// can take 20 s from cold (user, Oct 12 2026: "it doesn't give much
+    /// feedback"). Three beats in plain words, not Steam's every status
+    /// (Oct 11: the card names beats, it doesn't narrate). nil keeps the
+    /// current line.
+    nonisolated static func gettingReadyStepText(for status: String) -> String? {
+        if status.localizedCaseInsensitiveContains("Steam is ready") { return "Steam is ready" }
+        if status.localizedCaseInsensitiveContains("Signing in")
+            || status.localizedCaseInsensitiveContains("sign-in")
+            || status.localizedCaseInsensitiveContains("Signed in") { return "Signing in to your account" }
+        if status.localizedCaseInsensitiveContains("Steam servers") { return "Connecting to Steam" }
+        if status.localizedCaseInsensitiveContains("Starting Steam") { return "Starting Steam in the background" }
+        return nil
     }
 
     /// Resets the staged progress at the start of a launch attempt (and on
@@ -1128,7 +1198,10 @@ final class Launcher {
     nonisolated static func launchStepText(for task: String, gameName: String) -> String? {
         switch task {
         case "UpdatingAppTicket", "SiteLicenseSeatCheckout": return "Checking with Steam"
-        case "RunningInstallScript": return "Finishing setup"
+        // Steam's install scripts: the game's Visual C++ and DirectX
+        // redistributables (`_CommonRedist`), again after an engine update
+        // resets the Windows folder they install into.
+        case "RunningInstallScript": return "Installing Windows components"
         case "SynchronizingCloud": return "Syncing your saves"
         case "SynchronizingStats": return "Loading your achievements"
         case "CreatingProcess": return "Opening \(gameName)"

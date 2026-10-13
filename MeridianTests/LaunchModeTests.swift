@@ -200,11 +200,13 @@ final class LaunchModeTests: XCTestCase {
     /// sign-out the warm-up found sends Play straight to Steam's sign-in.
     func testSteamWarmUp_isJoinedByPlay() throws {
         let session = try readSource("Meridian/Steam/SteamSession.swift")
-        XCTAssertTrue(session.contains("guard warmUpTask == nil, state == .idle, AppSettings.shared.steamClientSignedIn else { return }"),
+        XCTAssertTrue(session.contains("guard warmUpTask == nil, AppSettings.shared.steamClientSignedIn else { return }"),
                       "Warm-up only for a Mac where Steam's own sign-in succeeded (no sign-in window from the background)")
+        XCTAssertTrue(session.contains("guard state == .idle || missingGame else { return }"),
+                      "Warm-up starts an idle Steam, or restarts a running one only for a game it hasn't loaded")
         XCTAssertTrue(session.contains("if let warmUpTask {"),
                       "ensureReadyForDRM must wait for a running warm-up instead of racing it")
-        XCTAssertTrue(session.contains("try await bringUpForDRM(engine: engine, appID: nil, onStatus: nil)"),
+        XCTAssertTrue(session.contains("try await bringUpForDRM(engine: engine, appID: appID, onStatus: nil)"),
                       "The warm-up must use the inner bring-up, or it would wait on itself")
 
         let launcher = try readSource("Meridian/Launch/Launcher.swift")
@@ -212,6 +214,8 @@ final class LaunchModeTests: XCTestCase {
                       "Play must use a sign-out the warm-up already found")
         XCTAssertTrue(launcher.contains("try await signInToSteam(.signedOut, appID: game.id, session: session, engine: engine)"),
                       "A known sign-out goes straight to Steam's sign-in")
+        XCTAssertTrue(launcher.contains("session.warmUp(engine: engine, appID: game.id)"),
+                      "A finished install brings Steam up with the new game, so its first Play doesn't wait")
 
         let content = try readSource("Meridian/Views/ContentView.swift")
         XCTAssertTrue(content.contains("session.warmUp(engine: engine)"),
