@@ -763,13 +763,13 @@ struct CardLayoutMetrics {
     static let peekFraction: CGFloat = 0.2
 
     /// The content-column width at the app's DEFAULT window size
-    /// (AppDelegate.fullFrameSize 1040 − sidebar 215). The column-count
+    /// (AppDelegate.fullFrameSize 1028 − sidebar 215). The column-count
     /// step anchors to this so the default window always shows the canonical
     /// 5-columns + peek layout.
-    static let defaultContentWidth: CGFloat = 825
+    static let defaultContentWidth: CGFloat = 805
 
     /// The card size at the default window (5 columns + peek at
-    /// `defaultContentWidth`, ≈130.6 pt). This is the ANCHOR for the column
+    /// `defaultContentWidth`, ≈126.9 pt). This is the ANCHOR for the column
     /// step: a new column is added roughly every time another default-size
     /// card would fit — so the default layout is exactly reproduced and
     /// resizing feels proportional around it.
@@ -803,7 +803,7 @@ struct CardLayoutMetrics {
             return CardLayoutMetrics(cardWidth: w, visibleCount: 5, leadingPadding: s + p * w)
         }
 
-        // Column count anchored to the default card step: floor(825 / 150.6)
+        // Column count anchored to the default card step: floor(805 / 146.9)
         // = 5 at the default width, stepping down/up as the window shrinks
         // or grows.
         let rawN = Int(floor(containerWidth / (referenceCardWidth + s)))
