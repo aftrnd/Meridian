@@ -12,7 +12,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // (`CardLayoutMetrics.defaultContentWidth`). Height: Home's first row sits
     // centred under the hero, 63.6 pt from the hero to the card art and 63.6
     // from the art to the window bottom (hero 302 + 63.6 + art 195.8 + 63.6).
-    private static let fullFrameSize  = NSSize(width: 1040, height: 625)
+    // Floating sidebar: 1038×625, the glass's 8 pt inset + 215 pt glass +
+    // 815 pt content (user, Oct 13 2026); still 5 columns + peek.
+    private static var fullFrameSize: NSSize {
+        let floating = FloatingSidebar.isAvailable
+            && UserDefaults.standard.bool(forKey: FeatureFlag.floatingSidebar.defaultsKey)
+        return NSSize(width: floating ? 1038 : 1040, height: 625)
+    }
     /// Splash → full-size resize. ContentView swaps the splash for the main
     /// content only after this has elapsed (`ContentView.splashHandoffDelay`),
     /// so the app's heaviest layout never lands mid-resize.
