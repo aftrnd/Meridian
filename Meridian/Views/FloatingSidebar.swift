@@ -8,9 +8,9 @@ import SwiftUI
 /// to inset it), so this replaces the split view instead of styling it.
 ///
 /// The pages run the full window underneath. Their leading safe area clears
-/// the panel (`width`, applied by ContentView), so layout starts beside it,
-/// while art that ignores the leading edge (Home's banner, under
-/// `floatingSidebarActive`) bleeds under the glass to the window's edge.
+/// the panel (`width`, applied by ContentView), so layout, widths and art crops
+/// match the classic column exactly. Home's banner fills the panel's area with
+/// its background extension (a mirror of the art), as macOS 26 did.
 enum FloatingSidebar {
     /// The classic column's width, so pages lay out exactly as beside it.
     static let width: CGFloat = 215
@@ -66,8 +66,8 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
 }
 
 extension EnvironmentValues {
-    /// True under FloatingSidebarLayout: art meant to run under the panel
-    /// ignores the leading safe area. False (the classic column) leaves
-    /// every layout exactly as it was.
+    /// True under FloatingSidebarLayout: Home's banner shade runs under the
+    /// panel with its mirrored art. False (the classic column) leaves every
+    /// layout exactly as it was.
     @Entry var floatingSidebarActive: Bool = false
 }
