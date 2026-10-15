@@ -144,8 +144,10 @@ struct GameDetailView: View {
                 // the zoom rect. `.scrollIndicators` isn't re-applied once the
                 // NSScrollView exists, so drive the scroller's alpha directly:
                 // layout never changes, it fades in after the flight settles.
+                // The same landing puts the page back at its top if the
+                // flight left it a pixel or two down (see ScrollViewLanding).
                 .background(alignment: .topLeading) {
-                    ScrollerVisibility(visible: showsAmbient).frame(width: 0, height: 0)
+                    ScrollViewLanding(landed: showsAmbient).frame(width: 0, height: 0)
                 }
             }
         }
@@ -404,26 +406,37 @@ struct GameDetailView: View {
     /// Bleed fade once the zoom has landed (and out as a close begins).
     private static var ambientFade: Animation { .easeOut(duration: DetailZoomTuning.shared.params.ambientFade) }
 
-    // MARK: - Scroller visibility
+    // MARK: - Scroll view landing
 
 /// Zero-size probe inside a `ScrollView`'s content: finds the enclosing
-/// `NSScrollView` and fades its scrollers (alpha, not presence — a legacy
-/// scroller takes layout space, so removing it would reflow the page).
-private struct ScrollerVisibility: NSViewRepresentable {
-    let visible: Bool
+/// `NSScrollView` and settles it as the zoom lands (`landed`):
+/// - Fades its scrollers in (alpha, not presence — a legacy scroller takes
+///   layout space, so removing it would reflow the page).
+/// - Puts the page back at its top. While the page is scaled inside the zoom
+///   rect, AppKit recomputes the scroll view's top inset through the scale
+///   every frame (52 pt → ~49 → 52 with the spring's overshoot) and the
+///   offset chases it in whole pixels. 7 of 17 opens rested 0.5–1.5 pt down
+///   (meridian.log, Oct 14 2026); a probe without the scale always rested
+///   at the top. Only within `topSnap` of it, so a scroll made mid-flight
+///   stays where it is.
+private struct ScrollViewLanding: NSViewRepresentable {
+    let landed: Bool
 
-    func makeNSView(context: Context) -> ScrollerProbe {
-        let v = ScrollerProbe()
-        v.visible = visible
+    func makeNSView(context: Context) -> LandingProbe {
+        let v = LandingProbe()
+        v.landed = landed
         return v
     }
 
-    func updateNSView(_ v: ScrollerProbe, context: Context) {
-        v.visible = visible
+    func updateNSView(_ v: LandingProbe, context: Context) {
+        v.landed = landed
     }
 
-    final class ScrollerProbe: NSView {
-        var visible = true { didSet { if visible != oldValue { apply(animated: true) } } }
+    final class LandingProbe: NSView {
+        static let topSnap: CGFloat = 4
+        private static let log = MeridianLog(category: "GameDetail")
+
+        var landed = true { didSet { if landed != oldValue { apply(animated: true) } } }
 
         override var isFlipped: Bool { true }
         // An AppKit subview sits above the hosting view's SwiftUI drawing in
@@ -437,8 +450,9 @@ private struct ScrollerVisibility: NSViewRepresentable {
 
         private func apply(animated: Bool) {
             guard let scrollView = enclosingScrollView else { return }
+            if landed { returnToTop(scrollView) }
             let scrollers = [scrollView.verticalScroller, scrollView.horizontalScroller].compactMap { $0 }
-            let alpha: CGFloat = visible ? 1 : 0
+            let alpha: CGFloat = landed ? 1 : 0
             guard animated else {
                 scrollers.forEach { $0.alphaValue = alpha }
                 return
@@ -448,7 +462,17 @@ private struct ScrollerVisibility: NSViewRepresentable {
                 scrollers.forEach { $0.animator().alphaValue = alpha }
             }
             // Overlay style: announce the now-visible scroller as a fresh page would.
-            if visible { scrollView.flashScrollers() }
+            if landed { scrollView.flashScrollers() }
+        }
+
+        private func returnToTop(_ scrollView: NSScrollView) {
+            let clip = scrollView.contentView
+            let top = -scrollView.contentInsets.top
+            let y = clip.bounds.origin.y
+            guard y != top, abs(y - top) < Self.topSnap else { return }
+            Self.log.debug("[ScrollViewLanding] back to the top from \(y - top) pt")
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: top))
+            scrollView.reflectScrolledClipView(clip)
         }
     }
 }
