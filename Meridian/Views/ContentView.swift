@@ -456,7 +456,8 @@ struct ContentView: View {
                     // Outside `.id(game.id)` so a same-game close → open
                     // retargets in place; inside `.id(openGeneration)` so a
                     // fresh open never inherits a running close.
-                    .modifier(DetailZoomReveal(progress: zoomProgress, rootFade: rootFade, zoom: zoom, stageSize: stageSize))
+                    .modifier(DetailZoomReveal(progress: zoomProgress, rootFade: rootFade, zoom: zoom, stageSize: stageSize,
+                                               leadingSafeArea: floatingSidebarInset))
                     // Likewise usable as soon as the open starts (target 1).
                     .allowsHitTesting(zoomProgress == 1)
                     .id(openGeneration)
@@ -466,6 +467,12 @@ struct ContentView: View {
                 .id(openGeneration)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The window's own background, under the toolbar and the floating
+        // panel too. Unpainted, the pages show the backdrop of the container
+        // `.inspector` wraps them in, which macOS 27 draws much lighter in
+        // dark mode (#373535 against the window's #282828; light is white
+        // either way).
+        .background(Color(nsColor: .windowBackgroundColor))
         .onGeometryChange(for: CGSize.self) { $0.size } action: {
             stageSize = $0
             layoutSizes.content = $0.width
