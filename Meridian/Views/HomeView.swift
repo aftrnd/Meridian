@@ -131,7 +131,7 @@ struct HomeView: View {
                         isFavorite: { library.isFavorite(appID: $0) },
                         gameState: gameState(for:),
                         onSelect: { selectedGame = $0 },
-                        contextMenu: { gameContextMenu(for: $0) }
+                        contextMenu: { gameContextMenu(for: $0, inRecentlyPlayed: true) }
                     )
                 }
 
@@ -279,7 +279,7 @@ struct HomeView: View {
     }
 
     @ViewBuilder
-    private func gameContextMenu(for game: Game) -> some View {
+    private func gameContextMenu(for game: Game, inRecentlyPlayed: Bool = false) -> some View {
         Button {
             library.toggleFavorite(appID: game.id)
         } label: {
@@ -295,6 +295,14 @@ struct HomeView: View {
             Label("View Details", systemImage: "info.circle")
         }
         Divider()
+        if inRecentlyPlayed {
+            // Back in the list once the game is played again.
+            Button {
+                library.removeFromRecentlyPlayed(game)
+            } label: {
+                Label("Remove from Recently Played", systemImage: "clock.badge.xmark")
+            }
+        }
         Button(role: .destructive) {
             library.hideGame(appID: game.id)
         } label: {

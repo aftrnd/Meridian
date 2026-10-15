@@ -106,6 +106,24 @@ final class AppSettings: @unchecked Sendable {
         hiddenAppIDs = ids
     }
 
+    // MARK: - Recently Played Removals
+
+    /// Games removed from Home's Recently Played: app ID → the last-played
+    /// time (seconds since 1970) the game had when it was removed. Mirrored by
+    /// `SteamLibraryStore`, which reads it on the hot path.
+    var recentlyPlayedRemovals: [Int: TimeInterval] {
+        get {
+            let raw = UserDefaults.standard.dictionary(forKey: "recentlyPlayedRemovals") as? [String: Double] ?? [:]
+            return raw.reduce(into: [Int: TimeInterval]()) { result, pair in
+                if let key = Int(pair.key) { result[key] = pair.value }
+            }
+        }
+        set {
+            let stringKeyed = newValue.reduce(into: [String: Double]()) { $0[String($1.key)] = $1.value }
+            UserDefaults.standard.set(stringKeyed, forKey: "recentlyPlayedRemovals")
+        }
+    }
+
     // MARK: - Launch History
 
     /// In-memory mirrors of the hot collections below. Sorting the Home rows
@@ -322,6 +340,7 @@ final class AppSettings: @unchecked Sendable {
         installedAppIDs = []
         hiddenAppIDs    = []
         favoriteAppIDs  = []
+        recentlyPlayedRemovals = [:]
         UserDefaults.standard.removeObject(forKey: "launchTimestamps")
         cacheLock.lock()
         _launchTimestamps = nil
