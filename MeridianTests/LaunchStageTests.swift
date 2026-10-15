@@ -369,4 +369,51 @@ final class LaunchStageTests: XCTestCase {
         XCTAssertEqual(GameProcess.gameProcessLines(in: output, ourPID: 99999),
                        ["37501 \(game)\\TheBabyInYellow.exe"])
     }
+
+    /// A launcher's game starts after the launcher was confirmed and activated
+    /// (FalloutNVLauncher.exe pid 20174 → FalloutNV.exe pid 20197, Oct 14
+    /// 2026), and nobody activated it; winemac applies a game's display-mode
+    /// switch only once it is active. Later game processes are activated once
+    /// they show a window, so windowless helpers never are.
+    func testGameDetection_activatesTheGameALauncherStarts() throws {
+        let monitor = try readSource("Meridian/Engine/GameProcess.swift")
+        XCTAssertTrue(monitor.contains("await activateNewGameProcesses(result)"),
+                      "The running phase must look for game processes that start later")
+        XCTAssertTrue(monitor.contains("for pid in current.subtracting(gamePIDs)"),
+                      "Only processes not seen before are new")
+        XCTAssertTrue(monitor.contains("if withWindow.contains(pid) {"),
+                      "A new process takes focus only once it shows a window")
+        XCTAssertTrue(monitor.contains("gamePIDs = detectedPIDs"),
+                      "The processes confirmed at startup are not new")
+    }
+
+    /// Older games keep their installers elsewhere (`Redists\directx\DXSETUP.exe`),
+    /// and `SteamService.exe /installscript` names the game's folder too, so
+    /// no folder filter tells them from the game. Steam's console_log does:
+    /// while Steam runs the install scripts nothing counts as the game, and
+    /// the startup timeout waits (Fallout: New Vegas, Oct 14 2026: confirmed
+    /// "running" 6 s into Steam's DirectX setup; the player saw nothing,
+    /// pressed Stop and killed it). Lines verbatim from its console_log.txt.
+    func testGameDetection_waitsOutSteamsInstallScripts() throws {
+        let log = """
+        [2026-10-14 23:14:44] GameAction [AppID 22380, ActionID 2] : LaunchApp changed task to RunningInstallScript with ""
+        [2026-10-14 23:15:04] GameAction [AppID 22380, ActionID 2] : LaunchApp changed task to SynchronizingCloud with ""
+
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        XCTAssertEqual(Launcher.steamLaunchEvents(in: log, appID: 22380),
+                       [.task("RunningInstallScript"), .task("SynchronizingCloud")])
+        XCTAssertEqual(Launcher.launchStepText(for: "RunningInstallScript", gameName: "Fallout: New Vegas"),
+                       "Installing Windows components")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("runningInstallScript = task == \"RunningInstallScript\""),
+                      "Steam's current launch step says whether its install scripts are running")
+        XCTAssertTrue(launcher.contains("gameProcess.startupHeld = steamWaitingOnPlayer != nil || runningInstallScript"),
+                      "The install scripts hold the startup, like a prompt waiting on the player")
+        let monitor = try readSource("Meridian/Engine/GameProcess.swift")
+        XCTAssertTrue(monitor.contains("if gameDetected, !startupHeld {"),
+                      "Nothing confirms the game while the startup is held")
+        XCTAssertTrue(monitor.contains("self.startupHeld = false"),
+                      "A hold left by an earlier launch must not carry into the next")
+    }
 }

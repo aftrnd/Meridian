@@ -616,6 +616,7 @@ final class Launcher {
         var pendingWait: (step: String, since: ContinuousClock.Instant)?
         var eulaHandOff: [SteamEula]?
         var steamFailed = false
+        var runningInstallScript = false
         // Steam-side failure/progress signal (fail-fast rule): if Steam
         // decided the app needs an update/validation instead of launching, the
         // ACF's StateFlags leaves "4". Report THAT instead of a mislabeled
@@ -638,6 +639,7 @@ final class Launcher {
                     if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
                 }
                 guard case .task(let task) = event else { continue }
+                runningInstallScript = task == "RunningInstallScript"
                 if let step = Self.launchStepText(for: task, gameName: game.name) { latestStep = step }
                 if task == "CreatingProcess" { openedAt = .now }
                 if task == "Failed" { steamFailed = true }
@@ -662,6 +664,10 @@ final class Launcher {
                 }
                 showSteamPrompt(pendingWait.step)
             }
+            // Steam hasn't started the game while it waits on the player or
+            // runs the game's install scripts (DirectX, Visual C++): hold the
+            // startup timeout, and don't take the installers for the game.
+            gameProcess.startupHeld = steamWaitingOnPlayer != nil || runningInstallScript
             // Some games sit a long while before their first window; past
             // "Almost there" the card says that's normal instead of going quiet.
             if let openedAt {
@@ -1181,10 +1187,10 @@ final class Launcher {
     }
 
     /// Shows (or, with nil, hides) Steam's window while it waits on the
-    /// player, and holds the startup timeout and the card meanwhile.
+    /// player, and holds the card meanwhile (the launch loop holds the
+    /// startup timeout from `steamWaitingOnPlayer`).
     private func showSteamPrompt(_ step: String?) {
         steamWaitingOnPlayer = step
-        gameProcess.startupHeld = step != nil
         if let step {
             appendLog("Steam is waiting for your answer (\(step)); showing its window")
             steamWindow?.presentSteamPrompt()
@@ -1199,8 +1205,8 @@ final class Launcher {
         switch task {
         case "UpdatingAppTicket", "SiteLicenseSeatCheckout": return "Checking with Steam"
         // Steam's install scripts: the game's Visual C++ and DirectX
-        // redistributables (`_CommonRedist`), again after an engine update
-        // resets the Windows folder they install into.
+        // redistributables (`_CommonRedist`, `Redists` in older games), again
+        // after an engine update resets the Windows folder they install into.
         case "RunningInstallScript": return "Installing Windows components"
         case "SynchronizingCloud": return "Syncing your saves"
         case "SynchronizingStats": return "Loading your achievements"

@@ -54,9 +54,14 @@ final class GameProcess {
 
     var confirmedRunning: Bool { monitorPhase == .running }
 
-    /// Set while Steam waits on the player before it starts the game (an
-    /// EULA): the startup timeout counts from when this clears, so reading
-    /// the agreement never times the launch out.
+    /// Set while Steam is busy before it starts the game: waiting on the
+    /// player (an EULA) or running the game's install scripts. The startup
+    /// timeout counts from when this clears, and nothing counts as the game
+    /// meanwhile: the install scripts run from the game's folder
+    /// (`SteamService.exe /installscript …\<game>\…`,
+    /// `…\<game>\Redists\directx\DXSETUP.exe`) and match its pattern.
+    /// Fallout: New Vegas, Oct 14 2026: confirmed "running" 6 s into Steam's
+    /// DirectX setup; the player saw nothing, pressed Stop and killed it.
     var startupHeld = false
 
     private var monitorTask: Task<Void, Never>?
@@ -68,6 +73,11 @@ final class GameProcess {
 
     /// PIDs that existed at baseline (fallback mode only).
     private var baselinePIDs: Set<Int32> = []
+
+    /// Every game process seen this session, and the ones that appeared after
+    /// confirmation and wait to show a window before being activated.
+    private var gamePIDs: Set<Int32> = []
+    private var awaitingWindow: [Int32: ContinuousClock.Instant] = [:]
 
     /// The pgrep search pattern derived from the Wine engine binary path.
     private var wineSearchPattern: String = "wine"
@@ -98,10 +108,13 @@ final class GameProcess {
         self.appID = appID
         self.launchedPID = launchedPID
         self.monitorPhase = .startup
+        self.startupHeld = false
         self.logs = []
         self.onLog = onLog
         self.baselineHostCount = 0
         self.baselinePIDs = []
+        self.gamePIDs = []
+        self.awaitingWindow = [:]
 
         let wineBinDir = engine.wine64URL.deletingLastPathComponent().path(percentEncoded: false)
         self.wineSearchPattern = wineBinDir
@@ -299,7 +312,7 @@ final class GameProcess {
                 if gameDetected { detectedPIDs = newPIDs }
             }
 
-            if gameDetected {
+            if gameDetected, !startupHeld {
                 consecutiveDetected += 1
             } else {
                 consecutiveDetected = 0
@@ -310,6 +323,7 @@ final class GameProcess {
                 log.info("[monitor:startup] game CONFIRMED after \(pollCount) polls (\(elapsed)) via \(detectionMethod)")
                 appendLog("Game confirmed running (via \(detectionMethod))")
                 onLog?("Game is running")
+                gamePIDs = detectedPIDs
                 activateGameApplication(pids: detectedPIDs)
                 return true
             }
@@ -329,7 +343,7 @@ final class GameProcess {
 
             if pollCount % 3 == 0 || consecutiveDetected > 0 {
                 let secs = Int(elapsed.components.seconds)
-                log.info("[monitor:startup] poll=\(pollCount) | \(secs)s | \(detectionMethod) | wineserver=\(wineserverAlive) | consecutive=\(consecutiveDetected)")
+                log.info("[monitor:startup] poll=\(pollCount) | \(secs)s | \(detectionMethod) | wineserver=\(wineserverAlive) | held=\(startupHeld) | consecutive=\(consecutiveDetected)")
             }
             if pollCount % 5 == 0 {
                 onLog?("Waiting for game to start… (\(Int(elapsed.components.seconds))s)")
@@ -379,6 +393,7 @@ final class GameProcess {
                         log.debug("[monitor:running]   game-match: \(line.prefix(200))")
                     }
                 }
+                await activateNewGameProcesses(result)
             } else {
                 // Fallback: continuously-refreshed PID-set above baseline
                 let result = await Task.detached {
@@ -471,7 +486,58 @@ final class GameProcess {
                 }
                 try? await Task.sleep(for: .milliseconds(500))
             }
+            // macOS activation is cooperative: from Meridian it may need
+            // Meridian to be the active app. Say who was, for the next trace.
+            let front = NSWorkspace.shared.frontmostApplication
+            log.warning("[monitor] game app pids=\(pids.sorted()) not active after 6 s; frontmost=\(front?.localizedName ?? "none") pid=\(front?.processIdentifier ?? 0)")
         }
+    }
+
+    /// Activates game processes that start after the game was confirmed: the
+    /// game a launcher starts (FalloutNVLauncher.exe → FalloutNV.exe) or the
+    /// real exe behind a bootstrap. Nobody activated them (Oct 14 2026:
+    /// Meridian activated only New Vegas's launcher, pid 20174), and winemac
+    /// applies a game's display-mode switch only once it is active (see
+    /// above). Its quarter-size frame needs Wine patch 0006 as well: a switch
+    /// applied late leaves winemac's Retina cache stale (Pattern 54). Each new
+    /// process is activated once it shows a window, so helpers without one
+    /// (crash handlers) never take focus; one that shows none within a minute
+    /// is left alone.
+    private func activateNewGameProcesses(_ result: ProcessCheckResult) async {
+        let current = result.pids
+        for pid in current.subtracting(gamePIDs) {
+            awaitingWindow[pid] = .now
+            log.info("[monitor:running] new game process pid=\(pid); activating it once it shows a window")
+        }
+        gamePIDs.formUnion(current)
+        guard !awaitingWindow.isEmpty else { return }
+
+        let waiting = Set(awaitingWindow.keys)
+        let withWindow = await Task.detached { Self.pidsWithOnScreenWindow(among: waiting) }.value
+        for (pid, since) in awaitingWindow {
+            if withWindow.contains(pid) {
+                awaitingWindow[pid] = nil
+                activateGameApplication(pids: [pid])
+            } else if !current.contains(pid) || ContinuousClock.now - since > .seconds(60) {
+                awaitingWindow[pid] = nil
+            }
+        }
+    }
+
+    /// Which of `pids` own an on-screen window. Owner PID and bounds need no
+    /// Screen Recording permission (window titles would).
+    private nonisolated static func pidsWithOnScreenWindow(among pids: Set<Int32>) -> Set<Int32> {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        var owners: Set<Int32> = []
+        for window in windows {
+            guard let pid = window[kCGWindowOwnerPID as String] as? Int32, pids.contains(pid),
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  rect.width > 1, rect.height > 1 else { continue }
+            owners.insert(pid)
+        }
+        return owners
     }
 
     struct ProcessCheckResult: Sendable {
