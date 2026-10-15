@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SearchView: View {
     @Environment(SteamLibraryStore.self) private var library
@@ -199,6 +200,8 @@ struct SearchView: View {
             // Typing rearranges the cards in place: kept ones glide to their
             // new spots, dropped ones blur out, new ones blur in.
             .animation(Self.reflow, value: results.map(\.id))
+            // Inside the scroll view, so it can find it.
+            .background { NoTopScrollEdgeEffect().frame(width: 0, height: 0) }
         }
         .scrollIndicators(.hidden)
         .onScrollPhaseChange { _, phase in hoverGate.scrollPhaseChanged(to: phase) }
@@ -279,6 +282,32 @@ private struct TopBar<Bar: View>: ViewModifier {
             content.safeAreaBar(edge: .top) { bar }
         } else {
             content.safeAreaInset(edge: .top, spacing: 0) { bar }
+        }
+    }
+}
+
+// MARK: - Scroll edge effect
+
+/// Turns off the enclosing scroll view's top scroll edge effect: the blur
+/// macOS 26+ draws under the toolbar and the genre row, with a hard line at
+/// its foot (user: no blur, Oct 14 2026). SwiftUI's
+/// `scrollEdgeEffectHidden(true)` never reaches it on 27.0.1. Probes without
+/// the blur only lacked it because their scroll view was there from the
+/// window's first frame, which leaves the effect stuck off; Search always
+/// mounts later (probe, Oct 14 2026). NSScrollView's private
+/// `allowedPocketEdges` (top = 1) is the switch. Only used while it exists;
+/// without it the page keeps the system blur.
+private struct NoTopScrollEdgeEffect: NSViewRepresentable {
+    func makeNSView(context: Context) -> ScrollViewHook { ScrollViewHook() }
+    func updateNSView(_ view: ScrollViewHook, context: Context) {}
+
+    final class ScrollViewHook: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let scrollView = enclosingScrollView,
+                  scrollView.responds(to: NSSelectorFromString("setAllowedPocketEdges:")),
+                  let edges = scrollView.value(forKey: "allowedPocketEdges") as? Int else { return }
+            scrollView.setValue(edges & ~1, forKey: "allowedPocketEdges")
         }
     }
 }
