@@ -38,4 +38,17 @@ final class ScrollEdgeEffectTests: XCTestCase {
         XCTAssertFalse(src.contains(".scrollEdgeEffectHidden("),
                        "scrollEdgeEffectHidden doesn't reach this effect on macOS 27.0.1")
     }
+
+    /// The fade that took the blur's place (TopFade) draws its variable blur
+    /// with private Core Animation classes, only while they exist, so a
+    /// macOS without them gets the darkening alone.
+    func testSearchTopFade_variableBlurStaysGuarded() throws {
+        let src = try readSource("Meridian/Views/Library/SearchView.swift")
+        XCTAssertTrue(src.contains("TopFade(blurClearance:"),
+                      "the genre row carries the top fade")
+        XCTAssertTrue(src.contains("NSClassFromString(\"CABackdropLayer\") as? CALayer.Type"),
+                      "the backdrop layer class is looked up, never assumed")
+        XCTAssertTrue(src.contains("filterType.responds(to: factory)"),
+                      "the variableBlur filter factory is checked before use")
+    }
 }

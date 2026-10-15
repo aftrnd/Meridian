@@ -157,6 +157,15 @@ struct SearchView: View {
         }
         .scrollIndicators(.hidden)
         .contentMargins(.horizontal, CardLayoutMetrics.spacing, for: .scrollContent)
+        // Up under the toolbar to the window's top, and under the floating
+        // panel, so the fade has no edge anywhere. It fades across the chips
+        // and ends one padding below the row, where the first row of cards
+        // rests: nothing is under it until the page scrolls.
+        .background {
+            TopFade(blurClearance: Self.genreRowPadding * 2)
+                .padding(.bottom, -Self.genreRowPadding)
+                .ignoresSafeArea(edges: [.top, .leading])
+        }
     }
 
     // MARK: - Results
@@ -308,6 +317,120 @@ private struct NoTopScrollEdgeEffect: NSViewRepresentable {
                   scrollView.responds(to: NSSelectorFromString("setAllowedPocketEdges:")),
                   let edges = scrollView.value(forKey: "allowedPocketEdges") as? Int else { return }
             scrollView.setValue(edges & ~1, forKey: "allowedPocketEdges")
+        }
+    }
+}
+
+/// In place of that blur (user, Oct 14 2026): the results fade into the
+/// window colour towards the top, `peak` at the window's top edge and clear
+/// one padding below the genre row, along (1 − t)²: strong only near the
+/// top, a long gentle tail through the chips, no edge at either end. (Dark
+/// down to the chips, then a fade across them, read as a wall in light
+/// mode, user.) Under it, a variable blur `blurRadius` from the window's top
+/// edge eases to none at the chips' foot (`blurClearance` up from the
+/// bottom), along smootherstep so it never visibly starts or stops (user:
+/// "from there to there, smooth, eased"): a touch of detail, the darkening
+/// carries it (16 and 4 read as too much, user), and the search field's and
+/// the chips' own glass do the rest. The page's own
+/// colour, so it's invisible over the bare page at rest (probe: at most
+/// 3/255 under the glass) and only shows once cards scroll under: darker in
+/// dark mode, lighter in light.
+private struct TopFade: View {
+    static let peak = 0.95
+    static let blurRadius: CGFloat = 2
+    /// The blur holds full until this far down its band, then eases out
+    /// (user: more blur until near the end; an even taper read as linear).
+    static let blurHold = 0.3
+    /// The bottom of the view the blur stays out of: below the chips.
+    let blurClearance: CGFloat
+
+    var body: some View {
+        let base = Color(nsColor: .windowBackgroundColor)
+        let steps = 16
+        let stops = (0...steps).map { i -> Gradient.Stop in
+            let t = Double(i) / Double(steps)
+            return Gradient.Stop(color: base.opacity(Self.peak * (1 - t) * (1 - t)), location: t)
+        }
+        ZStack {
+            VStack(spacing: 0) {
+                VariableBlur(radius: Self.blurRadius, hold: Self.blurHold)
+                Color.clear.frame(height: blurClearance)
+            }
+            LinearGradient(stops: stops, startPoint: .top, endPoint: .bottom)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// A blur `radius` strong from the top edge to `hold` (a fraction of the
+/// height), easing (smootherstep) to none at the bottom, over whatever is
+/// behind it: Core Animation's `variableBlur`
+/// filter on a backdrop layer, as macOS's own soft scroll edge draws it
+/// (probe, 27.0.1). Private (CABackdropLayer, CAFilter), so it's only drawn
+/// while both exist; without them, no blur.
+private struct VariableBlur: NSViewRepresentable {
+    let radius: CGFloat
+    let hold: Double
+
+    func makeNSView(context: Context) -> BlurView { BlurView(radius: radius, hold: hold) }
+    func updateNSView(_ view: BlurView, context: Context) {}
+
+    final class BlurView: NSView {
+        private let backdrop: CALayer?
+
+        init(radius: CGFloat, hold: Double) {
+            backdrop = Self.makeBackdrop(radius: radius, hold: hold)
+            super.init(frame: .zero)
+            wantsLayer = true
+            if let backdrop { layer?.addSublayer(backdrop) }
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+        // An AppKit view sits above SwiftUI's drawing in hit-testing; never take events.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func layout() {
+            super.layout()
+            // Follows resizes without the implicit frame animation.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            backdrop?.frame = bounds
+            CATransaction.commit()
+        }
+
+        private static func makeBackdrop(radius: CGFloat, hold: Double) -> CALayer? {
+            let factory = NSSelectorFromString("filterWithType:")
+            guard let layerType = NSClassFromString("CABackdropLayer") as? CALayer.Type,
+                  let filterType = NSClassFromString("CAFilter") as? NSObject.Type,
+                  filterType.responds(to: factory),
+                  let filter = filterType.perform(factory, with: "variableBlur")?.takeUnretainedValue() as? NSObject,
+                  let mask = maskImage(hold: hold) else { return nil }
+            filter.setValue(radius, forKey: "inputRadius")
+            filter.setValue(true, forKey: "inputNormalizeEdges")
+            filter.setValue(mask, forKey: "inputMaskImage")
+            let backdrop = layerType.init()
+            backdrop.filters = [filter]
+            return backdrop
+        }
+
+        /// The filter's radius map: opaque (full radius) from the top to
+        /// `hold`, then smootherstep (flat at both ends) to clear along the
+        /// bottom.
+        private static func maskImage(hold: Double) -> CGImage? {
+            let height = 64
+            guard let context = CGContext(data: nil, width: 1, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceGray(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            for row in 0..<height {
+                // CG rows count up from the bottom.
+                let t = 1 - Double(row) / Double(height - 1)
+                let u = max(0, t - hold) / (1 - hold)
+                let eased = u * u * u * (u * (u * 6 - 15) + 10)
+                context.setFillColor(gray: 0, alpha: 1 - eased)
+                context.fill(CGRect(x: 0, y: row, width: 1, height: 1))
+            }
+            return context.makeImage()
         }
     }
 }
