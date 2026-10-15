@@ -466,6 +466,12 @@ struct ContentView: View {
                 .id(openGeneration)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The window's own background, under the toolbar and the floating
+        // panel too. Unpainted, the pages show the backdrop of the container
+        // `.inspector` wraps them in, which macOS 27 draws much lighter in
+        // dark mode (#373535 against the window's #282828; light is white
+        // either way).
+        .background(Color(nsColor: .windowBackgroundColor))
         .onGeometryChange(for: CGSize.self) { $0.size } action: {
             stageSize = $0
             layoutSizes.content = $0.width
