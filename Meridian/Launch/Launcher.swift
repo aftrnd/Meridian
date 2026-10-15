@@ -894,7 +894,7 @@ final class Launcher {
         if let profile {
             gameEngine = profile.gameEngine
         } else {
-            gameEngine = await GameStackResolver.shared.resolve(appID: game.id, installDir: gamePath).engine
+            gameEngine = await GameStackResolver.shared.resolve(appID: game.id, name: game.name, installDir: gamePath).engine
         }
         return profileArgs + (await seedDefaultResolution(
             game: game, engine: engine, gameEngine: gameEngine, profileArgs: profileArgs
@@ -952,7 +952,7 @@ final class Launcher {
         case .godot:
             log.info("[launch] first launch appID=\(game.id): Godot \(w)x\(h) fullscreen")
             return ["--resolution", "\(w)x\(h)", "--fullscreen"]
-        case .custom, .unknown:
+        case .gamebryo, .custom, .unknown:
             return []
         }
     }

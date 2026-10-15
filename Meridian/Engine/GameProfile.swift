@@ -7,8 +7,24 @@ enum GameEngine: String {
     case unreal
     case godot
     case source
+    /// Gamebryo (NetImmerse's successor): Bethesda's Oblivion, Fallout 3 and
+    /// Fallout: New Vegas, among others. Not Skyrim / Fallout 4, which
+    /// PCGamingWiki lists as Creation Engine.
+    case gamebryo
     case custom
     case unknown
+
+    var displayName: String {
+        switch self {
+        case .unity:    return "Unity"
+        case .unreal:   return "Unreal Engine"
+        case .godot:    return "Godot"
+        case .source:   return "Source"
+        case .gamebryo: return "Gamebryo"
+        case .custom:   return "Custom Engine"
+        case .unknown:  return "Unknown"
+        }
+    }
 }
 
 /// What DirectX/Vulkan API the game renders with.
@@ -19,6 +35,29 @@ enum GraphicsAPI: String {
     case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
     case unknown
+
+    var displayName: String {
+        switch self {
+        case .dx9:     return "DirectX 9"
+        case .dx11:    return "DirectX 11"
+        case .dx12:    return "DirectX 12"
+        case .vulkan:  return "Vulkan"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    /// The game page's render path. One copy: the page's own had drifted to
+    /// "DXVK → MoltenVK → Metal" for DX9, which draws nothing on this engine
+    /// (engine-research-findings Patterns 27, 31).
+    var translationLayer: String {
+        switch self {
+        case .dx9:     return "wined3d → OpenGL → Metal"
+        case .dx11:    return "DXMT → Metal"
+        case .dx12:    return "GPTK → D3DMetal → Metal"
+        case .vulkan:  return "MoltenVK"
+        case .unknown: return "Wine default"
+        }
+    }
 }
 
 /// How well the game runs under Meridian.
@@ -134,39 +173,6 @@ struct GameProfile {
         self.notes = notes
     }
 
-    // MARK: - Display helpers
-
-    var gameEngineDisplayName: String {
-        switch gameEngine {
-        case .unity:   return "Unity"
-        case .unreal:  return "Unreal Engine"
-        case .godot:   return "Godot"
-        case .source:  return "Source"
-        case .custom:  return "Custom Engine"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    var graphicsAPIDisplayName: String {
-        switch graphicsAPI {
-        case .dx9:     return "DirectX 9"
-        case .dx11:    return "DirectX 11"
-        case .dx12:    return "DirectX 12"
-        case .vulkan:  return "Vulkan"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    var translationLayerDescription: String {
-        switch graphicsAPI {
-        case .dx9:     return "wined3d → OpenGL → Metal"
-        case .dx11:    return "DXMT → Metal"
-        case .dx12:    return "GPTK → D3DMetal → Metal"
-        case .vulkan:  return "MoltenVK"
-        case .unknown: return "Unknown"
-        }
-    }
-
     // MARK: - Factory methods
 
     /// Unity game preset.
@@ -280,6 +286,35 @@ struct GameProfile {
             dllOverrides: dllOverrides,
             dxmtMode: dxmtMode,
             extraEnv: extraEnv, preferD3DMetal: preferD3DMetal, enableDLSSBridge: enableDLSSBridge, launchArgs: launchArgs,
+            skipSteamDRM: skipSteamDRM,
+            launchViaSteam: launchViaSteam,
+            verifiedWith: verifiedWith, notes: notes
+        )
+    }
+
+    /// Gamebryo game preset. Oblivion, Fallout 3 and New Vegas are all
+    /// "Gamebryo (TES Engine)", 32-bit, Direct3D 9.0c (PCGamingWiki, Oct 14
+    /// 2026), so DX9 (wined3d → OpenGL here) is the default.
+    static func gamebryo(
+        appID: Int,
+        name: String,
+        status: CompatStatus = .untested,
+        graphicsAPI: GraphicsAPI = .dx9,
+        dxmtMode: DXMTMode = .auto,
+        dllOverrides: String? = nil,
+        extraEnv: [String: String] = [:],
+        launchArgs: [String] = [],
+        skipSteamDRM: Bool = false,
+        launchViaSteam: Bool = false,
+        verifiedWith: String? = nil,
+        notes: String
+    ) -> GameProfile {
+        GameProfile(
+            appID: appID, name: name,
+            gameEngine: .gamebryo, graphicsAPI: graphicsAPI, status: status,
+            dllOverrides: dllOverrides,
+            dxmtMode: dxmtMode,
+            extraEnv: extraEnv, launchArgs: launchArgs,
             skipSteamDRM: skipSteamDRM,
             launchViaSteam: launchViaSteam,
             verifiedWith: verifiedWith, notes: notes

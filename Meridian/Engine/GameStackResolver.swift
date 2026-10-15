@@ -117,7 +117,9 @@ enum GameStackDetector {
         case .unity:   return .dx11   // Unity defaults to DX11 unless forced
         case .unreal:  return .dx11   // conservative; UE5 can DX12 but DX11 is safe + matches global default
         case .godot:   return .vulkan
-        case .custom, .unknown: return .unknown
+        // Gamebryo isn't fingerprinted (Bethesda's .esm/.bsa layout is
+        // Creation Engine's too), so detection never returns it.
+        case .gamebryo, .custom, .unknown: return .unknown
         }
     }
 
@@ -236,7 +238,7 @@ struct PCGamingWikiInfo: Codable, Sendable {
     var fetchedAt: Date
 
     // GameEngine / GraphicsAPI aren't Codable, so store rawValue and bridge.
-    enum GameEngineCodable: String, Codable { case unity, unreal, godot, source, custom, unknown }
+    enum GameEngineCodable: String, Codable { case unity, unreal, godot, source, gamebryo, custom, unknown }
     enum GraphicsAPICodable: String, Codable { case dx9, dx11, dx12, vulkan, unknown }
 
     var resolvedEngine: GameEngine? {
@@ -249,10 +251,11 @@ struct PCGamingWikiInfo: Codable, Sendable {
     }
 }
 
-/// Fetches + caches PCGamingWiki Cargo data. Network is off the launch hot
-/// path: callers fetch lazily (library load / detail view / install) and the
-/// result is cached on disk. Respects PCGW's rate-limit guidance — one request
-/// per game, long TTL, descriptive User-Agent.
+/// Fetches + caches a game's PCGamingWiki tech facts. Network is off the
+/// launch hot path: callers fetch lazily (library load / detail view /
+/// install) and the result is cached on disk. Respects PCGW's rate-limit
+/// guidance: a few requests per game at most (its page, else a search and up
+/// to three candidates), long TTL, descriptive User-Agent.
 actor PCGamingWikiService {
     static let shared = PCGamingWikiService()
     private init() {}
@@ -283,89 +286,138 @@ actor PCGamingWikiService {
     /// Returns PCGW info for an app, from disk cache when fresh, otherwise
     /// fetched + cached. Returns nil only on a network/parse failure (a
     /// "game not on PCGW" result is cached with `found == false`).
-    func info(for appID: Int) async -> PCGamingWikiInfo? {
+    func info(for appID: Int, name: String) async -> PCGamingWikiInfo? {
         if let cached = readCache(appID: appID),
            Date().timeIntervalSince(cached.fetchedAt) < Self.ttl {
             return cached
         }
-        guard let fetched = await fetch(appID: appID) else { return readCache(appID: appID) }
+        guard let fetched = await fetch(appID: appID, name: name) else { return readCache(appID: appID) }
         writeCache(fetched, appID: appID)
         return fetched
     }
 
     // MARK: Fetch
 
-    private func fetch(appID: Int) async -> PCGamingWikiInfo? {
-        // Join Infobox_game (Steam_AppID lookup + Engines) with the API table
-        // (Direct3D versions, bitness, Vulkan, Metal) on the shared _pageID.
-        var comps = URLComponents(string: "https://www.pcgamingwiki.com/w/api.php")!
-        comps.queryItems = [
-            .init(name: "action", value: "cargoquery"),
-            .init(name: "tables", value: "Infobox_game,API"),
-            .init(name: "join_on", value: "Infobox_game._pageID=API._pageID"),
-            .init(name: "fields", value: [
-                "Infobox_game._pageName=Page",
-                "Infobox_game.Engines=Engines",
-                "API.Direct3D_versions=Direct3D",
-                "API.Vulkan_versions=Vulkan",
-                "API.Metal_support=Metal",
-                "API.Windows_32bit_executable=Win32",
-                "API.Windows_64bit_executable=Win64",
-            ].joined(separator: ",")),
-            .init(name: "where", value: "Infobox_game.Steam_AppID HOLDS \"\(appID)\""),
-            .init(name: "format", value: "json"),
-        ]
-        guard let url = comps.url else { return nil }
-
+    /// PCGamingWiki no longer answers anonymous Cargo queries: HTTP 200 with
+    /// `{"error":{"code":"permissiondenied","info":"You don't have permission
+    /// to run arbitrary Cargo queries."}}` (CLI-verified Oct 14 2026), so the
+    /// old lookup failed to decode for every game and none got PCGW data.
+    /// Special:CargoExport sits behind a Cloudflare challenge and
+    /// `api/appid.php` answers 403. The MediaWiki parse API still serves a
+    /// page's wikitext, whose templates carry the same fields. App IDs are
+    /// not searchable, so the page is found by the game's name (then a
+    /// search) and kept only when its `steam appid` lists this app.
+    private func fetch(appID: Int, name: String) async -> PCGamingWikiInfo? {
+        let title = name.filter { !"™®©".contains($0) }.trimmingCharacters(in: .whitespaces)
         do {
-            let (data, response) = try await session.data(from: url)
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                log.warning("[pcgw] appID=\(appID) HTTP \(http.statusCode)")
-                return nil
+            if let info = try await pageInfo(title: title, appID: appID) { return info }
+            for other in try await search(title) where other != title {
+                if let info = try await pageInfo(title: other, appID: appID) { return info }
             }
-            let decoded = try JSONDecoder().decode(CargoResponse.self, from: data)
-            guard let row = decoded.cargoquery.first?.title else {
-                log.info("[pcgw] appID=\(appID) not found on PCGamingWiki")
-                return PCGamingWikiInfo(found: false, engine: nil, graphicsAPI: nil, bitness: nil,
-                                        vulkan: false, metal: false, engineRaw: nil, direct3dRaw: nil,
-                                        fetchedAt: Date())
-            }
-            return Self.makeInfo(from: row)
+            log.info("[pcgw] appID=\(appID) not found on PCGamingWiki (\"\(title)\")")
+            return PCGamingWikiInfo(found: false, engine: nil, graphicsAPI: nil, bitness: nil,
+                                    vulkan: false, metal: false, engineRaw: nil, direct3dRaw: nil,
+                                    fetchedAt: Date())
         } catch {
             log.warning("[pcgw] appID=\(appID) fetch/parse failed: \(error.localizedDescription)")
             return nil
         }
     }
 
+    /// The tech facts on the page titled `title`, or nil when there is no
+    /// such page or it is another game's.
+    private func pageInfo(title: String, appID: Int) async throws -> PCGamingWikiInfo? {
+        let reply = try await request(ParseReply.self, [
+            .init(name: "action", value: "parse"),
+            .init(name: "page", value: title),
+            .init(name: "prop", value: "wikitext"),
+            .init(name: "redirects", value: "1"),
+        ])
+        if reply.error?.code == "missingtitle" { return nil }
+        if let code = reply.error?.code { throw PCGamingWikiError.api(code) }
+        guard let wikitext = reply.parse?.wikitext.text else { throw PCGamingWikiError.api("no wikitext") }
+        return Self.info(fromWikitext: wikitext, appID: appID)
+    }
+
+    /// Up to three page titles PCGamingWiki's search finds for `title`.
+    private func search(_ title: String) async throws -> [String] {
+        let reply = try await request(SearchReply.self, [
+            .init(name: "action", value: "query"),
+            .init(name: "list", value: "search"),
+            .init(name: "srsearch", value: title),
+            .init(name: "srlimit", value: "3"),
+            .init(name: "srprop", value: ""),
+        ])
+        if let code = reply.error?.code { throw PCGamingWikiError.api(code) }
+        return reply.query?.search.map(\.title) ?? []
+    }
+
+    private func request<Reply: Decodable>(_ type: Reply.Type, _ query: [URLQueryItem]) async throws -> Reply {
+        var comps = URLComponents(string: "https://www.pcgamingwiki.com/w/api.php")!
+        comps.queryItems = query + [.init(name: "format", value: "json")]
+        guard let url = comps.url else { throw PCGamingWikiError.api("bad query") }
+        let (data, response) = try await session.data(from: url)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw PCGamingWikiError.http(http.statusCode)
+        }
+        return try JSONDecoder().decode(type, from: data)
+    }
+
     // MARK: Parse helpers
 
-    private static func makeInfo(from row: CargoRow) -> PCGamingWikiInfo {
-        let engine = parseEngine(row.Engines)
-        let api = parseDirect3D(row.Direct3D)
-        let vulkan = boolish(row.Vulkan)
-        let metal = boolish(row.Metal)
+    /// The tech facts in a page's wikitext, or nil when the page is another
+    /// game's (its `steam appid` and `steam appid side` don't list `appID`).
+    /// Reads the templates' `|key = value` lines, the first of each key.
+    static func info(fromWikitext text: String, appID: Int) -> PCGamingWikiInfo? {
+        var fields: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) where line.hasPrefix("|") {
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = line[line.index(after: line.startIndex)..<equals]
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            // A reference's digits (`<ref>{{Refcheck|date=2022-11-30`) would
+            // read as Direct3D versions.
+            var value = line[line.index(after: equals)...]
+            if let note = value.firstRange(of: /<ref|<!--/) { value = value[..<note.lowerBound] }
+            if fields[key] == nil { fields[key] = value.trimmingCharacters(in: .whitespaces) }
+        }
+        let appIDs = [fields["steam appid"], fields["steam appid side"]]
+            .compactMap { $0 }
+            .flatMap { $0.split { !$0.isNumber } }
+            .compactMap { Int($0) }
+        guard appIDs.contains(appID) else { return nil }
+
+        // `{{Infobox game/row/engine|Gamebryo (TES Engine)}}`, one per engine.
+        let engines = text.matches(of: /\{\{Infobox game\/row\/engine\|([^|}]+)/)
+            .map { $0.1.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: " • ")
+        let engineRaw = engines.isEmpty ? nil : engines
+        let direct3D = fields["direct3d versions"].flatMap { $0.isEmpty ? nil : $0 }
+        // Versions ("1.1"), or "true"; empty or "false" when it has none.
+        let vulkanVersions = fields["vulkan versions"] ?? ""
+        let vulkan = vulkanVersions.lowercased() == "true" || vulkanVersions.contains(where: \.isNumber)
         let bitness: Int? = {
             // Prefer 64-bit when the game ships a 64-bit exe.
-            if boolish(row.Win64) { return 64 }
-            if boolish(row.Win32) { return 32 }
+            if boolish(fields["windows 64-bit exe"]) { return 64 }
+            if boolish(fields["windows 32-bit exe"]) { return 32 }
             return nil
         }()
         // If no Direct3D but Vulkan is supported, report Vulkan.
-        let finalAPI: PCGamingWikiInfo.GraphicsAPICodable? = api ?? (vulkan ? .vulkan : nil)
+        let api: PCGamingWikiInfo.GraphicsAPICodable? = parseDirect3D(direct3D) ?? (vulkan ? .vulkan : nil)
         return PCGamingWikiInfo(
             found: true,
-            engine: engine,
-            graphicsAPI: finalAPI,
+            engine: parseEngine(engineRaw),
+            graphicsAPI: api,
             bitness: bitness,
             vulkan: vulkan,
-            metal: metal,
-            engineRaw: row.Engines,
-            direct3dRaw: row.Direct3D,
+            metal: boolish(fields["metal support"]),
+            engineRaw: engineRaw,
+            direct3dRaw: direct3D,
             fetchedAt: Date()
         )
     }
 
-    /// PCGW `Engines` is a list of `Engine:<name>` page titles. Map by substring.
+    /// PCGW engine names (`Gamebryo (TES Engine)`, several joined with " • ").
+    /// Map by substring.
     static func parseEngine(_ raw: String?) -> PCGamingWikiInfo.GameEngineCodable? {
         guard let raw, !raw.isEmpty else { return nil }
         let l = raw.lowercased()
@@ -373,6 +425,7 @@ actor PCGamingWikiService {
         if l.contains("unity")  { return .unity }
         if l.contains("source") { return .source }
         if l.contains("godot")  { return .godot }
+        if l.contains("gamebryo") { return .gamebryo }
         return .custom
     }
 
@@ -407,18 +460,40 @@ actor PCGamingWikiService {
         }
     }
 
-    // MARK: Cargo response shapes
+    // MARK: API reply shapes
 
-    private struct CargoResponse: Decodable { let cargoquery: [CargoItem] }
-    private struct CargoItem: Decodable { let title: CargoRow }
-    struct CargoRow: Decodable {
-        let Page: String?
-        let Engines: String?
-        let Direct3D: String?
-        let Vulkan: String?
-        let Metal: String?
-        let Win32: String?
-        let Win64: String?
+    private struct APIError: Decodable { let code: String }
+
+    /// `action=parse`: `{"parse":{"wikitext":{"*":"…"}}}`, or
+    /// `{"error":{"code":"missingtitle"}}` for a page that doesn't exist.
+    private struct ParseReply: Decodable {
+        struct Parse: Decodable { let wikitext: Wikitext }
+        struct Wikitext: Decodable {
+            let text: String
+            enum CodingKeys: String, CodingKey { case text = "*" }
+        }
+        let parse: Parse?
+        let error: APIError?
+    }
+
+    /// `list=search`: `{"query":{"search":[{"title":"…"}]}}`.
+    private struct SearchReply: Decodable {
+        struct Query: Decodable { let search: [Hit] }
+        struct Hit: Decodable { let title: String }
+        let query: Query?
+        let error: APIError?
+    }
+}
+
+enum PCGamingWikiError: LocalizedError {
+    case http(Int)
+    case api(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .http(let status): return "HTTP \(status)"
+        case .api(let code):    return "API error \(code)"
+        }
     }
 }
 
@@ -432,6 +507,10 @@ struct ResolvedGameStack: Sendable {
     enum Source: String, Sendable { case explicit, pcgw, detected, unknown }
 
     var engine: GameEngine
+    /// The engine as the game page names it: PCGamingWiki's name for one
+    /// without a case of its own ("Divinity Engine", "MonoGame • The Forge"),
+    /// otherwise `engine.displayName`.
+    var engineName: String
     var graphicsAPI: GraphicsAPI
     var bitness: Int?
     var requiresSteamAPI: Bool
@@ -473,7 +552,7 @@ final class GameStackResolver {
     /// background task; PCGW is fetched (cached) via its actor. Safe to call
     /// repeatedly — cheap on a cache hit.
     @discardableResult
-    func resolve(appID: Int, installDir: URL?) async -> ResolvedGameStack {
+    func resolve(appID: Int, name: String, installDir: URL?) async -> ResolvedGameStack {
         let explicit = GameCompatibilityDB.shared.profile(for: appID)
 
         // Local detection (off-main; small file reads).
@@ -485,7 +564,7 @@ final class GameStackResolver {
         }
 
         // PCGW enrichment (cached; nil on failure / offline).
-        let pcgw = await PCGamingWikiService.shared.info(for: appID)
+        let pcgw = await PCGamingWikiService.shared.info(for: appID, name: name)
 
         let resolved = Self.merge(appID: appID, explicit: explicit, detected: detected, pcgw: pcgw)
         cache[appID] = resolved
@@ -501,18 +580,23 @@ final class GameStackResolver {
         detected: DetectedGameStack?,
         pcgw: PCGamingWikiInfo?
     ) -> ResolvedGameStack {
-        // Engine: explicit > detected > pcgw.
+        // Engine: explicit > detected > pcgw > detected "custom". Detection's
+        // `.custom` only means "an exe no fingerprint matched", which said
+        // Custom Engine for Fallout: New Vegas over PCGW's Gamebryo.
         let engine: GameEngine
         let engineSource: ResolvedGameStack.Source
         if let e = explicit?.gameEngine, e != .unknown {
             engine = e; engineSource = .explicit
-        } else if let d = detected?.engine, d != .unknown {
+        } else if let d = detected?.engine, d != .unknown, d != .custom {
             engine = d; engineSource = .detected
         } else if let p = pcgw?.resolvedEngine, p != .unknown {
             engine = p; engineSource = .pcgw
+        } else if detected?.engine == .custom {
+            engine = .custom; engineSource = .detected
         } else {
             engine = .unknown; engineSource = .unknown
         }
+        let engineName = (engine == .custom ? pcgw?.engineRaw : nil) ?? engine.displayName
 
         // Graphics API: explicit > pcgw (tested) > detected (engine default).
         let api: GraphicsAPI
@@ -536,6 +620,7 @@ final class GameStackResolver {
 
         return ResolvedGameStack(
             engine: engine,
+            engineName: engineName,
             graphicsAPI: api,
             bitness: bitness,
             requiresSteamAPI: drm,

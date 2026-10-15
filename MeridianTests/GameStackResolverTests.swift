@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+@testable import Meridian
 
 /// Tests for the game tech-stack detection + resolution subsystem
 /// (`Meridian/Engine/GameStackResolver.swift`).
@@ -172,6 +173,7 @@ final class GameStackResolverTests: XCTestCase {
         if l.contains("unity")  { return "unity" }
         if l.contains("source") { return "source" }
         if l.contains("godot")  { return "godot" }
+        if l.contains("gamebryo") { return "gamebryo" }
         return "custom"
     }
 
@@ -190,6 +192,7 @@ final class GameStackResolverTests: XCTestCase {
         XCTAssertEqual(parseEngineMirror("Engine:Unity"), "unity")
         XCTAssertEqual(parseEngineMirror("Engine:Source"), "source")
         XCTAssertEqual(parseEngineMirror("Engine:Godot"), "godot")
+        XCTAssertEqual(parseEngineMirror("Gamebryo (TES Engine)"), "gamebryo")
         XCTAssertEqual(parseEngineMirror("Engine:Glacier 2"), "custom")
         XCTAssertNil(parseEngineMirror(nil))
         XCTAssertNil(parseEngineMirror(""))
@@ -204,6 +207,97 @@ final class GameStackResolverTests: XCTestCase {
         XCTAssertNil(parseDirect3DMirror("unknown"))
         XCTAssertNil(parseDirect3DMirror(""))
         XCTAssertNil(parseDirect3DMirror(nil))
+    }
+
+    /// PCGW's Cargo API refused every lookup (permissiondenied, Oct 14 2026);
+    /// the facts now come from the page's wikitext. Lines verbatim from the
+    /// Fallout: New Vegas page that day, with a Direct3D note whose reference
+    /// date ("2022-11-30") must not read as Direct3D 11 or 12.
+    func testPCGWWikitext_readsTheGamesTechFacts() throws {
+        let page = """
+        {{Infobox game
+        |engines      =
+        {{Infobox game/row/engine|Gamebryo (TES Engine)}}
+        |steam appid  = 22380
+        |steam appid side = 2028016,72840,901778,72760,72750,72740,72730,22470,22490,72774,72709,72770,72772,72773
+        }}
+        {{API
+        |direct3d versions      = 9.0c<ref>{{Refcheck|user=Aemony|date=2022-11-30|comment=D3D9Ex}}</ref>
+        |vulkan versions        =
+        |windows 32-bit exe     = true
+        |windows 64-bit exe     = false
+        }}
+        """
+        let info = try XCTUnwrap(PCGamingWikiService.info(fromWikitext: page, appID: 22380))
+        XCTAssertEqual(info.engineRaw, "Gamebryo (TES Engine)")
+        XCTAssertEqual(info.engine, .gamebryo)
+        XCTAssertEqual(info.graphicsAPI, .dx9)
+        XCTAssertEqual(info.bitness, 32)
+        XCTAssertFalse(info.vulkan)
+        XCTAssertNotNil(PCGamingWikiService.info(fromWikitext: page, appID: 22490),
+                        "A DLC or edition listed as a side app is the same page")
+        XCTAssertNil(PCGamingWikiService.info(fromWikitext: page, appID: 22370),
+                     "A page found by name is another game's unless it lists the app")
+
+        // Baldur's Gate 3's page the same day: a named engine row, Vulkan versions.
+        let bg3 = """
+        {{Infobox game/row/engine|Divinity Engine|name=Divinity Engine 4.0}}
+        |steam appid  = 1086940
+        |direct3d versions      = 11
+        |metal support          = true
+        |vulkan versions        = 1.1
+        |windows 64-bit exe     = true
+        """
+        let other = try XCTUnwrap(PCGamingWikiService.info(fromWikitext: bg3, appID: 1086940))
+        XCTAssertEqual(other.engineRaw, "Divinity Engine")
+        XCTAssertEqual(other.graphicsAPI, .dx11)
+        XCTAssertEqual(other.bitness, 64)
+        XCTAssertTrue(other.vulkan)
+        XCTAssertTrue(other.metal)
+    }
+
+    /// The file detector calls any engine it can't fingerprint "custom",
+    /// which used to win over PCGamingWiki's answer: Fallout: New Vegas showed
+    /// Custom Engine, not Gamebryo (Oct 14 2026). A specific detection still wins.
+    @MainActor
+    func testMerge_pcgwNamesTheEngineDetectionCallsCustom() {
+        func detected(_ engine: GameEngine) -> DetectedGameStack {
+            DetectedGameStack(engine: engine, graphicsAPI: .unknown, bitness: 32,
+                              requiresSteamAPI: true, mainExecutable: "Game.exe")
+        }
+        func pcgw(_ raw: String) -> PCGamingWikiInfo {
+            PCGamingWikiInfo(found: true, engine: PCGamingWikiService.parseEngine(raw), graphicsAPI: .dx9,
+                             bitness: 32, vulkan: false, metal: false, engineRaw: raw, direct3dRaw: "9.0c",
+                             fetchedAt: Date())
+        }
+
+        let newVegas = GameStackResolver.merge(appID: 1, explicit: nil, detected: detected(.custom),
+                                               pcgw: pcgw("Gamebryo (TES Engine)"))
+        XCTAssertEqual(newVegas.engine, .gamebryo)
+        XCTAssertEqual(newVegas.engineSource, .pcgw)
+        XCTAssertEqual(newVegas.engineName, "Gamebryo")
+
+        let baldursGate = GameStackResolver.merge(appID: 1, explicit: nil, detected: detected(.custom),
+                                                  pcgw: pcgw("Divinity Engine"))
+        XCTAssertEqual(baldursGate.engine, .custom)
+        XCTAssertEqual(baldursGate.engineName, "Divinity Engine",
+                       "An engine without a case of its own shows PCGamingWiki's name")
+
+        let unity = GameStackResolver.merge(appID: 1, explicit: nil, detected: detected(.unity),
+                                            pcgw: pcgw("Gamebryo (TES Engine)"))
+        XCTAssertEqual(unity.engine, .unity)
+        XCTAssertEqual(unity.engineSource, .detected, "A fingerprinted engine is read from the installed build")
+
+        let offline = GameStackResolver.merge(appID: 1, explicit: nil, detected: detected(.custom), pcgw: nil)
+        XCTAssertEqual(offline.engine, .custom)
+        XCTAssertEqual(offline.engineName, "Custom Engine")
+    }
+
+    @MainActor
+    func testDB_falloutNewVegasIsAGamebryoGame() {
+        let profile = GameCompatibilityDB.shared.profile(for: 22380)
+        XCTAssertEqual(profile?.gameEngine, .gamebryo)
+        XCTAssertEqual(profile?.graphicsAPI, .dx9)
     }
 
     // MARK: - Resolver graphics-API priority
@@ -254,10 +348,12 @@ final class GameStackResolverTests: XCTestCase {
                       "PE bitness reader must exist")
         XCTAssertTrue(resolver.contains("actor PCGamingWikiService"),
                       "PCGamingWiki service must exist")
-        XCTAssertTrue(resolver.contains("cargoquery") && resolver.contains("Infobox_game,API"),
-                      "PCGW fetch must join Infobox_game + API via the Cargo API")
-        XCTAssertTrue(resolver.contains("Steam_AppID HOLDS"),
-                      "PCGW query must look up by Steam AppID (HOLDS for the list column)")
+        XCTAssertFalse(resolver.contains("cargoquery"),
+                       "PCGW refuses anonymous Cargo queries (permissiondenied, Oct 14 2026)")
+        XCTAssertTrue(resolver.contains(".init(name: \"action\", value: \"parse\")"),
+                      "PCGW fetch must read the page's wikitext through the parse API")
+        XCTAssertTrue(resolver.contains("guard appIDs.contains(appID) else { return nil }"),
+                      "A page found by name counts only when its steam appid lists the game")
         XCTAssertTrue(resolver.contains("final class GameStackResolver"),
                       "Resolver must exist")
         XCTAssertTrue(resolver.contains("func cached(appID:") && resolver.contains("func resolve("),
