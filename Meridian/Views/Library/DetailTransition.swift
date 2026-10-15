@@ -147,11 +147,12 @@ struct DetailZoom {
     /// page comes forward and dissolves on its own eased clock (ContentView
     /// `rootFade`), not on the spring's progress.
 
-    /// How far the page's clip extends past the stage, 0 → rest inset over
-    /// the final stretch, so the ambient bleed under the toolbar fades in as
-    /// the rect reaches it rather than popping in when the clip is dropped.
-    @MainActor static func clipOverreach(at p: CGFloat) -> CGFloat {
-        CGFloat(tuning.clipRestInset) * CGFloat(smoothstep(unit(p), from: tuning.clipOverreachStart, to: 1))
+    /// How far the page's clip has grown past the stage, 0 → 1 (its rest
+    /// overreach) over the final stretch, so the ambient bleed under the
+    /// toolbar fades in as the rect reaches it rather than popping in when
+    /// the clip is dropped.
+    @MainActor static func clipOverreachProgress(at p: CGFloat) -> CGFloat {
+        CGFloat(smoothstep(unit(p), from: tuning.clipOverreachStart, to: 1))
     }
 
     @MainActor static var tuning: DetailZoomParameters { DetailZoomTuning.shared.params }
@@ -240,6 +241,11 @@ struct DetailZoomReveal: ViewModifier, Animatable {
     var rootFade: Double
     let zoom: DetailZoom?
     let stageSize: CGSize
+    /// The floating sidebar's room on the stage's leading edge (0 beside the
+    /// classic column). The page is laid out past it, but its bleeds ignore
+    /// the safe area and run under the panel to the window's edge, so the
+    /// clip reaches that much further left.
+    let leadingSafeArea: CGFloat
 
     nonisolated var animatableData: AnimatablePair<CGFloat, Double> {
         get { AnimatablePair(progress, rootFade) }
@@ -274,19 +280,25 @@ struct DetailZoomReveal: ViewModifier, Animatable {
         // under the toolbar + blur) without a giant mask layer.
         let restInset = CGFloat(DetailZoom.tuning.clipRestInset)
         guard let zoom, stageSize.width > 0, stageSize.height > 0 else {
-            return Geometry(clip: bounds.insetBy(dx: -restInset, dy: -restInset))
+            return Geometry(clip: Self.overreach(bounds, by: restInset, leading: leadingSafeArea))
         }
         let rect = zoom.rect(at: progress, in: stageSize)
         let s = max(rect.width / stageSize.width, rect.height / stageSize.height)
-        let over = DetailZoom.clipOverreach(at: progress)
+        let reach = DetailZoom.clipOverreachProgress(at: progress)
         return Geometry(
             scale: s,
             offset: CGPoint(x: rect.midX - stageSize.width * s / 2, y: rect.minY),
-            clip: rect.insetBy(dx: -over, dy: -over),
+            clip: Self.overreach(rect, by: restInset * reach, leading: leadingSafeArea * reach),
             cornerRadius: DetailZoom.cornerRadius(at: progress),
             opacity: zoom.poster == nil ? DetailZoom.fallbackPageOpacity(at: progress) : 1,
             backing: 1 - rootFade
         )
+    }
+
+    /// `rect` grown by `inset` on every side and by `leading` more on the left.
+    private static func overreach(_ rect: CGRect, by inset: CGFloat, leading: CGFloat) -> CGRect {
+        let grown = rect.insetBy(dx: -inset, dy: -inset)
+        return CGRect(x: grown.minX - leading, y: grown.minY, width: grown.width + leading, height: grown.height)
     }
 }
 

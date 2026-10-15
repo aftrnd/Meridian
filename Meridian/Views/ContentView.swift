@@ -456,7 +456,8 @@ struct ContentView: View {
                     // Outside `.id(game.id)` so a same-game close → open
                     // retargets in place; inside `.id(openGeneration)` so a
                     // fresh open never inherits a running close.
-                    .modifier(DetailZoomReveal(progress: zoomProgress, rootFade: rootFade, zoom: zoom, stageSize: stageSize))
+                    .modifier(DetailZoomReveal(progress: zoomProgress, rootFade: rootFade, zoom: zoom, stageSize: stageSize,
+                                               leadingSafeArea: floatingSidebarInset))
                     // Likewise usable as soon as the open starts (target 1).
                     .allowsHitTesting(zoomProgress == 1)
                     .id(openGeneration)
