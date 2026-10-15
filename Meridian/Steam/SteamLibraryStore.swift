@@ -70,6 +70,8 @@ final class SteamLibraryStore {
     // Stored so @Observable can track changes and re-evaluate filteredGames immediately.
     // AppSettings persists to UserDefaults; this mirrors it for reactive updates.
     private(set) var hiddenAppIDs: Set<Int> = AppSettings.shared.hiddenAppIDs
+    /// Mirrors AppSettings.recentlyPlayedRemovals, the same way.
+    private(set) var recentlyPlayedRemovals: [Int: TimeInterval] = AppSettings.shared.recentlyPlayedRemovals
     /// Each game's top Steam store tags (most-voted first) and the tags'
     /// names, for Search's genre row. From the disk cache at launch, then
     /// refreshed with the library.
@@ -221,6 +223,7 @@ final class SteamLibraryStore {
         searchQuery = ""
         filter = .all
         hiddenAppIDs = settings.hiddenAppIDs
+        recentlyPlayedRemovals = settings.recentlyPlayedRemovals
     }
 
     /// Fetches library capsule content hashes for all owned games and stores them on
@@ -612,11 +615,27 @@ final class SteamLibraryStore {
         return max(steam, local)
     }
 
-    /// All games that have been played, sorted by most recently launched first.
+    /// All games that have been played, sorted by most recently launched first,
+    /// minus those removed from the list since they were last played.
     var recentlyPlayedGames: [Game] {
         games
-            .filter { effectiveLastPlayed($0) > .distantPast }
+            .filter { effectiveLastPlayed($0) > .distantPast && !isRemovedFromRecentlyPlayed($0) }
             .sorted { effectiveLastPlayed($0) > effectiveLastPlayed($1) }
+    }
+
+    /// A removed game stays out until it's played again: a last-played time
+    /// later than the one it had when it was removed.
+    private func isRemovedFromRecentlyPlayed(_ game: Game) -> Bool {
+        guard let removedAt = recentlyPlayedRemovals[game.id] else { return false }
+        return effectiveLastPlayed(game).timeIntervalSince1970 <= removedAt
+    }
+
+    func removeFromRecentlyPlayed(_ game: Game) {
+        log.info("[removeFromRecentlyPlayed] appID=\(game.id)")
+        var removals = recentlyPlayedRemovals
+        removals[game.id] = effectiveLastPlayed(game).timeIntervalSince1970
+        settings.recentlyPlayedRemovals = removals
+        recentlyPlayedRemovals = removals
     }
 
     /// The single most recently played game (for the hero banner).
