@@ -10,7 +10,7 @@ import Observation
 /// ## Adding a new game
 /// 1. Test the game from CLI (see Scripts/test-game-cli.sh pattern)
 /// 2. Document the root cause of any failure
-/// 3. Pick the right factory: `.unity()`, `.unreal()`, `.custom()`
+/// 3. Pick the right factory: `.unity()`, `.unreal()`, `.gamebryo()`, `.custom()`
 /// 4. Add the entry to the matching extension file (e.g. `GameCompatibilityDB+Unity.swift`)
 /// 5. Run `swift test` to verify no regressions
 /// 6. Set `status` to `.verified` once confirmed working end-to-end
@@ -27,6 +27,7 @@ import Observation
 /// - `GameCompatibilityDB+Unity.swift`   → all Unity games
 /// - `GameCompatibilityDB+Unreal.swift`  → all Unreal Engine games
 /// - `GameCompatibilityDB+Source.swift`  → all Source engine games
+/// - `GameCompatibilityDB+Gamebryo.swift` → Gamebryo games (Oblivion, Fallout 3, New Vegas)
 /// - `GameCompatibilityDB+Custom.swift`  → custom/proprietary engine games
 /// - `GameCompatibilityDB+Godot.swift`   → all Godot games
 ///
@@ -42,7 +43,7 @@ final class GameCompatibilityDB {
     /// Merges all per-engine extension arrays into a single list.
     /// Add new engine categories here as a single additional term.
     private static var allProfiles: [GameProfile] {
-        unityProfiles + unrealProfiles + sourceEngineProfiles + customEngineProfiles + godotProfiles
+        unityProfiles + unrealProfiles + sourceEngineProfiles + gamebryoProfiles + customEngineProfiles + godotProfiles
     }
 
     /// All known game profiles, keyed by appID for O(1) lookup at launch time.

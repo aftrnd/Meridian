@@ -42,6 +42,30 @@ final class CompatDBGeneralizationTests: XCTestCase {
                       "GameProfile must expose the .godot() engine-level factory.")
     }
 
+    /// Gamebryo games (Oblivion, Fallout 3, New Vegas) have their own factory
+    /// and file. `swift test` compiles every file by path, so only this catches
+    /// a file missing from the Xcode project (the build file, its reference,
+    /// the Engine group and the Sources phase).
+    func testGamebryoProfilesFile_existsAndIsWired() throws {
+        let dbFile = try readSource("Meridian/Engine/GameCompatibilityDB+Gamebryo.swift")
+        XCTAssertTrue(dbFile.contains("static let gamebryoProfiles: [GameProfile]"),
+                      "GameCompatibilityDB+Gamebryo.swift must declare gamebryoProfiles.")
+
+        let db = try readSource("Meridian/Engine/GameCompatibilityDB.swift")
+        XCTAssertTrue(db.contains("gamebryoProfiles"),
+                      "allProfiles must include gamebryoProfiles so Gamebryo entries are loaded.")
+
+        let profile = try readSource("Meridian/Engine/GameProfile.swift")
+        XCTAssertTrue(profile.contains("static func gamebryo("),
+                      "GameProfile must expose the .gamebryo() engine-level factory.")
+
+        let project = try readSource("Meridian.xcodeproj/project.pbxproj")
+        // Named twice on the build-file and file-reference lines, once each in
+        // the group and the Sources phase (as GameCompatibilityDB+Godot.swift).
+        XCTAssertEqual(project.components(separatedBy: "GameCompatibilityDB+Gamebryo.swift").count - 1, 6,
+                       "The Xcode build compiles only files registered in project.pbxproj.")
+    }
+
     /// Guard for the Godot Forward+ black-square fix (godotengine/godot#104168,
     /// #121201): Idols of Ash must avoid the Vulkan clustered-light path that
     /// mis-renders on Apple Silicon. Forward Mobile was tried first and broke

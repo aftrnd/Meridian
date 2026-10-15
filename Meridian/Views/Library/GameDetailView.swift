@@ -1100,6 +1100,7 @@ private struct ScrollViewLanding: NSViewRepresentable {
         }
         resolvedStack = await GameStackResolver.shared.resolve(
             appID: currentGame.id,
+            name: currentGame.name,
             installDir: installDir
         )
     }
@@ -2231,9 +2232,9 @@ private struct BannerCompatBadge: View {
     private var pipelineInfo: PipelineInfo? {
         if let r = resolved {
             return PipelineInfo(
-                engine: engineDisplay(r.engine),
-                api: apiDisplay(r.graphicsAPI),
-                translation: translationDisplay(r.graphicsAPI),
+                engine: r.engineName,
+                api: r.graphicsAPI.displayName,
+                translation: r.graphicsAPI.translationLayer,
                 bitness: r.bitness != nil ? r.bitnessDescription : nil,
                 engineSource: r.engineSource,
                 apiSource: r.apiSource
@@ -2242,9 +2243,9 @@ private struct BannerCompatBadge: View {
         if let p = profile {
             // A hand-written compat profile is, by definition, verified.
             return PipelineInfo(
-                engine: p.gameEngineDisplayName,
-                api: p.graphicsAPIDisplayName,
-                translation: p.translationLayerDescription,
+                engine: p.gameEngine.displayName,
+                api: p.graphicsAPI.displayName,
+                translation: p.graphicsAPI.translationLayer,
                 bitness: nil,
                 engineSource: .explicit,
                 apiSource: .explicit
@@ -2270,37 +2271,6 @@ private struct BannerCompatBadge: View {
         case .pcgw:     return "From PCGamingWiki"
         case .detected: return "Detected from the game's files"
         case .unknown:  return "Inferred"
-        }
-    }
-
-    private func engineDisplay(_ e: GameEngine) -> String {
-        switch e {
-        case .unity:   return "Unity"
-        case .unreal:  return "Unreal Engine"
-        case .godot:   return "Godot"
-        case .source:  return "Source"
-        case .custom:  return "Custom Engine"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    private func apiDisplay(_ a: GraphicsAPI) -> String {
-        switch a {
-        case .dx9:     return "DirectX 9"
-        case .dx11:    return "DirectX 11"
-        case .dx12:    return "DirectX 12"
-        case .vulkan:  return "Vulkan"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    private func translationDisplay(_ a: GraphicsAPI) -> String {
-        switch a {
-        case .dx9:     return "DXVK → MoltenVK → Metal"
-        case .dx11:    return "DXMT → Metal"
-        case .dx12:    return "GPTK → D3DMetal → Metal"
-        case .vulkan:  return "MoltenVK"
-        case .unknown: return "Wine default"
         }
     }
 

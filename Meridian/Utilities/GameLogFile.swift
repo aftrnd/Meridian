@@ -564,11 +564,11 @@ struct GameStackReport {
     var detailBlock: String {
         let engineStr: String = {
             guard let e = declaredEngine else { return "Unknown" }
-            return "\(displayEngine(e)) (\(sourceLabel(engineSource)))"
+            return "\(e.displayName) (\(sourceLabel(engineSource)))"
         }()
         let apiStr: String = {
             guard let api = declaredAPI, api != .unknown else { return "Unknown (inferred from env)" }
-            return "\(displayAPI(api)) (\(sourceLabel(apiSource)))"
+            return "\(api.displayName) (\(sourceLabel(apiSource)))"
         }()
         let bitnessStr: String = {
             switch bitness {
@@ -597,27 +597,6 @@ struct GameStackReport {
           DLL overrides:   \(overridesLine)
           Engine build:    \(engineVersion ?? "unknown")
         """
-    }
-
-    private func displayEngine(_ e: GameEngine) -> String {
-        switch e {
-        case .unity:   return "Unity"
-        case .unreal:  return "Unreal Engine"
-        case .godot:   return "Godot"
-        case .source:  return "Source"
-        case .custom:  return "Custom Engine"
-        case .unknown: return "Unknown"
-        }
-    }
-
-    private func displayAPI(_ a: GraphicsAPI) -> String {
-        switch a {
-        case .dx9:     return "DirectX 9"
-        case .dx11:    return "DirectX 11"
-        case .dx12:    return "DirectX 12"
-        case .vulkan:  return "Vulkan"
-        case .unknown: return "Unknown"
-        }
     }
 }
 
