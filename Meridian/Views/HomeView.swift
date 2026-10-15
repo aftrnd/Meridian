@@ -328,6 +328,7 @@ private struct HeroCarousel: View {
     let onSelect: (Game) -> Void
 
     @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(SteamAuthService.self) private var steamAuth
 
     /// Continuous page position. Whole numbers are resting pages.
@@ -486,7 +487,7 @@ private struct HeroCarousel: View {
                     .modifier(HeroGlassCapsule())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(controlActiveState == .inactive ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            .foregroundStyle(buttonLabelStyle)
             // No hover modifier on the glass button itself: one on top of the
             // interactive glass rasterised its label (jagged text in light
             // mode). Prefetch rides the hero-level hover instead.
@@ -497,6 +498,15 @@ private struct HeroCarousel: View {
         .padding(.bottom, 26.75)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .id(g.id)
+    }
+
+    /// In light mode an active window's `.primary` goes through the glass's
+    /// vibrancy, which crushes the label's anti-aliasing (jagged edges; Apple's
+    /// `.buttonStyle(.glass)` draws it the same). Plain black is as dark and
+    /// stays smooth. Dark mode and inactive windows are smooth as they are.
+    private var buttonLabelStyle: AnyShapeStyle {
+        if controlActiveState == .inactive { return AnyShapeStyle(.secondary) }
+        return colorScheme == .light ? AnyShapeStyle(Color.black) : AnyShapeStyle(.primary)
     }
 
     private var indicators: some View {
