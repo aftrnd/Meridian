@@ -179,8 +179,8 @@ extension EnvironmentValues {
     /// Non-nil while a zoom is departing from / returning to a card.
     @Entry var detailFlightSource: DetailFlightSource? = nil
     /// True while a game detail is presented (or in flight). Root pages use
-    /// it to drop toolbar-owned chrome (the Search field) the detail page
-    /// shouldn't inherit.
+    /// it to drop chrome in the toolbar row (the Search field) the detail
+    /// page shouldn't inherit.
     @Entry var detailPresented: Bool = false
 }
 

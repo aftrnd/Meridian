@@ -777,6 +777,13 @@ struct CardLayoutMetrics {
         (defaultContentWidth - 6 * spacing) / (5 + 2 * peekFraction)
     }
 
+    /// The library grid's columns: `visibleCount` flexible columns, `spacing`
+    /// apart. Shared by the library pages and Search, which keep one
+    /// `spacing` margin all round.
+    var gridColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: Self.spacing), count: visibleCount)
+    }
+
     /// Derives layout metrics for the given container width.
     ///
     /// STEPPED-PROPORTIONAL model (July 12 2026, settled): cards resize

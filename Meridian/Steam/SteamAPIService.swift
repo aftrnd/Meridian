@@ -505,6 +505,58 @@ actor SteamAPIService {
         }
     }
 
+    // MARK: - Store tags
+
+    /// Each app's Steam store tags, most-voted first, via
+    /// IStoreBrowseService/GetItems/v1 (up to 50 apps per call; public, no key).
+    func fetchStoreTagIDs(appIDs: [Int]) async -> [Int: [Int]] {
+        guard !appIDs.isEmpty else { return [:] }
+        struct AppIDRef: Encodable { let appid: Int }
+        struct Context: Encodable {
+            let language: String
+            let country_code: String
+            let steam_realm: Int
+        }
+        struct DataRequest: Encodable { let include_tag_count: Int }
+        struct BrowseInput: Encodable {
+            let ids: [AppIDRef]
+            let context: Context
+            let data_request: DataRequest
+        }
+        let input = BrowseInput(
+            ids: appIDs.map { AppIDRef(appid: $0) },
+            context: Context(language: "english", country_code: "US", steam_realm: 1),
+            data_request: DataRequest(include_tag_count: 20)
+        )
+        do {
+            let json = String(decoding: try JSONEncoder().encode(input), as: UTF8.self)
+            let url = try buildURL(path: "/IStoreBrowseService/GetItems/v1/", params: ["input_json": json])
+            let decoded: StoreTagsResponse = try await get(url)
+            var result: [Int: [Int]] = [:]
+            for item in decoded.response?.storeItems ?? [] {
+                guard let appID = item.appid ?? item.id, let tags = item.tags, !tags.isEmpty else { continue }
+                result[appID] = tags.sorted { $0.weight > $1.weight }.map(\.tagid)
+            }
+            return result
+        } catch {
+            log.warning("[fetchStoreTagIDs] \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
+    /// Steam's store tag names by ID, via IStoreService/GetTagList/v1 (public, no key).
+    func fetchStoreTagNames() async -> [Int: String] {
+        do {
+            let url = try buildURL(path: "/IStoreService/GetTagList/v1/", params: ["language": "english"])
+            let decoded: StoreTagListResponse = try await get(url)
+            let pairs = (decoded.response?.tags ?? []).map { ($0.tagid, $0.name) }
+            return Dictionary(pairs, uniquingKeysWith: { first, _ in first })
+        } catch {
+            log.warning("[fetchStoreTagNames] \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
     /// Parses the raw `IStoreBrowseService/GetItems` JSON without relying on
     /// specific field names. Searches each item's assets for library capsule and
     /// logo hashes using filename patterns, making it robust to field renames.
@@ -714,6 +766,35 @@ private struct StoreBrowseItem: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, appid, assets
         case assetsWithoutOverrides = "assets_without_overrides"
+    }
+}
+
+/// `IStoreBrowseService/GetItems` with only `include_tag_count` requested.
+private struct StoreTagsResponse: Decodable {
+    let response: Body?
+    struct Body: Decodable {
+        let storeItems: [Item]?
+        enum CodingKeys: String, CodingKey { case storeItems = "store_items" }
+    }
+    struct Item: Decodable {
+        /// Some API versions return "id", others "appid".
+        let id: Int?
+        let appid: Int?
+        let tags: [Tag]?
+    }
+    struct Tag: Decodable {
+        let tagid: Int
+        let weight: Int
+    }
+}
+
+/// `IStoreService/GetTagList`.
+private struct StoreTagListResponse: Decodable {
+    let response: Body?
+    struct Body: Decodable { let tags: [Tag]? }
+    struct Tag: Decodable {
+        let tagid: Int
+        let name: String
     }
 }
 
