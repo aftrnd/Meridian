@@ -1,0 +1,19 @@
+--- a/dlls/winemac.drv/display.c
++++ b/dlls/winemac.drv/display.c
+@@ -1070,6 +1070,16 @@
+ void macdrv_displays_changed(const macdrv_event *event)
+ {
+     HWND hwnd = NtUserGetDesktopWindow();
++
++    /* Meridian: the display really changed: a system change, or a mode this
++     * process asked for while inactive and macOS applied on activation
++     * (latentDisplayModes). macdrv_ChangeDisplaySettings reset the cached
++     * desktop rect and Retina state before that deferred switch, so they
++     * kept the old mode: Fallout: New Vegas switched a 5K display to 1x
++     * 3840x2160, Wine still reported a 5120x2880 desktop with Retina on, and
++     * halved the game's 3840x2160 window into a quarter of the screen.
++     * Recompute them from the mode now on screen. */
++    macdrv_reset_device_metrics();
+ 
+     /* A system display change will get delivered to all GUI-attached threads,
+        so the desktop-window-owning thread will get it and all others should
