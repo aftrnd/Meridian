@@ -102,8 +102,9 @@ struct ArtGlowBackground: View {
                 .padding(-8)
                 .blur(radius: 32)
                 .saturation(colorScheme == .dark ? 1.0 : 1.3)
-                // 20% under the original 0.47 / 0.6 (user, Oct 11 2026).
-                .opacity(colorScheme == .dark ? 0.376 : 0.48)
+                // 20% under the original 0.47 / 0.6 (user, Oct 11 2026); dark
+                // then down to 0.15 (user, Oct 13 2026).
+                .opacity(colorScheme == .dark ? 0.15 : 0.48)
                 .allowsHitTesting(false)
         }
     }
