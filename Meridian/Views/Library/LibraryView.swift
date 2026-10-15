@@ -38,12 +38,7 @@ struct LibraryView: View {
     /// top one; the old fixed 27 pt was close but uneven.
     private var gridInset: CGFloat { CardLayoutMetrics.spacing }
 
-    private var gridColumns: [GridItem] {
-        Array(
-            repeating: GridItem(.flexible(), spacing: CardLayoutMetrics.spacing),
-            count: metrics.visibleCount
-        )
-    }
+    private var gridColumns: [GridItem] { metrics.gridColumns }
 
     // MARK: - Body
 

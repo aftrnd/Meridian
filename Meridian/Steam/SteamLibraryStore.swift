@@ -61,11 +61,20 @@ final class SteamLibraryStore {
 
     init() {
         artCache = Self.loadArtCache()
+        if let cached = Self.loadStoreTagsCache() {
+            storeTags = cached.tags
+            storeTagNames = cached.names
+        }
     }
 
     // Stored so @Observable can track changes and re-evaluate filteredGames immediately.
     // AppSettings persists to UserDefaults; this mirrors it for reactive updates.
     private(set) var hiddenAppIDs: Set<Int> = AppSettings.shared.hiddenAppIDs
+    /// Each game's top Steam store tags (most-voted first) and the tags'
+    /// names, for Search's genre row. From the disk cache at launch, then
+    /// refreshed with the library.
+    private(set) var storeTags: [Int: [Int]] = [:]
+    private(set) var storeTagNames: [Int: String] = [:]
     var showHiddenGames: Bool = AppSettings.shared.showHiddenGames {
         didSet { settings.showHiddenGames = showHiddenGames }
     }
@@ -144,6 +153,56 @@ final class SteamLibraryStore {
         // @Observable mutations inside the task trigger SwiftUI re-renders that
         // restart the card's .task(id:), which then retries with new-CDN URLs.
         Task { await prefetchLibraryCapsuleHashes(apiKey: apiKey) }
+        Task { await loadStoreTags() }
+    }
+
+    /// Store tags per game; a game keeps its top `tagsPerGame` (the rest are
+    /// thin votes, and "Singleplayer"-style tags would match everything).
+    private static let tagsPerGame = 5
+
+    private func loadStoreTags() async {
+        let names = await SteamAPIService.shared.fetchStoreTagNames()
+        var tags: [Int: [Int]] = [:]
+        for batch in games.map(\.id).chunked(into: 50) {
+            let fetched = await SteamAPIService.shared.fetchStoreTagIDs(appIDs: batch)
+            for (appID, ids) in fetched { tags[appID] = Array(ids.prefix(Self.tagsPerGame)) }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        log.info("[loadStoreTags] \(tags.count)/\(self.games.count) games tagged, \(names.count) tag names")
+        // A failed fetch keeps what the cache had rather than emptying the row.
+        guard !names.isEmpty, !tags.isEmpty else { return }
+        storeTagNames = names
+        storeTags = tags
+        saveStoreTagsCache()
+    }
+
+    // MARK: - Store-tags cache (disk persistence)
+
+    /// The last loaded store tags, so Search's genre row is there at launch
+    /// instead of ~10 s in. Public per-app data, kept across sign-outs like
+    /// the art cache.
+    nonisolated static let storeTagsCacheURL: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appending(path: "com.meridian.app/store-tags-cache.json")
+    }()
+
+    private struct StoreTagsCache: Codable {
+        var tags: [Int: [Int]]
+        var names: [Int: String]
+    }
+
+    private static func loadStoreTagsCache() -> StoreTagsCache? {
+        guard let data = try? Data(contentsOf: storeTagsCacheURL) else { return nil }
+        return try? JSONDecoder().decode(StoreTagsCache.self, from: data)
+    }
+
+    private func saveStoreTagsCache() {
+        guard let data = try? JSONEncoder().encode(StoreTagsCache(tags: storeTags, names: storeTagNames)) else { return }
+        try? FileManager.default.createDirectory(
+            at: Self.storeTagsCacheURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: Self.storeTagsCacheURL, options: .atomic)
     }
 
     /// Empties everything the signed-out account loaded. The art cache stays:
