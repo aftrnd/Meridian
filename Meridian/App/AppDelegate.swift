@@ -116,6 +116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Traffic lights fade in with the resize instead of popping at t=0.
         setTrafficLights(hidden: false, in: window)
         setTrafficLights(alpha: 0, in: window)
+        // The startup window keeps the system corners; the app window's go on
+        // as it starts to grow, where the change is lost in the motion.
+        applyMainWindowCornerRadius(to: window)
 
         // Expand from the splash's current center so the final window lands
         // at the same center point that window.center() chose for the splash.
@@ -157,6 +160,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             guard let button = window.standardWindowButton(kind) else { continue }
             if animated { button.animator().alphaValue = alpha } else { button.alphaValue = alpha }
         }
+    }
+
+    /// `AppSettings.mainWindowCornerRadius` on this window only. There's no
+    /// public API: `NSView.cornerConfiguration` is read-only, and AppKit's
+    /// `NSConvolutionOverride1` default rounds every window in the app (read
+    /// once, then cached). NSWindow's private `_setCornerRadius:` is per window
+    /// and holds through resizes and appearance changes (27.0.1); without it
+    /// the window keeps the system radius.
+    private func applyMainWindowCornerRadius(to window: NSWindow) {
+        let selector = NSSelectorFromString("_setCornerRadius:")
+        guard window.responds(to: selector) else {
+            log.warning("NSWindow has no _setCornerRadius:; the main window keeps the system corner radius")
+            return
+        }
+        typealias SetCornerRadius = @convention(c) (NSWindow, Selector, CGFloat) -> Void
+        let setCornerRadius = unsafeBitCast(window.method(for: selector), to: SetCornerRadius.self)
+        setCornerRadius(window, selector, AppSettings.mainWindowCornerRadius)
     }
 
     private var mainWindow: NSWindow? {
