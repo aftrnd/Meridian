@@ -18,9 +18,11 @@ enum FloatingSidebar {
     static let widthRange: ClosedRange<Double> = 180...360
     /// UserDefaults key for the dragged width.
     static let widthKey = "floatingSidebar.width"
-    /// Gap between the glass and the window's edges. The corners follow the
-    /// window's (16 pt on macOS 27), concentric, never under 12 pt.
+    /// Gap between the glass and the window's edges.
     static let inset: CGFloat = 8
+    /// The glass's corners, concentric with the window's
+    /// (`AppSettings.mainWindowCornerRadius`): 26 − 8 = 18 pt.
+    static let cornerRadius = AppSettings.mainWindowCornerRadius - inset
 
     /// Where glass this wide ends; the pages start here.
     static func edge(width: Double) -> CGFloat {
@@ -99,7 +101,7 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
     /// macOS 27's own sidebar glass where this macOS has it, else SwiftUI's.
     @ViewBuilder private var glass: some View {
         if SidebarGlass.isSupported {
-            SidebarGlass(cornerRadius: 12)
+            SidebarGlass(cornerRadius: FloatingSidebar.cornerRadius)
         } else {
             Color.clear
                 .glassEffect(.regular, in: ConcentricRectangle(corners: .concentric(minimum: .fixed(12)), isUniform: true))

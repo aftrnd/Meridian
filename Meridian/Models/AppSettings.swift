@@ -387,6 +387,14 @@ final class AppSettings: @unchecked Sendable {
             && !steamCredentialRefreshToken.isEmpty
     }
 
+    // MARK: - Window Corners
+
+    /// macOS 26's window corner radius, for the main window only once it
+    /// grows out of the startup window (user, Oct 13 2026); the startup
+    /// window, Settings and every other window keep the system's (16 pt on
+    /// macOS 27). Applied by AppDelegate.
+    static let mainWindowCornerRadius: CGFloat = 26
+
     // MARK: - Developer
 
     /// True for Xcode "Debug" / `swift build` (no `-c release`) builds — the
