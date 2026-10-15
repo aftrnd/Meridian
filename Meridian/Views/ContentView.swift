@@ -939,30 +939,42 @@ extension Color {
 }
 
 private extension View {
-    /// Sidebar icon tint: monochrome (white in dark mode) at rest, brand
-    /// purple when the row is selected. `.fixed` so the selection highlight
-    /// can't override it back to the system accent; the selected row's icon
-    /// is also coloured outright (`SidebarIcon`), because the row's selection
-    /// styling still whitened it (user, Oct 13 2026).
+    /// Sidebar icon tint: monochrome (white in dark mode). In light mode the
+    /// selected row's icon is brand purple; dark mode keeps it white too
+    /// (user, Oct 13 2026).
     func sidebarTint(selected: Bool) -> some View {
-        listItemTint(.fixed(selected ? .meridianAccent : .primary))
-            .environment(\.sidebarRowSelected, selected)
+        modifier(SidebarTint(selected: selected))
+    }
+}
+
+/// `.fixed` so the selection highlight can't override the tint back to the
+/// system accent; a purple icon is also coloured outright (`SidebarIcon`),
+/// because the row's selection styling still whitened it.
+private struct SidebarTint: ViewModifier {
+    let selected: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        let accented = selected && colorScheme == .light
+        content
+            .listItemTint(.fixed(accented ? .meridianAccent : .primary))
+            .environment(\.sidebarIconAccented, accented)
     }
 }
 
 extension EnvironmentValues {
     /// Set by `sidebarTint(selected:)` for `SidebarIcon`.
-    @Entry var sidebarRowSelected: Bool = false
+    @Entry var sidebarIconAccented: Bool = false
 }
 
-/// A sidebar row's icon: Meridian's purple while its row is selected, in
+/// A sidebar row's icon: Meridian's purple while `SidebarTint` accents it, in
 /// every window state; otherwise as the row's tint draws it.
 private struct SidebarIcon<Icon: View>: View {
     let icon: Icon
-    @Environment(\.sidebarRowSelected) private var selected
+    @Environment(\.sidebarIconAccented) private var accented
 
     var body: some View {
-        if selected {
+        if accented {
             icon.foregroundStyle(Color.meridianAccent)
         } else {
             icon
