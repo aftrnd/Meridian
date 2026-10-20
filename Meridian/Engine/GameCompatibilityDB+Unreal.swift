@@ -43,12 +43,9 @@ extension GameCompatibilityDB {
             appID: 3124540,
             name: "Far Far West",
             status: .playable,
-            // DXMT reports an NVIDIA GPU and serves DLSS Super Resolution
-            // through MetalFX's temporal scaler (its nvngx.dll). Unverified.
-            extraEnv: ["DXMT_ENABLE_NVEXT": "1"],
             // Straight to the D3D11 RHI it falls back to anyway.
             launchArgs: ["-dx11"],
-            verifiedWith: "v4.1.0-engine",
+            verifiedWith: "v4.2.0-engine",
             notes: """
             Unreal Engine 5.8.1 (Evil Raptor's "CanyonEngine" branch, build \
             0.2.0.20 CL 915; PCGamingWiki still lists 5.7.3), 64-bit, Direct3D 12 \
@@ -89,11 +86,18 @@ extension GameCompatibilityDB {
             \
             DLSS: the DLSS-SR 8.7.0 plugin (NGX 310.6) said "requires an NVIDIA \
             RTX series graphics card ... DLSS-SR=0" on DXMT's Apple adapter. \
-            DXMT_ENABLE_NVEXT=1 makes DXMT report vendor 0x10DE and answer NGX \
-            with MetalFX temporal upscaling (DLSS-SR only, no frame generation). \
-            It reaches the game through engine patch 0008 (Pattern 56). Not yet \
-            run: check the next UE log for DLSS-SR=1 and the graphics menu for \
-            DLSS; drop the variable if the game misrenders.
+            DXMT_ENABLE_NVEXT=1 (Oct 20 17:03, v4.1.1 local engine, through \
+            engine patch 0008) made DXMT report vendor 10de and the RHI "NVIDIA \
+            D3D11", but NGX still refused: "NGXGetPathUsingQAI: no matching \
+            adapter found", then "failed to load C:\\Windows\\System32\\nvngx.dll" \
+            (and _nvngx.dll), Init -> NVSDK_NGX_Result_FAIL_FeatureNotSupported, \
+            DLSS-SR=0. Wine itself loads DXMT's nvngx.dll from that path with its \
+            exports (mingw LoadLibrary probe, same engine), so the game's NGX SDK \
+            (310.6) rejects it, most likely for lacking NVIDIA's code signature \
+            (DXMT's file is unsigned). Removed the variable: an NVIDIA vendor ID \
+            with no DLSS only risks NVIDIA-specific paths. -dx11 kept (the log \
+            goes straight to D3D11). The VC++ prompt is gone in the app on the \
+            same engine (bootstrapper to -Shipping.exe in 0.2 s).
             """
         ),
 
