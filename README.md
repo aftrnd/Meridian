@@ -89,7 +89,7 @@ Meridian never stores your Steam password. Sign-in happens directly against Stea
 
 Meridian is commercial software. Every new install includes a 14-day trial with no sign-up. After the trial, a license key unlocks Play and Install.
 
-License keys are verified entirely offline against a public key embedded in the app. There is no activation server, no account to create, and no phone-home. Your key lives in Settings, under License.
+License keys are verified entirely offline against a public key embedded in the app. There is no activation server, no account to create, and no phone-home. Once the trial ends, Play or Install brings up a sheet to buy Meridian or paste your key, and a valid key unlocks the moment it goes in.
 
 ## Privacy
 
@@ -140,7 +140,6 @@ Meridian is in active development. The items below are what stands between the c
 | Engine | msync, memory tier, Metal Performance HUD, virtual desktop, reset |
 | Permissions | macOS permissions Meridian needs |
 | Updates | Current app and engine versions, Check for Updates, diagnostics |
-| License | Trial status and license key |
 | Developer | Developer menu and feature flags (off by default in release builds) |
 
 ## Where Meridian keeps its data

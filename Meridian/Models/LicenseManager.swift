@@ -154,6 +154,12 @@ final class LicenseManager {
         defaults.string(forKey: Self.licenseKeyDefaultsKey)
     }
 
+    /// Whether `key` would activate, without storing it or logging a
+    /// rejection: the license sheet checks its field as a key is pasted.
+    func accepts(key: String) -> Bool {
+        (try? License.verify(key: key, publicKeyBase64: Self.publicKeyBase64, now: now())) != nil
+    }
+
     // MARK: Actions
 
     /// Verifies and stores a key. Returns the verification error on failure;
