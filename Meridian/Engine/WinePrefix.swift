@@ -2431,6 +2431,69 @@ struct WinePrefix: Sendable {
         log.info("[writeMacDriverDisplayKeys] CaptureDisplaysForFullscreen=y RetinaMode=y ✓")
     }
 
+    // MARK: - Per-game environment
+
+    /// Stores a game's own environment variables under
+    /// `HKCU\Software\Wine\AppDefaults\<executable>\Environment`. The engine's
+    /// kernelbase (patch 0008) sets them in that executable's environment when
+    /// it starts, and its children inherit them. Games inherit steam.exe's
+    /// environment, so this is the only way one game gets its own settings
+    /// (Pattern 56).
+    ///
+    /// Each variable is written twice: as is, for Windows code (DXMT reads its
+    /// switches there), and prefixed `__CX_UNIX_`, which ntdll copies into the
+    /// Unix environment, where Wine itself reads WINEDLLOVERRIDES and
+    /// WINEDLLPATH. One `reg import`, and only when the set changed since the
+    /// last write (marker file in the prefix, which a prefix reset removes
+    /// together with the registry). An empty set clears the key.
+    func writeAppEnvironment(executable: String, variables: [String: String], engine: WineEngine) async {
+        let markerURL = path.appending(path: ".meridian-app-environment")
+        var written = (try? JSONDecoder().decode(
+            [String: [String: String]].self, from: Data(contentsOf: markerURL)
+        )) ?? [:]
+        let exeKey = executable.lowercased()
+        guard (written[exeKey] ?? [:]) != variables else { return }
+
+        let regFile = driveC.appending(path: "windows/temp/meridian-app-environment.reg")
+        defer { try? FileManager.default.removeItem(at: regFile) }
+        do {
+            try Self.appEnvironmentRegFile(executable: executable, variables: variables)
+                .write(to: regFile, atomically: true, encoding: .utf16LittleEndian)
+            let process = try await engine.run(
+                args: ["reg", "import", "C:\\windows\\temp\\meridian-app-environment.reg"],
+                prefix: self
+            )
+            guard process.terminationStatus == 0 else { return }
+        } catch {
+            log.error("[writeAppEnvironment] \(executable): \(error.localizedDescription)")
+            return
+        }
+        written[exeKey] = variables.isEmpty ? nil : variables
+        if let data = try? JSONEncoder().encode(written) { try? data.write(to: markerURL) }
+        let names = variables.keys.sorted().joined(separator: ", ")
+        log.info("[writeAppEnvironment] \(executable): \(names.isEmpty ? "cleared" : names)")
+    }
+
+    /// The `.reg` file `writeAppEnvironment` imports: it deletes the key, then
+    /// writes each variable as is and prefixed `__CX_UNIX_`. Starts with a
+    /// byte-order mark, by which reg.exe reads it as Unicode.
+    static func appEnvironmentRegFile(executable: String, variables: [String: String]) -> String {
+        func quoted(_ s: String) -> String {
+            "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let key = "HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(executable)\\Environment"
+        var lines = ["Windows Registry Editor Version 5.00", "", "[-\(key)]", ""]
+        if !variables.isEmpty {
+            lines.append("[\(key)]")
+            for (name, value) in variables.sorted(by: { $0.key < $1.key }) {
+                lines.append("\(quoted(name))=\(quoted(value))")
+                lines.append("\(quoted("__CX_UNIX_" + name))=\(quoted(value))")
+            }
+            lines.append("")
+        }
+        return "\u{FEFF}" + lines.joined(separator: "\r\n")
+    }
+
     // MARK: - Windows Version Registration
 
     /// Increment when the Windows-version registry mapping changes. Valve

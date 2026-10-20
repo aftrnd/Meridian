@@ -295,7 +295,7 @@ final class AppUpdateChecker {
         // Apply engine result
         if let latestEngine = engineUpdate,
            let installed = installedEngineTag,
-           isNewerEngine(latestEngine, than: installed) {
+           Self.isNewerEngine(latestEngine, than: installed) {
             availableEngineTag = latestEngine
             log.info("[check] engine update available: \(latestEngine) (installed: \(installed))")
         } else {
@@ -306,7 +306,7 @@ final class AppUpdateChecker {
         // Apply app result
         switch appUpdate {
         case .success(let release):
-            if let release, isNewer(release.tagName, than: Self.currentVersion) {
+            if let release, Self.isNewer(release.tagName, than: Self.currentVersion) {
                 availableVersion = release.tagName
                 releaseNotes = release.body
                 releasePageURL = release.pageURL
@@ -457,7 +457,7 @@ final class AppUpdateChecker {
 
     /// Returns `true` if `candidate` is strictly newer than `current`.
     /// Strips any leading `v` and ignores suffixes before comparing major.minor.patch.
-    private func isNewer(_ candidate: String, than current: String) -> Bool {
+    private nonisolated static func isNewer(_ candidate: String, than current: String) -> Bool {
         let a = semverComponents(candidate)
         let b = semverComponents(current)
         let length = max(a.count, b.count)
@@ -471,14 +471,16 @@ final class AppUpdateChecker {
     }
 
     /// Compares two engine tags (e.g. `v1.0.3-engine` vs `v1.0.2-engine`).
-    private func isNewerEngine(_ candidate: String, than current: String) -> Bool {
+    /// Also gates `EngineDownloader`'s launch-time update, so a locally
+    /// installed newer engine (`install-local.sh`) is never downgraded.
+    nonisolated static func isNewerEngine(_ candidate: String, than current: String) -> Bool {
         let clean = { (s: String) -> String in
             s.replacingOccurrences(of: "-engine", with: "")
         }
         return isNewer(clean(candidate), than: clean(current))
     }
 
-    private func semverComponents(_ version: String) -> [Int] {
+    private nonisolated static func semverComponents(_ version: String) -> [Int] {
         version
             .trimmingCharacters(in: CharacterSet(charactersIn: "v"))
             .split(separator: ".")

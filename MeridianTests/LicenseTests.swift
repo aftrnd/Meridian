@@ -217,9 +217,11 @@ final class LicenseTests: XCTestCase {
         let src = try readSource("Meridian/Views/Library/GameDetailView.swift")
         XCTAssertTrue(src.contains("@Environment(LicenseManager.self)"),
                       "GameDetailView must observe LicenseManager.")
-        XCTAssertEqual(src.components(separatedBy: "guard licenseManager.allowsPlay else { showLicenseRequired = true; return }").count - 1, 2,
-                       "Both Play and Install must be gated on licenseManager.allowsPlay.")
-        XCTAssertTrue(src.contains("LicenseRequiredSheet()"),
+        XCTAssertTrue(src.contains("guard licenseManager.allowsPlay else { requireLicense(for: .play); return }"),
+                      "Play must be gated on licenseManager.allowsPlay.")
+        XCTAssertTrue(src.contains("guard licenseManager.allowsPlay else { requireLicense(for: .install); return }"),
+                      "Install must be gated on licenseManager.allowsPlay.")
+        XCTAssertTrue(src.contains("LicenseRequiredSheet(action: licenseGatedAction)"),
                       "The trial-expired sheet must be presented from GameDetailView.")
     }
 
@@ -230,7 +232,7 @@ final class LicenseTests: XCTestCase {
         // No License tab in Settings until licensing is settled (user, Oct 12
         // 2026); a key is entered where the trial ends.
         let sheet = try readSource("Meridian/Views/Settings/LicenseSettingsView.swift")
-        XCTAssertTrue(sheet.contains("LicenseStatusView()"),
+        XCTAssertTrue(sheet.contains("licenseManager.activate(key:"),
                       "The trial-ended sheet must still take a license key.")
     }
 

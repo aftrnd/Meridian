@@ -1,0 +1,95 @@
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -28,6 +28,7 @@
+ #include "winnls.h"
+ #include "wincontypes.h"
+ #include "winternl.h"
++#include "winreg.h"
+ 
+ #include "kernelbase.h"
+ #include "wine/debug.h"
+@@ -134,6 +135,62 @@
+ 
+ 
+ /***********************************************************************
++ *           create_app_environment
++ *
++ * Meridian: HKCU\Software\Wine\AppDefaults\<app.exe>\Environment lists
++ * variables for that executable, set over the environment it would otherwise
++ * get. Steam starts every game with steam.exe's environment, so this is how
++ * one game gets its own settings (DXMT options). Names prefixed __CX_UNIX_
++ * also reach the Unix environment (CW Hack 24717 in ntdll).
++ * Returns a heap block, or NULL when the executable has no such key.
++ */
++static WCHAR *create_app_environment( const WCHAR *imagepath, const WCHAR *env )
++{
++    const WCHAR *name = wcsrchr( imagepath, '\\' );
++    WCHAR keyname[MAX_PATH + 64], valname[256], value[4096];
++    UNICODE_STRING nameW, valueW;
++    DWORD i, name_len, value_len, type;
++    WCHAR *ret = NULL;
++    LSTATUS status;
++    HKEY key;
++
++    name = name ? name + 1 : imagepath;
++    if (lstrlenW( name ) >= MAX_PATH) return NULL;
++    lstrcpyW( keyname, L"Software\\Wine\\AppDefaults\\" );
++    lstrcatW( keyname, name );
++    lstrcatW( keyname, L"\\Environment" );
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, keyname, 0, KEY_QUERY_VALUE, &key )) return NULL;
++
++    if (env)
++    {
++        const WCHAR *p = env;
++        SIZE_T size;
++
++        while (*p) p += lstrlenW( p ) + 1;
++        size = (p - env + 1) * sizeof(WCHAR);
++        if ((ret = RtlAllocateHeap( GetProcessHeap(), 0, size ))) memcpy( ret, env, size );
++    }
++    else RtlCreateEnvironment( TRUE, &ret );
++
++    for (i = 0; ret; i++)
++    {
++        name_len = ARRAY_SIZE( valname );
++        value_len = sizeof(value) - sizeof(WCHAR);
++        status = RegEnumValueW( key, i, valname, &name_len, NULL, &type, (BYTE *)value, &value_len );
++        if (status == ERROR_NO_MORE_ITEMS) break;
++        if (status || type != REG_SZ) continue;
++        value[value_len / sizeof(WCHAR)] = 0;
++        RtlInitUnicodeString( &nameW, valname );
++        RtlInitUnicodeString( &valueW, value );
++        TRACE( "%s: %s=%s\n", debugstr_w(name), debugstr_w(valname), debugstr_w(value) );
++        RtlSetEnvironmentVariable( &ret, &nameW, &valueW );
++    }
++    RegCloseKey( key );
++    return ret;
++}
++
++
++/***********************************************************************
+  *           create_process_params
+  */
+ static RTL_USER_PROCESS_PARAMETERS *create_process_params( const WCHAR *filename, const WCHAR *cmdline,
+@@ -143,7 +200,7 @@
+     RTL_USER_PROCESS_PARAMETERS *params;
+     UNICODE_STRING imageW, curdirW, cmdlineW, titleW, desktopW, runtimeW, newdirW;
+     WCHAR imagepath[MAX_PATH];
+-    WCHAR *envW = env;
++    WCHAR *envW = env, *app_envW;
+ 
+     if (!GetLongPathNameW( filename, imagepath, MAX_PATH )) lstrcpynW( imagepath, filename, MAX_PATH );
+     if (!GetFullPathNameW( imagepath, MAX_PATH, imagepath, NULL )) lstrcpynW( imagepath, filename, MAX_PATH );
+@@ -160,6 +217,12 @@
+             MultiByteToWideChar( CP_ACP, 0, env, e - (char *)env, envW, lenW );
+     }
+ 
++    if ((app_envW = create_app_environment( imagepath, envW )))
++    {
++        if (envW != env) RtlFreeHeap( GetProcessHeap(), 0, envW );
++        envW = app_envW;
++    }
++
+     newdirW.Buffer = NULL;
+     if (cur_dir)
+     {

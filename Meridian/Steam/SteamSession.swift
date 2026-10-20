@@ -988,11 +988,31 @@ final class SteamSession {
 
     // MARK: - Game launch environment
 
+    /// The variables a game's profile changes relative to the default game
+    /// environment, which steam.exe carries and every game inherits
+    /// (`WineEngine.steamClientEnvironment`). A removed variable maps to "".
+    /// The launcher stores them under the game's executable
+    /// (`WinePrefix.writeAppEnvironment`, engine patch 0008). Variables every
+    /// process attached to the shared wineserver must agree on are left out:
+    /// an msync client exits when its WINEMSYNC differs from the server's.
+    func gameEnvironmentOverrides(for appID: Int, engine: WineEngine) -> [String: String] {
+        let sessionWide: Set<String> = ["WINEPREFIX", "WINESERVER", "WINELOADER", "WINEMSYNC"]
+        let base = engine.environment(for: prefix)
+        let game = gameEnvironment(for: appID, engine: engine)
+        var overrides: [String: String] = [:]
+        for (key, value) in game where base[key] != value { overrides[key] = value }
+        for key in base.keys where game[key] == nil { overrides[key] = "" }
+        for key in sessionWide where overrides[key] != nil {
+            overrides[key] = nil
+            log.warning("[gameEnvironment] appID=\(appID): \(key) is shared by the whole Wine session — ignored")
+        }
+        return overrides
+    }
+
     /// Returns the environment dictionary for launching a game process.
     /// Merges per-game overrides from GameCompatibilityDB on top of WineEngine defaults.
     func gameEnvironment(for appID: Int, engine: WineEngine) -> [String: String] {
         var env = engine.environment(for: prefix)
-        env["WINE_DISABLE_WINE_CRASH_DIALOG"] = "1"
 
         let compat = GameCompatibilityDB.shared
         for (key, value) in compat.extraEnv(for: appID) {

@@ -41,6 +41,10 @@ struct GameDetailView: View {
 
     @State private var showEngineSetup = false
     @State private var showLicenseRequired = false
+    /// What raised the license sheet: Play or Install.
+    @State private var licenseGatedAction: LicenseRequiredSheet.Action = .play
+    /// Set when the player licensed Meridian and chose to carry on.
+    @State private var resumeGatedAction = false
     @State private var showResetConfirm = false
     @State private var appDetails: AppDetails? = nil
     /// Width÷height from the loaded hero `NSImage` (falls back to Steam's typical 1920×622 until decode).
@@ -294,8 +298,9 @@ struct GameDetailView: View {
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
         }
-        .sheet(isPresented: $showLicenseRequired) {
-            LicenseRequiredSheet().environment(licenseManager)
+        .sheet(isPresented: $showLicenseRequired, onDismiss: resumeAfterLicenseSheet) {
+            LicenseRequiredSheet(action: licenseGatedAction) { resumeGatedAction = true }
+                .environment(licenseManager)
         }
         .sheet(item: $selectedAchievement) { ach in
             AchievementDetailSheet(achievement: ach)
@@ -1310,7 +1315,7 @@ private struct ScrollViewLanding: NSViewRepresentable {
     }
 
     private func handleInstallTapped() {
-        guard licenseManager.allowsPlay else { showLicenseRequired = true; return }
+        guard licenseManager.allowsPlay else { requireLicense(for: .install); return }
         guard engine.isReady else { showEngineSetup = true; return }
         launcher.installOnly(
             game: currentGame, engine: engine,
@@ -1319,12 +1324,28 @@ private struct ScrollViewLanding: NSViewRepresentable {
     }
 
     private func handlePlayTapped() {
-        guard licenseManager.allowsPlay else { showLicenseRequired = true; return }
+        guard licenseManager.allowsPlay else { requireLicense(for: .play); return }
         guard engine.isReady else { showEngineSetup = true; return }
         launcher.launch(
             game: currentGame, engine: engine,
             session: session, steamAuth: steamAuth, library: library
         )
+    }
+
+    private func requireLicense(for action: LicenseRequiredSheet.Action) {
+        licenseGatedAction = action
+        showLicenseRequired = true
+    }
+
+    /// Runs once the license sheet has fully closed, so the engine-setup
+    /// sheet can follow it when the engine isn't ready.
+    private func resumeAfterLicenseSheet() {
+        guard resumeGatedAction else { return }
+        resumeGatedAction = false
+        switch licenseGatedAction {
+        case .play: handlePlayTapped()
+        case .install: handleInstallTapped()
+        }
     }
 
 }
