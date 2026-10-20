@@ -429,8 +429,9 @@ final class WineEngine {
     /// (DXMT for D3D10/11, GStreamer plugins for video, audio on) on top of
     /// `steamCMDEnvironment`. With admin's Wine D3D and `mmdevapi=d`, Unity
     /// 6 games failed InitializeEngineGraphics and had no sound (No, I'm not
-    /// a Human, Oct 7 2026). Per-game routing (`SteamSession.gameEnvironment`)
-    /// does not reach games Steam launches.
+    /// a Human, Oct 7 2026). A game's own variables reach it through the
+    /// registry instead (`SteamSession.gameEnvironmentOverrides` →
+    /// `WinePrefix.writeAppEnvironment`, engine patch 0008).
     func steamClientEnvironment(for prefix: WinePrefix) -> [String: String] {
         var env = steamCMDEnvironment(for: prefix)
         let game = environment(for: prefix)
@@ -652,9 +653,9 @@ final class WineEngine {
         // lower CPU overhead than esync's eventfd emulation on Apple Silicon.
         // MUST match the admin/steam.exe path (steamCMDEnvironment) so the
         // shared wineserver is consistent — the msync client aborts if it
-        // attaches to a wineserver started with a different msync setting.
-        // Per-game opt-out lands later in SteamSession.gameEnvironment via
-        // GameProfile.extraEnv (a profile can set WINEMSYNC=0). Default ON.
+        // attaches to a wineserver started with a different msync setting,
+        // so it cannot differ per game (gameEnvironmentOverrides drops it).
+        // Default ON.
         if settings.msyncEnabled { env["WINEMSYNC"] = "1" }
 
         if let wineExe = wineExecutableURL {
@@ -684,7 +685,7 @@ final class WineEngine {
             // (headless-verified with Scripts/engine/smoke: lib/dxmt first →
             // DXMT device at feature level 11_0; lib/wined3d first → wined3d).
             // `n,b` still lets a game directory's own native d3d11 win.
-            // `SteamSession.gameEnvironment` re-routes per game.
+            // `SteamSession.gameEnvironmentOverrides` re-routes per game.
             env["WINEDLLPATH"] = dllSearchPath(preferring: dxmtPath)
             if dxmtPath != nil {
                 env["WINEDLLOVERRIDES"] = "d3d11=n,b;dxgi=n,b;d3d10core=n,b"

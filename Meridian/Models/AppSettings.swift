@@ -39,8 +39,8 @@ final class AppSettings: @unchecked Sendable {
     /// paths so every wineserver in the prefix is started with the SAME msync
     /// setting — the msync client aborts (`exit(1)`) if it attaches to a
     /// wineserver started without it. Default ON; master kill-switch if a
-    /// broad regression ever appears. Per-game opt-out via
-    /// `GameProfile.extraEnv["WINEMSYNC"] = "0"`.
+    /// broad regression ever appears. It cannot be set per game: every game
+    /// shares Steam's wineserver.
     var msyncEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "msyncEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "msyncEnabled") }
         set { UserDefaults.standard.set(newValue, forKey: "msyncEnabled") }

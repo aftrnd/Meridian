@@ -86,9 +86,14 @@ final class EngineDownloader {
             // The `installedTag` read goes through `WineEngine` which sources
             // it from `wine/meridian-engine-version.txt` — written by
             // `release-engine.sh` and untouched after extraction.
+            //
+            // Skip unless the release is NEWER, not merely different: an
+            // engine installed with `install-local.sh` carries an unpublished
+            // higher tag, and an equality check replaced it with the older
+            // release on the next launch (v4.1.1 → v4.1.0, Oct 20 2026).
             if let installedTag = WineEngine.installedEngineTagOnDisk(),
-               installedTag == asset.releaseTag {
-                log.info("[download] installed engine \(installedTag) matches latest \(asset.releaseTag) — skipping (no-op)")
+               !AppUpdateChecker.isNewerEngine(asset.releaseTag, than: installedTag) {
+                log.info("[download] installed engine \(installedTag) is current (latest release \(asset.releaseTag)) — skipping (no-op)")
                 state = .complete
                 onComplete()
                 return

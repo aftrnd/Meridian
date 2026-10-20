@@ -567,6 +567,7 @@ final class Launcher {
         // (Unity Player.log). Wine's output goes to Steam, which owns the
         // game's process (Pattern 20).
         let arguments = await launchArguments(for: game, engine: engine)
+        await applyGameEnvironment(for: game, session: session, engine: engine)
         activeGameInstallDir = prefix.gameInstallDir(appID: game.id)
             .map { prefix.steamInstallDir.appending(path: "steamapps/common/\($0)") }
         activeLaunchStartedAt = Date()
@@ -905,6 +906,24 @@ final class Launcher {
         return profileArgs + (await seedDefaultResolution(
             game: game, engine: engine, gameEngine: gameEngine, profileArgs: profileArgs
         ))
+    }
+
+    // MARK: - Private: per-game environment
+
+    /// Stores the variables the game's profile sets under the executable
+    /// Steam starts (the install root's main exe); a launcher or bootstrap
+    /// passes them on to the game it starts. No profile variables and nothing
+    /// written before: no Wine process at all.
+    private func applyGameEnvironment(for game: Game, session: SteamSession, engine: WineEngine) async {
+        guard let installDir = prefix.gameInstallDir(appID: game.id) else { return }
+        let gamePath = prefix.steamInstallDir.appending(path: "steamapps/common/\(installDir)")
+        let top = (try? FileManager.default.contentsOfDirectory(atPath: gamePath.path(percentEncoded: false))) ?? []
+        guard let executable = GameStackDetector.mainExecutable(in: top) else { return }
+        let variables = session.gameEnvironmentOverrides(for: game.id, engine: engine)
+        if !variables.isEmpty {
+            log.info("[launch] \(executable) environment: \(variables.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " "))")
+        }
+        await prefix.writeAppEnvironment(executable: executable, variables: variables, engine: engine)
     }
 
     // MARK: - Private: first-launch resolution
