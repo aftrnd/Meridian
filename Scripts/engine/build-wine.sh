@@ -47,6 +47,13 @@ main() {
     local gst="--without-gstreamer"
     [ -f "$DEPS/lib/pkgconfig/gstreamer-1.0.pc" ] && gst="--with-gstreamer"
 
+    # 32-bit PE modules do their floating point in SSE, not x87 (mingw's i686
+    # default). Rosetta has no fast path for x87: Wine's dsound resampler ran
+    # ~118x slower as x87, so two resampled sounds already took a core and
+    # Fallout: New Vegas stalled at 1 fps waiting on the mixer. Same flags as
+    # Proton's i386 build (stack realigned: Windows callers keep 4-byte stacks).
+    local i386_cflags="-g -O2 -mstackrealign -march=nocona -mtune=core-avx2 -mfpmath=sse"
+
     say "Configuring Wine $(cat "$SRC/wine/VERSION") (gstreamer: ${gst#--})"
     rm -rf "$BUILD"; mkdir -p "$BUILD"
     (
@@ -56,6 +63,7 @@ main() {
             --host=x86_64-apple-darwin --build=x86_64-apple-darwin \
             --prefix=/ \
             --enable-archs=i386,x86_64 \
+            i386_CFLAGS="$i386_cflags" \
             --disable-tests \
             --without-x --without-wayland --without-alsa --without-oss --without-pulse \
             --without-dbus --without-udev --without-v4l2 --without-sane --without-gphoto \
