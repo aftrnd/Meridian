@@ -412,7 +412,7 @@ struct GameStackReport {
     enum Renderer: String {
         case dxmt        // D3D11/D3D10 → DXMT → Metal
         case gptk        // D3D12 → GPTK → D3DMetal → Metal
-        case dxvk        // D3D9/10/11 → DXVK → MoltenVK → Metal
+        case dxvk        // D3D9 → DXVK → Vulkan loader → KosmicKrisp → Metal
         case wined3d     // D3D → Wine builtin (wined3d) → MoltenVK → Metal
         case wined3dGL   // D3D9 → Wine builtin (wined3d) → Apple OpenGL → Metal
         case unknown     // No D3D override seen (OpenGL/Vulkan game, or unconfigured)
@@ -421,7 +421,7 @@ struct GameStackReport {
             switch self {
             case .dxmt:      return "DXMT → Metal"
             case .gptk:      return "GPTK → D3DMetal → Metal"
-            case .dxvk:      return "DXVK → MoltenVK → Metal"
+            case .dxvk:      return "DXVK → KosmicKrisp → Metal"
             case .wined3d:   return "Wine builtin (wined3d) → MoltenVK → Metal"
             case .wined3dGL: return "Wine builtin (wined3d) → OpenGL → Metal"
             case .unknown:   return "Wine default (no D3D override: OpenGL/Vulkan or unconfigured)"
@@ -470,10 +470,10 @@ struct GameStackReport {
 
         // The engine keeps every switchable D3D front-end outside lib/wine, so
         // the FIRST WINEDLLPATH entry is the implementation Wine loads
-        // (WineEngine.dllSearchPath). The DX9 branch comes first because no
-        // engine backend covers d3d9: it is wined3d, whose d3d9 path on macOS
-        // is the OpenGL renderer (CLI-verified 2026-09-16, HL2:
-        // `lib/wine/i386-windows/d3d9.dll` + AppleMetalOpenGLRenderer mapped).
+        // (WineEngine.dllSearchPath). A DX9 game whose path doesn't start with
+        // lib/dxvk (WineEngine.d3d9MetalEnvironment) gets wined3d's d3d9, the
+        // OpenGL renderer on macOS (CLI-verified 2026-09-16, HL2:
+        // AppleMetalOpenGLRenderer mapped).
         let preferred = dllPath.split(separator: ":").first.map(String.init) ?? ""
         let renderer: Renderer
         if declaredAPI == .dx9, overrides["d3d9"] == nil, !preferred.contains("/dxvk") {

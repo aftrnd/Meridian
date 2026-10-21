@@ -1079,6 +1079,13 @@ final class SteamSession {
             )
         }
 
+        // DX9 → DXVK → KosmicKrisp → Metal where this Mac and engine have it
+        // (macOS 26); elsewhere D3D9 stays on wined3d's OpenGL renderer, whose
+        // CPU overhead held New Vegas to ~27 fps (Pattern 61).
+        if effectiveAPI == .dx9, let d3d9 = engine.d3d9MetalEnvironment() {
+            env.merge(d3d9) { _, routed in routed }
+        }
+
         // D3DMetal opt-in (per-game): D3D11/DXGI/D3D12 all from Apple GPTK.
         // Why: DXMT cannot service the Media Foundation video processor's D3D11
         // texture path → Unity VideoPlayer / MF cutscenes render black. D3DMetal

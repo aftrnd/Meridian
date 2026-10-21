@@ -30,7 +30,7 @@ enum GameEngine: String {
 /// What DirectX/Vulkan API the game renders with.
 /// Drives DXMT vs DXVK selection at launch.
 enum GraphicsAPI: String {
-    case dx9       // DirectX 9 → wined3d → OpenGL → Metal (no d3d9 backend on this engine yet)
+    case dx9       // DirectX 9 → DXVK → KosmicKrisp → Metal (macOS 26+), else wined3d → OpenGL
     case dx11      // DirectX 11 → DXMT → Metal
     case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
@@ -48,10 +48,11 @@ enum GraphicsAPI: String {
 
     /// The game page's render path. One copy: the page's own had drifted to
     /// "DXVK → MoltenVK → Metal" for DX9, which draws nothing on this engine
-    /// (engine-research-findings Patterns 27, 31).
-    var translationLayer: String {
+    /// (engine-research-findings Patterns 27, 31). `d3d9OnMetal`: this Mac's
+    /// engine routes D3D9 through DXVK and KosmicKrisp (`WineEngine.dxvkPath`).
+    func translationLayer(d3d9OnMetal: Bool) -> String {
         switch self {
-        case .dx9:     return "wined3d → OpenGL → Metal"
+        case .dx9:     return d3d9OnMetal ? "DXVK → KosmicKrisp → Metal" : "wined3d → OpenGL → Metal"
         case .dx11:    return "DXMT → Metal"
         case .dx12:    return "GPTK → D3DMetal → Metal"
         case .vulkan:  return "MoltenVK"

@@ -2171,6 +2171,7 @@ private struct BannerCompatBadge: View {
     var profile: GameProfile?
     var resolved: ResolvedGameStack? = nil
     var style: Style = .icon
+    @Environment(WineEngine.self) private var engine
     @State private var showingPopover = false
 
     private var icon: String {
@@ -2255,7 +2256,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: r.engineName,
                 api: r.graphicsAPI.displayName,
-                translation: r.graphicsAPI.translationLayer,
+                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: engine.dxvkPath != nil),
                 bitness: r.bitness != nil ? r.bitnessDescription : nil,
                 engineSource: r.engineSource,
                 apiSource: r.apiSource
@@ -2266,7 +2267,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: p.gameEngine.displayName,
                 api: p.graphicsAPI.displayName,
-                translation: p.graphicsAPI.translationLayer,
+                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: engine.dxvkPath != nil),
                 bitness: nil,
                 engineSource: .explicit,
                 apiSource: .explicit
