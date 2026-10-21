@@ -15,7 +15,7 @@ private let log = MeridianLog(category: "SteamSessionBackup")
 ///  2. On the next cold start, `restoreIfNeeded()` copies the backup back into the
 ///     prefix BEFORE steam.exe launches, so `-silent` auth succeeds from the token.
 ///  3. On sign-out, `clear()` removes the backup so the next user starts fresh.
-///  4. `resetToEngineTemplate` calls `restoreIfNeeded()` implicitly (BootstrapManager
+///  4. `updateToEngineTemplate` calls `restoreIfNeeded()` implicitly (BootstrapManager
 ///     calls it every launch, which covers the post-reset case).
 ///
 /// ## Why not ssfn?

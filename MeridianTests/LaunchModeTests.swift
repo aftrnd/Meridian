@@ -206,8 +206,12 @@ final class LaunchModeTests: XCTestCase {
                       "Warm-up starts an idle Steam, or restarts a running one only for a game it hasn't loaded")
         XCTAssertTrue(session.contains("if let warmUpTask {"),
                       "ensureReadyForDRM must wait for a running warm-up instead of racing it")
-        XCTAssertTrue(session.contains("try await bringUpForDRM(engine: engine, appID: appID, onStatus: nil)"),
+        XCTAssertTrue(session.contains("try await bringUpForDRM(engine: engine, appID: appID, onStatus: { status in"),
                       "The warm-up must use the inner bring-up, or it would wait on itself")
+        // A Play that joins the warm-up shows its progress, not a frozen
+        // "Getting ready…" (Pattern 59).
+        XCTAssertTrue(session.contains("self.warmUpListener?(status)") && session.contains("warmUpListener = onStatus"),
+                      "The warm-up must forward its status lines to the Play that joined it")
 
         let launcher = try readSource("Meridian/Launch/Launcher.swift")
         XCTAssertTrue(launcher.contains("let signedOut = session.state == .signedOut"),

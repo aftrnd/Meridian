@@ -246,14 +246,14 @@ final class BootstrapManager {
             settings.lastPrefixEngineModTime = Self.engineVersionFileModTime()
             // A freshly-created prefix has NONE of the versioned registry
             // mutations (WinRT classes, WoW64 crypto provider types, Windows
-            // version, steamservice cleanup). The version counters live in
+            // version). The version counters live in
             // global UserDefaults, NOT tied to prefix identity, so a prefix
             // recreated after a manual `bottles/` wipe inherits the old
             // "already applied" counters and the step-3 block below would SKIP
             // all of it — leaving the new prefix without the WoW64 crypto keys
             // and re-breaking 32-bit games (Pattern 11 / HL2). Zero the
             // counters so step 3 re-applies the full registry setup. (The
-            // engine-reset path does the same — see 2b.)
+            // engine-update path does the same — see 2b.)
             resetVersionedRegistryCounters()
         }
 
@@ -266,24 +266,23 @@ final class BootstrapManager {
         let needsUpdate = prefix.exists && !currentTag.isEmpty
             && (storedTag != currentTag || currentEngineModTime != settings.lastPrefixEngineModTime)
         if needsUpdate {
-            log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — resetting prefix")
+            log.info("[bootstrap] engine changed \(storedTag.isEmpty ? "(unknown)" : storedTag) → \(currentTag) — updating prefix")
             transition(to: .creatingPrefix, message: "Applying new Wine engine…")
             do {
-                try await prefix.resetToEngineTemplate(engine: engine)
+                // No wineserver may hold the old registry while the hives are
+                // rewritten: it saves its own copy back on exit.
                 session.killAllWineProcesses(engine: engine)
                 try? await Task.sleep(for: .seconds(1))
+                try await prefix.updateToEngineTemplate(engine: engine)
                 settings.lastPrefixEngineTag = currentTag
                 settings.lastPrefixEngineModTime = currentEngineModTime
-                // resetToEngineTemplate copies a fresh system.reg from the
-                // template (Pattern 10), so EVERY versioned registry mutation
-                // is gone and must be re-applied. Previously only 2 of the 4
-                // counters were reset here, leaving windowsVersion +
-                // staleSteamService stale after an engine upgrade. Zero all of
-                // them; step 3 below re-applies everything (incl. WinRT, so the
-                // explicit registerWinRTClasses call here is no longer needed).
+                // Keys the template defines come back as the template has
+                // them, so registry mutations Meridian made inside those keys
+                // (Windows version, …) are gone and must be re-applied. Zero
+                // the counters; step 3 below re-applies everything.
                 resetVersionedRegistryCounters()
             } catch {
-                log.error("[bootstrap] prefix reset failed (non-fatal): \(error.localizedDescription)")
+                log.error("[bootstrap] prefix update failed (non-fatal): \(error.localizedDescription)")
             }
         } else {
             log.info("[bootstrap] engine tag unchanged (\(currentTag)) — no prefix update needed")
@@ -381,23 +380,28 @@ final class BootstrapManager {
 
     /// Zeros every versioned prefix-registry counter so the step-3 setup block
     /// re-applies the full registry state (WinRT classes, WoW64 crypto provider
-    /// types, Windows version, stale steamservice cleanup) to a freshly
-    /// created OR engine-reset prefix.
+    /// types, Windows version) to a freshly created OR engine-updated prefix.
     ///
     /// These counters track "applied to the current prefix" but persist in
     /// global UserDefaults, decoupled from prefix identity. Whenever the prefix
     /// is (re)built — `prefix.create()` on a fresh/wiped bottle, or
-    /// `resetToEngineTemplate()` on an engine change (which copies a fresh
-    /// system.reg per Pattern 10) — the on-disk registry is empty but the
-    /// counters still read "already applied", causing step 3 to skip the
-    /// writes. That left 32-bit games (HL2) without the WoW64 crypto provider
-    /// types and crashing in `CryptAcquireContextA` (Pattern 11). Resetting all
-    /// of them on every (re)build keeps the registry and the counters in sync.
+    /// `updateToEngineTemplate()` on an engine change (template keys come back
+    /// as the template has them) — the writes may be gone but the counters
+    /// still read "already applied", causing step 3 to skip them. That left
+    /// 32-bit games (HL2) without the WoW64 crypto provider types and crashing
+    /// in `CryptAcquireContextA` (Pattern 11). Resetting all of them on every
+    /// (re)build keeps the registry and the counters in sync.
+    ///
+    /// Not `staleSteamServiceCleanupVersion`: that one DELETES the Steam Client
+    /// Service. An engine update now keeps the service Steam registered, and
+    /// re-running the cleanup would remove it; without the service Steam sits
+    /// on a hidden "Steam Service Error" and no game starts (Pattern 58). A
+    /// fresh prefix has no stale entry, so it needs the cleanup no more than
+    /// an updated one.
     private func resetVersionedRegistryCounters() {
         settings.winRTRegistrationAppliedVersion = 0
         settings.steamInstallPathRegistrationVersion = 0
         settings.windowsVersionAppliedVersion = 0
-        settings.staleSteamServiceCleanupVersion = 0
         settings.wow64ComRegistrationAppliedVersion = 0
         settings.macDriverDisplayAppliedVersion = 0
     }

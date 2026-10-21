@@ -120,6 +120,13 @@ final class SteamSession {
     /// second caller would otherwise see "not ready" mid-boot.
     private var warmUpTask: Task<Void, Never>?
 
+    /// The warm-up's latest progress line, and the Play that joined it.
+    /// Without them a Play pressed mid warm-up showed "Starting Steam…" for
+    /// the whole wait, through a Steam install, download and self-update
+    /// (Oct 20 2026: "kinda sits at getting ready").
+    private var warmUpStatus: String?
+    private var warmUpListener: (@MainActor (String) -> Void)?
+
     // MARK: - Dependency injection (set by MeridianApp)
 
     var steamWindow: SteamWindow?
@@ -215,7 +222,9 @@ final class SteamSession {
         onStatus: (@MainActor (String) -> Void)? = nil
     ) async throws {
         if let warmUpTask {
-            onStatus?("Starting Steam…")
+            onStatus?(warmUpStatus ?? "Starting Steam…")
+            warmUpListener = onStatus
+            defer { warmUpListener = nil }
             // Stop during the wait stops the warm-up too.
             await withTaskCancellationHandler {
                 await warmUpTask.value
@@ -245,9 +254,13 @@ final class SteamSession {
         log.info(missingGame
                  ? "[warmUp] restarting Steam in the background so it loads appID=\(appID ?? 0)"
                  : "[warmUp] starting Steam in the background")
+        warmUpStatus = nil
         warmUpTask = Task {
             do {
-                try await bringUpForDRM(engine: engine, appID: appID, onStatus: nil)
+                try await bringUpForDRM(engine: engine, appID: appID, onStatus: { status in
+                    self.warmUpStatus = status
+                    self.warmUpListener?(status)
+                })
             } catch {
                 log.info("[warmUp] Steam isn't ready (\(error.localizedDescription)); Play will handle it")
             }
