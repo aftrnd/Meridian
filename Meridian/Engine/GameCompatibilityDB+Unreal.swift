@@ -82,7 +82,12 @@ extension GameCompatibilityDB {
             with the resolution slider lowered (player's Metal HUD). A Slate \
             "FontCache flush requested. Reason: Large atlases out of space; 2/1 \
             Textures" repeats every 2-10 s at 5K (18 in 2.5 min): a glyph-cache \
-            rebuild each time. \
+            rebuild each time. The display is a 60 Hz Studio Display (NSScreen \
+            maximumFramesPerSecond 60, no VRR) and GameUserSettings has \
+            bUseVSync=True, so under 60 the frames alternate 60/30. 50% at 5K \
+            renders 2560×1440, the same pixels as the windowed 1440p run, and both \
+            sit near 50, which points away from output resolution; CPU \
+            (Rosetta) vs GPU is unmeasured (Metal HUD GPU time vs frame time). \
             \
             DLSS: the DLSS-SR 8.7.0 plugin (NGX 310.6) said "requires an NVIDIA \
             RTX series graphics card ... DLSS-SR=0" on DXMT's Apple adapter. \
