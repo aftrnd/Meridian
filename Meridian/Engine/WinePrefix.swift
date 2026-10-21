@@ -91,8 +91,8 @@ struct WinePrefix: Sendable {
 
     /// `drive_c/users/<user>`: game saves and settings (AppData, Documents,
     /// Saved Games) and Steam's sign-in. A prefix made by an engine that named
-    /// the user differently keeps its own folder until the next engine reset
-    /// moves it (`resetToEngineTemplate`), so this reads the folder that exists.
+    /// the user differently keeps its own folder until the next engine update
+    /// renames it (`applyEngineTemplate`), so this reads the folder that exists.
     var userProfileDir: URL {
         let users = driveC.appending(path: "users")
         let current = users.appending(path: Self.windowsUserName)
@@ -276,6 +276,10 @@ struct WinePrefix: Sendable {
                     log.warning("[create] i386-windows not found in engine — WoW64 (32-bit apps) may fail")
                 }
 
+                // The template's MachineGuid is shared by every install of
+                // this engine; give this prefix its own (Patterns 36, 58).
+                writeMachineGuid(UUID().uuidString.lowercased())
+
                 let dllCount = (try? fm.contentsOfDirectory(atPath: path.appending(path: "drive_c/windows/system32").path(percentEncoded: false)))?.filter { $0.hasSuffix(".dll") }.count ?? 0
                 log.info("[create] prefix created from template ✓ | DLLs in system32=\(dllCount)")
                 // No wineboot --update here. The template built by release-engine.sh is
@@ -304,163 +308,235 @@ struct WinePrefix: Sendable {
         log.info("[create] prefix created via wineboot --init ✓")
     }
 
-    /// Resets the prefix system files to the new engine's pre-built template, preserving
-    /// Steam user configuration (login session, library paths).
-    ///
-    /// This replaces the slow `wineboot --update` path for engine upgrades. The template
-    /// already has all the correct DLLs for the new Wine version, so no Wine process
-    /// needs to run during the reset. The operation is a file copy — instant and atomic.
-    ///
-    /// Preserved across the reset (saved before, restored after):
-    ///   - `drive_c/Program Files/Steam/config/loginusers.vdf` (or `Program Files (x86)/Steam` on older installs)
-    ///   - `drive_c/Program Files/Steam/config/config.vdf`
-    ///   - `steamapps/` (installed games)
-    ///   - the Windows user profile (game saves, settings, Steam's `local.vdf`),
-    ///     restored under `windowsUserName` whatever the old engine called it
-    func resetToEngineTemplate(engine: WineEngine) async throws {
-        let fm = FileManager.default
-        let templateURL = WineEngine.engineDir.appending(path: "prefix-template")
+    // MARK: - Engine updates
 
-        guard fm.fileExists(atPath: templateURL.path(percentEncoded: false)) else {
-            // No template available — fall back to wineboot --update
-            log.warning("[resetToTemplate] no template found — falling back to wineboot --update")
+    /// Brings the prefix up to the new engine's pre-built template without
+    /// deleting anything the user owns. Same result as Wine's own
+    /// `wineboot --update`, which took 230 s on this Mac (Oct 20 2026); this
+    /// is a file overlay plus a text merge of the registry.
+    ///
+    /// Until Oct 20 2026 an engine update deleted the prefix and restored an
+    /// allowlist: sign-in files, then steamapps/, the profile, the Steam
+    /// folder. Each round lost what the list missed: accepted EULAs, the
+    /// machine identity Steam's saved sign-in is tied to, and Steam's own
+    /// service, after which Steam waited on a hidden "Steam Service Error"
+    /// and no game started (engine-research Pattern 58).
+    func updateToEngineTemplate(engine: WineEngine) async throws {
+        let templateURL = WineEngine.engineDir.appending(path: "prefix-template")
+        guard FileManager.default.fileExists(atPath: templateURL.path(percentEncoded: false)) else {
+            log.warning("[updateToTemplate] no template found — falling back to wineboot --update")
             try await refreshSystemDLLs(engine: engine, engineTag: engine.engineVersion ?? "unknown")
             return
         }
+        let i386 = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
+        if !FileManager.default.fileExists(atPath: i386.path(percentEncoded: false)) {
+            log.warning("[updateToTemplate] i386-windows not found in engine — WoW64 (32-bit apps) may fail")
+        }
+        let update = try Self.applyEngineTemplate(templateURL, to: path, engineI386: i386)
+        if let renamed = update.renamedProfile {
+            log.info("[updateToTemplate] moved the profile \(renamed) to \(Self.windowsUserName)")
+        }
+        log.info("[updateToTemplate] \(update.itemsCopied) template item(s) copied, \(update.nativeFilesKept) native file(s) kept, \(update.keptRegistryKeys) registry key(s) kept, MachineGuid \(update.keptMachineGuid ?? "from the template"), \(update.syswow64Added) syswow64 file(s) added")
+        log.info("[updateToTemplate] prefix updated to the new engine template ✓")
+    }
 
-        log.info("[resetToTemplate] saving Steam config before prefix reset")
+    /// What `applyEngineTemplate` did, for the log.
+    struct TemplateUpdate: Equatable {
+        var renamedProfile: String?
+        var itemsCopied = 0
+        var nativeFilesKept = 0
+        var keptRegistryKeys = 0
+        var keptMachineGuid: String?
+        var syswow64Added = 0
+    }
 
-        // Save important Steam config files so login session survives the reset.
-        // Capture the full URL for each file so the restore step can write back to
-        // the exact same path in the new prefix (prefix URL doesn't change).
-        let configFilesToPreserve: [URL] = [
-            steamInstallDir.appending(path: "config/loginusers.vdf"),
-            steamInstallDir.appending(path: "config/config.vdf"),
-        ]
-        let savedConfigs: [(dest: URL, data: Data)] = configFilesToPreserve.compactMap { url in
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            return (dest: url, data: data)
+    /// Lays `template` over `prefix`:
+    ///   - files: every template file replaces the prefix's copy unless that
+    ///     copy is native where the template's is Wine's (`overlay`); files it
+    ///     doesn't ship stay (the Steam install and games, `Common Files\Steam`,
+    ///     whatever installers wrote, `system32` additions). Under
+    ///     `drive_c/users` only missing items are added: saves, settings and
+    ///     Steam's `local.vdf` live there.
+    ///   - registry (`system.reg`, `user.reg`): `mergedRegistry`, with the
+    ///     prefix's own MachineGuid (Steam's machine ID hashes it).
+    ///   - `dosdevices` c: and z: (machine-local, not in the template) and the
+    ///     engine's 32-bit files in `syswow64`.
+    /// A profile an older engine named differently becomes `windowsUserName`'s
+    /// first. Running it twice changes nothing.
+    static func applyEngineTemplate(_ template: URL, to prefix: URL, engineI386: URL) throws -> TemplateUpdate {
+        let fm = FileManager.default
+        var update = TemplateUpdate()
+
+        let users = prefix.appending(path: "drive_c/users")
+        let currentProfile = users.appending(path: windowsUserName)
+        if !fm.fileExists(atPath: currentProfile.path(percentEncoded: false)),
+           let other = ((try? fm.contentsOfDirectory(atPath: users.path(percentEncoded: false))) ?? [])
+            .first(where: { $0 != "Public" && !$0.hasPrefix(".") }) {
+            try fm.moveItem(at: users.appending(path: other), to: currentProfile)
+            update.renamedProfile = other
         }
 
-        log.info("[resetToTemplate] saved \(savedConfigs.count) Steam config file(s)")
+        (update.itemsCopied, update.nativeFilesKept) = try overlay(template, onto: prefix)
 
-        // Preserve the Windows user profile the same way: games keep saves and
-        // settings there (AppData, Documents, Saved Games), and Steam its
-        // sign-in (AppData/Local/Steam/local.vdf). Without this every engine
-        // update deleted local saves. It comes back under the current user
-        // name, so a prefix whose engine used another name keeps its data.
-        let profileURL = userProfileDir
-        let profileHold = path.deletingLastPathComponent()
-            .appending(path: "profile-preserve-\(UUID().uuidString)")
-        var profileMoved = false
-        if fm.fileExists(atPath: profileURL.path(percentEncoded: false)) {
-            do {
-                try fm.moveItem(at: profileURL, to: profileHold)
-                profileMoved = true
-                log.info("[resetToTemplate] moved user profile \(profileURL.lastPathComponent) aside")
-            } catch {
-                log.warning("[resetToTemplate] could not move the user profile aside — saves will be lost: \(error.localizedDescription)")
+        for hive in ["system.reg", "user.reg"] {
+            let hiveURL = prefix.appending(path: hive)
+            let installed = try fm.fileExists(atPath: hiveURL.path(percentEncoded: false))
+                ? String(contentsOf: hiveURL, encoding: .utf8) : ""
+            let templateHive = try String(contentsOf: template.appending(path: hive), encoding: .utf8)
+            let merge = mergedRegistry(installed: installed, template: templateHive)
+            var merged = merge.text
+            if hive == "system.reg", let guid = machineGuid(inSystemReg: installed) {
+                merged = settingMachineGuid(guid, inSystemReg: merged)
+                update.keptMachineGuid = guid
             }
+            try merged.write(to: hiveURL, atomically: true, encoding: .utf8)
+            update.keptRegistryKeys += merge.keptKeys
         }
 
-        // Preserve installed games across the reset. steamapps/ (game files +
-        // appmanifest ACFs) is multi-GB, so move it aside with a same-volume
-        // rename (instant, no copy) and move it back after the template copy.
-        // Without this, every engine version bump wipes the user's installed
-        // games and forces full re-downloads.
-        let steamappsURL = steamInstallDir.appending(path: "steamapps")
-        let steamappsHold = path.deletingLastPathComponent()
-            .appending(path: "steamapps-preserve-\(UUID().uuidString)")
-        var steamappsMoved = false
-        if fm.fileExists(atPath: steamappsURL.path(percentEncoded: false)) {
-            do {
-                try fm.moveItem(at: steamappsURL, to: steamappsHold)
-                steamappsMoved = true
-                log.info("[resetToTemplate] moved steamapps/ aside to preserve installed games")
-            } catch {
-                log.warning("[resetToTemplate] could not move steamapps/ aside — installed games will be lost: \(error.localizedDescription)")
-            }
-        }
-
-        // Remove the existing prefix and copy the new template
-        log.info("[resetToTemplate] removing existing prefix")
-        try fm.removeItem(at: path)
-
-        log.info("[resetToTemplate] copying new engine template")
-        try fm.copyItem(at: templateURL, to: path)
-
-        // Recreate dosdevices with correct machine-local symlinks.
-        // The template ships without dosdevices (they point to the build machine's paths).
-        // Both c: and z: are required — z: maps the entire Unix filesystem so Wine can
-        // resolve host paths (e.g. for SteamSetup.exe passed as an absolute Unix path).
-        let dosdev = path.appending(path: "dosdevices")
-        try? fm.removeItem(at: dosdev)
+        // Both are required: z: maps the Unix filesystem so Wine can resolve
+        // host paths (e.g. SteamSetup.exe passed as an absolute Unix path).
+        let dosdev = prefix.appending(path: "dosdevices")
         try fm.createDirectory(at: dosdev, withIntermediateDirectories: true)
-        try fm.createSymbolicLink(
-            atPath: dosdev.appending(path: "c:").path(percentEncoded: false),
-            withDestinationPath: "../drive_c"
-        )
-        try fm.createSymbolicLink(
-            atPath: dosdev.appending(path: "z:").path(percentEncoded: false),
-            withDestinationPath: "/"
-        )
-
-        // Populate syswow64 with all 32-bit PE files from the engine.
-        // Wine 8.x left syswow64 empty; Wine 11.x does not create it at all.
-        // Always create the directory and populate it from i386-windows/ so that
-        // 32-bit executables (SteamSetup.exe) can find kernel32.dll via WoW64.
-        let i386Src  = WineEngine.engineDir.appending(path: "wine/lib/wine/i386-windows")
-        let syswow64 = path.appending(path: "drive_c/windows/syswow64")
-        if fm.fileExists(atPath: i386Src.path(percentEncoded: false)) {
-            try? fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
-            let i386Files = (try? fm.contentsOfDirectory(atPath: i386Src.path(percentEncoded: false))) ?? []
-            var wow64Copied = 0
-            for file in i386Files where Self.isWoW64FileType(file) {
-                let dest = syswow64.appending(path: file)
-                guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
-                try? fm.copyItem(at: i386Src.appending(path: file), to: dest)
-                wow64Copied += 1
-            }
-            log.info("[resetToTemplate] populated syswow64 with \(wow64Copied) 32-bit files for WoW64")
-        } else {
-            log.warning("[resetToTemplate] i386-windows not found in engine — WoW64 (32-bit apps) may fail")
-        }
-
-        // Restore saved Steam config files to their original paths.
-        // Writing back to the captured URL is correct because the prefix URL hasn't changed —
-        // only its contents were replaced by the template copy above.
-        for (dest, data) in savedConfigs {
-            try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: dest)
-        }
-
-        // Restore the user profile over the template's empty one.
-        if profileMoved {
-            let profileDest = driveC.appending(path: "users/\(Self.windowsUserName)")
-            do {
-                try? fm.removeItem(at: profileDest)
-                try fm.createDirectory(at: profileDest.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fm.moveItem(at: profileHold, to: profileDest)
-                log.info("[resetToTemplate] restored user profile as \(Self.windowsUserName) (saves preserved)")
-            } catch {
-                log.error("[resetToTemplate] failed to restore the user profile from \(profileHold.lastPathComponent): \(error.localizedDescription)")
+        for (drive, target) in [("c:", "../drive_c"), ("z:", "/")] {
+            let link = dosdev.appending(path: drive).path(percentEncoded: false)
+            if (try? fm.destinationOfSymbolicLink(atPath: link)) != target {
+                try? fm.removeItem(atPath: link)
+                try fm.createSymbolicLink(atPath: link, withDestinationPath: target)
             }
         }
 
-        // Restore steamapps/ (installed games + ACF manifests).
-        if steamappsMoved {
-            do {
-                try fm.createDirectory(at: steamInstallDir, withIntermediateDirectories: true)
-                try fm.moveItem(at: steamappsHold, to: steamappsURL)
-                log.info("[resetToTemplate] restored steamapps/ (installed games preserved)")
-            } catch {
-                log.error("[resetToTemplate] failed to restore steamapps/ from \(steamappsHold.lastPathComponent): \(error.localizedDescription)")
+        // Wine 11.x creates no syswow64; 32-bit executables (SteamSetup.exe)
+        // need the engine's i386 PE files there to find kernel32.dll.
+        let syswow64 = prefix.appending(path: "drive_c/windows/syswow64")
+        let i386Files = (try? fm.contentsOfDirectory(atPath: engineI386.path(percentEncoded: false))) ?? []
+        if !i386Files.isEmpty {
+            try fm.createDirectory(at: syswow64, withIntermediateDirectories: true)
+        }
+        for file in i386Files where isWoW64FileType(file) {
+            let dest = syswow64.appending(path: file)
+            guard !fm.fileExists(atPath: dest.path(percentEncoded: false)) else { continue }
+            try fm.copyItem(at: engineI386.appending(path: file), to: dest)
+            update.syswow64Added += 1
+        }
+        return update
+    }
+
+    /// Copies `template` over `prefix` (see `applyEngineTemplate`). Skips the
+    /// two hives (merged instead) and `dosdevices`; copies symlinks as links,
+    /// never follows them. Like Wine's own fake-DLL install (setupapi
+    /// fakedll.c, "is not a fake dll, not overwriting it"), one of Wine's
+    /// files never replaces a file that isn't one: the Microsoft runtimes
+    /// Steam's installers put in system32 stay, and Steam's registry record
+    /// of those installs stays true. Returns the items copied and the native
+    /// files kept.
+    static func overlay(_ template: URL, onto prefix: URL) throws -> (copied: Int, nativeKept: Int) {
+        let fm = FileManager.default
+        guard let walker = fm.enumerator(atPath: template.path(percentEncoded: false)) else { return (0, 0) }
+        var copied = 0
+        var nativeKept = 0
+        while let relative = walker.nextObject() as? String {
+            if ["system.reg", "user.reg", "dosdevices"].contains(relative) {
+                walker.skipDescendants()
+                continue
+            }
+            let source = template.appending(path: relative)
+            let destination = prefix.appending(path: relative)
+            let isDirectory = walker.fileAttributes?[.type] as? FileAttributeType == .typeDirectory
+            let existing = (try? fm.attributesOfItem(atPath: destination.path(percentEncoded: false)))?[.type] as? FileAttributeType
+            if isDirectory && existing == .typeDirectory { continue }
+            if isDirectory { walker.skipDescendants() }
+            if existing != nil {
+                if relative.hasPrefix("drive_c/users/") { continue }
+                if existing == .typeRegular, isWineBuiltin(source), !isWineBuiltin(destination) {
+                    nativeKept += 1
+                    continue
+                }
+                try fm.removeItem(at: destination)
+            }
+            try fm.copyItem(at: source, to: destination)
+            copied += 1
+        }
+        return (copied, nativeKept)
+    }
+
+    /// Whether `url` is one of Wine's own PE files: "Wine builtin DLL" or
+    /// "Wine placeholder DLL" right after the DOS header, the check of
+    /// setupapi's `is_fake_dll`.
+    static func isWineBuiltin(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 96), data.count == 96 else { return false }
+        let header = [UInt8](data)
+        guard header[0] == 0x4D, header[1] == 0x5A else { return false }
+        let lfanew = header[60..<64].reversed().reduce(0) { $0 << 8 | Int($1) }
+        guard lfanew >= 96 else { return false }
+        return ["Wine builtin DLL", "Wine placeholder DLL"].contains {
+            header[64...].starts(with: Array($0.utf8) + [0])
+        }
+    }
+
+    /// Wine registry text after an engine update: the template's keys, then
+    /// every installed key the template doesn't define (Steam's service and
+    /// settings, games' own keys such as Unity's PlayerPrefs). A key both
+    /// define comes from the template, as `wineboot --update` re-applies
+    /// wine.inf; keys match case-insensitively, like the registry. Returns
+    /// the text and how many installed keys it kept.
+    static func mergedRegistry(installed: String, template: String) -> (text: String, keptKeys: Int) {
+        let templateHive = registrySections(template)
+        let templateKeys = Set(templateHive.sections.map(\.key))
+        let kept = registrySections(installed).sections.filter { !templateKeys.contains($0.key) }
+        let lines = templateHive.preamble + (templateHive.sections + kept).flatMap(\.lines)
+        return (lines.joined(separator: "\n"), kept.count)
+    }
+
+    /// Splits Wine registry text into the lines before the first key and one
+    /// entry per `[key] timestamp` header, each running to the next header
+    /// (its trailing blank line included). No value line starts with `[`:
+    /// Wine escapes newlines in strings and indents hex continuations.
+    private static func registrySections(_ text: String) -> (preamble: [Substring], sections: [(key: String, lines: [Substring])]) {
+        var preamble: [Substring] = []
+        var sections: [(key: String, lines: [Substring])] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("["), let close = line.lastIndex(of: "]") {
+                sections.append((line[line.index(after: line.startIndex)..<close].lowercased(), [line]))
+            } else if sections.isEmpty {
+                preamble.append(line)
+            } else {
+                sections[sections.count - 1].lines.append(line)
             }
         }
+        return (preamble, sections)
+    }
 
-        log.info("[resetToTemplate] restored \(savedConfigs.count) Steam config file(s)")
+    // MARK: - Machine identity
 
-        log.info("[resetToTemplate] prefix reset to new engine template ✓")
+    /// The MachineGuid (`HKLM\Software\Microsoft\Cryptography`) in a
+    /// `system.reg` text, or nil when it has none.
+    static func machineGuid(inSystemReg reg: String) -> String? {
+        let key = #""MachineGuid"=""#
+        guard let start = reg.range(of: key),
+              let end = reg[start.upperBound...].firstIndex(of: "\"") else { return nil }
+        return String(reg[start.upperBound..<end])
+    }
+
+    /// `reg` with its MachineGuid set to `guid`; unchanged when it has none.
+    static func settingMachineGuid(_ guid: String, inSystemReg reg: String) -> String {
+        guard let current = machineGuid(inSystemReg: reg), current != guid else { return reg }
+        return reg.replacingOccurrences(of: #""MachineGuid"="\#(current)""#, with: #""MachineGuid"="\#(guid)""#)
+    }
+
+    /// Sets this prefix's MachineGuid in `system.reg`. A real key, not a
+    /// registry symlink, so editing the file is safe while no wineserver
+    /// runs for the prefix (one would write its own copy back on exit).
+    private func writeMachineGuid(_ guid: String) {
+        let regURL = path.appending(path: "system.reg")
+        do {
+            let reg = try String(contentsOf: regURL, encoding: .utf8)
+            try Self.settingMachineGuid(guid, inSystemReg: reg).write(to: regURL, atomically: true, encoding: .utf8)
+            log.info("[machineGuid] set to \(guid)")
+        } catch {
+            log.error("[machineGuid] could not write system.reg: \(error.localizedDescription)")
+        }
     }
 
     /// Ensures the four core Wine services Steam needs are registered:

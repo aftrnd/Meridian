@@ -197,11 +197,11 @@ final class BootstrapTests: XCTestCase {
     }
 
     /// Pattern 11 recurrence guard (Jun 19 2026). The versioned prefix-registry
-    /// counters (winRT / steamInstallPath / windowsVersion / staleSteamService)
-    /// live in global UserDefaults, NOT tied to prefix identity. When a prefix
-    /// is (re)built — fresh `create()` on a wiped bottle, OR
-    /// `resetToEngineTemplate()` on an engine change — the on-disk system.reg is
-    /// empty but the counters still read "already applied", so the step-3 setup
+    /// counters (winRT / steamInstallPath / windowsVersion) live in global
+    /// UserDefaults, NOT tied to prefix identity. When a prefix is (re)built —
+    /// fresh `create()` on a wiped bottle, OR `updateToEngineTemplate()` on an
+    /// engine change — the writes may be gone but the counters still read
+    /// "already applied", so the step-3 setup
     /// block SKIPS the writes. That left HL2's 32-bit `filesystem_stdio.dll`
     /// without the WoW64 crypto provider types → `CryptAcquireContextA` crash.
     ///
@@ -212,18 +212,23 @@ final class BootstrapTests: XCTestCase {
     func testBootstrap_resetsVersionedRegistryCountersOnPrefixRebuild() throws {
         let src = try readSource("Meridian/App/BootstrapManager.swift")
 
-        // The shared helper must exist and zero all four versioned counters.
+        // The shared helper must exist and zero the versioned counters.
         XCTAssertTrue(src.contains("func resetVersionedRegistryCounters"),
                       "BootstrapManager must define resetVersionedRegistryCounters() — the single source of truth for clearing prefix-registry counters")
         for counter in [
             "winRTRegistrationAppliedVersion = 0",
             "steamInstallPathRegistrationVersion = 0",
             "windowsVersionAppliedVersion = 0",
-            "staleSteamServiceCleanupVersion = 0",
         ] {
             XCTAssertTrue(src.contains(counter),
                           "resetVersionedRegistryCounters() must zero \(counter) so a rebuilt prefix re-applies every versioned registry mutation")
         }
+        // The stale-service cleanup DELETES the Steam Client Service. An engine
+        // update keeps the service Steam registered; re-running the cleanup
+        // would remove it and Steam would wait on a hidden "Steam Service
+        // Error" with no game starting (Pattern 58).
+        XCTAssertFalse(src.contains("staleSteamServiceCleanupVersion = 0"),
+                       "resetVersionedRegistryCounters() must not re-arm the Steam Client Service cleanup")
 
         // It must be invoked from BOTH (re)build paths — at least twice
         // (fresh create + engine reset). A single call site means one path
@@ -234,7 +239,7 @@ final class BootstrapTests: XCTestCase {
         // skips the registry setup.
         let mentions = src.components(separatedBy: "resetVersionedRegistryCounters()").count - 1
         XCTAssertGreaterThanOrEqual(mentions, 3,
-                      "resetVersionedRegistryCounters() must be called on BOTH prefix create (!prefix.exists) AND engine reset (resetToEngineTemplate) — found \(mentions) mention(s) incl. definition")
+                      "resetVersionedRegistryCounters() must be called on BOTH prefix create (!prefix.exists) AND engine update (updateToEngineTemplate) — found \(mentions) mention(s) incl. definition")
 
         // The counter must also be re-applied (not just zeroed) by the step-3
         // block, so the live prefix actually gets the keys after a reset.
