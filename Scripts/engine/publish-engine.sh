@@ -10,12 +10,14 @@
 #
 #   1. build-deps.sh      x86_64 libraries (stamped; finished packages skip)
 #   2. build-wine.sh      Wine from its published LGPL source
-#   3. package-engine.sh  stage, relink, sign, prefix template, tarball
-#   4. smoke/smoke-test.sh  DXMT + wined3d (32/64-bit) and HTTPS, headless
-#   5. gh release create  vX.Y.Z-engine with the tarball attached
+#   3. build-d3d9.sh      DXVK d3d9, Vulkan loader, KosmicKrisp (D3D9 → Metal)
+#   4. package-engine.sh  stage, relink, sign, prefix template, tarball
+#   5. smoke/smoke-test.sh  DXMT, wined3d and DXVK (32/64-bit) and HTTPS, headless
+#   6. gh release create  vX.Y.Z-engine with the tarball attached
 #
 # Prerequisites: Xcode command line tools, and
-#   brew install meson ninja cmake bison flex autoconf automake libtool mingw-w64 coreutils gh
+#   brew install meson ninja cmake bison flex autoconf automake libtool mingw-w64 coreutils gh \
+#                glslang llvm libclc spirv-llvm-translator spirv-tools
 
 source "$(dirname "$0")/env.sh"
 
@@ -34,6 +36,7 @@ fi
 
 bash "$HERE/build-deps.sh"
 [ -x "$WORK/wine-install/bin/wine" ] || bash "$HERE/build-wine.sh"
+[ -f "$WORK/d3d9-install/versions.txt" ] || bash "$HERE/build-d3d9.sh"
 bash "$HERE/package-engine.sh" "$TAG"
 bash "$HERE/smoke/smoke-test.sh"
 

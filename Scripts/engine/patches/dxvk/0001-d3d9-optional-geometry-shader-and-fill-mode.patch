@@ -1,0 +1,63 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 1c34094d..49dda045 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -3274,7 +3274,7 @@ namespace dxvk {
+       static bool s_errorShown = false;
+ 
+       if (!std::exchange(s_errorShown, true))
+-        Logger::err("D3D9DeviceEx::ProcessVertices: SWVP emu unsupported (vertexPipelineStoresAndAtomics)");
++        Logger::err("D3D9DeviceEx::ProcessVertices: SWVP emu unsupported (vertexPipelineStoresAndAtomics, geometryShader)");
+ 
+       return D3D_OK;
+     }
+@@ -4712,7 +4712,8 @@ namespace dxvk {
+ 
+ 
+   bool D3D9DeviceEx::SupportsSWVP() {
+-    return m_dxvkDevice->features().core.features.vertexPipelineStoresAndAtomics;
++    const auto& features = m_dxvkDevice->features().core.features;
++    return features.vertexPipelineStoresAndAtomics && features.geometryShader;
+   }
+ 
+ 
+@@ -7049,7 +7050,18 @@ namespace dxvk {
+     state.setCullMode(DecodeCullMode(D3DCULL(rs[D3DRS_CULLMODE])));
+     state.setDepthClip(true);
+     state.setFrontFace(VK_FRONT_FACE_CLOCKWISE);
+-    state.setPolygonMode(DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE])));
++    VkPolygonMode polygonMode = DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE]));
++
++    if (unlikely(polygonMode != VK_POLYGON_MODE_FILL && !m_dxvkDevice->features().core.features.fillModeNonSolid)) {
++      static bool s_warningShown = false;
++
++      if (!std::exchange(s_warningShown, true))
++        Logger::warn("D3D9DeviceEx: Wireframe and point fill unsupported (fillModeNonSolid), drawing solid");
++
++      polygonMode = VK_POLYGON_MODE_FILL;
++    }
++
++    state.setPolygonMode(polygonMode);
+     state.setFlatShading(m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT);
+     state.setSampleCount(m_state.renderStates[D3DRS_MULTISAMPLEANTIALIAS]
+       ? VkSampleCountFlags(0u)
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 7e3d16a7..9d7f5bac 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -850,10 +850,13 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, depthClamp, true),
+       ENABLE_FEATURE(core.features, drawIndirectFirstInstance, false),
+       ENABLE_FEATURE(core.features, dualSrcBlend, true),
+-      ENABLE_FEATURE(core.features, fillModeNonSolid, true),
++      // Optional for D3D9 on Metal drivers (KosmicKrisp): D3D9 only uses
++      // geometry shaders for ProcessVertices and non-solid fill for
++      // wireframe/point modes, both of which check for the feature.
++      ENABLE_FEATURE(core.features, fillModeNonSolid, false),
+       ENABLE_FEATURE(core.features, fragmentStoresAndAtomics, true),
+       ENABLE_FEATURE(core.features, fullDrawIndexUint32, true),
+-      ENABLE_FEATURE(core.features, geometryShader, true),
++      ENABLE_FEATURE(core.features, geometryShader, false),
+       ENABLE_FEATURE(core.features, imageCubeArray, true),
+       ENABLE_FEATURE(core.features, independentBlend, true),
+       ENABLE_FEATURE(core.features, largePoints, false),

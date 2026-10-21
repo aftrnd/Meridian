@@ -1,0 +1,24 @@
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -3000,15 +3000,15 @@
+     VkExtensionProperties *properties = NULL;
+     uint32_t count = 0;
+     VkResult res;
+-    const char *libvulkan, *graphics_backend;
++    const char *libvulkan;
+ 
+-    /* CW HACK 25909: Allow specifying libvulkan */
+-    if (!(libvulkan = getenv( "CX_LIBVULKAN" )) ||
+-        !(graphics_backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" )) ||
+-        strcmp( graphics_backend, "wined3d" ))
++    /* Meridian: WINE_VULKAN_LIBRARY names the host Vulkan library to load in
++     * place of MoltenVK, e.g. a Vulkan loader that selects its driver through
++     * VK_DRIVER_FILES (KosmicKrisp for D3D9 games). Replaces CW HACK 25909. */
++    if (!(libvulkan = getenv( "WINE_VULKAN_LIBRARY" )))
+         libvulkan = SONAME_LIBVULKAN;
+     else
+-        ERR( "Using %s\n", libvulkan );
++        TRACE( "Using %s\n", libvulkan );
+ 
+     if (!(vulkan_handle = dlopen( libvulkan, RTLD_NOW )))
+     {
