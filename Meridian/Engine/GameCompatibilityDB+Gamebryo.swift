@@ -85,6 +85,18 @@ extension GameCompatibilityDB {
             Meridian now also activates the game a launcher starts (activation \
             alone did not fix the frame, 00:06 run). \
             \
+            STALL (Oct 21 2026, v4.2.0-engine, 1920×1080 windowed): menus ~118 \
+            fps, then 1-3 fps about ten seconds into the world. The game's main \
+            thread waited on Wine's DirectSound mixer, which used a full core: \
+            every 32-bit Wine DLL was compiled to x87, which Rosetta runs slowly, \
+            and dsound resamples each 44.1/22.05 kHz sound to the 48 kHz mix. \
+            Fixed for every 32-bit game by building them with SSE math \
+            (v4.2.1-engine, Pattern 60); not yet played on it. \
+            \
+            LAUNCHER: Options › Windowed lists only resolutions up to 1920×1080 \
+            (PCGamingWiki: windowed mode supports a limited set); untick it for \
+            fullscreen, which needs engine patch 0006 to fill the screen. \
+            \
             SETTINGS FOR SPEED until the D3D9 → Metal path lands (Pattern 32): \
             2560×1440 (exactly half the 5K panel each way, so it scales sharp; \
             the same 1× path Half-Life 2 runs well on) and antialiasing off or 2×. \
