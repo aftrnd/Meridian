@@ -161,6 +161,9 @@ final class Launcher {
     /// while its window is shown; nil otherwise. The card asks for it.
     private(set) var steamWaitingOnPlayer: String?
     private(set) var downloadProgress: Double?
+    /// The install in progress brings an installed game up to date rather
+    /// than downloading it from scratch: the UI says "Updating".
+    private(set) var installIsUpdate = false
     private(set) var downloadBytesDone: Int64 = 0
     private(set) var downloadBytesTotal: Int64 = 0
     private(set) var downloadRateBps: Double = 0
@@ -378,16 +381,25 @@ final class Launcher {
 
         activeAppID = game.id
         downloadProgress = nil
+        installIsUpdate = false
         runningSince = nil
         processesConfirmed = false
         resetLaunchStage()
 
         let steamID = steamAuth?.steamID ?? AppSettings.shared.steamCredentialSteamID
 
-        // Install if needed — headless via the DepotDownloader fork (no steam.exe).
-        if !prefix.isGameFullyInstalled(appID: game.id) {
+        // Install or update if needed — headless via the DepotDownloader fork
+        // (no steam.exe), unless Steam is already updating the game itself.
+        let installState = prefix.installState(appID: game.id)
+        if installState != .installed {
+            installIsUpdate = installState == .updateRequired
             do {
-                try await installHeadless(game: game, engine: engine, steamID: steamID)
+                if installIsUpdate, session.isReady, prefix.isSteamDownloading(appID: game.id) {
+                    try await waitForSteamUpdate(game: game, session: session)
+                }
+                if prefix.installState(appID: game.id) != .installed {
+                    try await installHeadless(game: game, engine: engine, steamID: steamID)
+                }
             } catch is CancellationError {
                 log.info("[pipeline] install cancelled")
                 launchState = .idle
@@ -771,6 +783,31 @@ final class Launcher {
         appendLog("Game exited")
     }
 
+    // MARK: - Private: Steam's own update
+
+    /// Steam is already applying this game's update (it auto-updates at
+    /// sign-in: Far Far West, Oct 22 2026, 2.8 GB within a minute of Steam
+    /// starting). Wait for it to commit rather than start a second download
+    /// into the same folder. Returns once the game is current, Steam exits,
+    /// or Steam stops downloading without finishing (its staging folder gone
+    /// for 5 s); the caller then updates the game itself if it still needs it.
+    private func waitForSteamUpdate(game: Game, session: SteamSession) async throws {
+        launchState = .installing(appID: game.id)
+        currentActivity = "Updating…"
+        appendLog("Steam is already updating \(game.name); waiting for it to finish")
+        log.info("[waitForSteamUpdate] appID=\(game.id) Steam is mid-update, waiting instead of a second download")
+        var lastSeenDownloading = ContinuousClock.now
+        while session.isReady, prefix.installState(appID: game.id) == .updateRequired {
+            if prefix.isSteamDownloading(appID: game.id) {
+                lastSeenDownloading = .now
+            } else if ContinuousClock.now - lastSeenDownloading > .seconds(5) {
+                break
+            }
+            try await Task.sleep(for: .seconds(1))
+        }
+        log.info("[waitForSteamUpdate] appID=\(game.id) done waiting, state=\(prefix.installState(appID: game.id))")
+    }
+
     // MARK: - Private: headless install (DepotDownloader)
 
     /// Installs an owned game headlessly via the DepotDownloader fork — no
@@ -789,7 +826,8 @@ final class Launcher {
             throw InstallError.installerMissing
         }
 
-        let installDirName = game.name
+        // An update goes into the folder the game is already in.
+        let installDirName = installIsUpdate ? (prefix.gameInstallDir(appID: game.id) ?? game.name) : game.name
         let installDir = prefix.steamInstallDir
             .appending(path: "steamapps/common/\(installDirName)")
 
@@ -798,12 +836,14 @@ final class Launcher {
         launchState = .installing(appID: game.id)
         // Steps only: the numbers are `downloadProgressText`, so the line
         // that names the step doesn't change on every progress tick.
-        currentActivity = resuming ? "Resuming download…" : "Preparing download…"
+        currentActivity = installIsUpdate ? "Preparing update…"
+            : resuming ? "Resuming download…" : "Preparing download…"
+        let downloadingActivity = installIsUpdate ? "Updating…" : "Downloading…"
         downloadProgress = nil
         downloadBytesDone = 0
         downloadBytesTotal = 0
         downloadRateBps = 0
-        appendLog("Starting install for \(game.name)")
+        appendLog("Starting \(installIsUpdate ? "update" : "install") for \(game.name)")
 
         // Rate smoothing across progress callbacks.
         var lastBytes: Int64 = 0
@@ -848,8 +888,8 @@ final class Launcher {
                     lastSampleAt = now
                 }
 
-                if self.currentActivity != "Downloading…" {
-                    self.currentActivity = "Downloading…"
+                if self.currentActivity != downloadingActivity {
+                    self.currentActivity = downloadingActivity
                 }
             }
         )
@@ -877,11 +917,12 @@ final class Launcher {
             buildID: result.buildID,
             depots: result.depots
         )
+        activeSession?.manifestRewritten(appID: game.id)
 
         downloadProgress = 1.0
         downloadRateBps = 0
-        currentActivity = "Installed"
-        appendLog("\(game.name) install complete (\(result.bytesDownloaded / (1024 * 1024)) MB)")
+        currentActivity = installIsUpdate ? "Updated" : "Installed"
+        appendLog("\(game.name) \(installIsUpdate ? "update" : "install") complete (\(result.bytesDownloaded / (1024 * 1024)) MB)")
         log.info("[installHeadless] ✓ appID=\(game.id) bytes=\(result.bytesDownloaded) buildid=\(result.buildID)")
     }
 

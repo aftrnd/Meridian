@@ -219,7 +219,7 @@ struct SearchView: View {
 
     private func gameState(for game: Game) -> GameCardState {
         guard launcher.activeAppID == game.id else {
-            return game.isInstalled ? .idle : .notInstalled
+            return GameCardState(resting: game)
         }
         switch launcher.launchState {
         case .downloading, .installing:
@@ -231,7 +231,7 @@ struct SearchView: View {
         case .stopping:
             return .stopping
         default:
-            return game.isInstalled ? .idle : .notInstalled
+            return GameCardState(resting: game)
         }
     }
 }

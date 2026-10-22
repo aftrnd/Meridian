@@ -50,11 +50,13 @@ enum GraphicsAPI: String {
     /// "DXVK → MoltenVK → Metal" for DX9, which draws nothing on this engine
     /// (engine-research-findings Patterns 27, 31). `d3d9OnMetal`: this Mac's
     /// engine routes D3D9 through DXVK and KosmicKrisp (`WineEngine.dxvkPath`).
-    func translationLayer(d3d9OnMetal: Bool) -> String {
+    /// `d3d12OnD3DMetal`: the engine carries GPTK (`WineEngine.gptkPath`);
+    /// without it D3D12 is Wine's vkd3d on MoltenVK (Pattern 65, Animal Well).
+    func translationLayer(d3d9OnMetal: Bool, d3d12OnD3DMetal: Bool) -> String {
         switch self {
         case .dx9:     return d3d9OnMetal ? "DXVK → KosmicKrisp → Metal" : "wined3d → OpenGL → Metal"
         case .dx11:    return "DXMT → Metal"
-        case .dx12:    return "GPTK → D3DMetal → Metal"
+        case .dx12:    return d3d12OnD3DMetal ? "GPTK → D3DMetal → Metal" : "vkd3d → MoltenVK → Metal"
         case .vulkan:  return "MoltenVK"
         case .unknown: return "Wine default"
         }

@@ -58,8 +58,21 @@ final class SteamSession {
 
     /// Apps with an appmanifest when the running steam.exe started. Steam
     /// reads `appmanifest_*.acf` once per start, so a game Meridian installs
-    /// after that (DepotDownloader) is unknown to it until it restarts.
+    /// after that (DepotDownloader) is unknown to it until it restarts, and
+    /// one Meridian updates is still the old build to it
+    /// (`manifestRewritten(appID:)`).
     private var appsSteamLoaded: Set<Int> = []
+
+    /// Meridian rewrote `appID`'s appmanifest (a DepotDownloader install or
+    /// update). A running Steam still holds what it read at start, for an
+    /// update the old build with "Update Required", and would run the update
+    /// again before launching (its scheduler puts a launching app at
+    /// "Priority First", content_log Oct 20 2026). Counting the app as not
+    /// loaded makes the next `warmUp`/launch restart Steam so it reads the
+    /// new manifest, as for a new install.
+    func manifestRewritten(appID: Int) {
+        appsSteamLoaded.remove(appID)
+    }
 
     /// License agreements the player accepted in Meridian, written into
     /// Steam's localconfig.vdf the next time steam.exe starts: Steam reads
@@ -243,8 +256,8 @@ final class SteamSession {
     /// Valve has made is found here rather than mid-launch (`state ==
     /// .signedOut`, which `Launcher` checks before it starts).
     ///
-    /// With `appID` (a game that just finished installing) a running Steam
-    /// that started before the install is restarted now, in the background,
+    /// With `appID` (a game that just finished installing or updating) a
+    /// running Steam that started before that is restarted now, in the background,
     /// instead of when the player presses Play: Steam reads install
     /// manifests only when it starts (Pattern 43).
     func warmUp(engine: WineEngine, appID: Int? = nil) {
@@ -280,7 +293,7 @@ final class SteamSession {
             } else if let appID, !appsSteamLoaded.contains(appID) {
                 // Otherwise -applaunch fails at once with AppError_18 and no
                 // game ever starts (Endacopia, The Baby in Yellow, Oct 12 2026).
-                log.info("[ensureReadyForDRM] appID=\(appID) was installed after Steam started — restarting Steam so it loads the game")
+                log.info("[ensureReadyForDRM] appID=\(appID) was installed or updated after Steam started — restarting Steam so it loads the game")
             } else if !pendingEulaAcceptances.isEmpty {
                 log.info("[ensureReadyForDRM] license agreement accepted in Meridian — restarting Steam so it reads the answer")
             } else {
@@ -1039,36 +1052,38 @@ final class SteamSession {
             }
         }
         let profile = compat.profile(for: appID)
-        if let profile {
-            switch profile.dxmtMode {
-            case .disabled:
-                // Per-game opt-out of DXMT: Wine's own D3D for games DXMT
-                // mis-renders. Dropping lib/dxmt from the search path is what
-                // selects wined3d; `b` keeps a game-shipped d3d11 from winning.
-                env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)
-                env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
-                    env["WINEDLLOVERRIDES"],
-                    overriding: ["d3d11", "dxgi"],
-                    with: "b"
-                )
-            case .required, .auto:
-                break
-            }
-        }
 
-        // DX12 → GPTK routing. The effective graphics API is the explicit
+        // The effective graphics API is the explicit
         // profile's (hand-verified override) when set, otherwise the resolved
         // value from GameStackResolver (PCGamingWiki's tested Direct3D version,
         // or local engine-default). This means a DX12 game with NO explicit
-        // compat entry — identified by detection/PCGW — still gets the GPTK
-        // (D3D12 → D3DMetal → Metal) path instead of falling through to the
-        // DX11/DXMT global default. The resolver cache is warmed by the
+        // compat entry — identified by detection/PCGW — still gets the DX12
+        // route below (GPTK where present, else Wine's own D3D) instead of
+        // falling through to the DX11/DXMT global default. The resolver cache is warmed by the
         // launcher immediately before this is called (`resolve(appID:...)`);
         // on a cold cache this is nil and behaviour is unchanged (DXMT default).
         let effectiveAPI: GraphicsAPI = {
             if let a = profile?.graphicsAPI, a != .unknown { return a }
             return GameStackResolver.shared.cached(appID: appID)?.graphicsAPI ?? .unknown
         }()
+
+        // Wine's own D3D: for games DXMT mis-renders (per-game opt-out), and
+        // for every DX12 game without GPTK. Wine's d3d12 (vkd3d) asks the DXGI
+        // adapter for Wine's private IWineDXGIAdapter (d3d12_main.c
+        // d3d12_get_adapter), which DXMT's dxgi doesn't implement, so
+        // D3D12CreateDevice fails (Animal Well, Oct 22 2026, Pattern 65).
+        // Dropping lib/dxmt from the search path is what selects wined3d; `b`
+        // keeps a game-shipped d3d11 or dxgi from winning.
+        if profile?.dxmtMode == .disabled || (effectiveAPI == .dx12 && engine.gptkPath == nil) {
+            env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)
+            env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
+                env["WINEDLLOVERRIDES"],
+                overriding: ["d3d11", "dxgi"],
+                with: "b"
+            )
+        }
+
+        // DX12 → GPTK where the engine carries it: D3D12 → D3DMetal → Metal.
         if effectiveAPI == .dx12, let gptk = engine.gptkPath {
             // GPTK's builtins (d3d12, dxgi, d3d11) first in the search path.
             env["WINEDLLPATH"] = engine.dllSearchPath(preferring: "\(gptk)/wine")
@@ -1176,6 +1191,14 @@ final class SteamSession {
                 // Steam asks in its own window instead (Launcher shows it).
                 log.error("[launchSteamProcess] couldn't record accepted license agreements: \(error.localizedDescription)")
             }
+        }
+        // Steam's "Grab a controller and kick back!" screen stays closed; the
+        // game page shows controller support instead (Pattern 64).
+        do {
+            try prefix.hideControllerRecommendedScreen(steamID64: AppSettings.shared.steamCredentialSteamID)
+        } catch {
+            // Steam shows its own screen instead (Launcher brings its window up).
+            log.error("[launchSteamProcess] couldn't turn off Steam's controller screen: \(error.localizedDescription)")
         }
         connectionLogOffset = connectionLogFileSize()
         webhelperLogOffset = fileSize(of: prefix.steamInstallDir

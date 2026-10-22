@@ -20,10 +20,10 @@ final class SteamLibraryStore {
     private(set) var loadError: String?
     private(set) var lastRefreshed: Date?
 
-    /// Background task that polls ACF files every 5 seconds and flips
-    /// `isInstalled` on any game whose state changed on disk. Keeps the
-    /// Install/Play button accurate when Steam downloads a game silently
-    /// (e.g. via the no-restart IPC path) without Meridian's download loop.
+    /// Background task that polls ACF files every 5 seconds and updates
+    /// `installState` on any game whose state changed on disk. Keeps the
+    /// Install/Update/Play button accurate when Steam changes a game on its
+    /// own: an update found at sign-in, or one it applies in the background.
     @ObservationIgnored private var installPollTask: Task<Void, Never>?
 
     var searchQuery: String = ""
@@ -482,7 +482,7 @@ final class SteamLibraryStore {
     @ObservationIgnored private var installStatePollingSuspended = false
 
     /// Starts a 5-second background poll that re-reads ACF files and updates
-    /// `isInstalled` flags without a full API refresh. Called once after the
+    /// each game's `installState` without a full API refresh. Called once after the
     /// library loads; idempotent — cancels any prior task before starting.
     func startInstallStatePolling() {
         guard !installStatePollingSuspended else { return }
@@ -511,7 +511,7 @@ final class SteamLibraryStore {
         }
     }
 
-    /// Reads ACF state for every game in the library and updates `isInstalled`
+    /// Reads ACF state for every game in the library and updates `installState`
     /// in-memory when it differs from disk. The disk scan runs OFF the main
     /// actor: done here it read every game's ACF and re-parsed
     /// libraryfolders.vdf per game, ~22 ms of main thread every 5 s, a
@@ -521,30 +521,33 @@ final class SteamLibraryStore {
     private func syncInstallStateFromDisk() async {
         guard !games.isEmpty else { return }
         let appIDs = games.map(\.id)
-        let installed = await Task.detached(priority: .utility) { () -> Set<Int>? in
+        let onDisk = await Task.detached(priority: .utility) { () -> [Int: GameInstallState]? in
             let prefix = WinePrefix.defaultPrefix
             guard prefix.exists else { return nil }
-            return prefix.fullyInstalledAppIDs(among: appIDs)
+            return prefix.installStates(among: appIDs)
         }.value
-        guard let installed, !Task.isCancelled else { return }
+        guard let onDisk, !Task.isCancelled else { return }
 
         var changedIDs = Set<Int>()
         for idx in games.indices {
             let appID = games[idx].id
-            let onDisk = installed.contains(appID)
-            guard games[idx].isInstalled != onDisk else { continue }
-            games[idx].isInstalled = onDisk
+            let state = onDisk[appID] ?? .notInstalled
+            let previous = games[idx].installState
+            guard previous != state else { continue }
+            games[idx].installState = state
             changedIDs.insert(appID)
-            if onDisk {
-                log.info("[installPoll] appID=\(appID) '\(games[idx].name)' became installed — updating UI")
-                settings.markInstalled(appID: appID)
-            } else {
+            if state == .notInstalled {
                 settings.markNotInstalled(appID: appID)
+            } else {
+                let change = state == .updateRequired ? "has an update"
+                    : previous == .updateRequired ? "finished updating" : "became installed"
+                log.info("[installPoll] appID=\(appID) '\(games[idx].name)' \(change) — updating UI")
+                settings.markInstalled(appID: appID)
             }
         }
         guard !changedIDs.isEmpty else { return }
         for idx in recentGames.indices where changedIDs.contains(recentGames[idx].id) {
-            recentGames[idx].isInstalled = installed.contains(recentGames[idx].id)
+            recentGames[idx].installState = onDisk[recentGames[idx].id] ?? .notInstalled
         }
     }
 
@@ -555,7 +558,7 @@ final class SteamLibraryStore {
         } else {
             settings.markNotInstalled(appID: appID)
         }
-        updateInstalledFlag(for: appID, installed: installed)
+        updateInstallState(for: appID, to: installed ? .installed : .notInstalled)
     }
 
     // MARK: - Private helpers
@@ -578,13 +581,13 @@ final class SteamLibraryStore {
                 log.info("[applyInstallCache] prefix absent — clearing \(self.settings.installedAppIDs.count) stale installed IDs")
                 settings.installedAppIDs = []
             }
-            return source.map { var g = $0; g.isInstalled = false; return g }
+            return source.map { var g = $0; g.installState = .notInstalled; return g }
         }
 
         var reconciledIDs = Set<Int>()
         let result: [Game] = source.map { game in
             var copy = game
-            copy.isInstalled = prefix.isGameFullyInstalled(appID: game.id)
+            copy.installState = prefix.installState(appID: game.id)
             if copy.isInstalled { reconciledIDs.insert(game.id) }
             return copy
         }
@@ -597,12 +600,12 @@ final class SteamLibraryStore {
         return result
     }
 
-    private func updateInstalledFlag(for appID: Int, installed: Bool) {
+    private func updateInstallState(for appID: Int, to state: GameInstallState) {
         if let idx = games.firstIndex(where: { $0.id == appID }) {
-            games[idx].isInstalled = installed
+            games[idx].installState = state
         }
         if let idx = recentGames.firstIndex(where: { $0.id == appID }) {
-            recentGames[idx].isInstalled = installed
+            recentGames[idx].installState = state
         }
     }
 
@@ -690,7 +693,7 @@ final class SteamLibraryStore {
             playtime2WeekMinutes: twoWeek,
             lastPlayedDate: base.lastPlayedDate,
             iconHash: base.iconHash,
-            isInstalled: base.isInstalled,
+            installState: base.installState,
             windowsOnly: base.windowsOnly,
             libraryCapsuleHash: base.libraryCapsuleHash,
             logoHash: base.logoHash,

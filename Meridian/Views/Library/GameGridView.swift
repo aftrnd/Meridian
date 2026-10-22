@@ -218,11 +218,22 @@ extension EnvironmentValues {
 enum GameCardState: Equatable {
     case idle
     case notInstalled
+    /// Installed, but Steam has a newer build to download first.
+    case updateAvailable
     /// Game files are downloading. `progress` is 0…1 or nil while preparing.
     case downloading(progress: Double?)
     case launching
     case running
     case stopping
+
+    /// A game nothing is happening to right now: its install state alone.
+    init(resting game: Game) {
+        switch game.installState {
+        case .installed:      self = .idle
+        case .updateRequired: self = .updateAvailable
+        case .notInstalled:   self = .notInstalled
+        }
+    }
 }
 
 struct GameGridView: View {
@@ -601,9 +612,7 @@ struct GameGridView: View {
 
         case .downloading(let progress):
             HStack(spacing: 4) {
-                ProgressView()
-                    .scaleEffect(0.5)
-                    .frame(width: 10, height: 10)
+                BadgeSpinner()
                 Text(progress.map { "\(Int($0 * 100))%" } ?? "Downloading")
                     .font(.caption2)
                     .fontWeight(.semibold)
@@ -617,10 +626,23 @@ struct GameGridView: View {
 
         case .launching, .stopping:
             HStack(spacing: 4) {
-                ProgressView()
-                    .scaleEffect(0.5)
-                    .frame(width: 10, height: 10)
+                BadgeSpinner()
                 Text(gameState == .launching ? "Launching" : "Stopping")
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.6), in: Capsule())
+            .padding(6)
+
+        case .updateAvailable:
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                Text("Update")
                     .font(.caption2)
                     .fontWeight(.semibold)
                     .foregroundStyle(.white)
@@ -660,6 +682,22 @@ struct GameGridView: View {
 
     private var cardBorderWidth: CGFloat {
         (isRunning || isSelected) ? 1.5 : 1
+    }
+}
+
+// MARK: - Badge spinner
+
+/// The status badge's busy glyph: SF Symbols' spinner at the badge's text
+/// size, white on the dark capsule, like the Update badge's arrow. A
+/// `ProgressView` scaled by 0.5 drew AppKit's 32 pt spinner at 16 pt in a
+/// 10 pt frame, in light mode's dark gray (user, Oct 22 2026: "a bit big
+/// and incorrect color").
+private struct BadgeSpinner: View {
+    var body: some View {
+        Image(systemName: "progress.indicator")
+            .font(.caption2)
+            .foregroundStyle(.white)
+            .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing)
     }
 }
 

@@ -849,18 +849,16 @@ private struct ScrollViewLanding: NSViewRepresentable {
         let publisher  = appDetails?.publishers?.first
         let metacritic = appDetails?.metacritic?.score
         let releaseStr = appDetails?.releaseDate?.date.flatMap { $0.isEmpty ? nil : $0 }
+        let controller = appDetails?.controllerSupport
         let hasAnyInfo = !genres.isEmpty || developer != nil || publisher != nil
-            || currentGame.windowsOnly || metacritic != nil || releaseStr != nil
+            || currentGame.windowsOnly || metacritic != nil || releaseStr != nil || controller != nil
 
         if hasAnyInfo {
             VStack(spacing: 0) {
                 // Install status
-                DetailRow(
-                    icon: currentGame.isInstalled ? "internaldrive" : "icloud.and.arrow.down",
-                    label: "Installation",
-                    value: currentGame.isInstalled ? "Installed" : "Not Installed",
-                    valueColor: currentGame.isInstalled ? .green : .orange
-                )
+                let installation = installationRow
+                DetailRow(icon: installation.icon, label: "Installation",
+                          value: installation.value, valueColor: installation.color)
 
                 // Platform
                 if currentGame.windowsOnly {
@@ -874,6 +872,14 @@ private struct ScrollViewLanding: NSViewRepresentable {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
+                }
+
+                // Controller support: Meridian's word for Steam's "Grab a
+                // controller and kick back!" screen, which it keeps closed.
+                if let controller {
+                    DetailDivider()
+                    DetailRow(icon: "gamecontroller", label: "Controller",
+                              value: controller == .full ? "Full support" : "Partial support")
                 }
 
                 // Release date
@@ -1145,14 +1151,14 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
         case .installing:
             HStack(spacing: 8) {
-                ProgressButton("Preparing…")
+                ProgressButton(launcher.installIsUpdate ? "Updating…" : "Preparing…")
                 cancelButton
             }
 
         case .downloading:
             let isInstalling = (launcher.downloadProgress ?? 0) > 0.88
             HStack(spacing: 8) {
-                ProgressButton(isInstalling ? "Installing…" : "Downloading…")
+                ProgressButton(launcher.installIsUpdate ? "Updating…" : isInstalling ? "Installing…" : "Downloading…")
                 cancelButton
             }
 
@@ -1214,7 +1220,7 @@ private struct ScrollViewLanding: NSViewRepresentable {
                         .inactiveAwareProminence(controlActiveState == .inactive)
                         .controlSize(.large)
                     } else {
-                        Button { currentGame.isInstalled ? handlePlayTapped() : handleInstallTapped() } label: {
+                        Button { currentGame.installState == .installed ? handlePlayTapped() : handleInstallTapped() } label: {
                             Label("Retry", systemImage: "arrow.clockwise")
                                 .frame(
                                     minWidth: GameDetailMetrics.launchButtonMinWidth,
@@ -1244,7 +1250,8 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
     @ViewBuilder
     private var idleButton: some View {
-        if currentGame.isInstalled {
+        switch currentGame.installState {
+        case .installed:
             let label = launchButtonLabel("Play", systemImage: "play.fill")
             Button { handlePlayTapped() } label: { label }
                 .inactiveAwareProminence(controlActiveState == .inactive)
@@ -1252,7 +1259,17 @@ private struct ScrollViewLanding: NSViewRepresentable {
                 .modifier(settledLaunchButton { label })
                 .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
                 .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
-        } else {
+        case .updateRequired:
+            // Play would only make Steam update first (a launching app's
+            // update goes to the front of its queue): say so up front.
+            let label = launchButtonLabel("Update", systemImage: "arrow.down.circle.fill")
+            Button { handleInstallTapped() } label: { label }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+                .modifier(settledLaunchButton { label })
+                .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+                .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "A newer version is available")
+        case .notInstalled:
             let label = launchButtonLabel("Install", systemImage: "arrow.down.circle.fill")
             Button { handleInstallTapped() } label: { label }
                 .inactiveAwareProminence(controlActiveState == .inactive)
@@ -1312,6 +1329,15 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    /// The "Installation" row's icon, wording and colour.
+    private var installationRow: (icon: String, value: String, color: Color) {
+        switch currentGame.installState {
+        case .installed:      ("internaldrive", "Installed", .green)
+        case .updateRequired: ("arrow.down.circle", "Update Available", .orange)
+        case .notInstalled:   ("icloud.and.arrow.down", "Not Installed", .orange)
+        }
     }
 
     private func handleInstallTapped() {
@@ -2177,6 +2203,9 @@ private struct BannerCompatBadge: View {
     /// D3D9 goes through DXVK and KosmicKrisp only for games that opt in
     /// (`GameProfile.preferDXVK`), as `SteamSession.gameEnvironment` routes it.
     private var d3d9OnMetal: Bool { engine.dxvkPath != nil && profile?.preferDXVK == true }
+    /// D3D12 goes through D3DMetal only where the engine carries GPTK;
+    /// otherwise Wine's vkd3d (`SteamSession.gameEnvironment`).
+    private var d3d12OnD3DMetal: Bool { engine.gptkPath != nil }
 
     private var icon: String {
         switch status {
@@ -2260,7 +2289,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: r.engineName,
                 api: r.graphicsAPI.displayName,
-                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
+                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal, d3d12OnD3DMetal: d3d12OnD3DMetal),
                 bitness: r.bitness != nil ? r.bitnessDescription : nil,
                 engineSource: r.engineSource,
                 apiSource: r.apiSource
@@ -2271,7 +2300,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: p.gameEngine.displayName,
                 api: p.graphicsAPI.displayName,
-                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
+                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal, d3d12OnD3DMetal: d3d12OnD3DMetal),
                 bitness: nil,
                 engineSource: .explicit,
                 apiSource: .explicit
