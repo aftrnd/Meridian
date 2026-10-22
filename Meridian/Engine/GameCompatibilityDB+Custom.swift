@@ -57,7 +57,14 @@ extension GameCompatibilityDB {
             \
             Saves are over 50 MB (thousands of files): the first Steam Cloud \
             sync is long, and launches report "Unable to Sync" until it \
-            finishes (Pattern 66).
+            finishes (Pattern 66). \
+            \
+            Noita removes thousands of its world files as it runs (2904 in \
+            one session, Oct 22, 2026), and Steam deletes them from the \
+            cloud about 100 per 12 s batch (4327 pending). Steam syncs one \
+            game at a time, so every other game's \
+            launch waits at "Syncing your saves" until that upload ends \
+            (Pattern 68).
             """
         ),
 

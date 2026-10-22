@@ -55,7 +55,8 @@ final class GameProcess {
     var confirmedRunning: Bool { monitorPhase == .running }
 
     /// Set while Steam is busy before it starts the game: waiting on the
-    /// player (an EULA) or running the game's install scripts. The startup
+    /// player (an EULA), running the game's install scripts, or syncing
+    /// behind another game's cloud upload (Pattern 68). The startup
     /// timeout counts from when this clears, and nothing counts as the game
     /// meanwhile: the install scripts run from the game's folder
     /// (`SteamService.exe /installscript …\<game>\…`,

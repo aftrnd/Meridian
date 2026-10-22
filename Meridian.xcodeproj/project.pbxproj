@@ -41,6 +41,7 @@
 		B00A0001 /* GameArtOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00A0002 /* GameArtOverrides.swift */; };
 		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
 		B0E5A001 /* SteamEula.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5A002 /* SteamEula.swift */; };
+		B0E5D001 /* SteamCloudStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5D002 /* SteamCloudStatus.swift */; };
 		B0E5B001 /* EulaSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5B002 /* EulaSheet.swift */; };
 		B0E5C001 /* CloudSyncSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5C002 /* CloudSyncSheet.swift */; };
 		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
@@ -115,6 +116,7 @@
 		B00A0002 /* GameArtOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameArtOverrides.swift; sourceTree = "<group>"; };
 		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
 		B0E5A002 /* SteamEula.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamEula.swift; sourceTree = "<group>"; };
+		B0E5D002 /* SteamCloudStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCloudStatus.swift; sourceTree = "<group>"; };
 		B0E5B002 /* EulaSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EulaSheet.swift; sourceTree = "<group>"; };
 		B0E5C002 /* CloudSyncSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSheet.swift; sourceTree = "<group>"; };
 		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
@@ -204,6 +206,7 @@
 				B0010013 /* SteamLibraryStore.swift */,
 				B00AI002 /* SteamAppInfoResolver.swift */,
 				B0E5A002 /* SteamEula.swift */,
+				B0E5D002 /* SteamCloudStatus.swift */,
 				B00F0002 /* SteamSession.swift */,
 				B00G0002 /* SteamSessionBackup.swift */,
 				B00F0004 /* SteamWindow.swift */,
@@ -489,6 +492,7 @@
 				B0010012 /* SteamLibraryStore.swift in Sources */,
 				B00AI001 /* SteamAppInfoResolver.swift in Sources */,
 				B0E5A001 /* SteamEula.swift in Sources */,
+				B0E5D001 /* SteamCloudStatus.swift in Sources */,
 				B0010014 /* Game.swift in Sources */,
 				B0010016 /* PlayerSummary.swift in Sources */,
 				B00E0001 /* WineEngine.swift in Sources */,

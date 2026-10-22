@@ -321,6 +321,33 @@ final class LaunchStageTests: XCTestCase {
                       "Try Again and Cancel quit Steam, which closes its hidden dialog")
     }
 
+    /// Oct 22 2026: "No, I'm not a Human" sat at SynchronizingCloud for 90 s
+    /// with no error; Steam was deleting 4000 of Noita's world files from the
+    /// cloud and syncs one game at a time (Pattern 68). Lines verbatim from
+    /// cloud_log.txt (CRLF).
+    func testLaunchSteps_cloudSyncWaitsOnAnotherGamesUpload() throws {
+        let log = """
+        [2026-10-22 18:28:18] [AppID 3180070] Starting sync (eval,)
+        [2026-10-22 18:28:25] [AppID 881100] Upload batch initiated, ID: 8922677724671454614, ChangeNumber: 305, App Build ID: 17130612
+        [2026-10-22 18:30:07] [AppID 881100] Delete OK for file Nolla_Games_Noita/save00/world/entities_42020.bin
+
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        XCTAssertEqual(Launcher.cloudUploadAppID(in: log, excluding: 3180070), 881100,
+                       "Noita's upload is what the launch waits on")
+        XCTAssertNil(Launcher.cloudUploadAppID(in: log, excluding: 881100),
+                     "A game's own upload isn't another game's")
+        let startup = """
+        [2026-10-22 18:28:07] [AppID 240] Starting sync (eval,)
+        [U:1:86752607] [AppID 7] Init cache request complete
+        """
+        XCTAssertNil(Launcher.cloudUploadAppID(in: startup, excluding: 3180070),
+                     "Steam's start-up evaluations aren't uploads")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains("|| runningInstallScript || cloudSyncPrompt != nil\n                || waitingOnUpload"),
+                      "The startup timeout holds while the other game's upload moves")
+    }
+
     func testLaunchSteps_seeSteamWaitingOnThePlayer() {
         let eula = """
         [2026-10-12 14:08:17] GameAction [AppID 4069520, ActionID 1] : LaunchApp changed task to ShowEula with ""

@@ -237,8 +237,9 @@ extension SteamEula {
     }
 
     /// The `{` and `}` line indexes of the block at `path`, matched
-    /// case-insensitively. Steam writes one key or brace per line.
-    private static func block(at path: [String], in lines: [String]) -> (open: Int, close: Int)? {
+    /// case-insensitively. Steam writes one key or brace per line. Also reads
+    /// a game's cloud state (`SteamCloudStatus`).
+    static func block(at path: [String], in lines: [String]) -> (open: Int, close: Int)? {
         var stack: [String] = []
         var pendingKey = ""
         var open: Int?
@@ -263,7 +264,7 @@ extension SteamEula {
             && zip(stack, path).allSatisfy { $0.caseInsensitiveCompare($1) == .orderedSame }
     }
 
-    private static func directValues(of block: (open: Int, close: Int), in lines: [String]) -> [(key: String, value: String)] {
+    static func directValues(of block: (open: Int, close: Int), in lines: [String]) -> [(key: String, value: String)] {
         directValueLines(of: block, in: lines).map { ($0.key, $0.value) }
     }
 

@@ -80,6 +80,11 @@ struct AppDetails: Decodable, Sendable {
         return nil
     }
 
+    /// Store category 23 "Steam Cloud" (Noita's appdetails, Oct 22 2026).
+    var supportsSteamCloud: Bool {
+        categories?.contains { $0.id == 23 } == true
+    }
+
     var isWindowsOnly: Bool {
         guard let p = platforms else { return false }
         return (p.windows == true) && (p.mac != true) && (p.linux != true)
