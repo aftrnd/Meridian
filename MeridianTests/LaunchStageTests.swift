@@ -298,6 +298,29 @@ final class LaunchStageTests: XCTestCase {
     /// Lines verbatim from its console_log.txt and the cabin game's
     /// interstitial, which Steam answers itself in the same second. Steam
     /// writes CRLF; parsing only "\n" missed the wait in the real file.
+    /// Noita, Oct 22 2026: Steam couldn't sync its cloud saves and waited on
+    /// its "Unable to Sync" dialog, which opens Steam's library window. Lines
+    /// verbatim from console_log.txt. Meridian asks in its own sheet instead
+    /// (Pattern 66).
+    func testLaunchSteps_cloudSyncFailureIsAskedInMeridian() throws {
+        let log = """
+        [2026-10-22 17:25:27] GameAction [AppID 881100, ActionID 1] : LaunchApp changed task to SynchronizingCloud with ""
+        [2026-10-22 17:25:28] GameAction [AppID 881100, ActionID 1] : LaunchApp waiting for user response to SynchronizingCloud "syncfailed"
+
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        XCTAssertEqual(Launcher.steamLaunchEvents(in: log, appID: 881100),
+                       [.task("SynchronizingCloud"), .waitingForPlayer("SynchronizingCloud", detail: "syncfailed")],
+                       "The wait keeps Steam's reason")
+
+        let launcher = try readSource("Meridian/Launch/Launcher.swift")
+        XCTAssertTrue(launcher.contains(#"if pendingWait.step == "SynchronizingCloud", pendingWait.detail == "syncfailed","#),
+                      "A failed cloud sync is asked in Meridian's sheet, not Steam's window")
+        XCTAssertTrue(launcher.contains("|| runningInstallScript || cloudSyncPrompt != nil"),
+                      "The startup timeout holds while the player decides")
+        XCTAssertTrue(launcher.contains("await session.shutdown(engine: engine)\n            steamWindow?.resumeAfterGame(steamPID: 0)\n            launchState = .idle"),
+                      "Try Again and Cancel quit Steam, which closes its hidden dialog")
+    }
+
     func testLaunchSteps_seeSteamWaitingOnThePlayer() {
         let eula = """
         [2026-10-12 14:08:17] GameAction [AppID 4069520, ActionID 1] : LaunchApp changed task to ShowEula with ""

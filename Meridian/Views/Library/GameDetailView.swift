@@ -348,6 +348,21 @@ struct GameDetailView: View {
                 onCancel: { launcher.declineEulas() }
             )
         }
+        // Steam couldn't sync the game's cloud saves (Pattern 66).
+        .sheet(item: Binding(
+            get: { launcher.cloudSyncPrompt },
+            set: { if $0 == nil { launcher.cancelCloudSync() } }
+        )) { prompt in
+            CloudSyncSheet(
+                prompt: prompt,
+                onTryAgain: {
+                    launcher.retryCloudSync(engine: engine, session: session,
+                                            steamAuth: steamAuth, library: library)
+                },
+                onCancel: { launcher.cancelCloudSync() },
+                onPlayAnyway: { launcher.decideCloudSyncInSteam() }
+            )
+        }
     }
 
     // MARK: - Body sub-sections (extracted to keep the body expression

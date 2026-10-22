@@ -42,6 +42,7 @@
 		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
 		B0E5A001 /* SteamEula.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5A002 /* SteamEula.swift */; };
 		B0E5B001 /* EulaSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5B002 /* EulaSheet.swift */; };
+		B0E5C001 /* CloudSyncSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5C002 /* CloudSyncSheet.swift */; };
 		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
 		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B00E0001 /* WineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0002 /* WineEngine.swift */; };
@@ -115,6 +116,7 @@
 		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
 		B0E5A002 /* SteamEula.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamEula.swift; sourceTree = "<group>"; };
 		B0E5B002 /* EulaSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EulaSheet.swift; sourceTree = "<group>"; };
+		B0E5C002 /* CloudSyncSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSheet.swift; sourceTree = "<group>"; };
 		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
 		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B00E0002 /* WineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineEngine.swift; sourceTree = "<group>"; };
@@ -268,6 +270,7 @@
 				B0010029 /* GameGridView.swift */,
 				B001002B /* GameDetailView.swift */,
 				B0E5B002 /* EulaSheet.swift */,
+				B0E5C002 /* CloudSyncSheet.swift */,
 				B00E0021 /* CachedAsyncImage.swift */,
 				B0DE0002 /* DetailTransition.swift */,
 				B0DE0004 /* DetailZoomTuning.swift */,
@@ -504,6 +507,7 @@
 				B0010028 /* GameGridView.swift in Sources */,
 				B001002A /* GameDetailView.swift in Sources */,
 				B0E5B001 /* EulaSheet.swift in Sources */,
+				B0E5C001 /* CloudSyncSheet.swift in Sources */,
 				B00E00C0 /* HeroArtViews.swift in Sources */,
 				B00E0009 /* EngineSetupView.swift in Sources */,
 				B00E0020 /* CachedAsyncImage.swift in Sources */,
