@@ -636,6 +636,8 @@ final class Launcher {
         // Before the dispatch, so every line Steam writes in answer is read.
         let consoleLog = prefix.steamInstallDir.appending(path: "logs/console_log.txt")
         var consoleLogOffset = Self.fileSize(consoleLog)
+        let cloudLog = prefix.steamInstallDir.appending(path: "logs/cloud_log.txt")
+        var cloudLogOffset = Self.fileSize(cloudLog)
         activeGameLogHandle = GameLogFile.beginSession(
             appID: game.id,
             gameName: game.name,
@@ -681,6 +683,10 @@ final class Launcher {
         var eulaHandOff: [SteamEula]?
         var steamFailed = false
         var runningInstallScript = false
+        var syncingCloud = false
+        // Another game's cloud upload this launch's sync waits behind: the
+        // card's line for it, and when Steam last logged it moving.
+        var cloudUpload: (appID: Int, step: String, movedAt: ContinuousClock.Instant)?
         // Steam-side failure/progress signal (fail-fast rule): if Steam
         // decided the app needs an update/validation instead of launching, the
         // ACF's StateFlags leaves "4". Report THAT instead of a mislabeled
@@ -704,6 +710,7 @@ final class Launcher {
                 }
                 guard case .task(let task) = event else { continue }
                 runningInstallScript = task == "RunningInstallScript"
+                syncingCloud = task == "SynchronizingCloud"
                 if let step = Self.launchStepText(for: task, gameName: game.name) { latestStep = step }
                 if task == "CreatingProcess" { openedAt = .now }
                 if task == "Failed" { steamFailed = true }
@@ -741,10 +748,29 @@ final class Launcher {
                     showSteamPrompt(pendingWait.step)
                 }
             }
+            // Steam syncs one game's cloud saves at a time: this launch's sync
+            // waits while another game's upload runs (Noita's 4000 deleted
+            // world files took minutes, Pattern 68). The card says whose it
+            // is. Its lines come under 5 s apart while it moves; 30 s without
+            // one and the startup timeout counts again.
+            if syncingCloud,
+               let other = Self.cloudUploadAppID(in: Self.readAppended(cloudLog, from: &cloudLogOffset), excluding: game.id) {
+                if cloudUpload?.appID != other {
+                    let name = library?.games.first { $0.id == other }?.name
+                    log.info("[launchOnline] \(game.name)'s cloud sync waits on \(name ?? "appID \(other)")'s upload")
+                    appendLog("Steam is uploading \(name ?? "appID \(other)")'s cloud saves first")
+                    let step = name.map { "Steam is uploading \($0)'s saves first" } ?? "Steam is finishing another upload first"
+                    cloudUpload = (other, step, .now)
+                }
+                cloudUpload?.movedAt = .now
+            }
+            let waitingOnUpload = syncingCloud && cloudUpload.map { ContinuousClock.now - $0.movedAt < .seconds(30) } == true
+            if waitingOnUpload, let cloudUpload { latestStep = cloudUpload.step }
             // Steam hasn't started the game while it waits on the player or
             // runs the game's install scripts (DirectX, Visual C++): hold the
             // startup timeout, and don't take the installers for the game.
             gameProcess.startupHeld = steamWaitingOnPlayer != nil || runningInstallScript || cloudSyncPrompt != nil
+                || waitingOnUpload
             // Some games sit a long while before their first window; past
             // "Almost there" the card says that's normal instead of going quiet.
             if let openedAt {
@@ -1330,6 +1356,26 @@ final class Launcher {
             if line.contains("LaunchApp continues with user response") { return .answered }
             return nil
         }
+    }
+
+    /// The other app whose cloud upload Steam logged last in `text`
+    /// (cloud_log.txt), or nil. Steam's transfer lines, verbatim from Noita's
+    /// world cleanup (Oct 22 2026):
+    /// `[AppID 881100] Upload batch initiated, ID: …`,
+    /// `[AppID 881100] HTTP upload for file '…' beginning . . .`,
+    /// `[AppID 881100] Upload OK for file …`,
+    /// `[AppID 881100] Delete OK for file …`.
+    /// Evaluations (`Starting sync (eval,)`) don't count: Steam runs one for
+    /// every game within a second of starting.
+    nonisolated static func cloudUploadAppID(in text: String, excluding appID: Int) -> Int? {
+        for line in text.split(whereSeparator: \.isNewline).reversed() {
+            guard let open = line.range(of: "[AppID "),
+                  let close = line[open.upperBound...].firstIndex(of: "]"),
+                  let id = Int(line[open.upperBound..<close]), id != appID else { continue }
+            let message = line[line.index(after: close)...].drop { $0 == " " }
+            if ["Upload ", "HTTP upload ", "Delete OK "].contains(where: { message.hasPrefix($0) }) { return id }
+        }
+        return nil
     }
 
     /// Shows (or, with nil, hides) Steam's window while it waits on the
