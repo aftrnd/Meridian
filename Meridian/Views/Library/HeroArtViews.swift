@@ -41,14 +41,22 @@ extension View {
 /// (`HeroLogoPositioned`) so the alpha-rejection rule stays identical.
 enum HeroLogoLoader {
     /// Returns the first URL whose image has a real alpha channel (a genuine
-    /// transparent logo lockup), checking the two-tier cache then network.
-    /// Opaque images (key art mistakenly published as logo.png) are rejected.
+    /// transparent logo lockup), checking every URL in the two-tier cache
+    /// before the network. Opaque images (key art mistakenly published as
+    /// logo.png) are rejected.
+    ///
+    /// Cache first, for all URLs: checking URL by URL asked the network again
+    /// for every candidate that failed on an earlier launch before reaching
+    /// the cached one (Noita has no logo_2x.png: three 404s, the first 3.5 s,
+    /// on every start before its cached logo.png).
     static func load(urls: [URL]) async -> NSImage? {
+        var opaque: Set<URL> = []
         for url in urls {
-            if let cached = ImageCache.shared.image(for: url) {
-                if hasAlpha(cached) { return cached }
-                continue
-            }
+            guard let cached = ImageCache.shared.image(for: url) else { continue }
+            if hasAlpha(cached) { return cached }
+            opaque.insert(url)
+        }
+        for url in urls where !opaque.contains(url) {
             guard !Task.isCancelled else { return nil }
             do {
                 let (data, response) = try await URLSession.imageSession.data(from: url)
@@ -257,6 +265,7 @@ struct HeroBannerImage: View {
     }
 
     private func loadImage() async {
+        // Every cached candidate before the network (see HeroLogoLoader.load).
         for url in urls {
             // Two-tier cache check (memory + disk); disk read + decode off-main.
             if let cached = await ImageCache.shared.imageAsync(for: url) {
@@ -264,7 +273,9 @@ struct HeroBannerImage: View {
                 emitSize(for: cached)
                 return
             }
+        }
 
+        for url in urls {
             guard !Task.isCancelled else { return }
             do {
                 let (data, response) = try await URLSession.imageSession.data(from: url)
