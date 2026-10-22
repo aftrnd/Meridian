@@ -1304,6 +1304,76 @@ struct WinePrefix: Sendable {
         log.info("[writeEulaAcceptances] recorded \(eulas.map { "\($0.id)=\($0.version)" }.joined(separator: ", ")) in \(url.path(percentEncoded: false))")
     }
 
+    /// Keeps Steam's "Grab a controller and kick back!" launch screen from
+    /// opening its window: records it as answered with "Don't show this on
+    /// future games", as Steam's own checkbox does. The game page shows the
+    /// game's controller support instead. Only while Steam is stopped, like
+    /// the license agreements: Steam reads these when it starts (Pattern 64).
+    func hideControllerRecommendedScreen(steamID64: String) throws {
+        guard let url = localConfigURL(steamID64: steamID64) else { return }
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let config = Self.settingWebStorage(Self.controllerRecommendedAnswer, in: existing)
+        guard config != existing else { return }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try config.write(to: url, atomically: true, encoding: .utf8)
+        log.info("[hideControllerRecommendedScreen] recorded Don't Show Again in \(url.path(percentEncoded: false))")
+    }
+
+    /// Steam's answer to its `GamepadRecommended` launch screen, which it
+    /// shows once per game it marks "gamepad preferred". Its web UI stores
+    /// each screen's answer under `Deck_ConfiguratorInterstitials…_<screen>`
+    /// in `localconfig.vdf > WebStorage` (steamui sp.js, Oct 22 2026): the
+    /// version seen, the "Don't show" checkbox, and a JSON list of the games
+    /// it was shown for. The checkbox at "1" skips the screen for every game;
+    /// a list Steam already has is kept.
+    static let controllerRecommendedAnswer: [(key: String, value: String, replace: Bool)] = [
+        ("Deck_ConfiguratorInterstitialsVersionSeen_GamepadRecommended", "1", true),
+        ("Deck_ConfiguratorInterstitialsCheckbox_GamepadRecommended", "1", true),
+        ("Deck_ConfiguratorInterstitialApps_GamepadRecommended", "[]", false),
+    ]
+
+    /// Returns `config` (Steam's line-based `localconfig.vdf`) with each key
+    /// set in its depth-1 `WebStorage` block, which is created when missing.
+    /// `replace: false` keeps a value Steam already wrote. Every other line
+    /// stays as it was: the block also holds Steam's cached preferences.
+    static func settingWebStorage(_ entries: [(key: String, value: String, replace: Bool)], in config: String) -> String {
+        var lines = config.contains("\"UserLocalConfigStore\"")
+            ? config.components(separatedBy: "\n")
+            : ["\"UserLocalConfigStore\"", "{", "}", ""]
+
+        // The block's `"WebStorage"` line and its closing brace, by brace depth.
+        var depth = 0
+        var start: Int?
+        var end: Int?
+        for (i, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if start == nil, depth == 1, trimmed == "\"WebStorage\"" { start = i }
+            if trimmed.hasPrefix("{") { depth += 1 }
+            if trimmed.hasPrefix("}") {
+                depth -= 1
+                if let start, depth == 1, i > start { end = i; break }
+            }
+        }
+        if start == nil || end == nil {
+            guard let root = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "{" }) else { return config }
+            lines.insert(contentsOf: ["\t\"WebStorage\"", "\t{", "\t}"], at: root + 1)
+            start = root + 1
+            end = root + 3
+        }
+        guard let start, var end else { return config }
+
+        for entry in entries {
+            let line = "\t\t\"\(entry.key)\"\t\t\"\(entry.value)\""
+            if let i = lines[start..<end].firstIndex(where: { vdfKeyValue(from: $0)?.key == entry.key }) {
+                if entry.replace { lines[i] = line }
+            } else {
+                lines.insert(line, at: end)
+                end += 1
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// The Notifications / Sounds suppression blocks, as depth-1 children of
     /// `UserLocalConfigStore`. Used by `mergeNotificationPreferences`.
     private static let notificationSuppressionBlocks: [(name: String, block: String)] = [

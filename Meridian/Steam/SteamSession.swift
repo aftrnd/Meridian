@@ -1190,6 +1190,14 @@ final class SteamSession {
                 log.error("[launchSteamProcess] couldn't record accepted license agreements: \(error.localizedDescription)")
             }
         }
+        // Steam's "Grab a controller and kick back!" screen stays closed; the
+        // game page shows controller support instead (Pattern 64).
+        do {
+            try prefix.hideControllerRecommendedScreen(steamID64: AppSettings.shared.steamCredentialSteamID)
+        } catch {
+            // Steam shows its own screen instead (Launcher brings its window up).
+            log.error("[launchSteamProcess] couldn't turn off Steam's controller screen: \(error.localizedDescription)")
+        }
         connectionLogOffset = connectionLogFileSize()
         webhelperLogOffset = fileSize(of: prefix.steamInstallDir
             .appending(path: "logs/webhelper_js.txt")

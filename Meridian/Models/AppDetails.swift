@@ -11,6 +11,7 @@ struct AppDetails: Decodable, Sendable {
     let publishers: [String]?
     let platforms: Platforms?
     let genres: [Genre]?
+    let categories: [Category]?
     let releaseDate: ReleaseDate?
     let metacritic: Metacritic?
     /// Total achievement count for this game, from the store page.
@@ -26,6 +27,13 @@ struct AppDetails: Decodable, Sendable {
         let id: String?
         let description: String?
     }
+
+    struct Category: Decodable, Sendable {
+        let id: Int?
+        let description: String?
+    }
+
+    enum ControllerSupport { case full, partial }
 
     struct ReleaseDate: Decodable, Sendable {
         let comingSoon: Bool?
@@ -56,9 +64,20 @@ struct AppDetails: Decodable, Sendable {
         case publishers
         case platforms
         case genres
+        case categories
         case releaseDate          = "release_date"
         case metacritic
         case achievementsSummary  = "achievements"
+    }
+
+    /// Store categories 28 "Full controller support" and 18 "Partial
+    /// Controller Support": the same ids as Steam's app info `category_28` /
+    /// `category_18` (checked against both, Oct 22 2026).
+    var controllerSupport: ControllerSupport? {
+        let ids = categories?.compactMap(\.id) ?? []
+        if ids.contains(28) { return .full }
+        if ids.contains(18) { return .partial }
+        return nil
     }
 
     var isWindowsOnly: Bool {

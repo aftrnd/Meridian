@@ -849,8 +849,9 @@ private struct ScrollViewLanding: NSViewRepresentable {
         let publisher  = appDetails?.publishers?.first
         let metacritic = appDetails?.metacritic?.score
         let releaseStr = appDetails?.releaseDate?.date.flatMap { $0.isEmpty ? nil : $0 }
+        let controller = appDetails?.controllerSupport
         let hasAnyInfo = !genres.isEmpty || developer != nil || publisher != nil
-            || currentGame.windowsOnly || metacritic != nil || releaseStr != nil
+            || currentGame.windowsOnly || metacritic != nil || releaseStr != nil || controller != nil
 
         if hasAnyInfo {
             VStack(spacing: 0) {
@@ -871,6 +872,14 @@ private struct ScrollViewLanding: NSViewRepresentable {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
+                }
+
+                // Controller support: Meridian's word for Steam's "Grab a
+                // controller and kick back!" screen, which it keeps closed.
+                if let controller {
+                    DetailDivider()
+                    DetailRow(icon: "gamecontroller", label: "Controller",
+                              value: controller == .full ? "Full support" : "Partial support")
                 }
 
                 // Release date
