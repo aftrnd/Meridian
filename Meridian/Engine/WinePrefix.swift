@@ -1678,7 +1678,7 @@ struct WinePrefix: Sendable {
     /// Used after a headless DepotDownloader install completes: DepotDownloader
     /// downloads depot files directly into `steamapps/common/<installDir>/` but
     /// writes no ACF, so Meridian writes one itself. The rest of the app keys
-    /// off this manifest — `isGameFullyInstalled` (StateFlags=="4"),
+    /// off this manifest — `installState` (StateFlags),
     /// `gameInstallDir` (installdir field), `gameRequiresSteamAPI`, uninstall,
     /// and launch path resolution all read it.
     ///
@@ -1898,7 +1898,7 @@ struct WinePrefix: Sendable {
     /// Steam library folders.
     ///
     /// A present ACF does NOT mean the game is playable: Steam writes it before and
-    /// during downloads. Use `isGameFullyInstalled(appID:)` for user-facing installed
+    /// during downloads. Use `installState(appID:)` for user-facing installed
     /// state and launch gating.
     func isGameInstalled(appID: Int) -> Bool {
         let result = acfURL(for: appID) != nil
@@ -1906,37 +1906,67 @@ struct WinePrefix: Sendable {
         return result
     }
 
-    /// Returns true only when the ACF exists AND `StateFlags` equals `"4"` (fully installed).
+    /// A game's install state from its ACF: not installed (no ACF, or files
+    /// not on disk yet), installed and current, or installed with an update
+    /// Steam must apply before the game can launch.
     ///
-    /// Steam creates the ACF as soon as the user confirms the install dialog
-    /// (`StateFlags` ≈ 1026 while queued/downloading). `StateFlags "4"` is written
-    /// only when every depot has been staged and verified — i.e. the game is playable.
-    /// Use this instead of `isGameInstalled` when you must not launch a partial download.
-    func isGameFullyInstalled(appID: Int) -> Bool {
-        guard let manifest = acfURL(for: appID), let value = Self.stateFlags(in: manifest) else { return false }
-        let fullyInstalled = value == "4"
-        log.debug("[isGameFullyInstalled] appID=\(appID) StateFlags=\(value) → \(fullyInstalled)")
-        return fullyInstalled
+    /// Steam creates the ACF as soon as an install starts (`StateFlags` 1026
+    /// while it downloads), so a present ACF alone is not an install. Use
+    /// this, not `isGameInstalled`, for anything the player sees or launches.
+    func installState(appID: Int) -> GameInstallState {
+        guard let manifest = acfURL(for: appID), let value = Self.stateFlags(in: manifest) else { return .notInstalled }
+        let state = Self.installState(stateFlags: value)
+        log.debug("[installState] appID=\(appID) StateFlags=\(value) → \(state)")
+        return state
     }
 
-    /// `isGameFullyInstalled` for a whole library at once: libraryfolders.vdf
+    /// `installState(appID:)` for a whole library at once: libraryfolders.vdf
     /// is read once and each `steamapps` folder listed once, instead of both
     /// per game (the 5 s install poll did that for every owned game). Same
-    /// rule: the FIRST library holding a game's ACF decides, StateFlags "4".
-    func fullyInstalledAppIDs(among appIDs: [Int]) -> Set<Int> {
+    /// rule: the FIRST library holding a game's ACF decides. Games with no
+    /// files on disk are left out.
+    func installStates(among appIDs: [Int]) -> [Int: GameInstallState] {
         let wanted = Set(appIDs)
         var seen = Set<Int>()
-        var installed = Set<Int>()
+        var states: [Int: GameInstallState] = [:]
         for library in steamLibraryFolders {
             let steamapps = library.appending(path: "steamapps")
             guard let names = try? FileManager.default.contentsOfDirectory(atPath: steamapps.path(percentEncoded: false)) else { continue }
             for name in names where name.hasPrefix("appmanifest_") && name.hasSuffix(".acf") {
                 guard let appID = Int(name.dropFirst("appmanifest_".count).dropLast(".acf".count)),
-                      wanted.contains(appID), seen.insert(appID).inserted else { continue }
-                if Self.stateFlags(in: steamapps.appending(path: name)) == "4" { installed.insert(appID) }
+                      wanted.contains(appID), seen.insert(appID).inserted,
+                      let value = Self.stateFlags(in: steamapps.appending(path: name)) else { continue }
+                let state = Self.installState(stateFlags: value)
+                if state != .notInstalled { states[appID] = state }
             }
         }
-        return installed
+        return states
+    }
+
+    /// `StateFlags` is a bitmask. Two bits decide what the player sees, each
+    /// matched against Steam's own `content_log.txt` wording for the same
+    /// ACF (Oct 22 2026, PEAK and Far Far West):
+    ///   - 4: "Fully Installed", the game's files are on disk.
+    ///   - 2: "Update Required", Steam found a newer build at sign-in. Steam
+    ///     leaves 4 set, so an outdated game reads `6`; it keeps both bits
+    ///     through its own update and clears 2 when the update commits.
+    /// A fresh install in progress (1026) has no 4: not installed yet.
+    ///
+    /// MIRROR CONTRACT: mirrored in GameInstallTests.installState(stateFlags:).
+    static func installState(stateFlags: String) -> GameInstallState {
+        guard let flags = Int(stateFlags), flags & 4 != 0 else { return .notInstalled }
+        return flags & 2 != 0 ? .updateRequired : .installed
+    }
+
+    /// Steam is downloading `appID` itself right now: its update stages
+    /// files in `steamapps/downloading/<appID>/` and commits them to
+    /// `common/` when done (content_log Oct 22 2026, "starting commit from
+    /// …\downloading\3124540"). Steam auto-updates at sign-in, so a game can
+    /// be mid-update before the player touches it.
+    func isSteamDownloading(appID: Int) -> Bool {
+        guard let manifest = acfURL(for: appID) else { return false }
+        let dir = manifest.deletingLastPathComponent().appending(path: "downloading/\(appID)")
+        return FileManager.default.fileExists(atPath: dir.path(percentEncoded: false))
     }
 
     /// Every app with an `appmanifest_*.acf` in any Steam library, whatever

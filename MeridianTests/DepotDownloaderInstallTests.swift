@@ -377,7 +377,7 @@ final class DepotDownloaderInstallTests: XCTestCase {
     func testInstalledManifest_roundTripsStateFlagsAndInstallDir() {
         let vdf = installedManifestVDF(appID: 813230, name: "Animal Well",
                                        installDir: "Animal Well", steamID64: "76561198047018335")
-        // StateFlags must be exactly "4" (what isGameFullyInstalled checks).
+        // StateFlags must be exactly "4" (installed and current to installState).
         XCTAssertTrue(vdf.contains("\"StateFlags\"\t\t\"4\""))
         // installdir must be present (what gameInstallDir reads).
         XCTAssertTrue(vdf.contains("\"installdir\"\t\t\"Animal Well\""))

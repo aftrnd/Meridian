@@ -19,7 +19,8 @@ import Foundation
 /// Mirrored functions (must stay in sync with production code):
 ///   • vdfKeyValue(from:)                          ← WinePrefix.vdfKeyValue(from:)
 ///   • isGameInstalled(...)                        ← WinePrefix.isGameInstalled()
-///   • isGameFullyInstalled(...)                   ← WinePrefix.isGameFullyInstalled()
+///   • installState(...)                           ← WinePrefix.installState(appID:)
+///   • installState(stateFlags:)                   ← WinePrefix.installState(stateFlags:)
 ///   • gameDownloadProgress(...)                   ← WinePrefix.gameDownloadProgress()
 ///   • gameInstallDir(...)                         ← WinePrefix.gameInstallDir()
 ///   • flipFullyInstalledToUpdateRequired(in:)     ← WinePrefix.flipFullyInstalledToUpdateRequired(in:)
@@ -81,16 +82,27 @@ final class GameInstallTests: XCTestCase {
         return FileManager.default.fileExists(atPath: candidate.path(percentEncoded: false))
     }
 
-    /// Mirror of WinePrefix.isGameFullyInstalled(appID:) — ACF present AND StateFlags == "4".
-    private func isGameFullyInstalled(appID: Int, steamInstallDir: URL) -> Bool {
+    /// Mirror of GameInstallState (Game.swift).
+    private enum TestInstallState { case notInstalled, installed, updateRequired }
+
+    /// Mirror of WinePrefix.installState(stateFlags:) — bit 4 "Fully Installed",
+    /// bit 2 "Update Required".
+    private func installState(stateFlags: String) -> TestInstallState {
+        guard let flags = Int(stateFlags), flags & 4 != 0 else { return .notInstalled }
+        return flags & 2 != 0 ? .updateRequired : .installed
+    }
+
+    /// Mirror of WinePrefix.installState(appID:) — the ACF's StateFlags, or
+    /// not installed when there is no ACF.
+    private func installState(appID: Int, steamInstallDir: URL) -> TestInstallState {
         let acf = steamInstallDir.appending(path: "steamapps/appmanifest_\(appID).acf")
         guard let contents = try? String(contentsOfFile: acf.path(percentEncoded: false), encoding: .utf8)
-        else { return false }
+        else { return .notInstalled }
         for line in contents.components(separatedBy: "\n") {
             guard let (key, value) = vdfKeyValue(from: line), key == "StateFlags" else { continue }
-            return value == "4"
+            return installState(stateFlags: value)
         }
-        return false
+        return .notInstalled
     }
 
     /// Mirror of WinePrefix.gameDownloadProgress(appID:)
@@ -175,35 +187,51 @@ final class GameInstallTests: XCTestCase {
         XCTAssertFalse(isGameInstalled(appID: 99999, steamInstallDir: tempDir))
     }
 
-    // MARK: - isGameFullyInstalled tests
+    // MARK: - installState tests
 
-    func testIsGameFullyInstalledReturnsFalseWhenACFMissing() {
-        XCTAssertFalse(isGameFullyInstalled(appID: 12345, steamInstallDir: tempDir))
+    func testInstallStateNotInstalledWhenACFMissing() {
+        XCTAssertEqual(installState(appID: 12345, steamInstallDir: tempDir), .notInstalled)
     }
 
-    func testIsGameFullyInstalledReturnsFalseForQueuedState() throws {
-        // StateFlags 1026 = download queued / in progress
+    func testInstallStateNotInstalledForQueuedState() throws {
+        // StateFlags 1026 = fresh download queued / in progress: no files yet
         try writeACF(appID: 12345, stateFlags: "1026")
-        XCTAssertFalse(isGameFullyInstalled(appID: 12345, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: 12345, steamInstallDir: tempDir), .notInstalled)
     }
 
-    func testIsGameFullyInstalledReturnsFalseForPartialDownload() throws {
+    func testInstallStateNotInstalledForPartialDownload() throws {
         try writeACF(appID: 12345, stateFlags: "1026", bytesDownloaded: 500_000_000, bytesToDownload: 1_000_000_000)
-        XCTAssertFalse(isGameFullyInstalled(appID: 12345, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: 12345, steamInstallDir: tempDir), .notInstalled)
     }
 
-    func testIsGameFullyInstalledReturnsTrueForStateFlags4() throws {
+    func testInstallStateInstalledForStateFlags4() throws {
         // StateFlags 4 = fully installed / playable
         try writeACF(appID: 12345, stateFlags: "4")
-        XCTAssertTrue(isGameFullyInstalled(appID: 12345, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: 12345, steamInstallDir: tempDir), .installed)
     }
 
-    func testIsGameFullyInstalledReturnsFalseForUnrelatedStateFlags() throws {
+    func testInstallStateUpdateRequiredForStateFlags6() throws {
+        // StateFlags 6 = "Update Required,Fully Installed" in Steam's content_log
+        // (PEAK, Oct 22 2026): the game is installed, not something to download
+        // from scratch. Before, only "4" counted and it showed Install.
+        try writeACF(appID: 3527290, stateFlags: "6")
+        XCTAssertEqual(installState(appID: 3527290, steamInstallDir: tempDir), .updateRequired)
+    }
+
+    func testInstallStateReadsStateFlagsAsBits() {
+        // Other bits ride along with 4 / 2 while Steam works on an installed
+        // game; only those two decide the state.
+        XCTAssertEqual(installState(stateFlags: "68"), .installed)          // 4 | 64
+        XCTAssertEqual(installState(stateFlags: "1030"), .updateRequired)   // 4 | 2 | 1024
+        XCTAssertEqual(installState(stateFlags: ""), .notInstalled)
+        XCTAssertEqual(installState(stateFlags: "abc"), .notInstalled)
+    }
+
+    func testInstallStateNotInstalledForUnrelatedStateFlags() throws {
         for flags in ["0", "1", "2", "4096", "16"] {
             try writeACF(appID: 12345, stateFlags: flags)
-            let result = isGameFullyInstalled(appID: 12345, steamInstallDir: tempDir)
-            let expected = flags == "4"
-            XCTAssertEqual(result, expected, "StateFlags=\(flags) should produce \(expected)")
+            XCTAssertEqual(installState(appID: 12345, steamInstallDir: tempDir), .notInstalled,
+                           "StateFlags=\(flags) has no Fully Installed bit")
         }
     }
 
@@ -306,12 +334,12 @@ final class GameInstallTests: XCTestCase {
 
         // Step 1: no ACF → not installed
         XCTAssertFalse(isGameInstalled(appID: appID, steamInstallDir: tempDir))
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: tempDir), .notInstalled)
 
-        // Step 2: ACF appears with queued state → installed but not fully
+        // Step 2: ACF appears with queued state → ACF present, files not yet
         try writeACF(appID: appID, stateFlags: "1026", bytesDownloaded: 0, bytesToDownload: 2_000_000_000)
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: tempDir))
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: tempDir), .notInstalled)
 
         // Step 3: progress mid-download
         try writeACF(appID: appID, stateFlags: "1026", bytesDownloaded: 1_000_000_000, bytesToDownload: 2_000_000_000)
@@ -319,12 +347,12 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(mid.downloaded, 1_000_000_000)
         XCTAssertEqual(mid.total, 2_000_000_000)
         XCTAssertEqual(mid.stateFlags, "1026")
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: tempDir), .notInstalled)
 
         // Step 4: StateFlags flips to 4 → fully installed
         try writeACF(appID: appID, stateFlags: "4", bytesDownloaded: 2_000_000_000, bytesToDownload: 2_000_000_000)
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: tempDir))
-        XCTAssertTrue(isGameFullyInstalled(appID: appID, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: tempDir), .installed)
 
         let done = try XCTUnwrap(gameDownloadProgress(appID: appID, steamInstallDir: tempDir))
         XCTAssertEqual(done.stateFlags, "4")
@@ -361,13 +389,13 @@ final class GameInstallTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(src.contains("isGameFullyInstalled(appID: game.id)"),
-                      "Launch/install gate must use fully-installed state, not mere ACF presence.")
+        XCTAssertTrue(src.contains("prefix.installState(appID: game.id) != .installed"),
+                      "Launch/install gate must install or update unless the game is installed and current, not go by mere ACF presence.")
         XCTAssertTrue(src.contains("isGameInstalled(appID: game.id)"),
                       "Fresh installs still need the pre-seeded ACF path.")
     }
 
-    func testLibraryReconciliationUsesFullyInstalledState() throws {
+    func testLibraryReconciliationUsesInstallState() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -376,8 +404,22 @@ final class GameInstallTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(src.contains("prefix.isGameFullyInstalled(appID: game.id)"),
-                      "Library badges must not mark queued/partial ACFs as installed.")
+        XCTAssertTrue(src.contains("copy.installState = prefix.installState(appID: game.id)"),
+                      "Library badges read StateFlags (installed, update, not installed); queued/partial ACFs are not installed.")
+    }
+
+    func testUpdateDefersToSteamsOwnUpdateAndReloadsSteam() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let src = try String(
+            contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(src.contains("if installIsUpdate, session.isReady, prefix.isSteamDownloading(appID: game.id) {"),
+                      "An update Steam is already running must not get a second DepotDownloader download into the same folder.")
+        XCTAssertTrue(src.contains("activeSession?.manifestRewritten(appID: game.id)"),
+                      "After Meridian rewrites a manifest the running Steam must reload it, or it re-runs the update from its stale state.")
     }
 
     func testFailedInstallResetIsGameScoped() throws {
@@ -445,8 +487,8 @@ final class GameInstallTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Meridian/Launch/Launcher.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(src.contains("isGameFullyInstalled(appID: game.id)"),
-                      "Install flow must use fully-installed state to detect completion.")
+        XCTAssertTrue(src.contains("prefix.installState(appID: game.id) != .installed"),
+                      "Install flow must use install state to detect completion.")
     }
 
     // MARK: - GameCompatibilityDB profile tests
@@ -850,8 +892,8 @@ final class GameInstallTests: XCTestCase {
         XCTAssertEqual(count, 2, "Only the two StateFlags=4 manifests should be rewritten.")
 
         // The two installed ACFs flipped to 1026
-        XCTAssertFalse(isGameFullyInstalled(appID: 220, steamInstallDir: tempDir))
-        XCTAssertFalse(isGameFullyInstalled(appID: 813230, steamInstallDir: tempDir))
+        XCTAssertEqual(installState(appID: 220, steamInstallDir: tempDir), .notInstalled)
+        XCTAssertEqual(installState(appID: 813230, steamInstallDir: tempDir), .notInstalled)
 
         // The mid-download ACF stays at 1026 (no double-flip, no regression)
         let p = try XCTUnwrap(gameDownloadProgress(appID: 3527290, steamInstallDir: tempDir))

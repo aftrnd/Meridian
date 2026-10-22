@@ -58,8 +58,21 @@ final class SteamSession {
 
     /// Apps with an appmanifest when the running steam.exe started. Steam
     /// reads `appmanifest_*.acf` once per start, so a game Meridian installs
-    /// after that (DepotDownloader) is unknown to it until it restarts.
+    /// after that (DepotDownloader) is unknown to it until it restarts, and
+    /// one Meridian updates is still the old build to it
+    /// (`manifestRewritten(appID:)`).
     private var appsSteamLoaded: Set<Int> = []
+
+    /// Meridian rewrote `appID`'s appmanifest (a DepotDownloader install or
+    /// update). A running Steam still holds what it read at start, for an
+    /// update the old build with "Update Required", and would run the update
+    /// again before launching (its scheduler puts a launching app at
+    /// "Priority First", content_log Oct 20 2026). Counting the app as not
+    /// loaded makes the next `warmUp`/launch restart Steam so it reads the
+    /// new manifest, as for a new install.
+    func manifestRewritten(appID: Int) {
+        appsSteamLoaded.remove(appID)
+    }
 
     /// License agreements the player accepted in Meridian, written into
     /// Steam's localconfig.vdf the next time steam.exe starts: Steam reads
@@ -243,8 +256,8 @@ final class SteamSession {
     /// Valve has made is found here rather than mid-launch (`state ==
     /// .signedOut`, which `Launcher` checks before it starts).
     ///
-    /// With `appID` (a game that just finished installing) a running Steam
-    /// that started before the install is restarted now, in the background,
+    /// With `appID` (a game that just finished installing or updating) a
+    /// running Steam that started before that is restarted now, in the background,
     /// instead of when the player presses Play: Steam reads install
     /// manifests only when it starts (Pattern 43).
     func warmUp(engine: WineEngine, appID: Int? = nil) {
@@ -280,7 +293,7 @@ final class SteamSession {
             } else if let appID, !appsSteamLoaded.contains(appID) {
                 // Otherwise -applaunch fails at once with AppError_18 and no
                 // game ever starts (Endacopia, The Baby in Yellow, Oct 12 2026).
-                log.info("[ensureReadyForDRM] appID=\(appID) was installed after Steam started — restarting Steam so it loads the game")
+                log.info("[ensureReadyForDRM] appID=\(appID) was installed or updated after Steam started — restarting Steam so it loads the game")
             } else if !pendingEulaAcceptances.isEmpty {
                 log.info("[ensureReadyForDRM] license agreement accepted in Meridian — restarting Steam so it reads the answer")
             } else {

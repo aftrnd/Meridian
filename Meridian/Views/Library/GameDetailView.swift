@@ -855,12 +855,9 @@ private struct ScrollViewLanding: NSViewRepresentable {
         if hasAnyInfo {
             VStack(spacing: 0) {
                 // Install status
-                DetailRow(
-                    icon: currentGame.isInstalled ? "internaldrive" : "icloud.and.arrow.down",
-                    label: "Installation",
-                    value: currentGame.isInstalled ? "Installed" : "Not Installed",
-                    valueColor: currentGame.isInstalled ? .green : .orange
-                )
+                let installation = installationRow
+                DetailRow(icon: installation.icon, label: "Installation",
+                          value: installation.value, valueColor: installation.color)
 
                 // Platform
                 if currentGame.windowsOnly {
@@ -1145,14 +1142,14 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
         case .installing:
             HStack(spacing: 8) {
-                ProgressButton("Preparing…")
+                ProgressButton(launcher.installIsUpdate ? "Updating…" : "Preparing…")
                 cancelButton
             }
 
         case .downloading:
             let isInstalling = (launcher.downloadProgress ?? 0) > 0.88
             HStack(spacing: 8) {
-                ProgressButton(isInstalling ? "Installing…" : "Downloading…")
+                ProgressButton(launcher.installIsUpdate ? "Updating…" : isInstalling ? "Installing…" : "Downloading…")
                 cancelButton
             }
 
@@ -1214,7 +1211,7 @@ private struct ScrollViewLanding: NSViewRepresentable {
                         .inactiveAwareProminence(controlActiveState == .inactive)
                         .controlSize(.large)
                     } else {
-                        Button { currentGame.isInstalled ? handlePlayTapped() : handleInstallTapped() } label: {
+                        Button { currentGame.installState == .installed ? handlePlayTapped() : handleInstallTapped() } label: {
                             Label("Retry", systemImage: "arrow.clockwise")
                                 .frame(
                                     minWidth: GameDetailMetrics.launchButtonMinWidth,
@@ -1244,7 +1241,8 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
     @ViewBuilder
     private var idleButton: some View {
-        if currentGame.isInstalled {
+        switch currentGame.installState {
+        case .installed:
             let label = launchButtonLabel("Play", systemImage: "play.fill")
             Button { handlePlayTapped() } label: { label }
                 .inactiveAwareProminence(controlActiveState == .inactive)
@@ -1252,7 +1250,17 @@ private struct ScrollViewLanding: NSViewRepresentable {
                 .modifier(settledLaunchButton { label })
                 .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
                 .help(isLauncherBusyWithOtherGame ? "Stop the current game before launching another" : "")
-        } else {
+        case .updateRequired:
+            // Play would only make Steam update first (a launching app's
+            // update goes to the front of its queue): say so up front.
+            let label = launchButtonLabel("Update", systemImage: "arrow.down.circle.fill")
+            Button { handleInstallTapped() } label: { label }
+                .inactiveAwareProminence(controlActiveState == .inactive)
+                .controlSize(.large)
+                .modifier(settledLaunchButton { label })
+                .disabled(!steamAuth.isAuthenticated || isLauncherBusyWithOtherGame)
+                .help(isLauncherBusyWithOtherGame ? "Another game is currently active" : "A newer version is available")
+        case .notInstalled:
             let label = launchButtonLabel("Install", systemImage: "arrow.down.circle.fill")
             Button { handleInstallTapped() } label: { label }
                 .inactiveAwareProminence(controlActiveState == .inactive)
@@ -1312,6 +1320,15 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
     private var currentGame: Game {
         library.gameWithMergedPlaytime(appID: game.id) ?? library.games.first(where: { $0.id == game.id }) ?? game
+    }
+
+    /// The "Installation" row's icon, wording and colour.
+    private var installationRow: (icon: String, value: String, color: Color) {
+        switch currentGame.installState {
+        case .installed:      ("internaldrive", "Installed", .green)
+        case .updateRequired: ("arrow.down.circle", "Update Available", .orange)
+        case .notInstalled:   ("icloud.and.arrow.down", "Not Installed", .orange)
+        }
     }
 
     private func handleInstallTapped() {

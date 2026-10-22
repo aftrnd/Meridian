@@ -10,6 +10,18 @@ struct LogoPlacement: Hashable, Sendable {
     let heightPct: Double
 }
 
+/// Whether a game's files are on disk, read from its Steam appmanifest
+/// (`WinePrefix.installState(stateFlags:)`).
+enum GameInstallState: Sendable {
+    case notInstalled
+    /// Files on disk and current: ready to play.
+    case installed
+    /// Files on disk, but Steam has a newer build. The game must update
+    /// before it can launch; it is still installed, not something to download
+    /// from scratch.
+    case updateRequired
+}
+
 /// A game in the user's Steam library.
 struct Game: Identifiable, Hashable, Sendable {
     let id: Int
@@ -18,7 +30,9 @@ struct Game: Identifiable, Hashable, Sendable {
     let playtime2WeekMinutes: Int?
     let lastPlayedDate: Date?
     let iconHash: String?
-    var isInstalled: Bool = false
+    var installState: GameInstallState = .notInstalled
+    /// Files on disk, current or not: an outdated game is still installed.
+    var isInstalled: Bool { installState != .notInstalled }
     var windowsOnly: Bool = false
     /// SHA-1 content hash for the library capsule art on Steam's new CDN.
     /// Populated in the background by SteamLibraryStore after library refresh.
@@ -270,7 +284,7 @@ struct Game: Identifiable, Hashable, Sendable {
         playtime2WeekMinutes: Int? = nil,
         lastPlayedDate: Date? = nil,
         iconHash: String? = nil,
-        isInstalled: Bool = false,
+        installState: GameInstallState = .notInstalled,
         windowsOnly: Bool = false,
         libraryCapsuleHash: String? = nil,
         logoHash: String? = nil,
@@ -285,7 +299,7 @@ struct Game: Identifiable, Hashable, Sendable {
         self.playtime2WeekMinutes = playtime2WeekMinutes
         self.lastPlayedDate       = lastPlayedDate
         self.iconHash             = iconHash
-        self.isInstalled          = isInstalled
+        self.installState         = installState
         self.windowsOnly          = windowsOnly
         self.libraryCapsuleHash   = libraryCapsuleHash
         self.logoHash             = logoHash

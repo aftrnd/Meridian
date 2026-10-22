@@ -33,7 +33,7 @@ import Foundation
 ///   • hasSteamLoginSession(configDir:)   ← WinePrefix.hasSteamLoginSession()
 ///   • steamLibraryFolders(...)           ← WinePrefix.steamLibraryFolders
 ///   • isGameInstalled(...)               ← WinePrefix.isGameInstalled()
-///   • isGameFullyInstalled(...)          ← WinePrefix.isGameFullyInstalled()
+///   • installState(...)                  ← WinePrefix.installState(appID:)
 ///   • gameInstallDir(...)                ← WinePrefix.gameInstallDir()
 ///   • gameRequiresSteamAPI(...)          ← WinePrefix.gameRequiresSteamAPI()
 ///   • writeSteamAppID(...)               ← WinePrefix.writeSteamAppID()
@@ -660,10 +660,14 @@ final class WinePrefixTests: XCTestCase {
         XCTAssertNil(windowsPathToURL("X", driveC: driveC))
     }
 
-    // MARK: - isGameFullyInstalled
+    // MARK: - installState
 
-    /// Mirrors WinePrefix.isGameFullyInstalled — checks ACF StateFlags == "4"
-    private func isGameFullyInstalled(appID: Int, steamInstallDir: URL, prefixDriveC: URL) -> Bool {
+    /// Mirror of GameInstallState (Game.swift).
+    private enum TestInstallState { case notInstalled, installed, updateRequired }
+
+    /// Mirrors WinePrefix.installState(appID:) — the first library's ACF
+    /// decides; StateFlags bit 4 = files on disk, bit 2 = update required.
+    private func installState(appID: Int, steamInstallDir: URL, prefixDriveC: URL) -> TestInstallState {
         let fm = FileManager.default
         for library in steamLibraryFolders(steamInstallDir: steamInstallDir, prefixDriveC: prefixDriveC) {
             let acf = library.appending(path: "steamapps/appmanifest_\(appID).acf")
@@ -671,14 +675,16 @@ final class WinePrefixTests: XCTestCase {
                   let contents = try? String(contentsOf: acf, encoding: .utf8) else { continue }
             for line in contents.components(separatedBy: "\n") {
                 if let (key, value) = vdfKeyValue(from: line), key == "StateFlags" {
-                    return value == "4"
+                    guard let flags = Int(value), flags & 4 != 0 else { return .notInstalled }
+                    return flags & 2 != 0 ? .updateRequired : .installed
                 }
             }
+            return .notInstalled
         }
-        return false
+        return .notInstalled
     }
 
-    func testIsGameFullyInstalled_returnsTrueWhenStateFlagsIsFour() throws {
+    func testInstallState_installedWhenStateFlagsIsFour() throws {
         let (steam, driveC) = try makePrefix()
         let appID = 220
         let steamapps = steam.appending(path: "steamapps")
@@ -695,7 +701,7 @@ final class WinePrefixTests: XCTestCase {
         """
         try acf.write(to: steamapps.appending(path: "appmanifest_\(appID).acf"), atomically: true, encoding: .utf8)
 
-        XCTAssertTrue(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .installed,
                       "StateFlags=4 should mean fully installed")
     }
 
@@ -722,8 +728,8 @@ final class WinePrefixTests: XCTestCase {
         // isGameInstalled should still be true (ACF exists)
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
                       "ACF exists so isGameInstalled should be true")
-        // but isGameFullyInstalled must be false (download not complete)
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        // but installState must be notInstalled (download not complete)
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .notInstalled,
                        "StateFlags=1026 means download in progress, not fully installed")
     }
 
@@ -777,8 +783,8 @@ final class WinePrefixTests: XCTestCase {
     ///
     /// This test exercises the full install-detection loop: once Steam creates the
     /// ACF after the user clicks Install in the `-install` dialog, `isGameInstalled`
-    /// transitions from false to true and `isGameFullyInstalled` correctly stays
-    /// false until the download completes (StateFlags == 4).
+    /// transitions from false to true and `installState` correctly stays
+    /// `.notInstalled` until the download completes (StateFlags == 4).
     func testInstallFlowStateProgression() throws {
         let (steam, driveC) = try makePrefix()
         let appID = 3180070
@@ -790,7 +796,7 @@ final class WinePrefixTests: XCTestCase {
         // Phase 1: before user confirms install dialog — no ACF yet
         XCTAssertFalse(isGameInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
                        "Phase 1: ACF must not exist before user confirms install")
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .notInstalled,
                        "Phase 1: game must not be fully installed before ACF exists")
 
         // Phase 2: user clicked Install — Steam wrote ACF with StateFlags=1026
@@ -809,7 +815,7 @@ final class WinePrefixTests: XCTestCase {
 
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
                       "Phase 2: ACF present means install confirmed (isGameInstalled=true)")
-        XCTAssertFalse(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .notInstalled,
                        "Phase 2: StateFlags=1026 download in progress — not fully installed")
 
         // Phase 3: download complete — Steam updated StateFlags to 4
@@ -826,7 +832,7 @@ final class WinePrefixTests: XCTestCase {
 
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
                       "Phase 3: game still detected as installed")
-        XCTAssertTrue(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .installed,
                       "Phase 3: StateFlags=4 means fully installed and ready to launch")
     }
 
@@ -984,7 +990,7 @@ final class WinePrefixTests: XCTestCase {
 
         XCTAssertTrue(isGameInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
                       "Game must be detected as installed once ACF is present")
-        XCTAssertTrue(isGameFullyInstalled(appID: appID, steamInstallDir: steam, prefixDriveC: driveC),
+        XCTAssertEqual(installState(appID: appID, steamInstallDir: steam, prefixDriveC: driveC), .installed,
                       "Game must be fully installed when StateFlags=4")
     }
 
