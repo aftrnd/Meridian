@@ -1079,10 +1079,10 @@ final class SteamSession {
             )
         }
 
-        // DX9 → DXVK → KosmicKrisp → Metal where this Mac and engine have it
-        // (macOS 26); elsewhere D3D9 stays on wined3d's OpenGL renderer, whose
-        // CPU overhead held New Vegas to ~27 fps (Pattern 61).
-        if effectiveAPI == .dx9, let d3d9 = engine.d3d9MetalEnvironment() {
+        // DX9 → DXVK → KosmicKrisp → Metal for games that opt in, where this
+        // Mac and engine have it (macOS 26); otherwise wined3d's OpenGL
+        // renderer, which ran New Vegas better (`GameProfile.preferDXVK`).
+        if effectiveAPI == .dx9, profile?.preferDXVK == true, let d3d9 = engine.d3d9MetalEnvironment() {
             env.merge(d3d9) { _, routed in routed }
         }
 

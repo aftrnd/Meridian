@@ -2174,6 +2174,10 @@ private struct BannerCompatBadge: View {
     @Environment(WineEngine.self) private var engine
     @State private var showingPopover = false
 
+    /// D3D9 goes through DXVK and KosmicKrisp only for games that opt in
+    /// (`GameProfile.preferDXVK`), as `SteamSession.gameEnvironment` routes it.
+    private var d3d9OnMetal: Bool { engine.dxvkPath != nil && profile?.preferDXVK == true }
+
     private var icon: String {
         switch status {
         case .verified, .playable: return "checkmark.seal.fill"
@@ -2256,7 +2260,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: r.engineName,
                 api: r.graphicsAPI.displayName,
-                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: engine.dxvkPath != nil),
+                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
                 bitness: r.bitness != nil ? r.bitnessDescription : nil,
                 engineSource: r.engineSource,
                 apiSource: r.apiSource
@@ -2267,7 +2271,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: p.gameEngine.displayName,
                 api: p.graphicsAPI.displayName,
-                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: engine.dxvkPath != nil),
+                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
                 bitness: nil,
                 engineSource: .explicit,
                 apiSource: .explicit

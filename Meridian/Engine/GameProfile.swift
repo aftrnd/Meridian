@@ -118,6 +118,13 @@ struct GameProfile {
     /// because it only helps games that actually call NVIDIA NGX.
     let enableDLSSBridge: Bool
 
+    /// When true, a DX9 game renders through DXVK → KosmicKrisp → Metal where
+    /// the engine and macOS have it (`WineEngine.dxvkPath`) instead of wined3d.
+    /// Opt-in: KosmicKrisp compiles pipelines at draw time, and New Vegas ran
+    /// 8-25 fps with drops to 1-3 there against a steady 26-30 on wined3d
+    /// (Oct 21 2026, Pattern 61), while Source games already run well on wined3d.
+    let preferDXVK: Bool
+
     /// Command-line arguments appended to the game executable when launching.
     /// Use for engine-level flags like `-force-d3d11` (Unity) that change
     /// rendering path without needing DLL overrides.
@@ -151,6 +158,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         preferD3DMetal: Bool = false,
         enableDLSSBridge: Bool = false,
+        preferDXVK: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -167,6 +175,7 @@ struct GameProfile {
         self.extraEnv = extraEnv
         self.preferD3DMetal = preferD3DMetal
         self.enableDLSSBridge = enableDLSSBridge
+        self.preferDXVK = preferDXVK
         self.launchArgs = launchArgs
         self.skipSteamDRM = skipSteamDRM
         self.launchViaSteam = launchViaSteam
