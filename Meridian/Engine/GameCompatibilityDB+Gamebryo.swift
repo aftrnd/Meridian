@@ -29,7 +29,7 @@ extension GameCompatibilityDB {
             appID: 22380,
             name: "Fallout: New Vegas",
             status: .launches,
-            verifiedWith: "v4.1.0-engine",
+            verifiedWith: "v4.3.1-engine",
             notes: """
             Gamebryo (TES Engine), 32-bit FalloutNV.exe, Direct3D 9.0c, shader \
             model 3.0; Havok physics, SpeedTree, DirectSound audio, Bink video \
@@ -81,7 +81,7 @@ extension GameCompatibilityDB {
             starts, before it is active, so winemac defers the switch; when it \
             lands, winemac's cached desktop rect and Retina flag stay on the old \
             5120×2880 desktop and it halves the 3840×2160 window to 1920×1080 pt. \
-            Root fix in Wine (engine patch 0006, Pattern 54), not yet in an engine. \
+            Root fix in Wine (engine patch 0006, Pattern 54), verified Oct 21 2026 on v4.3.1-engine: fullscreen 2560×1440 filled the 5K screen. \
             Meridian now also activates the game a launcher starts (activation \
             alone did not fix the frame, 00:06 run). \
             \
@@ -91,16 +91,31 @@ extension GameCompatibilityDB {
             every 32-bit Wine DLL was compiled to x87, which Rosetta runs slowly, \
             and dsound resamples each 44.1/22.05 kHz sound to the 48 kHz mix. \
             Fixed for every 32-bit game by building them with SSE math \
-            (v4.2.1-engine, Pattern 60); not yet played on it. \
+            (Pattern 60): 26-30 fps in the world on v4.2.1, 0 audio underruns. \
             \
-            LAUNCHER: Options › Windowed lists only resolutions up to 1920×1080 \
-            (PCGamingWiki: windowed mode supports a limited set); untick it for \
-            fullscreen, which needs engine patch 0006 to fill the screen. \
+            THE CEILING (Pattern 62): FalloutNV.exe is x87 code (69,791 x87 vs \
+            740 SSE instructions), which Rosetta emulates in software, and its \
+            Main thread was 100% busy on every renderer. DXVK → KosmicKrisp \
+            (Pattern 61) ran it at 8-25 fps with pipeline-compile drops, worse \
+            than wined3d, so it stays on wined3d. Best so far (v4.3.1-engine, \
+            fullscreen 2560×1440, MSAA 2×, transparency MSAA off): 30-44 fps \
+            between stalls; "most playable it's been", still choppy. Stalls of \
+            2-3 s every 10-20 s on area changes and the Pip-Boy, and a long \
+            quit, are the game's own Main-thread work (a +quartz trace shows no \
+            DirectShow call blocking it longer than 0.8 s). The game polls its \
+            music graphs every frame (IMediaControl::Run, GetCurrentPosition). \
+            A winegstreamer quartz_parser deadlock (pin.flushing_cs) still hits \
+            a background music thread in some sessions; open. \
             \
-            SETTINGS FOR SPEED until the D3D9 → Metal path lands (Pattern 32): \
-            2560×1440 (exactly half the 5K panel each way, so it scales sharp; \
-            the same 1× path Half-Life 2 runs well on) and antialiasing off or 2×. \
-            Not yet measured. Radio not yet checked.
+            SETTINGS: FalloutPrefs.ini overrides Fallout.ini, and on launch the \
+            game copies Fallout_default.ini over Fallout.ini (byte-identical, \
+            original timestamp), so tweaks belong in FalloutPrefs.ini, which the \
+            launcher rewrites only when it re-detects the adapter (it did when \
+            DXVK's Radeon replaced wined3d's GeForce). Threading switches \
+            (bUseThreadedAI, bMultiThreadAudio, threaded particles, blood, \
+            morpher) set there on Oct 21; not yet measured. Options › Windowed \
+            lists only resolutions up to 1920×1080 (PCGamingWiki). Radio not yet \
+            checked.
             """
         ),
 
