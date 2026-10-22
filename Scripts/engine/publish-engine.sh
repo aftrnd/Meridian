@@ -48,8 +48,9 @@ Meridian engine, built from source by Scripts/engine/.
 
 - Wine $(cat "$SRC/wine/VERSION" | sed 's/Wine version //') from its published ${WINE_SOURCE_VERSION} source (LGPL-2.1) plus the Meridian patches
 - DXMT $(sed 's/DXMT //' "$STAGE/wine/meridian-dxmt-version.txt") (D3D10/11 → Metal), selected per launch via WINEDLLPATH
+- DXVK d3d9, the Khronos Vulkan loader and Mesa KosmicKrisp (D3D9 → Metal on macOS 26, for games that opt in): $(cat "$STAGE/wine/meridian-d3d9-version.txt")
 - MoltenVK 1.4.2, GnuTLS, GStreamer (VideoToolbox decode)
-- x86_64 under Rosetta 2, WoW64 for 32-bit games
+- x86_64 under Rosetta 2, WoW64 for 32-bit games, 32-bit Wine modules built with SSE math
 
 Not included: Apple D3DMetal, any closed-source component, the gbe_fork Steamworks emulator, Valve binaries.
 License texts are in licenses/ inside the archive.
