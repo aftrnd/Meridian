@@ -46,13 +46,17 @@ struct CachedAsyncImage<Content: View>: View {
             return
         }
 
+        // Every cached candidate before the network: URL by URL re-asked the
+        // network for each one that failed before (see HeroLogoLoader.load).
         for tryURL in urlsToTry {
             // Two-tier cache: memory then disk (disk read + decode off-main).
             if let cached = await ImageCache.shared.imageAsync(for: tryURL) {
                 phase = .success(Image(nsImage: cached))
                 return
             }
+        }
 
+        for tryURL in urlsToTry {
             guard !Task.isCancelled else { return }
             do {
                 let (data, response) = try await URLSession.imageSession.data(from: tryURL)

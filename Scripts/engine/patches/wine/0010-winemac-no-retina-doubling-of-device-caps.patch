@@ -1,0 +1,17 @@
+--- a/dlls/winemac.drv/gdi.c
++++ b/dlls/winemac.drv/gdi.c
+@@ -219,8 +219,12 @@
+         pthread_mutex_unlock(&device_data_mutex);
+         dev = GET_NEXT_PHYSDEV( dev, pGetDeviceCaps );
+         ret = dev->funcs->pGetDeviceCaps( dev, cap );
+-        if ((cap == HORZRES || cap == VERTRES) && retina_on)
+-            ret *= 2;
++        /* Meridian: no Retina doubling of HORZRES/VERTRES. win32u takes them
++         * from the display/monitor rect, which this driver already reports in
++         * pixels in Retina mode (5120x2880 on a 5K display), so doubling gave
++         * 10240x5760 while SM_CXSCREEN, the monitor and the current mode said
++         * 5120x2880. Noita sized its fullscreen window from it: twice the
++         * screen, no mode switch, left where the window was. */
+         return ret;
+     }
+ 

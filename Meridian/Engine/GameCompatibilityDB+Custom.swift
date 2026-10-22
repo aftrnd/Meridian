@@ -37,5 +37,29 @@ extension GameCompatibilityDB {
             """
         ),
 
+        .custom(
+            appID: 881100,
+            name: "Noita",
+            status: .verified,
+            verifiedWith: "v4.3.2-engine",
+            notes: """
+            Nolla Games' own engine (Falling Everything), OpenGL, 32-bit, \
+            SDL 2.0.7. Manifest dpiAware=true. Fullscreen is the game's own \
+            routine: window sized to GetDeviceCaps' screen size, \
+            ChangeDisplaySettings, borderless popup at (0,0). \
+            \
+            v4.3.1-engine on a 5K Retina display (Oct 22, 2026): fullscreen \
+            was twice the screen, anchored mid-screen: winemac doubled \
+            HORZRES/VERTRES in Retina mode (patch 0010). The window had no \
+            visible title bar: OpenGL windows never turned opaque (patch \
+            0011). User-verified fixed on v4.3.2: fullscreen measured \
+            0,0 2560x1440 pt with Retina on (Pattern 67). \
+            \
+            Saves are over 50 MB (thousands of files): the first Steam Cloud \
+            sync is long, and launches report "Unable to Sync" until it \
+            finishes (Pattern 66).
+            """
+        ),
+
     ]
 }

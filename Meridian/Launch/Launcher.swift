@@ -125,6 +125,55 @@ final class Launcher {
         eulaPrompt = nil
     }
 
+    // MARK: - Steam Cloud sync failures (asked by Meridian)
+
+    /// Steam couldn't sync a game's cloud saves before starting it and waits
+    /// on the player (`SynchronizingCloud "syncfailed"`). Meridian asks in
+    /// its own sheet while Steam's dialog stays hidden: Steam's would open
+    /// its whole library window (Pattern 66).
+    struct CloudSyncPrompt: Identifiable, Equatable {
+        let game: Game
+        var id: Int { game.id }
+    }
+
+    private(set) var cloudSyncPrompt: CloudSyncPrompt?
+
+    /// The player's answer, read by the launch loop holding for it.
+    private enum CloudSyncAnswer { case tryAgain, cancel, decideInSteam }
+    private var cloudSyncAnswer: CloudSyncAnswer?
+    /// Launches the game again after Try Again, once Steam has quit.
+    private var cloudSyncRelaunch: (() -> Void)?
+
+    /// Try Again: quitting Steam closes its dialog, and the game launches
+    /// again, so Steam syncs again.
+    func retryCloudSync(
+        engine: WineEngine,
+        session: SteamSession,
+        steamAuth: SteamAuthService? = nil,
+        library: SteamLibraryStore? = nil
+    ) {
+        guard let prompt = cloudSyncPrompt else { return }
+        cloudSyncPrompt = nil
+        cloudSyncRelaunch = { [weak self] in
+            self?.launch(game: prompt.game, engine: engine, session: session, steamAuth: steamAuth, library: library)
+        }
+        cloudSyncAnswer = .tryAgain
+    }
+
+    /// Cancel: quitting Steam closes its dialog; the game doesn't start.
+    func cancelCloudSync() {
+        guard cloudSyncPrompt != nil else { return }
+        cloudSyncPrompt = nil
+        cloudSyncAnswer = .cancel
+    }
+
+    /// Play Anyway can only be answered in Steam, so its dialog is shown.
+    func decideCloudSyncInSteam() {
+        guard cloudSyncPrompt != nil else { return }
+        cloudSyncPrompt = nil
+        cloudSyncAnswer = .decideInSteam
+    }
+
     private(set) var launchState: LaunchState = .idle
     private(set) var currentActivity: String?
     /// The few beats the launch card names. Steam reports a dozen statuses on
@@ -623,10 +672,12 @@ final class Launcher {
         defer { library?.setInstallStatePollingSuspended(false) }
 
         appendLog("Waiting for game to start")
+        cloudSyncAnswer = nil
+        cloudSyncRelaunch = nil
         var latestStep: String?
         var stepShownAt = ContinuousClock.now
         var openedAt: ContinuousClock.Instant?
-        var pendingWait: (step: String, since: ContinuousClock.Instant)?
+        var pendingWait: (step: String, detail: String, since: ContinuousClock.Instant)?
         var eulaHandOff: [SteamEula]?
         var steamFailed = false
         var runningInstallScript = false
@@ -645,8 +696,8 @@ final class Launcher {
             let appended = Self.readAppended(consoleLog, from: &consoleLogOffset)
             for event in Self.steamLaunchEvents(in: appended, appID: game.id) {
                 switch event {
-                case .waitingForPlayer(let step):
-                    pendingWait = (step, .now)
+                case .waitingForPlayer(let step, let detail):
+                    pendingWait = (step, detail, .now)
                 case .answered, .task:
                     pendingWait = nil
                     if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
@@ -675,12 +726,25 @@ final class Launcher {
                         break
                     }
                 }
-                showSteamPrompt(pendingWait.step)
+                // Steam couldn't sync the game's cloud saves: Meridian asks
+                // while Steam's dialog stays hidden. Try Again and Cancel quit
+                // Steam (below); only Play Anyway needs Steam's own window.
+                if pendingWait.step == "SynchronizingCloud", pendingWait.detail == "syncfailed",
+                   cloudSyncAnswer != .decideInSteam {
+                    if cloudSyncPrompt == nil, cloudSyncAnswer == nil {
+                        log.info("[launchOnline] Steam couldn't sync \(game.name)'s cloud saves; asking in Meridian")
+                        appendLog("Steam couldn't sync \(game.name)'s cloud saves")
+                        cloudSyncPrompt = CloudSyncPrompt(game: game)
+                    }
+                    if cloudSyncAnswer != nil { break }
+                } else {
+                    showSteamPrompt(pendingWait.step)
+                }
             }
             // Steam hasn't started the game while it waits on the player or
             // runs the game's install scripts (DirectX, Visual C++): hold the
             // startup timeout, and don't take the installers for the game.
-            gameProcess.startupHeld = steamWaitingOnPlayer != nil || runningInstallScript
+            gameProcess.startupHeld = steamWaitingOnPlayer != nil || runningInstallScript || cloudSyncPrompt != nil
             // Some games sit a long while before their first window; past
             // "Almost there" the card says that's normal instead of going quiet.
             if let openedAt {
@@ -709,6 +773,24 @@ final class Launcher {
 
         launchStep = nil
         if steamWaitingOnPlayer != nil { showSteamPrompt(nil) }
+        cloudSyncPrompt = nil
+
+        if let answer = cloudSyncAnswer, answer != .decideInSteam {
+            // Quitting Steam closes its "Unable to Sync" dialog. Try Again
+            // launches again, which syncs again.
+            log.info("[launchOnline] cloud sync failure answered in Meridian: \(answer == .tryAgain ? "try again" : "cancel")")
+            gameProcess.cancelMonitoring()
+            closeActiveGameLog(reason: "cloud sync failed, \(answer == .tryAgain ? "trying again" : "cancelled")", exitCode: nil)
+            await session.shutdown(engine: engine)
+            steamWindow?.resumeAfterGame(steamPID: 0)
+            launchState = .idle
+            currentActivity = nil
+            let relaunch = answer == .tryAgain ? cloudSyncRelaunch : nil
+            cloudSyncAnswer = nil
+            cloudSyncRelaunch = nil
+            relaunch?()
+            return
+        }
 
         if let eulas = eulaHandOff {
             // Ask in Meridian's sheet. Quitting Steam closes its own dialog
@@ -1221,8 +1303,9 @@ final class Launcher {
         case task(String)
         /// `LaunchApp waiting for user response to ShowEula ""`: Steam shows
         /// a dialog and waits (it answers `ShowInterstitials` itself when
-        /// there are none).
-        case waitingForPlayer(String)
+        /// there are none). `detail` is the quoted reason, as in
+        /// `SynchronizingCloud "syncfailed"`; empty for most steps.
+        case waitingForPlayer(String, detail: String = "")
         /// `LaunchApp continues with user response "ShowEula"`
         case answered
     }
@@ -1240,7 +1323,10 @@ final class Launcher {
         return text.split(whereSeparator: \.isNewline).compactMap { line in
             guard line.contains(marker) else { return nil }
             if let task = word(after: "LaunchApp changed task to ", in: line) { return .task(task) }
-            if let step = word(after: "LaunchApp waiting for user response to ", in: line) { return .waitingForPlayer(step) }
+            if let step = word(after: "LaunchApp waiting for user response to ", in: line) {
+                let detail = line.split(separator: "\"", omittingEmptySubsequences: false).dropFirst().first ?? ""
+                return .waitingForPlayer(step, detail: String(detail))
+            }
             if line.contains("LaunchApp continues with user response") { return .answered }
             return nil
         }
