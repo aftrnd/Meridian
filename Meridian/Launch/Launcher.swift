@@ -1359,21 +1359,11 @@ final class Launcher {
     }
 
     /// The other app whose cloud upload Steam logged last in `text`
-    /// (cloud_log.txt), or nil. Steam's transfer lines, verbatim from Noita's
-    /// world cleanup (Oct 22 2026):
-    /// `[AppID 881100] Upload batch initiated, ID: …`,
-    /// `[AppID 881100] HTTP upload for file '…' beginning . . .`,
-    /// `[AppID 881100] Upload OK for file …`,
-    /// `[AppID 881100] Delete OK for file …`.
-    /// Evaluations (`Starting sync (eval,)`) don't count: Steam runs one for
-    /// every game within a second of starting.
+    /// (cloud_log.txt), or nil (`SteamCloudStatus.transferAppID` has the
+    /// lines that count).
     nonisolated static func cloudUploadAppID(in text: String, excluding appID: Int) -> Int? {
         for line in text.split(whereSeparator: \.isNewline).reversed() {
-            guard let open = line.range(of: "[AppID "),
-                  let close = line[open.upperBound...].firstIndex(of: "]"),
-                  let id = Int(line[open.upperBound..<close]), id != appID else { continue }
-            let message = line[line.index(after: close)...].drop { $0 == " " }
-            if ["Upload ", "HTTP upload ", "Delete OK "].contains(where: { message.hasPrefix($0) }) { return id }
+            if let id = SteamCloudStatus.transferAppID(line), id != appID { return id }
         }
         return nil
     }

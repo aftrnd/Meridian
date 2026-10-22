@@ -56,6 +56,8 @@ struct GameDetailView: View {
     @State private var bannerImageFailed = false
     /// Sampled banner colors — drives the ambient glow behind the hero card.
     @State private var bannerGlowColors: ImageCache.EdgeColors?
+    /// Steam Cloud state, kept current while the page is open; nil hides the row.
+    @State private var cloudStatus: SteamCloudStatus? = nil
     @State private var achievements: [GameAchievement] = []
     @State private var achievementsLoading = false
     @State private var achievementsUnavailable = false
@@ -105,6 +107,7 @@ struct GameDetailView: View {
         // Same for the info + achievements cards: cached data (hover prefetch
         // or an earlier visit) is on screen at mount, refreshed underneath.
         _appDetails = State(initialValue: SteamAPIService.shared.cachedAppDetails(appID: game.id))
+        _cloudStatus = State(initialValue: SteamCloudStatus.lastRead[game.id])
         if let cached = SteamAPIService.shared.cachedAchievements(appID: game.id) {
             _achievements = State(initialValue: cached)
         } else {
@@ -274,6 +277,7 @@ struct GameDetailView: View {
         .onChange(of: game.id) { _, newID in
             heroAspectRatio = SteamLibraryHeroMetrics.aspectRatio
             appDetails = SteamAPIService.shared.cachedAppDetails(appID: newID)
+            cloudStatus = SteamCloudStatus.lastRead[newID]
             bannerImage = nil
             bannerImageFailed = false
             achievements = SteamAPIService.shared.cachedAchievements(appID: newID) ?? []
@@ -294,6 +298,9 @@ struct GameDetailView: View {
         }
         .task(id: game.id) {
             await resolveStack()
+        }
+        .task(id: game.id) {
+            await watchCloudStatus()
         }
         .sheet(isPresented: $showEngineSetup) {
             EngineSetupView().environment(engine)
@@ -852,6 +859,12 @@ private struct ScrollViewLanding: NSViewRepresentable {
                 let value = recent >= 60 ? "\(recent / 60) hr\(recent/60 == 1 ? "" : "s")" : "\(recent) min"
                 DetailRow(icon: "calendar", label: "Last 2 Weeks", value: value)
             }
+
+            if appDetails?.supportsSteamCloud == true, let cloudStatus {
+                DetailDivider()
+                DetailRow(icon: cloudStatus.symbol, label: "Cloud Saves", value: cloudStatus.text,
+                          valueColor: cloudStatus == .conflict ? .orange : .primary)
+            }
         }
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.separator, lineWidth: 0.5))
@@ -1110,6 +1123,26 @@ private struct ScrollViewLanding: NSViewRepresentable {
         } catch {
             // Keep whatever the cache gave us; only an empty page reports failure.
             if achievements.isEmpty { achievementsUnavailable = true }
+        }
+    }
+
+    // MARK: - Steam Cloud status
+
+    /// Keeps the Cloud Saves row current while the page is open: Steam
+    /// uploads a game's saves after it exits, for seconds or, with Noita's
+    /// world files, minutes. Two small file reads every 2 s, off the main actor.
+    private func watchCloudStatus() async {
+        let prefix = WinePrefix.defaultPrefix
+        let localConfig = prefix.localConfigURL(steamID64: AppSettings.shared.steamCredentialSteamID)
+        let cloudLog = prefix.steamInstallDir.appending(path: "logs/cloud_log.txt")
+        let appID = game.id
+        while !Task.isCancelled {
+            let status = await Task.detached(priority: .utility) {
+                SteamCloudStatus.read(appID: appID, localConfig: localConfig, cloudLog: cloudLog)
+            }.value
+            if status != cloudStatus { cloudStatus = status }
+            SteamCloudStatus.lastRead[appID] = status
+            try? await Task.sleep(for: .seconds(2))
         }
     }
 
