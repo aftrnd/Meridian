@@ -1052,36 +1052,38 @@ final class SteamSession {
             }
         }
         let profile = compat.profile(for: appID)
-        if let profile {
-            switch profile.dxmtMode {
-            case .disabled:
-                // Per-game opt-out of DXMT: Wine's own D3D for games DXMT
-                // mis-renders. Dropping lib/dxmt from the search path is what
-                // selects wined3d; `b` keeps a game-shipped d3d11 from winning.
-                env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)
-                env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
-                    env["WINEDLLOVERRIDES"],
-                    overriding: ["d3d11", "dxgi"],
-                    with: "b"
-                )
-            case .required, .auto:
-                break
-            }
-        }
 
-        // DX12 → GPTK routing. The effective graphics API is the explicit
+        // The effective graphics API is the explicit
         // profile's (hand-verified override) when set, otherwise the resolved
         // value from GameStackResolver (PCGamingWiki's tested Direct3D version,
         // or local engine-default). This means a DX12 game with NO explicit
-        // compat entry — identified by detection/PCGW — still gets the GPTK
-        // (D3D12 → D3DMetal → Metal) path instead of falling through to the
-        // DX11/DXMT global default. The resolver cache is warmed by the
+        // compat entry — identified by detection/PCGW — still gets the DX12
+        // route below (GPTK where present, else Wine's own D3D) instead of
+        // falling through to the DX11/DXMT global default. The resolver cache is warmed by the
         // launcher immediately before this is called (`resolve(appID:...)`);
         // on a cold cache this is nil and behaviour is unchanged (DXMT default).
         let effectiveAPI: GraphicsAPI = {
             if let a = profile?.graphicsAPI, a != .unknown { return a }
             return GameStackResolver.shared.cached(appID: appID)?.graphicsAPI ?? .unknown
         }()
+
+        // Wine's own D3D: for games DXMT mis-renders (per-game opt-out), and
+        // for every DX12 game without GPTK. Wine's d3d12 (vkd3d) asks the DXGI
+        // adapter for Wine's private IWineDXGIAdapter (d3d12_main.c
+        // d3d12_get_adapter), which DXMT's dxgi doesn't implement, so
+        // D3D12CreateDevice fails (Animal Well, Oct 22 2026, Pattern 65).
+        // Dropping lib/dxmt from the search path is what selects wined3d; `b`
+        // keeps a game-shipped d3d11 or dxgi from winning.
+        if profile?.dxmtMode == .disabled || (effectiveAPI == .dx12 && engine.gptkPath == nil) {
+            env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)
+            env["WINEDLLOVERRIDES"] = mergeWineDllOverrides(
+                env["WINEDLLOVERRIDES"],
+                overriding: ["d3d11", "dxgi"],
+                with: "b"
+            )
+        }
+
+        // DX12 → GPTK where the engine carries it: D3D12 → D3DMetal → Metal.
         if effectiveAPI == .dx12, let gptk = engine.gptkPath {
             // GPTK's builtins (d3d12, dxgi, d3d11) first in the search path.
             env["WINEDLLPATH"] = engine.dllSearchPath(preferring: "\(gptk)/wine")

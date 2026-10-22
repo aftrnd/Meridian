@@ -1371,6 +1371,8 @@ final class GameInstallTests: XCTestCase {
                        "SteamSession.gameEnvironment must route BOTH the DX12 path and preferD3DMetal through gptk/wine first.")
         XCTAssertTrue(session.contains(#"env["WINEDLLPATH"] = engine.dllSearchPath(preferring: nil)"#),
                       "dxmtMode == .disabled must drop lib/dxmt from the search path.")
+        XCTAssertTrue(session.contains("if profile?.dxmtMode == .disabled || (effectiveAPI == .dx12 && engine.gptkPath == nil) {"),
+                      "A DX12 game without GPTK must get Wine's own dxgi: Wine's d3d12 needs IWineDXGIAdapter, which DXMT's dxgi lacks (Pattern 65).")
 
         for file in ["Meridian/Engine/WineEngine.swift", "Meridian/Steam/SteamSession.swift"] {
             let src = try String(contentsOf: root.appending(path: file), encoding: .utf8)

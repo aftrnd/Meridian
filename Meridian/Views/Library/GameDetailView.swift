@@ -2203,6 +2203,9 @@ private struct BannerCompatBadge: View {
     /// D3D9 goes through DXVK and KosmicKrisp only for games that opt in
     /// (`GameProfile.preferDXVK`), as `SteamSession.gameEnvironment` routes it.
     private var d3d9OnMetal: Bool { engine.dxvkPath != nil && profile?.preferDXVK == true }
+    /// D3D12 goes through D3DMetal only where the engine carries GPTK;
+    /// otherwise Wine's vkd3d (`SteamSession.gameEnvironment`).
+    private var d3d12OnD3DMetal: Bool { engine.gptkPath != nil }
 
     private var icon: String {
         switch status {
@@ -2286,7 +2289,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: r.engineName,
                 api: r.graphicsAPI.displayName,
-                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
+                translation: r.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal, d3d12OnD3DMetal: d3d12OnD3DMetal),
                 bitness: r.bitness != nil ? r.bitnessDescription : nil,
                 engineSource: r.engineSource,
                 apiSource: r.apiSource
@@ -2297,7 +2300,7 @@ private struct BannerCompatBadge: View {
             return PipelineInfo(
                 engine: p.gameEngine.displayName,
                 api: p.graphicsAPI.displayName,
-                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal),
+                translation: p.graphicsAPI.translationLayer(d3d9OnMetal: d3d9OnMetal, d3d12OnD3DMetal: d3d12OnD3DMetal),
                 bitness: nil,
                 engineSource: .explicit,
                 apiSource: .explicit
