@@ -1,0 +1,27 @@
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1822,6 +1822,10 @@
+             }
+             pendingOrderOut = FALSE;
+ 
++            /* Meridian: hiding cleared the background; an OpenGL view's
++             * content counts as drawn again now it's shown. */
++            [self updateForGLSubviews];
++
+             if ([self becameEligibleParentOrChild])
+                 needAdjustWindowLevels = TRUE;
+ 
+@@ -2806,6 +2810,13 @@
+     {
+         if (gl_surface_mode == GL_SURFACE_BEHIND)
+             [self checkTransparency];
++        /* Meridian: in front, an OpenGL view draws the window's content, as a
++         * Metal view does (newMetalViewWithDevice:), so the window has drawn
++         * and may turn opaque. Without this an OpenGL-only window kept the
++         * clear background windows are created and hidden with, and macOS 26+
++         * drew its title bar over that, see-through (Noita). */
++        else if ([(WineContentView*)[self contentView] hasGLDescendant])
++            [self windowDidDrawContent];
+     }
+ 
+     - (void) setRetinaMode:(BOOL)mode
