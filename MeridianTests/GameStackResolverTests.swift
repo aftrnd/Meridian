@@ -368,6 +368,8 @@ final class GameStackResolverTests: XCTestCase {
                       "gameEnvironment must read the resolved graphics API so DX12 games without an explicit profile still get GPTK")
         XCTAssertTrue(session.contains("effectiveAPI == .dx12"),
                       "gameEnvironment must route the EFFECTIVE DX12 api through GPTK, not just explicit-profile DX12")
+        XCTAssertTrue(session.contains("effectiveAPI == .dx9, profile?.preferDXVK == true, let d3d9 = engine.d3d9MetalEnvironment()"),
+                      "gameEnvironment must route DX9 games that opt in (preferDXVK) through DXVK and KosmicKrisp")
 
         // Launcher warms the resolver before building the env.
         let launcher = try String(

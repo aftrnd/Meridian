@@ -13,6 +13,7 @@
 #   libraries   GnuTLS, nettle, gmp, freetype, SDL2, GLib, GStreamer   build-deps.sh
 #   MoltenVK    Khronos release (Apache-2.0)                           build-deps.sh
 #   DXMT        3Shain/dxmt release (MIT)                              fetched here
+#   DXVK d3d9, Vulkan-Loader, KosmicKrisp (zlib, Apache-2.0, MIT)       build-d3d9.sh
 #
 # Renderer selection (no closed renderer switch):
 #   Wine searches its own lib/wine before any WINEDLLPATH entry, so a DLL that
@@ -22,9 +23,12 @@
 #   as  <preferred backend>:lib/wined3d:lib/wine  so Wine's own implementation
 #   fills in whatever the preferred backend does not provide:
 #     lib/dxmt/    d3d11 dxgi d3d10core (+ nvapi64, nvngx)   D3D10/11 → Metal
-#     lib/wined3d/ d3d11 dxgi d3d10core d3d12 d3d12core      Wine's own
+#     lib/dxvk/    d3d9                                       D3D9 → Vulkan → KosmicKrisp → Metal
+#     lib/wined3d/ d3d9 d3d11 dxgi d3d10core d3d12 d3d12core  Wine's own
 #   DXMT's backend, winemetal.dll/.so, links Wine's winemac.so via @loader_path
-#   and has no Wine counterpart, so it lives in lib/wine itself.
+#   and has no Wine counterpart, so it lives in lib/wine itself. DXVK's Vulkan
+#   goes through lib64/libvulkan.1.dylib (WINE_VULKAN_LIBRARY, patch 0009),
+#   which loads KosmicKrisp from lib64/kosmickrisp_icd.json (VK_DRIVER_FILES).
 #
 # Not shipped: Apple D3DMetal (GPTK license), cxcompatdb.so (closed source),
 # the gbe_fork Steamworks emulator, and any Valve binary.
@@ -43,7 +47,8 @@ INSTALLED_ENGINE="$HOME/Library/Application Support/com.meridian.app/engine"
 
 # The D3D front-ends Meridian switches between per launch. d3d12 moves too:
 # while it sits in lib/wine nothing on WINEDLLPATH can ever replace it.
-SWITCHED_DLLS=(d3d11 dxgi d3d10core d3d12 d3d12core)
+SWITCHED_DLLS=(d3d9 d3d11 dxgi d3d10core d3d12 d3d12core)
+D3D9_INSTALL="$WORK/d3d9-install"
 
 W="$STAGE/wine"
 
@@ -99,6 +104,41 @@ stage_dxmt() {
     done
     cp "$src/x86_64-unix/winemetal.so" "$W/lib/wine/x86_64-unix/"
     echo "DXMT $DXMT_VERSION" > "$W/meridian-dxmt-version.txt"
+}
+
+# MARK: - D3D9
+
+# DXVK's d3d9 in lib/dxvk; the Vulkan loader, KosmicKrisp and its manifest in
+# lib64 (build-d3d9.sh). Before stage_libraries, which relinks and rpaths
+# every dylib in the tree.
+stage_d3d9() {
+    say "Staging the D3D9 path ($(cat "$D3D9_INSTALL/versions.txt"))"
+    local arch dll strip
+    for arch in x86_64-windows i386-windows; do
+        mkdir -p "$W/lib/dxvk/$arch"
+        dll="$W/lib/dxvk/$arch/d3d9.dll"
+        cp "$D3D9_INSTALL/dxvk/$arch/d3d9.dll" "$dll"
+        strip=$([ "$arch" = i386-windows ] && echo i686-w64-mingw32-strip || echo x86_64-w64-mingw32-strip)
+        "$strip" -s "$dll"
+        mark_builtin "$dll"
+    done
+    mkdir -p "$W/lib64"
+    cp "$D3D9_INSTALL"/lib64/* "$W/lib64/"
+    cp "$D3D9_INSTALL/versions.txt" "$W/meridian-d3d9-version.txt"
+}
+
+# Wine loads a DLL from its own directories only when the DOS stub says
+# "Wine builtin DLL" at 0x40 (what winebuild --builtin writes); DXVK's
+# MinGW build doesn't, and Wine would skip it without a word.
+mark_builtin() {
+    python3 -I - "$1" <<'PY'
+import struct, sys
+p = sys.argv[1]
+d = bytearray(open(p, "rb").read())
+assert struct.unpack_from("<I", d, 0x3C)[0] >= 0x40 + 32, "no room in the DOS stub: " + p
+d[0x40:0x40 + 17] = b"Wine builtin DLL\0"
+open(p, "wb").write(d)
+PY
 }
 
 # MARK: - Libraries
@@ -256,6 +296,7 @@ build_prefix_template() {
     grep -q Dnscache "$tpl/system.reg" || die "prefix template missing Dnscache registration"
     [ "$services" -ge 15 ] || die "prefix template has only $services services"
     [ -f "$tpl/drive_c/windows/system32/d3d12.dll" ] || die "prefix template missing d3d12.dll (Unity 6 delay-loads it)"
+    [ -f "$tpl/drive_c/windows/syswow64/d3d9.dll" ] || die "prefix template missing the 32-bit d3d9.dll placeholder"
     echo "    template: $dlls DLLs, $services services"
 
     rm -rf "$tpl/dosdevices"; mkdir -p "$tpl/dosdevices" "$tpl/drive_c/windows/syswow64"
@@ -270,6 +311,7 @@ stage_licenses() {
     mkdir -p "$d"
     cp "$SRC/wine/COPYING.LIB" "$d/wine-LGPL-2.1.txt"
     cp "$SRC/wine/LICENSE"     "$d/wine-LICENSE.txt"
+    cp "$D3D9_INSTALL"/licenses/* "$d/"
     cat > "$d/README.txt" <<EOF
 Meridian engine $TAG — third-party components
 
@@ -278,6 +320,10 @@ Wine 11.0 (source ${WINE_SOURCE_VERSION} as published by CodeWeavers)  LGPL-2.1
   Meridian's changes: Scripts/engine/patches/wine/ in the Meridian repository
 DXMT ${DXMT_VERSION}                                MIT        https://github.com/3Shain/dxmt
 MoltenVK 1.4.2                                     Apache-2.0 https://github.com/KhronosGroup/MoltenVK
+DXVK (d3d9; Meridian's patches/dxvk applied)       zlib       https://github.com/doitsujin/dxvk
+Vulkan-Loader                                      Apache-2.0 https://github.com/KhronosGroup/Vulkan-Loader
+Mesa KosmicKrisp                                   MIT        https://gitlab.freedesktop.org/mesa/mesa
+  Revisions: $(cat "$D3D9_INSTALL/versions.txt")
 GnuTLS, nettle, GMP                                LGPL       https://gnutls.org
 FreeType                                           FTL        https://freetype.org
 SDL2                                               zlib       https://libsdl.org
@@ -300,6 +346,9 @@ validate() {
              lib/wine/x86_64-unix/winemetal.so lib/wine/x86_64-windows/winemetal.dll \
              lib/dxmt/x86_64-windows/d3d11.dll lib/dxmt/i386-windows/d3d11.dll \
              lib/wined3d/x86_64-windows/d3d11.dll lib/wined3d/i386-windows/d3d11.dll \
+             lib/wined3d/x86_64-windows/d3d9.dll lib/wined3d/i386-windows/d3d9.dll \
+             lib/dxvk/x86_64-windows/d3d9.dll lib/dxvk/i386-windows/d3d9.dll \
+             lib64/libvulkan.1.dylib lib64/libvulkan_kosmickrisp.dylib lib64/kosmickrisp_icd.json \
              lib64/libgnutls.30.dylib lib64/libMoltenVK.dylib lib64/libfreetype.6.dylib; do
         [ -e "$W/$f" ] || die "missing wine/$f"
     done
@@ -316,8 +365,10 @@ validate() {
 
 main() {
     [ -x "$WINE_INSTALL/bin/wine" ] || die "run build-wine.sh first"
+    [ -f "$D3D9_INSTALL/versions.txt" ] || die "run build-d3d9.sh first"
     stage_wine
     stage_dxmt
+    stage_d3d9
     stage_libraries
     stage_meridian_tools
     sign_loader

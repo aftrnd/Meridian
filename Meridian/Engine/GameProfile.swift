@@ -30,7 +30,7 @@ enum GameEngine: String {
 /// What DirectX/Vulkan API the game renders with.
 /// Drives DXMT vs DXVK selection at launch.
 enum GraphicsAPI: String {
-    case dx9       // DirectX 9 → wined3d → OpenGL → Metal (no d3d9 backend on this engine yet)
+    case dx9       // DirectX 9 → DXVK → KosmicKrisp → Metal (macOS 26+), else wined3d → OpenGL
     case dx11      // DirectX 11 → DXMT → Metal
     case dx12      // DirectX 12 → DXVK/MoltenVK → Metal
     case vulkan    // Vulkan → MoltenVK → Metal
@@ -48,10 +48,11 @@ enum GraphicsAPI: String {
 
     /// The game page's render path. One copy: the page's own had drifted to
     /// "DXVK → MoltenVK → Metal" for DX9, which draws nothing on this engine
-    /// (engine-research-findings Patterns 27, 31).
-    var translationLayer: String {
+    /// (engine-research-findings Patterns 27, 31). `d3d9OnMetal`: this Mac's
+    /// engine routes D3D9 through DXVK and KosmicKrisp (`WineEngine.dxvkPath`).
+    func translationLayer(d3d9OnMetal: Bool) -> String {
         switch self {
-        case .dx9:     return "wined3d → OpenGL → Metal"
+        case .dx9:     return d3d9OnMetal ? "DXVK → KosmicKrisp → Metal" : "wined3d → OpenGL → Metal"
         case .dx11:    return "DXMT → Metal"
         case .dx12:    return "GPTK → D3DMetal → Metal"
         case .vulkan:  return "MoltenVK"
@@ -117,6 +118,13 @@ struct GameProfile {
     /// because it only helps games that actually call NVIDIA NGX.
     let enableDLSSBridge: Bool
 
+    /// When true, a DX9 game renders through DXVK → KosmicKrisp → Metal where
+    /// the engine and macOS have it (`WineEngine.dxvkPath`) instead of wined3d.
+    /// Opt-in: KosmicKrisp compiles pipelines at draw time, and New Vegas ran
+    /// 8-25 fps with drops to 1-3 there against a steady 26-30 on wined3d
+    /// (Oct 21 2026, Pattern 61), while Source games already run well on wined3d.
+    let preferDXVK: Bool
+
     /// Command-line arguments appended to the game executable when launching.
     /// Use for engine-level flags like `-force-d3d11` (Unity) that change
     /// rendering path without needing DLL overrides.
@@ -150,6 +158,7 @@ struct GameProfile {
         extraEnv: [String: String] = [:],
         preferD3DMetal: Bool = false,
         enableDLSSBridge: Bool = false,
+        preferDXVK: Bool = false,
         launchArgs: [String] = [],
         skipSteamDRM: Bool = false,
         launchViaSteam: Bool = false,
@@ -166,6 +175,7 @@ struct GameProfile {
         self.extraEnv = extraEnv
         self.preferD3DMetal = preferD3DMetal
         self.enableDLSSBridge = enableDLSSBridge
+        self.preferDXVK = preferDXVK
         self.launchArgs = launchArgs
         self.skipSteamDRM = skipSteamDRM
         self.launchViaSteam = launchViaSteam

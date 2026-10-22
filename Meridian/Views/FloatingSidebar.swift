@@ -121,7 +121,10 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
                         let start = dragStartWidth ?? width
                         dragStartWidth = start
                         let range = FloatingSidebar.widthRange
-                        width = min(max(start + drag.translation.width, range.lowerBound), range.upperBound)
+                        // Whole points: drag translations are fractional, and
+                        // the pages start at the glass's edge (`edge(width:)`),
+                        // so a fractional width left them between pixels.
+                        width = min(max((start + drag.translation.width).rounded(), range.lowerBound), range.upperBound)
                     }
                     .onEnded { _ in dragStartWidth = nil }
             )

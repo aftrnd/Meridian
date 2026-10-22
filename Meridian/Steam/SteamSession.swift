@@ -1079,6 +1079,13 @@ final class SteamSession {
             )
         }
 
+        // DX9 → DXVK → KosmicKrisp → Metal for games that opt in, where this
+        // Mac and engine have it (macOS 26); otherwise wined3d's OpenGL
+        // renderer, which ran New Vegas better (`GameProfile.preferDXVK`).
+        if effectiveAPI == .dx9, profile?.preferDXVK == true, let d3d9 = engine.d3d9MetalEnvironment() {
+            env.merge(d3d9) { _, routed in routed }
+        }
+
         // D3DMetal opt-in (per-game): D3D11/DXGI/D3D12 all from Apple GPTK.
         // Why: DXMT cannot service the Media Foundation video processor's D3D11
         // texture path → Unity VideoPlayer / MF cutscenes render black. D3DMetal

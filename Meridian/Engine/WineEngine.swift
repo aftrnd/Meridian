@@ -75,7 +75,11 @@ final class WineEngine {
     /// could never be replaced per launch. See `dllSearchPath(preferring:)`.
     private(set) var wined3dPath: String?
 
-    /// Path to DXVK DLLs (DirectX -> Vulkan -> Metal via MoltenVK).
+    /// DXVK's d3d9 (`lib/dxvk`): Direct3D 9 → Vulkan → KosmicKrisp → Metal.
+    /// Set only when the engine ships it with the Vulkan loader and
+    /// KosmicKrisp (Scripts/engine/build-d3d9.sh) and this Mac runs macOS 26,
+    /// which KosmicKrisp's Metal 4 needs; otherwise D3D9 stays on wined3d.
+    /// See `d3d9MetalEnvironment()`.
     private(set) var dxvkPath: String?
 
     /// Path to the D3D12 implementation directory (VKD3D-proton, not used on macOS).
@@ -234,7 +238,14 @@ final class WineEngine {
             : nil
 
         let bundledDxvk = Self.engineDir.appending(path: "wine/lib/dxvk").path(percentEncoded: false)
-        if fm.fileExists(atPath: bundledDxvk) { dxvkPath = bundledDxvk }
+        let d3d9OnMetalShipped = fm.fileExists(atPath: "\(bundledDxvk)/i386-windows/d3d9.dll")
+            && lib64Path.map { fm.fileExists(atPath: "\($0)/libvulkan.1.dylib")
+                && fm.fileExists(atPath: "\($0)/kosmickrisp_icd.json") } == true
+        if #available(macOS 26.0, *), d3d9OnMetalShipped {
+            dxvkPath = bundledDxvk
+        } else {
+            dxvkPath = nil
+        }
 
         // D3D12: detect VKD3D-proton (present but NOT used on macOS — lacks VK_EXT_transform_feedback)
         let vkd3dProton = Self.engineDir.appending(path: "wine/lib/vkd3d-proton/x86_64-windows/d3d12.dll").path(percentEncoded: false)
@@ -637,6 +648,21 @@ final class WineEngine {
         return [backendDir, wined3dPath, "\(lib)/wine"]
             .compactMap { $0 }
             .joined(separator: ":")
+    }
+
+    /// What routes a D3D9 game through DXVK and KosmicKrisp (`dxvkPath`), nil
+    /// where that path isn't available. DXVK's d3d9 goes first, DXMT stays
+    /// ahead of wined3d for anything else. Wine loads the Vulkan loader instead
+    /// of MoltenVK (engine patch 0009) and the loader's only driver is
+    /// KosmicKrisp: MoltenVK reads D3D9 colour textures as one channel and
+    /// lacks features DXVK needs (engine-research-findings Patterns 32, 61).
+    func d3d9MetalEnvironment() -> [String: String]? {
+        guard let dxvk = dxvkPath, let l64 = lib64Path else { return nil }
+        return [
+            "WINEDLLPATH":         dxvk + ":" + dllSearchPath(preferring: dxmtPath),
+            "WINE_VULKAN_LIBRARY": "\(l64)/libvulkan.1.dylib",
+            "VK_DRIVER_FILES":     "\(l64)/kosmickrisp_icd.json",
+        ]
     }
 
     /// Builds the environment dictionary for launching a Wine process.
