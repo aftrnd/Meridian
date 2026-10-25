@@ -94,8 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let screen = window.screen ?? NSScreen.main {
             let vf = screen.visibleFrame
             window.setFrameOrigin(CGPoint(
-                x: vf.midX - window.frame.width  / 2,
-                y: vf.midY - window.frame.height / 2
+                x: (vf.midX - window.frame.width  / 2).rounded(),
+                y: (vf.midY - window.frame.height / 2).rounded()
             ))
         }
 
@@ -122,10 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // Expand from the splash's current center so the final window lands
         // at the same center point that window.center() chose for the splash.
+        // Rounded: 625 is odd, so the exact centre puts the origin on a half point.
         let currentFrame = window.frame
         let newFrame = NSRect(
-            x: currentFrame.midX - Self.fullFrameSize.width / 2,
-            y: currentFrame.midY - Self.fullFrameSize.height / 2,
+            x: (currentFrame.midX - Self.fullFrameSize.width / 2).rounded(),
+            y: (currentFrame.midY - Self.fullFrameSize.height / 2).rounded(),
             width: Self.fullFrameSize.width,
             height: Self.fullFrameSize.height
         )

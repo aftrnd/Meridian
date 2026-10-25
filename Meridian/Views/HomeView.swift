@@ -450,9 +450,10 @@ private struct HeroCarousel: View {
     // MARK: Layers
 
     // ── Logo / subtitle / button ────────────────────────────────────────────────────
-    // Metrics unchanged from the dissolve-era layout (user-specified):
-    //   .padding(.bottom, 26.75)   button bottom from banner bottom
-    //   Spacer().frame(height: 15.5)   subtitle bottom to button top
+    // Metrics from the dissolve-era layout (user-specified), rounded to
+    // whole points (user, Oct 24 2026; were 26.75 and 15.5):
+    //   .padding(.bottom, 27)   button bottom from banner bottom
+    //   Spacer().frame(height: 16)   subtitle bottom to button top
     // Each tier is its own parallax layer so the cascade can stagger them.
     @ViewBuilder
     private func caption(for g: Game, page: Int) -> some View {
@@ -475,7 +476,7 @@ private struct HeroCarousel: View {
                 .foregroundStyle(.white.opacity(0.7))
                 .lineLimit(2)
                 .modifier(HeroPageLayer(position: position, page: page, width: w, rate: Self.subtitleRate, fade: 1.6))
-            Spacer().frame(height: 15.5)
+            Spacer().frame(height: 16)
             Button {
                 onSelect(g)
             } label: {
@@ -495,7 +496,7 @@ private struct HeroCarousel: View {
         }
         .padding(.leading, heroInset)
         .padding(.trailing, 24)
-        .padding(.bottom, 26.75)
+        .padding(.bottom, 27)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .id(g.id)
     }
