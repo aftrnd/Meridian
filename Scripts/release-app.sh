@@ -105,7 +105,7 @@ bold "════════════════════════�
 echo ""
 
 # Must be run from the repo root.
-[ -f "${PROJECT}" ] || die "Run this script from the repository root: bash Scripts/release-app.sh"
+[ -d "${PROJECT}" ] || die "Run this script from the repository root: bash Scripts/release-app.sh"
 
 command -v gh >/dev/null 2>&1        || die "gh CLI not found. Install: brew install gh"
 gh auth status >/dev/null 2>&1       || die "gh CLI not authenticated. Run: gh auth login"
