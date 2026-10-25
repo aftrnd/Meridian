@@ -69,8 +69,8 @@ struct SplashView: View {
                let screen = window.screen ?? NSScreen.main {
                 let vf = screen.visibleFrame
                 window.setFrameOrigin(CGPoint(
-                    x: vf.midX - window.frame.width  / 2,
-                    y: vf.midY - window.frame.height / 2
+                    x: (vf.midX - window.frame.width  / 2).rounded(),
+                    y: (vf.midY - window.frame.height / 2).rounded()
                 ))
             }
             bootstrap.start(

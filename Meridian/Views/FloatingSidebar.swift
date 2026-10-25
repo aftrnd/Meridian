@@ -13,8 +13,9 @@ import SwiftUI
 /// meets the glass exactly: its background extension mirrors the art into
 /// that safe area, under the panel, unshaded, as macOS 26 and 27 draw it.
 enum FloatingSidebar {
-    /// The glass's width: the classic column's, until its edge is dragged.
-    static let defaultWidth: Double = 215
+    /// The glass's width until its edge is dragged (user, Oct 24 2026; the
+    /// classic column is 215).
+    static let defaultWidth: Double = 220
     static let widthRange: ClosedRange<Double> = 180...360
     /// UserDefaults key for the dragged width.
     static let widthKey = "floatingSidebar.width"

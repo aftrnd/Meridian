@@ -400,7 +400,7 @@ private struct FriendPanelRow: View {
                     SteamAvatarView(url: friend.avatarMediumURL, size: 32)
                         .opacity(dimmed ? 0.55 : 1)
                     StatusDot(color: friend.statusColor, size: 10)
-                        .offset(x: 1.5, y: 1.5)
+                        .offset(x: 2, y: 2)
                 }
 
                 VStack(alignment: .leading, spacing: 1) {

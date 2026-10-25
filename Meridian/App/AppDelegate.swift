@@ -7,13 +7,13 @@ private let log = MeridianLog(category: "AppDelegate")
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
 
     private static let splashSize     = NSSize(width: 480, height: 300)
-    // 1028×625, whole points throughout. Width: the sidebar is 215
-    // (ContentView) and the content column 805
+    // 1028×625, whole points throughout. Width: the classic sidebar column
+    // is 215 (ContentView) and the content column 805
     // (`CardLayoutMetrics.defaultContentWidth`). Height: Home's first row sits
     // centred under the hero, 63.6 pt from the hero to the card art and 63.6
     // from the art to the window bottom (hero 302 + 63.6 + art 195.8 + 63.6).
-    // Floating sidebar: 1028×625, the glass's 8 pt inset + 215 pt glass +
-    // 805 pt content (user, Oct 13 2026); still 5 columns + peek.
+    // Floating sidebar: 1028×625, the glass's 8 pt inset + 220 pt glass +
+    // 800 pt content (user, Oct 24 2026); still 5 columns + peek.
     private static var fullFrameSize: NSSize {
         NSSize(width: 1028, height: 625)
     }
@@ -94,8 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let screen = window.screen ?? NSScreen.main {
             let vf = screen.visibleFrame
             window.setFrameOrigin(CGPoint(
-                x: vf.midX - window.frame.width  / 2,
-                y: vf.midY - window.frame.height / 2
+                x: (vf.midX - window.frame.width  / 2).rounded(),
+                y: (vf.midY - window.frame.height / 2).rounded()
             ))
         }
 
@@ -122,10 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // Expand from the splash's current center so the final window lands
         // at the same center point that window.center() chose for the splash.
+        // Rounded: 625 is odd, so the exact centre puts the origin on a half point.
         let currentFrame = window.frame
         let newFrame = NSRect(
-            x: currentFrame.midX - Self.fullFrameSize.width / 2,
-            y: currentFrame.midY - Self.fullFrameSize.height / 2,
+            x: (currentFrame.midX - Self.fullFrameSize.width / 2).rounded(),
+            y: (currentFrame.midY - Self.fullFrameSize.height / 2).rounded(),
             width: Self.fullFrameSize.width,
             height: Self.fullFrameSize.height
         )

@@ -803,7 +803,8 @@ struct CardLayoutMetrics {
     /// The content-column width at the app's DEFAULT window size
     /// (AppDelegate.fullFrameSize 1028 − sidebar 215). The column-count
     /// step anchors to this so the default window always shows the canonical
-    /// 5-columns + peek layout.
+    /// 5-columns + peek layout. The floating sidebar's default (8 + 220)
+    /// leaves 800, still 5 columns.
     static let defaultContentWidth: CGFloat = 805
 
     /// The card size at the default window (5 columns + peek at
