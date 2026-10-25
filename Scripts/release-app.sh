@@ -73,6 +73,17 @@ xcode_build_setting() {
         | grep -w "$1" | awk '{print $3}'
 }
 
+# The project's build settings are the version's single source of truth
+# (Info.plist reads $(MARKETING_VERSION) and $(CURRENT_PROJECT_VERSION)).
+# Not agvtool: it overwrote those Info.plist references with literals and
+# left MARKETING_VERSION unchanged.
+set_version() {
+    sed -i '' -E \
+        -e "s/(MARKETING_VERSION = )[^;]+;/\1$1;/" \
+        -e "s/(CURRENT_PROJECT_VERSION = )[^;]+;/\1$2;/" \
+        "${PROJECT}/project.pbxproj"
+}
+
 bump_semver() {
     local version="$1" mode="$2"
     version="${version#v}"
@@ -158,8 +169,7 @@ if ${TAG_ONLY}; then
     [[ "${CONFIRM}" =~ ^[Yy]$ ]] || { echo "  Aborted."; exit 0; }
 
     step "Bumping version → ${NEW_VERSION} (build ${NEW_BUILD})"
-    xcrun agvtool new-marketing-version "${NEW_VERSION}" >/dev/null
-    xcrun agvtool new-version -all "${NEW_BUILD}" >/dev/null
+    set_version "${NEW_VERSION}" "${NEW_BUILD}"
     bash "$(dirname "${BASH_SOURCE[0]}")/check-version.sh" "${TAG}"
 
     step "Committing and tagging"
@@ -209,8 +219,7 @@ read -rp "  Continue with release ${NEW_VERSION}? [y/N] " CONFIRM
 # ---------- bump version ----------
 
 step "Bumping version → ${NEW_VERSION} (build ${NEW_BUILD})"
-xcrun agvtool new-marketing-version "${NEW_VERSION}"
-xcrun agvtool new-version -all "${NEW_BUILD}"
+set_version "${NEW_VERSION}" "${NEW_BUILD}"
 info "MARKETING_VERSION = ${NEW_VERSION}"
 info "CURRENT_PROJECT_VERSION = ${NEW_BUILD}"
 
