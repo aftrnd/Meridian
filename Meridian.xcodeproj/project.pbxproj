@@ -9,8 +9,8 @@
 /* Begin PBXBuildFile section */
 		22514C5D01E68E0515FA9EAA /* GameCompatibilityDB+Unity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 341C6A1510D9175DA42109B1 /* GameCompatibilityDB+Unity.swift */; };
 		31BBDC1F93444D77B811A589 /* BootstrapManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE9307949871471AB0E85285 /* BootstrapManager.swift */; };
-		7D0D0A11C0DE4450800A0001 /* GameCompatibilityDB+Godot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */; };
 		7D0D0A11C0DE0022380A0001 /* GameCompatibilityDB+Gamebryo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE0022380A0002 /* GameCompatibilityDB+Gamebryo.swift */; };
+		7D0D0A11C0DE4450800A0001 /* GameCompatibilityDB+Godot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */; };
 		7D0F0A11ABCDEF0000000001 /* FriendsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */; };
 		893C6023DF3C41F9A6624B1D /* CategoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46B315635523C0CF2D44F9BA /* CategoryStore.swift */; };
 		8B0812FC6BBB07573ED3A149 /* GameProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4965BA889D288764428E3E5 /* GameProfile.swift */; };
@@ -33,17 +33,12 @@
 		B001002A /* GameDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001002B /* GameDetailView.swift */; };
 		B0010030 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010031 /* SettingsView.swift */; };
 		B0010032 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010033 /* AuthView.swift */; };
-		B0A10001 /* OnboardingViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0A10002 /* OnboardingViews.swift */; };
 		B0010034 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035 /* AppSettings.swift */; };
 		B0010035A /* AppDetails.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010035B /* AppDetails.swift */; };
 		B0010036 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0010037 /* Assets.xcassets */; };
 		B0010036A /* GameAchievement.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0010036B /* GameAchievement.swift */; };
 		B00A0001 /* GameArtOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00A0002 /* GameArtOverrides.swift */; };
 		B00AI001 /* SteamAppInfoResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00AI002 /* SteamAppInfoResolver.swift */; };
-		B0E5A001 /* SteamEula.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5A002 /* SteamEula.swift */; };
-		B0E5D001 /* SteamCloudStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5D002 /* SteamCloudStatus.swift */; };
-		B0E5B001 /* EulaSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5B002 /* EulaSheet.swift */; };
-		B0E5C001 /* CloudSyncSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5C002 /* CloudSyncSheet.swift */; };
 		B00D0001 /* DownloadsToolbarButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00D0002 /* DownloadsToolbarButton.swift */; };
 		B00DD001 /* DepotDownloaderInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00DD002 /* DepotDownloaderInstall.swift */; };
 		B00E0001 /* WineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0002 /* WineEngine.swift */; };
@@ -54,7 +49,6 @@
 		B00E0030 /* EngineDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0031 /* EngineDownloader.swift */; };
 		B00E0040 /* TerminationCleanup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0041 /* TerminationCleanup.swift */; };
 		B00E0050 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0051 /* SearchView.swift */; };
-		B0F1D001 /* FloatingSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F1D002 /* FloatingSidebar.swift */; };
 		B00E0060 /* SteamWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0061 /* SteamWebView.swift */; };
 		B00E0070 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E0071 /* HomeView.swift */; };
 		B00E00B0 /* AppUpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00E00B1 /* AppUpdateChecker.swift */; };
@@ -65,10 +59,16 @@
 		B00F0005 /* Launcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00F0006 /* Launcher.swift */; };
 		B00G0001 /* SteamSessionBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00G0002 /* SteamSessionBackup.swift */; };
 		B00H0001 /* SteamCredentialAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00H0002 /* SteamCredentialAuth.swift */; };
+		B0A10001 /* OnboardingViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0A10002 /* OnboardingViews.swift */; };
 		B0DE0001 /* DetailTransition.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0DE0002 /* DetailTransition.swift */; };
 		B0DE0003 /* DetailZoomTuning.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0DE0004 /* DetailZoomTuning.swift */; };
 		B0DE0101 /* LicenseManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0DE0102 /* LicenseManager.swift */; };
 		B0DE0103 /* LicenseSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0DE0104 /* LicenseSettingsView.swift */; };
+		B0E5A001 /* SteamEula.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5A002 /* SteamEula.swift */; };
+		B0E5B001 /* EulaSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5B002 /* EulaSheet.swift */; };
+		B0E5C001 /* CloudSyncSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5C002 /* CloudSyncSheet.swift */; };
+		B0E5D001 /* SteamCloudStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0E5D002 /* SteamCloudStatus.swift */; };
+		B0F1D001 /* FloatingSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F1D002 /* FloatingSidebar.swift */; };
 		B4F5F3E797836CF9DA50A859 /* GameCompatibilityDB+Custom.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */; };
 		D1D8B7DD549091BB2876CCA0 /* MeridianLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE30B92B1C3871B6B2870750 /* MeridianLog.swift */; };
 		D2D4DECBBBDF414CAD07A818 /* GameCompatibilityDB+Source.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2352BE5CC5DF464F94E831C5 /* GameCompatibilityDB+Source.swift */; };
@@ -83,8 +83,8 @@
 		3BF608482E3FAC1C99244185 /* GameCompatibilityDB+Custom.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Custom.swift"; sourceTree = "<group>"; };
 		46B315635523C0CF2D44F9BA /* CategoryStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CategoryStore.swift; sourceTree = "<group>"; };
 		4F62085FF69F4F208309DA56 /* SplashView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SplashView.swift; sourceTree = "<group>"; };
-		7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Godot.swift"; sourceTree = "<group>"; };
 		7D0D0A22C0DE0022380A0002 /* GameCompatibilityDB+Gamebryo.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Gamebryo.swift"; sourceTree = "<group>"; };
+		7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Godot.swift"; sourceTree = "<group>"; };
 		7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FriendsPanel.swift; sourceTree = "<group>"; };
 		A66F49292F6617F1005601F4 /* app-icon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "app-icon.icon"; sourceTree = "<group>"; };
 		A7C4E1F200000002 /* GamePerformanceMonitor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GamePerformanceMonitor.swift; sourceTree = "<group>"; };
@@ -104,7 +104,6 @@
 		B001002B /* GameDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameDetailView.swift; sourceTree = "<group>"; };
 		B0010031 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		B0010033 /* AuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthView.swift; sourceTree = "<group>"; };
-		B0A10002 /* OnboardingViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingViews.swift; sourceTree = "<group>"; };
 		B0010035 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		B0010035B /* AppDetails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDetails.swift; sourceTree = "<group>"; };
 		B0010036B /* GameAchievement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameAchievement.swift; sourceTree = "<group>"; };
@@ -115,10 +114,6 @@
 		B001003C /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Package.swift; path = ../Package.swift; sourceTree = "<group>"; };
 		B00A0002 /* GameArtOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameArtOverrides.swift; sourceTree = "<group>"; };
 		B00AI002 /* SteamAppInfoResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamAppInfoResolver.swift; sourceTree = "<group>"; };
-		B0E5A002 /* SteamEula.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamEula.swift; sourceTree = "<group>"; };
-		B0E5D002 /* SteamCloudStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCloudStatus.swift; sourceTree = "<group>"; };
-		B0E5B002 /* EulaSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EulaSheet.swift; sourceTree = "<group>"; };
-		B0E5C002 /* CloudSyncSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSheet.swift; sourceTree = "<group>"; };
 		B00D0002 /* DownloadsToolbarButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsToolbarButton.swift; sourceTree = "<group>"; };
 		B00DD002 /* DepotDownloaderInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepotDownloaderInstall.swift; sourceTree = "<group>"; };
 		B00E0002 /* WineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WineEngine.swift; sourceTree = "<group>"; };
@@ -129,7 +124,6 @@
 		B00E0031 /* EngineDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineDownloader.swift; sourceTree = "<group>"; };
 		B00E0041 /* TerminationCleanup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminationCleanup.swift; sourceTree = "<group>"; };
 		B00E0051 /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchView.swift; sourceTree = "<group>"; };
-		B0F1D002 /* FloatingSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingSidebar.swift; sourceTree = "<group>"; };
 		B00E0061 /* SteamWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamWebView.swift; sourceTree = "<group>"; };
 		B00E0071 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		B00E00B1 /* AppUpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdateChecker.swift; sourceTree = "<group>"; };
@@ -140,10 +134,16 @@
 		B00F0006 /* Launcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Launcher.swift; sourceTree = "<group>"; };
 		B00G0002 /* SteamSessionBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamSessionBackup.swift; sourceTree = "<group>"; };
 		B00H0002 /* SteamCredentialAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCredentialAuth.swift; sourceTree = "<group>"; };
+		B0A10002 /* OnboardingViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingViews.swift; sourceTree = "<group>"; };
 		B0DE0002 /* DetailTransition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailTransition.swift; sourceTree = "<group>"; };
 		B0DE0004 /* DetailZoomTuning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailZoomTuning.swift; sourceTree = "<group>"; };
 		B0DE0102 /* LicenseManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseManager.swift; sourceTree = "<group>"; };
 		B0DE0104 /* LicenseSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseSettingsView.swift; sourceTree = "<group>"; };
+		B0E5A002 /* SteamEula.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamEula.swift; sourceTree = "<group>"; };
+		B0E5B002 /* EulaSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EulaSheet.swift; sourceTree = "<group>"; };
+		B0E5C002 /* CloudSyncSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSheet.swift; sourceTree = "<group>"; };
+		B0E5D002 /* SteamCloudStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCloudStatus.swift; sourceTree = "<group>"; };
+		B0F1D002 /* FloatingSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingSidebar.swift; sourceTree = "<group>"; };
 		D4965BA889D288764428E3E5 /* GameProfile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GameProfile.swift; sourceTree = "<group>"; };
 		E20520A6AF6648F0BC6B1C01 /* GameLogFile.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GameLogFile.swift; sourceTree = "<group>"; };
 		EE30B92B1C3871B6B2870750 /* MeridianLog.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeridianLog.swift; sourceTree = "<group>"; };
@@ -396,7 +396,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1600;
-				LastUpgradeCheck = 2700;
+				LastUpgradeCheck = 2710;
 				TargetAttributes = {
 					B0010060 = {
 						CreatedOnToolsVersion = 16.0;
