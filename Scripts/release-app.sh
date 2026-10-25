@@ -152,7 +152,7 @@ info "Tag:     ${TAG}"
 info "Repo:    ${REPO}"
 
 if ${TAG_ONLY}; then
-    info "Mode:    tag-only (CI Release workflow builds, signs, notarizes and publishes)"
+    info "Mode:    tag-only (CI Release workflow builds, signs, notarizes and drafts the release)"
     echo ""
     read -rp "  Bump to ${NEW_VERSION}, tag ${TAG} and push? [y/N] " CONFIRM
     [[ "${CONFIRM}" =~ ^[Yy]$ ]] || { echo "  Aborted."; exit 0; }
