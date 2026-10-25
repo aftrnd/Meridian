@@ -29,20 +29,23 @@ enum FloatingSidebar {
         inset + min(max(width, widthRange.lowerBound), widthRange.upperBound)
     }
 
-    /// Without a column the toolbar puts its first leading item just past
-    /// the traffic lights (x 96) and spaces leading items 8 pt apart;
-    /// beside the classic column, the game page's Back sits 8 pt past the
-    /// column's edge (x 223 for 215). Measured from the toolbar's glass
-    /// frames on macOS 27.0.1.
-    private static let toolbarLeadingStart: CGFloat = 96
-    private static let toolbarItemSpacing: CGFloat = 8
+    /// Beside the classic column the game page's Back sits 8 pt past the
+    /// column's edge (x 223 for 215 on macOS 27.0.1 and 27.2), in 36 pt
+    /// glass centred on its chevron.
     private static let backInsetFromEdge: CGFloat = 8
+    private static let backGlassWidth: CGFloat = 36
 
-    /// Width of an invisible leading toolbar item that puts Back where the
-    /// classic column puts it: 8 pt past the glass.
-    static func toolbarLeadingInset(width: Double) -> CGFloat {
-        edge(width: width) + backInsetFromEdge - toolbarLeadingStart - toolbarItemSpacing
+    /// Where Back's chevron centres beside glass this wide: its classic spot.
+    static func backMidX(width: Double) -> CGFloat {
+        edge(width: width) + backInsetFromEdge + backGlassWidth / 2
     }
+
+    /// How far past an invisible leading toolbar item's width the item after
+    /// it centres. That's the toolbar's own leading layout, and macOS moves
+    /// it between releases: 122 pt on 27.0.1, 114 on 27.2, which dropped the
+    /// 8 pt gap after an item with no glass (probed Oct 24). So Back measures
+    /// it where it lands (`ToolbarMidXReader`), and it's kept for the session.
+    @MainActor static var toolbarLeadingOffset: CGFloat = 114
     /// UserDefaults key for View › Show/Hide Sidebar (⌃⌘S). There is no
     /// toolbar button: the system's is too large for the panel's top band.
     static let shownKey = "floatingSidebar.shown"
@@ -67,7 +70,7 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
 
     var body: some View {
         content
-            .environment(\.toolbarLeadingInset, isPresented ? FloatingSidebar.toolbarLeadingInset(width: width) : nil)
+            .environment(\.toolbarBackMidX, isPresented ? FloatingSidebar.backMidX(width: width) : nil)
             .overlay(alignment: .leading) {
                 if isPresented {
                     panel.transition(.move(edge: .leading).combined(with: .opacity))
@@ -132,10 +135,43 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
 }
 
 extension EnvironmentValues {
-    /// Set while the floating panel shows: the room the toolbar's leading
-    /// items leave (an invisible item) so they start beside the pages, as
-    /// beside the classic column. nil: no panel, the toolbar's own layout.
-    @Entry var toolbarLeadingInset: CGFloat? = nil
+    /// Set while the floating panel shows: where the game page's Back
+    /// centres in the window (`FloatingSidebar.backMidX`), beside the pages
+    /// as beside the classic column. nil: no panel, the toolbar's own layout.
+    @Entry var toolbarBackMidX: CGFloat? = nil
+}
+
+/// Reports where the view it backs centres in the window, one runloop after
+/// it lands there: toolbar items are laid out by then (probe, macOS 27.2:
+/// settled at the next runloop, no insertion animation). Reports only on
+/// landing; a toolbar item that just moves sideways isn't re-read.
+struct ToolbarMidXReader: NSViewRepresentable {
+    let report: @MainActor (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> ReaderView {
+        let v = ReaderView()
+        v.report = report
+        return v
+    }
+
+    func updateNSView(_ v: ReaderView, context: Context) {
+        v.report = report
+    }
+
+    final class ReaderView: NSView {
+        var report: (@MainActor (CGFloat) -> Void)?
+
+        // Never take the button's clicks (see ScrollViewLanding).
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, window != nil else { return }
+                report?(convert(bounds, to: nil).midX)
+            }
+        }
+    }
 }
 
 /// The glass macOS 27 puts behind NavigationSplitView's sidebar:

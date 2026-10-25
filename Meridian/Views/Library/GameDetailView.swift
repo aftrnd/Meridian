@@ -36,8 +36,8 @@ struct GameDetailView: View {
     @Environment(LicenseManager.self)     private var licenseManager
     @Environment(\.openWindow)            private var openWindow
     @Environment(\.controlActiveState)    private var controlActiveState
-    /// Room before Back while the floating sidebar shows (FloatingSidebar).
-    @Environment(\.toolbarLeadingInset)   private var toolbarLeadingInset
+    /// Where Back centres while the floating sidebar shows (FloatingSidebar).
+    @Environment(\.toolbarBackMidX)       private var toolbarBackMidX
 
     @State private var showEngineSetup = false
     @State private var showLicenseRequired = false
@@ -76,6 +76,9 @@ struct GameDetailView: View {
     /// Bleeds start on a timer partway through the open flight (see
     /// `bleedsVisible`); cleared the instant a close begins.
     @State private var ambientArmed = false
+    /// The toolbar's leading layout as Back last measured it
+    /// (`FloatingSidebar.toolbarLeadingOffset`).
+    @State private var toolbarLeadingOffset = FloatingSidebar.toolbarLeadingOffset
 
     private func bannerHeight(contentWidth: CGFloat) -> CGFloat {
         contentWidth / heroAspectRatio
@@ -189,10 +192,13 @@ struct GameDetailView: View {
             // at the same moment the page begins to shrink.
             if showsToolbar {
                 // Beside the floating panel, Back keeps its classic spot: an
-                // invisible item first, sized to the panel's edge.
-                if let toolbarLeadingInset, #available(macOS 26.0, *) {
+                // invisible item first, sized so Back centres on
+                // `toolbarBackMidX`. Back reads where it really landed and
+                // corrects the size, since macOS changes the toolbar's
+                // leading layout between releases.
+                if let toolbarBackMidX, #available(macOS 26.0, *) {
                     ToolbarItem(placement: .navigation) {
-                        Color.clear.frame(width: toolbarLeadingInset, height: 1)
+                        Color.clear.frame(width: toolbarBackMidX - toolbarLeadingOffset, height: 1)
                     }
                     .sharedBackgroundVisibility(.hidden)
                 }
@@ -200,6 +206,16 @@ struct GameDetailView: View {
                     Button(action: onDismiss) {
                         Image(systemName: "chevron.backward")
                             .frame(width: 20)
+                            .background {
+                                if let toolbarBackMidX {
+                                    ToolbarMidXReader { midX in
+                                        let offset = toolbarLeadingOffset + midX - toolbarBackMidX
+                                        guard abs(offset - toolbarLeadingOffset) >= 0.5 else { return }
+                                        FloatingSidebar.toolbarLeadingOffset = offset
+                                        toolbarLeadingOffset = offset
+                                    }
+                                }
+                            }
                     }
                     .help("Back")
                 }
