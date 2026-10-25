@@ -933,52 +933,12 @@ extension Notification.Name {
 
 // MARK: - Sidebar
 
-/// Brand lavender sampled from the app icon (display-p3 0.788, 0.607, 1.0).
-extension Color {
-    static let meridianAccent = Color(.displayP3, red: 0.78809, green: 0.60742, blue: 1.0)
-}
-
 private extension View {
-    /// Sidebar icon tint: monochrome (white in dark mode). In light mode the
-    /// selected row's icon is brand purple; dark mode keeps it white too
-    /// (user, Oct 13 2026).
-    func sidebarTint(selected: Bool) -> some View {
-        modifier(SidebarTint(selected: selected))
-    }
-}
-
-/// `.fixed` so the selection highlight can't override the tint back to the
-/// system accent; a purple icon is also coloured outright (`SidebarIcon`),
-/// because the row's selection styling still whitened it.
-private struct SidebarTint: ViewModifier {
-    let selected: Bool
-    @Environment(\.colorScheme) private var colorScheme
-
-    func body(content: Content) -> some View {
-        let accented = selected && colorScheme == .light
-        content
-            .listItemTint(.fixed(accented ? .meridianAccent : .primary))
-            .environment(\.sidebarIconAccented, accented)
-    }
-}
-
-extension EnvironmentValues {
-    /// Set by `sidebarTint(selected:)` for `SidebarIcon`.
-    @Entry var sidebarIconAccented: Bool = false
-}
-
-/// A sidebar row's icon: Meridian's purple while `SidebarTint` accents it, in
-/// every window state; otherwise as the row's tint draws it.
-private struct SidebarIcon<Icon: View>: View {
-    let icon: Icon
-    @Environment(\.sidebarIconAccented) private var accented
-
-    var body: some View {
-        if accented {
-            icon.foregroundStyle(Color.meridianAccent)
-        } else {
-            icon
-        }
+    /// Sidebar icon tint: monochrome in both appearances, selected rows too;
+    /// no brand purple (user, Oct 24 2026). `.fixed` so the selection
+    /// highlight can't override the tint back to the system accent.
+    func sidebarTint() -> some View {
+        listItemTint(.fixed(.primary))
     }
 }
 
@@ -993,7 +953,7 @@ private struct SidebarLabelStyle: LabelStyle {
         Label {
             configuration.title
         } icon: {
-            SidebarIcon(icon: configuration.icon.font(.system(size: Self.iconSize)))
+            configuration.icon.font(.system(size: Self.iconSize))
         }
     }
 }
@@ -1007,17 +967,17 @@ private struct SidebarView: View {
         List(selection: $selectedDestination) {
             Label("Search", systemImage: "magnifyingglass")
                 .tag(SidebarDestination.search)
-                .sidebarTint(selected: selectedDestination == .search)
+                .sidebarTint()
 
             Label("Home", systemImage: "house")
                 .tag(SidebarDestination.home)
-                .sidebarTint(selected: selectedDestination == .home)
+                .sidebarTint()
 
             Section("Library") {
                 ForEach(SteamLibraryStore.LibraryFilter.allCases) { filter in
                     Label(filter.rawValue, systemImage: filterIcon(filter))
                         .tag(SidebarDestination.library(filter))
-                        .sidebarTint(selected: selectedDestination == .library(filter))
+                        .sidebarTint()
                 }
             }
 
@@ -1029,10 +989,10 @@ private struct SidebarView: View {
             Section("Steam") {
                 Label("Store", systemImage: "cart")
                     .tag(SidebarDestination.steamStore)
-                    .sidebarTint(selected: selectedDestination == .steamStore)
+                    .sidebarTint()
                 Label("Profile", systemImage: "person.crop.circle")
                     .tag(SidebarDestination.steamProfile)
-                    .sidebarTint(selected: selectedDestination == .steamProfile)
+                    .sidebarTint()
             }
         }
         .labelStyle(SidebarLabelStyle())
@@ -1116,7 +1076,7 @@ private struct CategoriesSidebarSection: View {
             }
         }
         .tag(SidebarDestination.category(cat.id))
-        .sidebarTint(selected: selectedDestination == .category(cat.id))
+        .sidebarTint()
         .contextMenu { categoryContextMenu(cat) }
     }
 
@@ -1146,7 +1106,7 @@ private struct CategoriesSidebarSection: View {
             }
             .contextMenu { folderContextMenu(folder) }
         }
-        .sidebarTint(selected: false)
+        .sidebarTint()
     }
 
     // MARK: Context menus
