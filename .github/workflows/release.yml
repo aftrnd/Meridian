@@ -1,9 +1,13 @@
 name: Release
 
-# Builds, signs, notarizes and publishes Meridian when a canonical app tag
-# (vX.Y.Z — no "-engine" suffix) is pushed. This is the ONLY path that should
-# produce a public DMG: it refuses to run unsigned, and it refuses a tag whose
+# Builds, signs, notarizes and drafts a Meridian release when a canonical app
+# tag (vX.Y.Z — no "-engine" suffix) is pushed. This is the ONLY path that
+# should produce a DMG: it refuses to run unsigned, and it refuses a tag whose
 # version doesn't match MARKETING_VERSION in the Xcode project.
+#
+# The release is a DRAFT: only the repo's owner and collaborators can see or
+# download it, and the in-app update check (unauthenticated) ignores it.
+# Meridian isn't public yet; publish the draft on GitHub to ship it.
 #
 # Required repository secrets (Settings › Secrets and variables › Actions):
 #   DEVELOPER_ID_P12_BASE64   base64 of a "Developer ID Application" .p12 export
@@ -189,7 +193,7 @@ jobs:
               --title "Meridian $VERSION" \
               --generate-notes \
               --notes-file "$BUILD_ROOT/notes-footer.md" \
-              --latest \
+              --draft \
               "$DMG" "$DMG.sha256"
           fi
 
