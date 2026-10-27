@@ -17,9 +17,8 @@ struct SteamWebView: View {
             canGoBack: $canGoBack,
             canGoForward: $canGoForward
         )
+        // Same corner radius as the library's cards.
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .padding(16)
-        .ignoresSafeArea(edges: [.top, .bottom])
         .overlay(alignment: .topLeading) {
             if canGoBack {
                 Button { webViewStore.webView?.goBack() } label: {
@@ -29,11 +28,14 @@ struct SteamWebView: View {
                         .foregroundStyle(.primary)
                 }
                 .buttonStyle(.plain)
-                .padding(.top, 24)
-                .padding(.leading, 24)
+                .padding(8)
                 .help("Back")
             }
         }
+        // The library grid's one margin all round, measured from the window
+        // edges top and bottom so the page runs up under the toolbar.
+        .padding(CardLayoutMetrics.spacing)
+        .ignoresSafeArea(edges: [.top, .bottom])
     }
 }
 
