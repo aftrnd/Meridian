@@ -194,8 +194,8 @@ final class LaunchModeTests: XCTestCase {
                        "A sign-out must not end the launch and start over")
     }
 
-    /// Steam boots in the background once the library is up, so Play doesn't
-    /// wait on it. A Play during the warm-up must JOIN it (start() skips while
+    /// Steam boots in the background at launch, so Play doesn't wait on it.
+    /// A Play during the warm-up must JOIN it (start() skips while
     /// .startingSilent, so racing it reported "not ready" mid-boot), and a
     /// sign-out the warm-up found sends Play straight to Steam's sign-in.
     func testSteamWarmUp_isJoinedByPlay() throws {
@@ -222,8 +222,8 @@ final class LaunchModeTests: XCTestCase {
                       "A finished install brings Steam up with the new game, so its first Play doesn't wait")
 
         let content = try readSource("Meridian/Views/ContentView.swift")
-        XCTAssertTrue(content.contains("session.warmUp(engine: engine)"),
-                      "The app must warm Steam up once the library is loaded")
+        XCTAssertTrue(content.contains("session.warmUp(engine: engine, after: .seconds(2))"),
+                      "The app must warm Steam up at launch, once the window has settled")
     }
 
     /// Steam reads appmanifest_*.acf once per start. A game Meridian installs

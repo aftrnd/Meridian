@@ -78,10 +78,7 @@ struct MeridianApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
-                    updateChecker.installedEngineTag = engine.engineVersion
-                    updateChecker.checkNow()
-                    UserDefaults.standard.set("updates", forKey: "meridian.settingsTab")
-                    NotificationCenter.default.post(name: .meridianOpenSettings, object: nil)
+                    updateChecker.checkAndShow(installedEngineTag: engine.engineVersion)
                 }
             }
             CommandGroup(replacing: .newItem) {}

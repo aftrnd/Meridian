@@ -104,6 +104,13 @@ final class SteamSession {
         return false
     }
 
+    /// Steam is on its way up: starting, or a background warm-up is under
+    /// way (including the moment the launch warm-up waits before it starts
+    /// Steam). Control Center's button shows it.
+    var isConnecting: Bool {
+        !isReady && (state == .startingSilent || warmUpTask != nil)
+    }
+
     // MARK: - Private state
 
     private var persistentProcess: Process?
@@ -260,7 +267,10 @@ final class SteamSession {
     /// running Steam that started before that is restarted now, in the background,
     /// instead of when the player presses Play: Steam reads install
     /// manifests only when it starts (Pattern 43).
-    func warmUp(engine: WineEngine, appID: Int? = nil) {
+    ///
+    /// With `delay`, Steam starts that much later, but the warm-up is under
+    /// way from now: `isConnecting` holds, and a Play pressed meanwhile joins it.
+    func warmUp(engine: WineEngine, appID: Int? = nil, after delay: Duration = .zero) {
         guard warmUpTask == nil, AppSettings.shared.steamClientSignedIn else { return }
         let missingGame = isReady && appID.map { !appsSteamLoaded.contains($0) } == true
         guard state == .idle || missingGame else { return }
@@ -270,6 +280,7 @@ final class SteamSession {
         warmUpStatus = nil
         warmUpTask = Task {
             do {
+                try await Task.sleep(for: delay)
                 try await bringUpForDRM(engine: engine, appID: appID, onStatus: { status in
                     self.warmUpStatus = status
                     self.warmUpListener?(status)

@@ -12,6 +12,8 @@
 		7D0D0A11C0DE0022380A0001 /* GameCompatibilityDB+Gamebryo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE0022380A0002 /* GameCompatibilityDB+Gamebryo.swift */; };
 		7D0D0A11C0DE4450800A0001 /* GameCompatibilityDB+Godot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */; };
 		7D0F0A11ABCDEF0000000001 /* FriendsPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */; };
+		7D0F0A44ABCDEF0000000004 /* ControlCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0F0A55ABCDEF0000000005 /* ControlCenter.swift */; };
+		7D0F0A66ABCDEF0000000006 /* StatusGlyphs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D0F0A77ABCDEF0000000007 /* StatusGlyphs.swift */; };
 		893C6023DF3C41F9A6624B1D /* CategoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46B315635523C0CF2D44F9BA /* CategoryStore.swift */; };
 		8B0812FC6BBB07573ED3A149 /* GameProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4965BA889D288764428E3E5 /* GameProfile.swift */; };
 		9005918A74DB42729238EB11 /* SplashView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F62085FF69F4F208309DA56 /* SplashView.swift */; };
@@ -86,6 +88,8 @@
 		7D0D0A22C0DE0022380A0002 /* GameCompatibilityDB+Gamebryo.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Gamebryo.swift"; sourceTree = "<group>"; };
 		7D0D0A22C0DE4450800A0002 /* GameCompatibilityDB+Godot.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Godot.swift"; sourceTree = "<group>"; };
 		7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FriendsPanel.swift; sourceTree = "<group>"; };
+		7D0F0A55ABCDEF0000000005 /* ControlCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlCenter.swift; sourceTree = "<group>"; };
+		7D0F0A77ABCDEF0000000007 /* StatusGlyphs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusGlyphs.swift; sourceTree = "<group>"; };
 		A66F49292F6617F1005601F4 /* app-icon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "app-icon.icon"; sourceTree = "<group>"; };
 		A7C4E1F200000002 /* GamePerformanceMonitor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GamePerformanceMonitor.swift; sourceTree = "<group>"; };
 		A7C4E1F200000004 /* GameCompatibilityDB+Unreal.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "GameCompatibilityDB+Unreal.swift"; sourceTree = "<group>"; };
@@ -165,6 +169,8 @@
 			isa = PBXGroup;
 			children = (
 				7D0F0A22ABCDEF0000000002 /* FriendsPanel.swift */,
+				7D0F0A55ABCDEF0000000005 /* ControlCenter.swift */,
+				7D0F0A77ABCDEF0000000007 /* StatusGlyphs.swift */,
 			);
 			path = Friends;
 			sourceTree = "<group>";
@@ -533,6 +539,8 @@
 				B0F1D001 /* FloatingSidebar.swift in Sources */,
 				B00D0001 /* DownloadsToolbarButton.swift in Sources */,
 				7D0F0A11ABCDEF0000000001 /* FriendsPanel.swift in Sources */,
+				7D0F0A44ABCDEF0000000004 /* ControlCenter.swift in Sources */,
+				7D0F0A66ABCDEF0000000006 /* StatusGlyphs.swift in Sources */,
 				B00E0060 /* SteamWebView.swift in Sources */,
 				31BBDC1F93444D77B811A589 /* BootstrapManager.swift in Sources */,
 				9005918A74DB42729238EB11 /* SplashView.swift in Sources */,
