@@ -333,14 +333,6 @@ final class SteamSession {
         //    one-time interactive sign-in, `signInInteractively`) is accepted
         //    for silent auto-login.
         SteamSessionBackup.restoreIfNeeded(prefix: prefix)
-        let settings = AppSettings.shared
-        if settings.hasSteamCredentials {
-            // Pre-write the per-user webhelper notification toggles BEFORE Steam
-            // starts so the post-login toast burst is silenced before the first
-            // toast can render. Best-effort — the userdata dir may not exist
-            // until Steam's first -silent launch creates it.
-            try? prefix.writeUserNotificationPreferences(steamID64: settings.steamCredentialSteamID)
-        }
 
         // 4. Start steam.exe -silent + wait for [Logged On,].
         onStatus?("Starting Steam…")
@@ -1305,23 +1297,6 @@ final class SteamSession {
             reg(["reg", "add",
                  "HKCU\\Software\\Valve\\Steam",
                  "/v", "StartMinimized", "/t", "REG_DWORD", "/d", "1", "/f"])
-            // Suppress Steam's post-login "you have new games" toast burst.
-            // After silent auth, Steam scans cloud-known + locally-cached
-            // appmanifests and announces every "installed" game via Windows
-            // toasts that Wine forwards to the macOS Notification Center.
-            // Meridian renders its own native library — Steam's toasts are
-            // never useful and can't be acted on (the user can't see Steam's
-            // UI to dismiss them). Belt-and-suspenders with the `localconfig.vdf`
-            // toggles that `WinePrefix.writeUserNotificationPreferences` writes
-            // post-sign-in — that file controls the webhelper-side toggles,
-            // these registry keys control the native-UI side. Both are needed
-            // because Steam routes different toasts through different layers.
-            reg(["reg", "add",
-                 "HKCU\\Software\\Valve\\Steam",
-                 "/v", "NotifyAvailableGames", "/t", "REG_DWORD", "/d", "0", "/f"])
-            reg(["reg", "add",
-                 "HKCU\\Software\\Valve\\Steam",
-                 "/v", "DesktopNotifications", "/t", "REG_DWORD", "/d", "0", "/f"])
             reg(["reg", "add",
                  "HKCU\\Software\\Valve\\Steam",
                  "/v", "EnableGameOverlay", "/t", "REG_DWORD", "/d", "0", "/f"])
