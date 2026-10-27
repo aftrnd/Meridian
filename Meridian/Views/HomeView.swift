@@ -330,6 +330,10 @@ private struct HeroCarousel: View {
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.colorScheme) private var colorScheme
     @Environment(SteamAuthService.self) private var steamAuth
+    /// Home stays mounted, faded, under a game page (ContentView's stage):
+    /// covered, the hero neither advances nor takes swipes, which would
+    /// otherwise land on the page or its sheets (the achievements Cover Flow).
+    @Environment(\.detailPresented) private var detailPresented
     /// Under the floating panel the shade runs under it with the mirrored
     /// art, so no unshaded strip shows around the glass (user, Oct 26 2026:
     /// its rounded corner and the gaps at the window's edge, once Home
@@ -437,19 +441,9 @@ private struct HeroCarousel: View {
             }
         }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame = $0 }
-        .onAppear {
-            startTimer()
-            wheel.install(.init(
-                isInside: { point in frame.contains(point) },
-                drag: { dx in drag(by: dx) },
-                release: { velocity in settle(pointVelocity: velocity) },
-                step: { dir in go(dir) }
-            ))
-        }
-        .onDisappear {
-            timer?.invalidate()
-            wheel.remove()
-        }
+        .onAppear { listen(!detailPresented) }
+        .onDisappear { listen(false) }
+        .onChange(of: detailPresented) { _, presented in listen(!presented) }
         .onChange(of: count) { _, _ in restartTimer() }
     }
 
@@ -536,6 +530,22 @@ private struct HeroCarousel: View {
 
     // MARK: Navigation
 
+    /// Auto-advance and swipes on while the hero is on screen, off otherwise.
+    private func listen(_ on: Bool) {
+        guard on else {
+            timer?.invalidate()
+            wheel.remove()
+            return
+        }
+        startTimer()
+        wheel.install(.init(
+            isInside: { point in frame.contains(point) },
+            drag: { dx in drag(by: dx) },
+            release: { velocity in settle(pointVelocity: velocity) },
+            step: { dir in go(dir) }
+        ))
+    }
+
     private func go(_ direction: Int) {
         guard count > 1 else { return }
         withAnimation(Self.page) { position = CGFloat(current + direction) }
@@ -581,7 +591,7 @@ private struct HeroCarousel: View {
     }
 
     private func startTimer() {
-        guard count > 1, !isHovered else { return }
+        guard count > 1, !isHovered, !detailPresented else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { _ in
             Task { @MainActor in
                 guard count > 1 else { return }
