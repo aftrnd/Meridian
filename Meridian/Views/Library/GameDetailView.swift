@@ -2235,7 +2235,8 @@ private struct AchievementFlowSheet: View {
         return VStack(spacing: 0) {
             ZStack {
                 ForEach(mounted, id: \.self) { index in
-                    AchievementCover(achievement: achievements[index])
+                    AchievementCover(achievement: achievements[index],
+                                     isFront: abs(CGFloat(index) - position) < 0.25)
                         .modifier(CoverFlowLayer(position: position, index: index))
                         .onTapGesture { go(to: index) }
                 }
@@ -2532,16 +2533,26 @@ private struct CoverFlowLayer: ViewModifier, Animatable {
 }
 
 /// One cover: the achievement's art with its reflection below. Unlocked
-/// shows the colour icon, locked the grey one.
+/// shows the colour icon, locked the grey one. The front cover takes the
+/// library card's Apple TV hover (`CardHoverTilt`, `CardHoverHighlight`),
+/// lifting from the floor it stands on; the reflection is the same lifted
+/// art flipped, so it mirrors the tilt and the sheen.
 private struct AchievementCover: View {
     let achievement: GameAchievement
+    /// Only the cover facing front responds to the pointer.
+    var isFront = false
+
+    @State private var isHovered = false
+    @State private var hoverLocation: CGPoint = .zero
+
+    private static let size = CGSize(width: AchievementFlow.cover, height: AchievementFlow.cover)
 
     var body: some View {
         CachedAsyncImage(url: achievement.achieved ? achievement.iconURL
                                                    : (achievement.iconGrayURL ?? achievement.iconURL)) { phase in
             VStack(spacing: 0) {
-                face(phase.image)
-                face(phase.image)
+                lifted(phase.image, tracksHover: true)
+                lifted(phase.image, tracksHover: false)
                     .scaleEffect(x: 1, y: -1)
                     .frame(height: AchievementFlow.reflection, alignment: .top)
                     .clipped()
@@ -2549,6 +2560,32 @@ private struct AchievementCover: View {
                                          startPoint: .top, endPoint: .bottom))
             }
         }
+        // The library card's hover timing.
+        .animation(.smooth(duration: 0.15), value: isHovered)
+        .animation(.interactiveSpring(response: 0.15, dampingFraction: 0.7), value: hoverLocation)
+        // Turned away (a scroll, a click on another cover): settle the lift.
+        .onChange(of: isFront) { _, front in
+            guard !front else { return }
+            isHovered = false
+            hoverLocation = .zero
+        }
+    }
+
+    private func lifted(_ image: Image?, tracksHover: Bool) -> some View {
+        face(image)
+            .onContinuousHover { phase in
+                guard tracksHover else { return }
+                switch phase {
+                case .active(let point):
+                    guard isFront else { return }
+                    hoverLocation = point
+                    isHovered = true
+                case .ended:
+                    isHovered = false
+                    hoverLocation = .zero
+                }
+            }
+            .modifier(CardHoverTilt(isHovered: isHovered, location: hoverLocation, size: Self.size, anchor: .bottom))
     }
 
     private func face(_ image: Image?) -> some View {
@@ -2568,6 +2605,7 @@ private struct AchievementCover: View {
             }
         }
         .frame(width: AchievementFlow.cover, height: AchievementFlow.cover)
+        .overlay { CardHoverHighlight(isHovered: isHovered, location: hoverLocation, size: Self.size) }
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
     }
 }
