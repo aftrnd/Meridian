@@ -330,6 +330,11 @@ private struct HeroCarousel: View {
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.colorScheme) private var colorScheme
     @Environment(SteamAuthService.self) private var steamAuth
+    /// Under the floating panel the shade runs under it with the mirrored
+    /// art, so no unshaded strip shows around the glass (user, Oct 26 2026:
+    /// its rounded corner and the gaps at the window's edge, once Home
+    /// scrolls). Beside the classic column the mirror stays unshaded.
+    @Environment(\.floatingSidebarActive) private var floatingSidebarActive
 
     /// Continuous page position. Whole numbers are resting pages.
     @State private var position: CGFloat = 0
@@ -381,6 +386,7 @@ private struct HeroCarousel: View {
                 startPoint: .init(x: 0.5, y: 0.3),
                 endPoint: .bottom
             )
+            .ignoresSafeArea(edges: floatingSidebarActive ? .leading : [])
 
             ForEach(mountedPages, id: \.self) { page in
                 caption(for: game(at: page), page: page)

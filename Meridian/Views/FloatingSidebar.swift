@@ -11,7 +11,8 @@ import SwiftUI
 /// the glass (`edge(width:)`, applied by ContentView), so everything sits as
 /// far from the panel as it does from the classic column, and Home's banner
 /// meets the glass exactly: its background extension mirrors the art into
-/// that safe area, under the panel, unshaded, as macOS 26 and 27 draw it.
+/// that safe area, under the panel, and its shade follows
+/// (`floatingSidebarActive`).
 enum FloatingSidebar {
     /// The glass's width until its edge is dragged (user, Oct 24 2026; the
     /// classic column is 215).
@@ -72,6 +73,9 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
     var body: some View {
         content
             .environment(\.toolbarBackMidX, isPresented ? FloatingSidebar.backMidX(width: width) : nil)
+            // Not tied to isPresented: hidden, the leading safe area is 0
+            // anyway, and the shade follows it as it animates.
+            .environment(\.floatingSidebarActive, true)
             .overlay(alignment: .leading) {
                 if isPresented {
                     panel.transition(.move(edge: .leading).combined(with: .opacity))
@@ -140,6 +144,11 @@ extension EnvironmentValues {
     /// centres in the window (`FloatingSidebar.backMidX`), beside the pages
     /// as beside the classic column. nil: no panel, the toolbar's own layout.
     @Entry var toolbarBackMidX: CGFloat? = nil
+    /// True under FloatingSidebarLayout, where the pages' leading safe area
+    /// is the panel's room: Home's banner shade runs into it with the
+    /// mirrored art. False beside the classic column, whose mirror stays
+    /// unshaded.
+    @Entry var floatingSidebarActive: Bool = false
 }
 
 /// Reports where the view it backs centres in the window, one runloop after
@@ -176,24 +185,38 @@ struct ToolbarMidXReader: NSViewRepresentable {
 }
 
 /// The glass macOS 27 puts behind NavigationSplitView's sidebar:
-/// NSGlassEffectView in its sidebar variant (`_variant` 17, read off a native
-/// sidebar on 27.0.1; toolbar buttons are 0). There's no public way to pick a
-/// variant, and SwiftUI's `.glassEffect` draws far lighter (#3b3b39 against
-/// the native #2b2a28 over the dark window background; the variant matches it
-/// exactly). Private, so it's only used while the setter exists; a macOS
-/// without it gets SwiftUI's glass instead.
+/// NSGlassEffectView in its sidebar variant (private `_variant`; toolbar
+/// buttons are 0). There's no public way to pick a variant, and SwiftUI's
+/// `.glassEffect` draws far lighter (#3b3b39 against the native #2b2a28 over
+/// the dark window background; the variant matches it exactly). Private, so
+/// it's only used while the variant can be read and set; a macOS without it
+/// gets SwiftUI's glass instead.
 @available(macOS 26.0, *)
 private struct SidebarGlass: NSViewRepresentable {
     let cornerRadius: CGFloat
 
-    static var isSupported: Bool {
-        NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:"))
-    }
+    /// The variant AppKit gives a sidebar, read off one it builds, because
+    /// macOS renumbers them: the sidebar was 17 on 27.0.1 and is 18 on 27.2,
+    /// where 17 became a lighter glass with a rim (probed Oct 26). The split
+    /// view needs no window; about 1 ms, once.
+    static let sidebarVariant: Int? = {
+        guard NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:")) else { return nil }
+        let sidebar = NSViewController()
+        sidebar.view = NSView()
+        let split = NSSplitViewController()
+        split.addSplitViewItem(NSSplitViewItem(sidebarWithViewController: sidebar))
+        _ = split.view
+        guard let glass = sequence(first: sidebar.view, next: \.superview).lazy.compactMap({ $0 as? NSGlassEffectView }).first,
+              glass.responds(to: NSSelectorFromString("_variant")) else { return nil }
+        return glass.value(forKey: "_variant") as? Int
+    }()
+
+    static var isSupported: Bool { sidebarVariant != nil }
 
     func makeNSView(context: Context) -> NSGlassEffectView {
         let view = NSGlassEffectView()
         view.cornerRadius = cornerRadius
-        view.setValue(17, forKey: "_variant")
+        if let variant = Self.sidebarVariant { view.setValue(variant, forKey: "_variant") }
         return view
     }
 
