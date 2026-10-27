@@ -1176,6 +1176,8 @@ final class SteamSession {
         if await configureSteamRegistry(engine: engine) {
             try? await Task.sleep(for: .seconds(2))
         }
+        // Steam's windows never reach the screen unless SteamWindow shows one.
+        await prefix.writeSteamWindowHold(steamWindow?.isPermissionGranted == true, engine: engine)
 
         try? prefix.ensureSteamCFG()
         prefix.stripBootStrapperInhibit()

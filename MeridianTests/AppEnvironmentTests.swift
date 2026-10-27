@@ -45,6 +45,35 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertTrue(reg.contains(#""X"="a \"b\" C:\\c""#))
     }
 
+    // MARK: - Steam window hold
+
+    /// winemac reads HoldWindowsOffscreen from the app's own Mac Driver key
+    /// (engine patch 0012), so the hold reaches Steam's processes and never
+    /// the games steam.exe starts.
+    func testSteamWindowHoldCoversOnlySteamsExecutables() {
+        let reg = WinePrefix.steamWindowHoldRegFile(hold: true)
+        XCTAssertTrue(reg.hasPrefix("\u{FEFF}Windows Registry Editor Version 5.00"))
+        for exe in ["steam.exe", "steamwebhelper.exe"] {
+            XCTAssertTrue(reg.contains("[HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(exe)\\Mac Driver]\r\n\"HoldWindowsOffscreen\"=\"y\""))
+        }
+        XCTAssertEqual(reg.components(separatedBy: "HoldWindowsOffscreen").count - 1, 2)
+        XCTAssertFalse(reg.contains("[HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]"),
+                       "A global key would hold every game's windows too.")
+    }
+
+    /// Without Accessibility access nothing could bring Steam's sign-in back,
+    /// so the hold is written off rather than left on from an earlier launch.
+    func testSteamWindowHoldOffWritesN() {
+        let reg = WinePrefix.steamWindowHoldRegFile(hold: false)
+        XCTAssertTrue(reg.contains(#""HoldWindowsOffscreen"="n""#))
+        XCTAssertFalse(reg.contains(#""HoldWindowsOffscreen"="y""#))
+    }
+
+    func testSteamLaunchWritesTheHoldFromAccessibilityPermission() throws {
+        let session = try readSource("Meridian/Steam/SteamSession.swift")
+        XCTAssertTrue(session.contains("prefix.writeSteamWindowHold(steamWindow?.isPermissionGranted == true, engine: engine)"))
+    }
+
     // MARK: - Launch wiring
 
     /// Steam starts the game with steam.exe's environment, so the game's own

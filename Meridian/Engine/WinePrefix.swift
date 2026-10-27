@@ -2670,6 +2670,57 @@ struct WinePrefix: Sendable {
         return "\u{FEFF}" + lines.joined(separator: "\r\n")
     }
 
+    // MARK: - Steam window hold
+
+    /// Whether the engine's winemac keeps Steam's windows off every screen
+    /// (patch 0012, `HKCU\Software\Wine\AppDefaults\<exe>\Mac Driver\
+    /// HoldWindowsOffscreen`) until SteamWindow moves one onto a screen
+    /// through Accessibility. SteamWindow could only hide a window after it
+    /// appeared: Steam's notification toasts slide in by moving a few points
+    /// per frame, and each step showed for a frame before it was hidden again
+    /// (meridian.log, Oct 26 2026: 18 hides per slide). Only with
+    /// Accessibility access, or nothing could show Steam's sign-in. Engines
+    /// without the patch ignore it. One `reg import`, only when the setting
+    /// changed (marker file in the prefix, which a reset removes with the
+    /// registry).
+    func writeSteamWindowHold(_ hold: Bool, engine: WineEngine) async {
+        let markerURL = path.appending(path: ".meridian-steam-window-hold")
+        let value = hold ? "y" : "n"
+        guard (try? String(contentsOf: markerURL, encoding: .utf8)) != value else { return }
+
+        let regFile = driveC.appending(path: "windows/temp/meridian-steam-window-hold.reg")
+        defer { try? FileManager.default.removeItem(at: regFile) }
+        do {
+            try Self.steamWindowHoldRegFile(hold: hold)
+                .write(to: regFile, atomically: true, encoding: .utf16LittleEndian)
+            let process = try await engine.run(
+                args: ["reg", "import", "C:\\windows\\temp\\meridian-steam-window-hold.reg"],
+                prefix: self
+            )
+            guard process.terminationStatus == 0 else {
+                log.error("[writeSteamWindowHold] reg import exited \(process.terminationStatus)")
+                return
+            }
+        } catch {
+            log.error("[writeSteamWindowHold] \(error.localizedDescription)")
+            return
+        }
+        try? value.write(to: markerURL, atomically: true, encoding: .utf8)
+        log.info("[writeSteamWindowHold] HoldWindowsOffscreen=\(value) for steam.exe, steamwebhelper.exe")
+    }
+
+    /// The `.reg` file `writeSteamWindowHold` imports, with a byte-order mark
+    /// so reg.exe reads it as Unicode.
+    static func steamWindowHoldRegFile(hold: Bool) -> String {
+        var lines = ["Windows Registry Editor Version 5.00", ""]
+        for exe in ["steam.exe", "steamwebhelper.exe"] {
+            lines.append("[HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(exe)\\Mac Driver]")
+            lines.append("\"HoldWindowsOffscreen\"=\"\(hold ? "y" : "n")\"")
+            lines.append("")
+        }
+        return "\u{FEFF}" + lines.joined(separator: "\r\n")
+    }
+
     // MARK: - Windows Version Registration
 
     /// Increment when the Windows-version registry mapping changes. Valve
