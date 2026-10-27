@@ -362,24 +362,28 @@ private struct TopFade: View {
     }
 }
 
-/// A blur `radius` strong from the top edge to `hold` (a fraction of the
-/// height), easing (smootherstep) to none at the bottom, over whatever is
+/// A blur `radius` strong from one edge (the top for Search, either side for
+/// the achievements Cover Flow) to `hold` (a fraction of the way across),
+/// easing (smootherstep) to none at the far side, over whatever is
 /// behind it: Core Animation's `variableBlur`
 /// filter on a backdrop layer, as macOS's own soft scroll edge draws it
 /// (probe, 27.0.1). Private (CABackdropLayer, CAFilter), so it's only drawn
 /// while both exist; without them, no blur.
-private struct VariableBlur: NSViewRepresentable {
+struct VariableBlur: NSViewRepresentable {
+    enum Edge { case top, leading, trailing }
+
     let radius: CGFloat
     let hold: Double
+    var edge: Edge = .top
 
-    func makeNSView(context: Context) -> BlurView { BlurView(radius: radius, hold: hold) }
+    func makeNSView(context: Context) -> BlurView { BlurView(radius: radius, hold: hold, edge: edge) }
     func updateNSView(_ view: BlurView, context: Context) {}
 
     final class BlurView: NSView {
         private let backdrop: CALayer?
 
-        init(radius: CGFloat, hold: Double) {
-            backdrop = Self.makeBackdrop(radius: radius, hold: hold)
+        init(radius: CGFloat, hold: Double, edge: Edge) {
+            backdrop = Self.makeBackdrop(radius: radius, hold: hold, edge: edge)
             super.init(frame: .zero)
             wantsLayer = true
             if let backdrop { layer?.addSublayer(backdrop) }
@@ -399,13 +403,13 @@ private struct VariableBlur: NSViewRepresentable {
             CATransaction.commit()
         }
 
-        private static func makeBackdrop(radius: CGFloat, hold: Double) -> CALayer? {
+        private static func makeBackdrop(radius: CGFloat, hold: Double, edge: Edge) -> CALayer? {
             let factory = NSSelectorFromString("filterWithType:")
             guard let layerType = NSClassFromString("CABackdropLayer") as? CALayer.Type,
                   let filterType = NSClassFromString("CAFilter") as? NSObject.Type,
                   filterType.responds(to: factory),
                   let filter = filterType.perform(factory, with: "variableBlur")?.takeUnretainedValue() as? NSObject,
-                  let mask = maskImage(hold: hold) else { return nil }
+                  let mask = maskImage(hold: hold, edge: edge) else { return nil }
             filter.setValue(radius, forKey: "inputRadius")
             filter.setValue(true, forKey: "inputNormalizeEdges")
             filter.setValue(mask, forKey: "inputMaskImage")
@@ -414,21 +418,26 @@ private struct VariableBlur: NSViewRepresentable {
             return backdrop
         }
 
-        /// The filter's radius map: opaque (full radius) from the top to
-        /// `hold`, then smootherstep (flat at both ends) to clear along the
-        /// bottom.
-        private static func maskImage(hold: Double) -> CGImage? {
-            let height = 64
-            guard let context = CGContext(data: nil, width: 1, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+        /// The filter's radius map: opaque (full radius) from the strong edge
+        /// to `hold`, then smootherstep (flat at both ends) to clear along
+        /// the far side. A 1 px strip along the blur's axis.
+        private static func maskImage(hold: Double, edge: Edge) -> CGImage? {
+            let length = 64
+            let vertical = edge == .top
+            guard let context = CGContext(data: nil, width: vertical ? 1 : length, height: vertical ? length : 1,
+                                          bitsPerComponent: 8, bytesPerRow: 0,
                                           space: CGColorSpaceCreateDeviceGray(),
                                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-            for row in 0..<height {
-                // CG rows count up from the bottom.
-                let t = 1 - Double(row) / Double(height - 1)
+            for step in 0..<length {
+                // 0 at the strong edge. CG rows count up from the bottom, so
+                // for the top edge that's the last row.
+                let fraction = Double(step) / Double(length - 1)
+                let t = edge == .leading ? fraction : 1 - fraction
                 let u = max(0, t - hold) / (1 - hold)
                 let eased = u * u * u * (u * (u * 6 - 15) + 10)
                 context.setFillColor(gray: 0, alpha: 1 - eased)
-                context.fill(CGRect(x: 0, y: row, width: 1, height: 1))
+                context.fill(vertical ? CGRect(x: 0, y: step, width: 1, height: 1)
+                                      : CGRect(x: step, y: 0, width: 1, height: 1))
             }
             return context.makeImage()
         }

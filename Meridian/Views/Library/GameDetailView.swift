@@ -326,7 +326,7 @@ struct GameDetailView: View {
                 .environment(licenseManager)
         }
         .sheet(item: $selectedAchievement) { ach in
-            AchievementDetailSheet(achievement: ach)
+            AchievementFlowSheet(achievements: achievementFlow, startID: ach.id, appID: currentGame.id)
         }
         .alert("Reset Game Install?", isPresented: $showResetConfirm) {
             Button("Cancel", role: .cancel) {}
@@ -994,14 +994,19 @@ private struct ScrollViewLanding: NSViewRepresentable {
 
     // MARK: - Achievements card
 
+    /// Every achievement in Cover Flow order: unlocks newest first, then the
+    /// locked ones in the game's own order.
+    private var achievementFlow: [GameAchievement] {
+        achievements.filter(\.achieved)
+            .sorted { ($0.unlockDate ?? .distantPast) > ($1.unlockDate ?? .distantPast) }
+            + achievements.filter { !$0.achieved }
+    }
+
     @ViewBuilder
     private func achievementsCard(radius: CGFloat) -> some View {
         let storeTotal = appDetails?.achievementsSummary?.total ?? 0
         let unlocked   = achievements.filter { $0.achieved }
-        let recentUnlocked = Array(
-            unlocked.sorted { ($0.unlockDate ?? .distantPast) > ($1.unlockDate ?? .distantPast) }
-                .prefix(5)
-        )
+        let recentUnlocked = Array(achievementFlow.prefix(while: \.achieved).prefix(5))
 
         VStack(alignment: .leading, spacing: 14) {
 
@@ -1085,15 +1090,13 @@ private struct ScrollViewLanding: NSViewRepresentable {
                 }
             }
 
-            // Steam achievements link
-            if !achievementsUnavailable {
+            // The whole list as a Cover Flow (Steam's page is a button in it).
+            if !achievementsUnavailable, let first = achievementFlow.first {
                 Button {
-                    if let url = URL(string: "https://steamcommunity.com/stats/\(currentGame.id)/achievements") {
-                        NSWorkspace.shared.open(url)
-                    }
+                    selectedAchievement = first
                 } label: {
                     HStack {
-                        Label("View all on Steam", systemImage: "arrow.up.right.square")
+                        Label("View all", systemImage: "square.stack")
                             .font(.subheadline)
                             .foregroundStyle(.primary)
                         Spacer()
@@ -2080,8 +2083,8 @@ private struct AchievementRow: View {
             Spacer()
 
             // Affordance so the row reads as tappable even on a trackpad
-            // without hover; matches the chevron used in the "View all
-            // on Steam" row below.
+            // without hover; matches the chevron used in the "View all"
+            // row below.
             Image(systemName: "chevron.right")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -2102,122 +2105,472 @@ private struct AchievementRow: View {
     }
 }
 
-// MARK: - Achievement Detail Sheet
+// MARK: - Achievement Cover Flow
 
-/// Modal that shows the essentials for a single Steam achievement: glyph,
-/// name, unlock status + date, description. Follows Apple HIG — a focused
-/// sheet with a clear hierarchy and no developer metadata.
+/// Cover Flow geometry (the iPod / iPhone OS album browser), tuned against
+/// offscreen renders of real achievement art.
+private enum AchievementFlow {
+    /// Most games ship Steam's classic 64 px icons (newer ones 256 px). 96 pt
+    /// is exactly 3× the classic icon on a Retina display, and the large ones
+    /// scale down to it, so no art is blown up far past what it has.
+    static let cover: CGFloat = 96
+    static let reflection: CGFloat = 40
+    /// Black above the art and between the art and the title: equal, so the
+    /// art sits centred between them.
+    static let artMargin: CGFloat = 36
+    /// Centre of the front cover to the centre of the first stacked one.
+    static let centerGap: CGFloat = 96
+    /// Spacing within a stack: wide and nearly flat, so each stacked cover
+    /// shows almost all its art (user: 22 pt at 65°, then 32 at 50°, were
+    /// too compact).
+    static let stackGap: CGFloat = 52
+    static let sideAngle: Double = 30
+    static let sheetWidth: CGFloat = 520
+    /// Covers each side to the sheet's edge and one past it: the stacks run
+    /// off the edges (under `edgeBlur`) rather than fading out short of them.
+    static let visible: CGFloat = ((sheetWidth / 2 - centerGap) / stackGap).rounded(.up) + 2
+    /// Furthest a flick carries. Covers this far past `visible` stay mounted,
+    /// so every cover on a spring's path is there for the whole spring.
+    static let maxJump: CGFloat = 8
+    /// Finger travel per cover.
+    static let pointsPerCover: CGFloat = 40
+    /// Where the covers stand: their reflections hang below it.
+    static let floor = UnitPoint(x: 0.5, y: cover / (cover + reflection))
+    /// How far in from each side the edge blur reaches.
+    static let edgeBlur: CGFloat = 120
+}
+
+/// One side of the Cover Flow's edge: Search's variable blur turned sideways,
+/// strongest at the sheet's edge and easing to none `edgeBlur` in, under a
+/// shade on the same curve so the stacks sink into the black as they blur.
+private struct CoverFlowEdge: View {
+    let edge: VariableBlur.Edge
+
+    /// Subtle, under Search's 2 (user: 8, then 3, were too much).
+    private static let radius: CGFloat = 1.5
+    private static let shade = 0.45
+
+    var body: some View {
+        let steps = 12
+        let stops = (0...steps).map { i -> Gradient.Stop in
+            let t = Double(i) / Double(steps)
+            return Gradient.Stop(color: .black.opacity(Self.shade * (1 - t) * (1 - t)), location: t)
+        }
+        ZStack {
+            VariableBlur(radius: Self.radius, hold: 0, edge: edge)
+            LinearGradient(stops: stops,
+                           startPoint: edge == .leading ? .leading : .trailing,
+                           endPoint: edge == .leading ? .trailing : .leading)
+        }
+        .frame(width: AchievementFlow.edgeBlur)
+    }
+}
+
+/// Every achievement as a Cover Flow: the current one faces front with its
+/// details below, the rest stand in angled stacks either side, reflected on
+/// a black floor, over a ruler with a tick per achievement. Opens on the
+/// achievement that was clicked. The mouse wheel steps a cover per notch,
+/// trackpad swipes flick through (both via the hero's `HeroWheelGesture`),
+/// the ruler scrubs, and a click on a stacked cover brings it to the front.
 ///
 /// Hidden-achievement handling mirrors Steam's own behaviour: if the
 /// achievement is flagged hidden AND the user hasn't unlocked it, we show
-/// a generic "Hidden Achievement" title + locked glyph and no description.
-/// Once unlocked, all fields render normally.
-private struct AchievementDetailSheet: View {
-    let achievement: GameAchievement
+/// a generic "Hidden Achievement" title and no description.
+private struct AchievementFlowSheet: View {
+    let achievements: [GameAchievement]
+    let appID: Int
 
     @Environment(\.dismiss) private var dismiss
+    /// Continuous cover position. Whole numbers are resting covers.
+    @State private var position: CGFloat
+    @State private var stageFrame: CGRect = .zero
+    /// Vertical too (a mouse wheel), and a cover per notch at any speed
+    /// short of a burst.
+    @State private var wheel = HeroWheelGesture(pagesVertically: true, stepInterval: 0.04)
+    @FocusState private var focused: Bool
 
-    private var isLockedHidden: Bool {
-        achievement.isHidden && !achievement.achieved
+    /// Wheel notches, arrow keys, clicks.
+    private static let flip = Animation.interpolatingSpring(duration: 0.4, bounce: 0.1)
+
+    init(achievements: [GameAchievement], startID: String, appID: Int) {
+        self.achievements = achievements
+        self.appID = appID
+        _position = State(initialValue: CGFloat(achievements.firstIndex { $0.id == startID } ?? 0))
     }
 
-    private var title: String {
-        isLockedHidden ? "Hidden Achievement" : achievement.displayName
-    }
-
-    private var description: String? {
-        guard !isLockedHidden else { return nil }
-        let text = achievement.description?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (text?.isEmpty == false) ? text : nil
-    }
-
-    private var statusText: String {
-        if let date = achievement.unlockDate {
-            return "Unlocked \(date.formatted(date: .long, time: .shortened))"
-        }
-        return "Locked"
-    }
+    private var last: Int { max(achievements.count - 1, 0) }
+    private var current: Int { min(max(Int(position.rounded()), 0), last) }
 
     var body: some View {
-        VStack(spacing: 20) {
-            AchievementDetailIcon(
-                url: achievement.iconURL,
-                grayURL: achievement.iconGrayURL,
-                achieved: achievement.achieved
-            )
+        VStack(spacing: 0) {
+            if !achievements.isEmpty {
+                stage
+            }
+            bottomBar
+        }
+        .frame(width: AchievementFlow.sheetWidth)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.leftArrow) { go(to: current - 1); return .handled }
+        .onKeyPress(.rightArrow) { go(to: current + 1); return .handled }
+        .onExitCommand { dismiss() }
+        .onAppear {
+            focused = true
+            wheel.install(.init(
+                isInside: { point in stageFrame.contains(point) },
+                drag: { dx in drag(by: dx) },
+                release: { velocity in settle(pointVelocity: velocity) },
+                step: { direction in go(to: current + direction) }
+            ))
+        }
+        .onDisappear { wheel.remove() }
+    }
 
-            VStack(spacing: 6) {
-                Text(title)
-                    .font(.title2).fontWeight(.bold)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
+    // MARK: Stage
 
-                HStack(spacing: 5) {
-                    Image(systemName: achievement.achieved ? "checkmark.seal.fill" : "lock.fill")
-                        .font(.caption2)
-                        .foregroundStyle(achievement.achieved ? .green : .secondary)
-                    Text(statusText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+    private var stage: some View {
+        let reach = AchievementFlow.visible + AchievementFlow.maxJump
+        let mounted = max(0, Int(floor(position - reach)))...min(last, Int(ceil(position + reach)))
+        return VStack(spacing: 0) {
+            ZStack {
+                ForEach(mounted, id: \.self) { index in
+                    AchievementCover(achievement: achievements[index])
+                        .modifier(CoverFlowLayer(position: position, index: index))
+                        .onTapGesture { go(to: index) }
                 }
             }
-
-            if let desc = description {
-                Text(desc)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: 380)
+            // The art alone takes up room, centred between the top and the
+            // text; its reflection hangs below, over the gap and the text.
+            .frame(maxWidth: .infinity)
+            .frame(height: AchievementFlow.cover, alignment: .top)
+            .padding(.vertical, AchievementFlow.artMargin)
+            // The stacks run off both sides into a soft blur rather than
+            // fading out short of them. From the black above the art to the
+            // foot of the reflections, so neither meets the band's edge.
+            .overlay(alignment: .top) {
+                HStack(spacing: 0) {
+                    CoverFlowEdge(edge: .leading)
+                    Spacer(minLength: 0)
+                    CoverFlowEdge(edge: .trailing)
+                }
+                .frame(height: AchievementFlow.artMargin + AchievementFlow.cover + AchievementFlow.reflection)
+                .allowsHitTesting(false)
             }
 
+            details(achievements[current])
+                .padding(.horizontal, 40)
+
+            if last > 0 {
+                AchievementRuler(
+                    achievements: achievements,
+                    position: position,
+                    scrub: { index, animated in scrub(to: index, animated: animated) },
+                    release: { settle(pointVelocity: 0) }
+                )
+                .padding(.top, 2)
+                .padding(.bottom, 14)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(.black)
+        .clipped()
+        .environment(\.colorScheme, .dark)
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { stageFrame = $0 }
+        // One adjustable element for VoiceOver: swipe up/down steps covers.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(achievements[current].isHidden && !achievements[current].achieved
+                            ? "Hidden Achievement" : achievements[current].displayName)
+        .accessibilityValue(statusText(achievements[current]))
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: go(to: current + 1)
+            case .decrement: go(to: current - 1)
+            @unknown default: break
+            }
+        }
+    }
+
+    /// Name, status and description of the front cover. Fixed height, so
+    /// the ruler never moves as the text changes.
+    private func details(_ achievement: GameAchievement) -> some View {
+        let lockedHidden = achievement.isHidden && !achievement.achieved
+        let description = lockedHidden ? nil
+            : achievement.description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return VStack(spacing: 4) {
+            Text(lockedHidden ? "Hidden Achievement" : achievement.displayName)
+                .font(.headline)
+                .lineLimit(1)
+            HStack(spacing: 5) {
+                Image(systemName: achievement.achieved ? "checkmark.seal.fill" : "lock.fill")
+                    .font(.caption2)
+                    .foregroundStyle(achievement.achieved ? .green : .secondary)
+                Text(statusText(achievement))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let description, !description.isEmpty {
+                Text(description)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 76, alignment: .top)
+    }
+
+    private func statusText(_ achievement: GameAchievement) -> String {
+        guard achievement.achieved else { return "Locked" }
+        guard let date = achievement.unlockDate else { return "Unlocked" }
+        return "Unlocked \(date.formatted(date: .long, time: .shortened))"
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            Text("\(current + 1) of \(achievements.count)")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Open in Steam") {
+                if let url = URL(string: "https://steamcommunity.com/stats/\(appID)/achievements") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
             Button("Done") { dismiss() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
                 .keyboardShortcut(.defaultAction)
         }
-        .padding(28)
-        .frame(width: 420)
+        .padding(16)
     }
-}
 
-/// Larger icon used by `AchievementDetailSheet` — mirrors `AchievementIcon`
-/// but at 96 × 96 and without the subtle 45 % fade on locked icons (the
-/// Steam-shipped grey asset is already visually distinct).
-private struct AchievementDetailIcon: View {
-    let url: URL?
-    let grayURL: URL?
-    let achieved: Bool
+    // MARK: Motion
 
-    var body: some View {
-        CachedAsyncImage(url: achieved ? url : (grayURL ?? url)) { phase in
-            switch phase {
-            case .success(let image):
-                image
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 96, height: 96)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .strokeBorder(.separator, lineWidth: 0.5)
-                    )
-                    .opacity(achieved ? 1.0 : 0.6)
-            default:
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color.secondary.opacity(0.15))
-                    .frame(width: 96, height: 96)
-                    .overlay(
-                        Image(systemName: "trophy.fill")
-                            .font(.system(size: 36, weight: .medium))
-                            .foregroundStyle(achieved ? .yellow.opacity(0.85) : .secondary.opacity(0.5))
-                    )
-            }
+    private func go(to index: Int) {
+        withAnimation(Self.flip) { position = CGFloat(min(max(index, 0), last)) }
+    }
+
+    /// The ruler: a click springs to the spot, a drag then tracks the cursor.
+    private func scrub(to index: CGFloat, animated: Bool) {
+        let target = min(max(index, 0), CGFloat(last))
+        if animated {
+            withAnimation(Self.flip) { position = target }
+        } else {
+            var t = Transaction()
+            t.disablesAnimations = true
+            withTransaction(t) { position = target }
+        }
+    }
+
+    /// Trackpad finger-down: the covers track the fingers 1:1, with
+    /// resistance past either end.
+    private func drag(by dx: CGFloat) {
+        var travel = dx / AchievementFlow.pointsPerCover
+        if position < 0 || position > CGFloat(last) { travel *= 0.3 }
+        var t = Transaction()
+        t.disablesAnimations = true
+        withTransaction(t) { position -= travel }
+    }
+
+    /// Fingers up: a flick carries on through the stack, then springs onto
+    /// a cover; the spring inherits the release velocity, as the hero's does.
+    private func settle(pointVelocity: CGFloat) {
+        let velocity = pointVelocity / AchievementFlow.pointsPerCover   // covers per second
+        let carry = min(max(velocity * 0.2, -AchievementFlow.maxJump), AchievementFlow.maxJump)
+        let target = min(max((position + carry).rounded(), 0), CGFloat(last))
+        let distance = target - position
+        let kick = abs(distance) > 0.001 ? min(max(velocity / distance, 0), 8) : 0
+        withAnimation(.interpolatingSpring(duration: 0.5, bounce: 0.1, initialVelocity: kick)) {
+            position = target
         }
     }
 }
 
+/// The Cover Flow's scale: a tick per achievement (every 5th taller), lit
+/// for unlocked, dim for locked, and a marker at the exact position. Ticks
+/// sit a whole number of device pixels apart on pixel boundaries, so every
+/// gap is identical; a long list ticks every 5th, 10th, 25th… achievement
+/// rather than crowding below `minTickGap`. Click to jump, drag to scrub.
+private struct AchievementRuler: View {
+    let achievements: [GameAchievement]
+    let position: CGFloat
+    let scrub: (_ index: CGFloat, _ animated: Bool) -> Void
+    let release: () -> Void
+
+    @Environment(\.displayScale) private var displayScale
+    @State private var scrubbing = false
+
+    private static let maxWidth: CGFloat = 360
+    /// Widest tick pitch: short lists make a short ruler, not sparse ticks.
+    private static let maxPitch: CGFloat = 16
+    private static let minTickGap: CGFloat = 4
+    private static let strides = [1, 5, 10, 25, 50, 100, 250, 500, 1000]
+    private static let height: CGFloat = 18
+    /// Room either side for the end ticks and the marker.
+    private static let inset: CGFloat = 2
+    /// The scrub lens. Taller than the ruler, so it sits over the ticks.
+    private static let lens = CGSize(width: 34, height: 24)
+
+    private struct Layout {
+        /// Achievements per drawn tick.
+        let stride: Int
+        /// Points per achievement; `stride` of them is whole device pixels.
+        let pitch: CGFloat
+    }
+
+    private var layout: Layout {
+        let gaps = CGFloat(max(achievements.count - 1, 1))
+        let rawPitchPx = min(Self.maxPitch, Self.maxWidth / gaps) * displayScale
+        let stride = Self.strides.first { CGFloat($0) * rawPitchPx >= Self.minTickGap * displayScale }
+            ?? Self.strides[Self.strides.count - 1]
+        let tickGapPx = max(1, floor(CGFloat(stride) * rawPitchPx))
+        return Layout(stride: stride, pitch: tickGapPx / CGFloat(stride) / displayScale)
+    }
+
+    /// Snaps a length in points to whole device pixels.
+    private func snap(_ value: CGFloat) -> CGFloat { (value * displayScale).rounded() / displayScale }
+
+    var body: some View {
+        let layout = layout
+        let last = achievements.count - 1
+        let width = CGFloat(last) * layout.pitch
+        let tick = max(1, snap(1))
+        let marker = max(2, snap(2))
+
+        Canvas { context, size in
+            for index in Swift.stride(from: 0, through: last, by: layout.stride) {
+                let major = (index / layout.stride) % 5 == 0
+                let height: CGFloat = major ? 10 : 6
+                let x = snap(Self.inset + CGFloat(index) * layout.pitch - tick / 2)
+                context.fill(
+                    Path(CGRect(x: x, y: (size.height - height) / 2, width: tick, height: height)),
+                    with: .color(.white.opacity(achievements[index].achieved ? 0.6 : 0.22))
+                )
+            }
+        }
+        .overlay(alignment: .leading) {
+            // While scrubbing, a glass lens rides the marker over the ticks
+            // (as iOS 26's slider thumb lifts into glass); the marker stays
+            // on top so the exact position still reads through it.
+            ZStack {
+                if scrubbing {
+                    ScrubLens()
+                        .frame(width: Self.lens.width, height: Self.lens.height)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
+                RoundedRectangle(cornerRadius: marker / 2)
+                    .fill(.white)
+                    .frame(width: marker, height: Self.height - 2)
+            }
+            .animation(.spring(duration: 0.3, bounce: 0.3), value: scrubbing)
+            .frame(width: Self.lens.width)
+            .offset(x: snap(Self.inset + min(max(position, 0), CGFloat(last)) * layout.pitch - Self.lens.width / 2))
+        }
+        // An even number of device pixels wide, so centring it lands every
+        // tick on a pixel boundary.
+        .frame(width: ceil((width + Self.inset * 2) * displayScale / 2) * 2 / displayScale,
+               height: Self.height, alignment: .leading)
+        // A taller strip to grab than to see.
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { drag in
+                    scrub((drag.location.x - Self.inset) / layout.pitch, !scrubbing)
+                    scrubbing = true
+                }
+                .onEnded { _ in
+                    scrubbing = false
+                    release()
+                }
+        )
+    }
+}
+
+/// The ruler's lens while scrubbing: Liquid Glass on macOS 26, frosted
+/// material before it.
+private struct ScrubLens: View {
+    var body: some View {
+        if #available(macOS 26.0, *) {
+            Color.clear.glassEffect(.regular.interactive(), in: .capsule)
+        } else {
+            Capsule()
+                .fill(.regularMaterial)
+                .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        }
+    }
+}
+
+/// One cover's place in the flow. `rel` = covers from the current position
+/// (0 = facing front). Animatable on the position, as `HeroPageLayer` is, so
+/// a spring re-lays every cover out along the real path each frame: covers
+/// turn through the centre instead of sliding straight across it.
+private struct CoverFlowLayer: ViewModifier, Animatable {
+    var position: CGFloat
+    let index: Int
+
+    nonisolated var animatableData: CGFloat {
+        get { position }
+        set { position = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        let rel = CGFloat(index) - position
+        // -1…1 through the centre, saturating in the stacks.
+        let turn = min(max(rel, -1), 1)
+        content
+            // Stacked covers stand in shadow.
+            .overlay(Color.black.opacity(0.35 * abs(turn)))
+            .rotation3DEffect(.degrees(-turn * AchievementFlow.sideAngle), axis: (x: 0, y: 1, z: 0),
+                              anchor: AchievementFlow.floor, perspective: 0.35)
+            .scaleEffect(1 - 0.2 * abs(turn), anchor: AchievementFlow.floor)
+            .offset(x: turn * AchievementFlow.centerGap + (rel - turn) * AchievementFlow.stackGap)
+            .opacity(min(1, max(0, AchievementFlow.visible - abs(rel))))
+            .zIndex(-Double(abs(rel)))
+            .allowsHitTesting(abs(rel) < AchievementFlow.visible)
+    }
+}
+
+/// One cover: the achievement's art with its reflection below. Unlocked
+/// shows the colour icon, locked the grey one.
+private struct AchievementCover: View {
+    let achievement: GameAchievement
+
+    var body: some View {
+        CachedAsyncImage(url: achievement.achieved ? achievement.iconURL
+                                                   : (achievement.iconGrayURL ?? achievement.iconURL)) { phase in
+            VStack(spacing: 0) {
+                face(phase.image)
+                face(phase.image)
+                    .scaleEffect(x: 1, y: -1)
+                    .frame(height: AchievementFlow.reflection, alignment: .top)
+                    .clipped()
+                    .mask(LinearGradient(colors: [.white.opacity(0.35), .clear],
+                                         startPoint: .top, endPoint: .bottom))
+            }
+        }
+    }
+
+    private func face(_ image: Image?) -> some View {
+        Group {
+            if let image {
+                image
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                ZStack {
+                    Color(white: 0.15)
+                    Image(systemName: "trophy.fill")
+                        .font(.system(size: 32, weight: .medium))
+                        .foregroundStyle(.yellow.opacity(achievement.achieved ? 0.85 : 0.3))
+                }
+            }
+        }
+        .frame(width: AchievementFlow.cover, height: AchievementFlow.cover)
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+}
 
 private struct AchievementIcon: View {
     let url: URL?

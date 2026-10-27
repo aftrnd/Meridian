@@ -330,6 +330,10 @@ private struct HeroCarousel: View {
     @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.colorScheme) private var colorScheme
     @Environment(SteamAuthService.self) private var steamAuth
+    /// Home stays mounted, faded, under a game page (ContentView's stage):
+    /// covered, the hero neither advances nor takes swipes, which would
+    /// otherwise land on the page or its sheets (the achievements Cover Flow).
+    @Environment(\.detailPresented) private var detailPresented
     /// Under the floating panel the shade runs under it with the mirrored
     /// art, so no unshaded strip shows around the glass (user, Oct 26 2026:
     /// its rounded corner and the gaps at the window's edge, once Home
@@ -437,19 +441,9 @@ private struct HeroCarousel: View {
             }
         }
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame = $0 }
-        .onAppear {
-            startTimer()
-            wheel.install(.init(
-                isInside: { point in frame.contains(point) },
-                drag: { dx in drag(by: dx) },
-                release: { velocity in settle(pointVelocity: velocity) },
-                step: { dir in go(dir) }
-            ))
-        }
-        .onDisappear {
-            timer?.invalidate()
-            wheel.remove()
-        }
+        .onAppear { listen(!detailPresented) }
+        .onDisappear { listen(false) }
+        .onChange(of: detailPresented) { _, presented in listen(!presented) }
         .onChange(of: count) { _, _ in restartTimer() }
     }
 
@@ -536,6 +530,22 @@ private struct HeroCarousel: View {
 
     // MARK: Navigation
 
+    /// Auto-advance and swipes on while the hero is on screen, off otherwise.
+    private func listen(_ on: Bool) {
+        guard on else {
+            timer?.invalidate()
+            wheel.remove()
+            return
+        }
+        startTimer()
+        wheel.install(.init(
+            isInside: { point in frame.contains(point) },
+            drag: { dx in drag(by: dx) },
+            release: { velocity in settle(pointVelocity: velocity) },
+            step: { dir in go(dir) }
+        ))
+    }
+
     private func go(_ direction: Int) {
         guard count > 1 else { return }
         withAnimation(Self.page) { position = CGFloat(current + direction) }
@@ -581,7 +591,7 @@ private struct HeroCarousel: View {
     }
 
     private func startTimer() {
-        guard count > 1, !isHovered else { return }
+        guard count > 1, !isHovered, !detailPresented else { return }
         timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { _ in
             Task { @MainActor in
                 guard count > 1 else { return }
@@ -642,9 +652,11 @@ private struct HeroPageLayer: ViewModifier, Animatable {
     }
 }
 
-/// Horizontal scroll-wheel/trackpad handling for the hero. A local event
-/// monitor (not an NSView in the hierarchy) so SwiftUI hit-testing for the
-/// hero's buttons is untouched. A gesture locks to the axis of its first
+/// Horizontal scroll-wheel/trackpad handling for the hero, and the
+/// achievements Cover Flow (GameDetailView). A local event monitor (not an
+/// NSView in the hierarchy) so SwiftUI hit-testing for the hero's buttons is
+/// untouched. It sees every window's events, so owners remove it while
+/// they're covered. A gesture locks to the axis of its first
 /// movement; horizontal gestures over the hero are consumed (Home's vertical
 /// scroll view never sees them), everything else passes straight through.
 @MainActor
@@ -656,6 +668,14 @@ final class HeroWheelGesture {
         var step: (Int) -> Void
     }
 
+    /// Whether vertical input pages too. The hero leaves it to Home's scroll
+    /// view; the Cover Flow has nothing to scroll vertically, so a mouse
+    /// wheel (vertical) flips its covers.
+    private let pagesVertically: Bool
+    /// Shortest gap between wheel-notch steps: a hero page per notch would
+    /// race, a cover per notch is what a wheel is for.
+    private let stepInterval: TimeInterval
+
     private var monitor: Any?
     private var handlers: Handlers?
     private enum Axis { case undecided, horizontal, vertical }
@@ -665,6 +685,26 @@ final class HeroWheelGesture {
     private var velocity: CGFloat = 0
     private var lastTimestamp: TimeInterval = 0
     private var lastStep: TimeInterval = 0
+
+    init(pagesVertically: Bool = false, stepInterval: TimeInterval = 0.35) {
+        self.pagesVertically = pagesVertically
+        self.stepInterval = stepInterval
+    }
+
+    private func pages(_ axis: Axis) -> Bool {
+        axis == .horizontal || (axis == .vertical && pagesVertically)
+    }
+
+    private func dominantAxis(_ e: NSEvent) -> Axis {
+        let dx = abs(e.scrollingDeltaX), dy = abs(e.scrollingDeltaY)
+        guard dx + dy > 0 else { return .undecided }
+        return dx > dy ? .horizontal : .vertical
+    }
+
+    /// Content travel on `axis`: positive moves content right (or down).
+    private func delta(_ e: NSEvent, on axis: Axis) -> CGFloat {
+        axis == .vertical ? e.scrollingDeltaY : e.scrollingDeltaX
+    }
 
     func install(_ handlers: Handlers) {
         remove()
@@ -691,11 +731,14 @@ final class HeroWheelGesture {
         let inside = h.isInside(CGPoint(x: p.x, y: content.bounds.height - p.y))
 
         // Legacy wheel (no gesture phases): each notch is a discrete page.
+        // Any non-zero notch counts: a slow mouse wheel reports fractions of
+        // a line.
         if e.phase.isEmpty && e.momentumPhase.isEmpty {
-            guard inside, abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY), abs(e.scrollingDeltaX) >= 1 else { return false }
-            if e.timestamp - lastStep > 0.35 {
+            let notch = dominantAxis(e)
+            guard inside, pages(notch) else { return false }
+            if e.timestamp - lastStep > stepInterval {
                 lastStep = e.timestamp
-                h.step(e.scrollingDeltaX < 0 ? 1 : -1)
+                h.step(delta(e, on: notch) < 0 ? 1 : -1)
             }
             return true
         }
@@ -718,22 +761,22 @@ final class HeroWheelGesture {
         if e.phase.contains(.changed) {
             guard startedInside else { return false }
             if axis == .undecided {
-                let dx = abs(e.scrollingDeltaX), dy = abs(e.scrollingDeltaY)
-                guard dx + dy > 0 else { return false }
-                axis = dx > dy ? .horizontal : .vertical
+                axis = dominantAxis(e)
+                guard axis != .undecided else { return false }
             }
-            guard axis == .horizontal else { return false }
+            guard pages(axis) else { return false }
+            let d = delta(e, on: axis)
             let dt = max(e.timestamp - lastTimestamp, 1.0 / 240)
             lastTimestamp = e.timestamp
             // Points/s, sign flipped: content moves against the fingers.
-            let v = -e.scrollingDeltaX / dt
+            let v = -d / dt
             velocity = velocity * 0.5 + v * 0.5
-            h.drag(e.scrollingDeltaX)
+            h.drag(d)
             return true
         }
 
         if e.phase.contains(.ended) || e.phase.contains(.cancelled) {
-            if axis == .horizontal {
+            if pages(axis) {
                 consumeMomentum = true
                 h.release(velocity)
             }
