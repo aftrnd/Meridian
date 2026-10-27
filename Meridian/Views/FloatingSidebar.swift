@@ -11,7 +11,8 @@ import SwiftUI
 /// the glass (`edge(width:)`, applied by ContentView), so everything sits as
 /// far from the panel as it does from the classic column, and Home's banner
 /// meets the glass exactly: its background extension mirrors the art into
-/// that safe area, under the panel, unshaded, as macOS 26 and 27 draw it.
+/// that safe area, under the panel, and its shade follows
+/// (`floatingSidebarActive`).
 enum FloatingSidebar {
     /// The glass's width until its edge is dragged (user, Oct 24 2026; the
     /// classic column is 215).
@@ -72,6 +73,9 @@ struct FloatingSidebarLayout<Sidebar: View, Content: View>: View {
     var body: some View {
         content
             .environment(\.toolbarBackMidX, isPresented ? FloatingSidebar.backMidX(width: width) : nil)
+            // Not tied to isPresented: hidden, the leading safe area is 0
+            // anyway, and the shade follows it as it animates.
+            .environment(\.floatingSidebarActive, true)
             .overlay(alignment: .leading) {
                 if isPresented {
                     panel.transition(.move(edge: .leading).combined(with: .opacity))
@@ -140,6 +144,11 @@ extension EnvironmentValues {
     /// centres in the window (`FloatingSidebar.backMidX`), beside the pages
     /// as beside the classic column. nil: no panel, the toolbar's own layout.
     @Entry var toolbarBackMidX: CGFloat? = nil
+    /// True under FloatingSidebarLayout, where the pages' leading safe area
+    /// is the panel's room: Home's banner shade runs into it with the
+    /// mirrored art. False beside the classic column, whose mirror stays
+    /// unshaded.
+    @Entry var floatingSidebarActive: Bool = false
 }
 
 /// Reports where the view it backs centres in the window, one runloop after
