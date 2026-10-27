@@ -652,20 +652,21 @@ private struct ScrollViewLanding: NSViewRepresentable {
     private func loadBannerImage() async {
         let urls = currentGame.newCDNHeroURLs + [currentGame.heroURL] + currentGame.heroURLFallbacks
 
-        // Preloaded by init from the memory tier — only the glow may be missing.
-        if let img = bannerImage {
-            if bannerGlowColors == nil, let url = urls.first(where: { ImageCache.shared.memoryImage(for: $0) === img }) {
-                bannerGlowColors = await ImageCache.shared.edgeColors(for: img, url: url)
-            }
-            return
-        }
-
+        // In priority order, even when init preloaded an image: init only
+        // sees the memory tier, so it can pick a fallback another view put
+        // there (the Friends panel loads the same header.jpg) over the real
+        // hero that's only on disk. The preload stands if it's the best hit.
         for url in urls {
             if let cached = await ImageCache.shared.imageAsync(for: url) {
-                let r = cached.size.width / cached.size.height
-                if r > 0.05, r < 20 { heroAspectRatio = r }
-                bannerImage = cached
-                bannerGlowColors = await ImageCache.shared.edgeColors(for: cached, url: url)
+                let isPreload = cached === bannerImage
+                if !isPreload {
+                    let r = cached.size.width / cached.size.height
+                    if r > 0.05, r < 20 { heroAspectRatio = r }
+                    bannerImage = cached
+                }
+                if !isPreload || bannerGlowColors == nil {
+                    bannerGlowColors = await ImageCache.shared.edgeColors(for: cached, url: url)
+                }
                 return
             }
         }
