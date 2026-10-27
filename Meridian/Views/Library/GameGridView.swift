@@ -312,42 +312,15 @@ struct GameGridView: View {
     private var isRunning: Bool { gameState == .running }
     private var isLaunching: Bool { gameState == .launching || gameState == .stopping }
 
-    private let maxTilt: Double = 6
-    private let perspective: CGFloat = 0.4
-    /// Matches `DetailZoomParameters.hoverLift` (0.015 per side).
-    private static let hoverScale: CGFloat = 1.03
-
-    private var liftScale: CGFloat { isHovered ? Self.hoverScale : 1 }
+    private var liftScale: CGFloat { isHovered ? CardHoverTilt.scale : 1 }
 
     /// Where the label sits once the art has lifted: it follows the art's
     /// bottom-left corner, snapped to device pixels so the text lands sharp.
     private var labelLift: CGSize {
         guard isHovered else { return .zero }
-        let half = (Self.hoverScale - 1) / 2
+        let half = (CardHoverTilt.scale - 1) / 2
         func snap(_ v: CGFloat) -> CGFloat { (v * displayScale).rounded() / displayScale }
         return CGSize(width: snap(-cardSize.width * half), height: snap(cardSize.height * half))
-    }
-
-    private var tiltX: Double {
-        guard isHovered, cardSize.height > 0 else { return 0 }
-        let normalized = (hoverLocation.y / cardSize.height) - 0.5
-        return -normalized * maxTilt
-    }
-
-    private var tiltY: Double {
-        guard isHovered, cardSize.width > 0 else { return 0 }
-        let normalized = (hoverLocation.x / cardSize.width) - 0.5
-        return normalized * maxTilt
-    }
-
-    private var highlightOffset: UnitPoint {
-        guard isHovered, cardSize.width > 0, cardSize.height > 0 else {
-            return .center
-        }
-        return UnitPoint(
-            x: hoverLocation.x / cardSize.width,
-            y: hoverLocation.y / cardSize.height
-        )
     }
 
     var body: some View {
@@ -355,22 +328,7 @@ struct GameGridView: View {
             // Transforms stop at the art: text under a scale/tilt is a bitmap
             // being resampled, so the label below grows via real font sizes.
             artSection
-                .rotation3DEffect(
-                    .degrees(tiltX),
-                    axis: (x: 1, y: 0, z: 0),
-                    perspective: perspective
-                )
-                .rotation3DEffect(
-                    .degrees(tiltY),
-                    axis: (x: 0, y: 1, z: 0),
-                    perspective: perspective
-                )
-                .scaleEffect(liftScale)
-                .shadow(
-                    color: .black.opacity(isHovered ? 0.3 : 0.0),
-                    radius: isHovered ? 16 : 0,
-                    y: isHovered ? 8 : 0
-                )
+                .modifier(CardHoverTilt(isHovered: isHovered, location: hoverLocation, size: cardSize))
             if isSelected {
                 Image(systemName: "chevron.compact.up")
                     .font(.system(size: 11, weight: .semibold))
@@ -471,21 +429,9 @@ struct GameGridView: View {
         .frame(maxWidth: .infinity)
         .clipped()
         // Radial highlight lives here so it's clipped to art bounds and
-        // highlightOffset / tiltX are computed against art dimensions only
+        // the highlight / tilt are computed against art dimensions only
         // (not the full card including the text label below).
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(
-                    RadialGradient(
-                        colors: [.white.opacity(0.12), .clear],
-                        center: highlightOffset,
-                        startRadius: 0,
-                        endRadius: max(cardSize.width, cardSize.height) * 0.8
-                    )
-                )
-                .opacity(isHovered ? 1 : 0)
-                .allowsHitTesting(false)
-        }
+        .overlay { CardHoverHighlight(isHovered: isHovered, location: hoverLocation, size: cardSize) }
         .overlay(alignment: .topLeading) { statusBadge }
         .overlay(alignment: .topTrailing) { trailingBadges }
         .overlay {
@@ -698,6 +644,85 @@ private struct BadgeSpinner: View {
             .font(.caption2)
             .foregroundStyle(.white)
             .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing)
+    }
+}
+
+// MARK: - Card hover (Apple TV style)
+
+/// The library card's Apple TV hover, shared with the achievements Cover
+/// Flow's front cover: the art tilts toward the pointer (up to `maxTilt` on
+/// each axis), lifts by `scale` and casts a shadow. `location` is the pointer
+/// in the art's own coordinates and `size` the art's size.
+struct CardHoverTilt: ViewModifier {
+    let isHovered: Bool
+    let location: CGPoint
+    let size: CGSize
+    /// Where the lift grows from: a card lifts from its centre, a Cover Flow
+    /// cover from the floor it stands on.
+    var anchor: UnitPoint = .center
+
+    static let maxTilt: Double = 6
+    static let perspective: CGFloat = 0.4
+    /// Matches `DetailZoomParameters.hoverLift` (0.015 per side).
+    static let scale: CGFloat = 1.03
+
+    private var tiltX: Double {
+        guard isHovered, size.height > 0 else { return 0 }
+        let normalized = (location.y / size.height) - 0.5
+        return -normalized * Self.maxTilt
+    }
+
+    private var tiltY: Double {
+        guard isHovered, size.width > 0 else { return 0 }
+        let normalized = (location.x / size.width) - 0.5
+        return normalized * Self.maxTilt
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .rotation3DEffect(
+                .degrees(tiltX),
+                axis: (x: 1, y: 0, z: 0),
+                perspective: Self.perspective
+            )
+            .rotation3DEffect(
+                .degrees(tiltY),
+                axis: (x: 0, y: 1, z: 0),
+                perspective: Self.perspective
+            )
+            .scaleEffect(isHovered ? Self.scale : 1, anchor: anchor)
+            .shadow(
+                color: .black.opacity(isHovered ? 0.3 : 0.0),
+                radius: isHovered ? 16 : 0,
+                y: isHovered ? 8 : 0
+            )
+    }
+}
+
+/// The hover's sheen: a soft white glow centred under the pointer. Laid over
+/// the art and clipped with it.
+struct CardHoverHighlight: View {
+    let isHovered: Bool
+    let location: CGPoint
+    let size: CGSize
+
+    private var center: UnitPoint {
+        guard isHovered, size.width > 0, size.height > 0 else { return .center }
+        return UnitPoint(x: location.x / size.width, y: location.y / size.height)
+    }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 12)
+            .fill(
+                RadialGradient(
+                    colors: [.white.opacity(0.12), .clear],
+                    center: center,
+                    startRadius: 0,
+                    endRadius: max(size.width, size.height) * 0.8
+                )
+            )
+            .opacity(isHovered ? 1 : 0)
+            .allowsHitTesting(false)
     }
 }
 
