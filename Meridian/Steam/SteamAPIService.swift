@@ -259,11 +259,24 @@ actor SteamAPIService {
                 unlockDate:  raw.unlocktime > 0
                     ? Date(timeIntervalSince1970: TimeInterval(raw.unlocktime))
                     : nil,
-                iconURL:     entry?.icon.flatMap { URL(string: $0) },
-                iconGrayURL: entry?.icongray.flatMap { URL(string: $0) },
+                iconURL:     Self.achievementIconURL(entry?.icon, appID: appID),
+                iconGrayURL: Self.achievementIconURL(entry?.icongray, appID: appID),
                 isHidden:    entry?.hidden == 1
             )
         }
+    }
+
+    /// The schema's icon URLs point at the legacy community CDN
+    /// (steamcdn-a…/steamcommunity/public/images/apps/), which 404s for newer
+    /// games, so their achievements showed the trophy placeholder. Steam's
+    /// own achievements pages load the same file from community_assets,
+    /// which serves every game. curl, Oct 26 2026: 5335510, 4108000 and
+    /// 4304900 are 404 on the legacy path and 200 here; 240, 730 and 813230
+    /// are 200 on both.
+    static func achievementIconURL(_ schemaIcon: String?, appID: Int) -> URL? {
+        guard let schemaURL = schemaIcon.flatMap({ URL(string: $0) }),
+              !schemaURL.pathExtension.isEmpty else { return nil }
+        return URL(string: "https://shared.fastly.steamstatic.com/community_assets/images/apps/\(appID)/\(schemaURL.lastPathComponent)")
     }
 
     private func loadSchema(apiKey: String, appID: Int) async -> [String: SchemaAchievement] {
