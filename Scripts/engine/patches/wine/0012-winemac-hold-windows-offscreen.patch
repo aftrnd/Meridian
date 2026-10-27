@@ -1,0 +1,173 @@
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -58,6 +58,8 @@
+ bool cursor_clipping_locks_windows = true;
+ bool use_precise_scrolling = true;
+ int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
++/* Meridian */
++bool hold_windows_offscreen = false;
+ bool retina_enabled = false;
+ bool enable_app_nap = false;
+ 
+@@ -332,6 +334,13 @@
+     if (!get_config_key(hkey, appkey, "AllowSetGamma", buffer, sizeof(buffer)))
+         allow_set_gamma = IS_OPTION_TRUE(buffer[0]);
+ 
++    /* Meridian: for an app whose windows another process shows (Steam, which
++     * Meridian keeps hidden except for the dialogs the player must answer).
++     * Every window keeps its size but stays off every screen until something
++     * outside winemac (Accessibility) moves it onto one. */
++    if (!get_config_key(hkey, appkey, "HoldWindowsOffscreen", buffer, sizeof(buffer)))
++        hold_windows_offscreen = IS_OPTION_TRUE(buffer[0]);
++
+     /* CrossOver Hack 10912: Mac Edit menu */
+     if (!get_config_key(hkey, appkey, "EditMenu", buffer, sizeof(buffer)))
+     {
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -138,6 +138,7 @@
+ extern bool left_command_is_ctrl;
+ extern bool right_command_is_ctrl;
+ extern bool allow_immovable_windows;
++extern bool hold_windows_offscreen;  /* Meridian */
+ extern bool use_confinement_cursor_clipping;
+ extern bool cursor_clipping_locks_windows;
+ extern bool use_precise_scrolling;
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -83,6 +83,13 @@
+     BOOL ignore_windowResize;
+     BOOL fakingClose;
+ 
++    /* Meridian (HoldWindowsOffscreen): Wine's frames land off every screen
++       while held; settingWineFrame tells winemac's own moves from others,
++       placingHeldWindow Cocoa's while winemac orders or focuses it. */
++    BOOL heldOffscreen;
++    BOOL settingWineFrame;
++    BOOL placingHeldWindow;
++
+     CAShapeLayer* contentViewMaskLayer;
+ }
+ 
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1090,6 +1090,7 @@
+                                                                   name:NSWorkspaceActiveSpaceDidChangeNotification
+                                                                 object:[NSWorkspace sharedWorkspace]];
+ 
++        window->heldOffscreen = hold_windows_offscreen;
+         [window setFrameAndWineFrame:[window frameRectForContentRect:window_frame]];
+ 
+         return window;
+@@ -1930,10 +1931,27 @@
+             [controller adjustWindowLevels];
+         }
+     }
++
++    /* Meridian (HoldWindowsOffscreen): a held window's frame keeps its size
++       but sits past the bottom-left corner of every screen. */
++    - (NSRect) heldFrame:(NSRect)frame
++    {
++        NSRect screens = NSZeroRect;
+ 
++        if (!heldOffscreen) return frame;
++        for (NSScreen* screen in [NSScreen screens])
++            screens = NSUnionRect(screens, [screen frame]);
++        frame.origin.x = NSMinX(screens) - NSWidth(frame) - 1000;
++        frame.origin.y = NSMinY(screens) - NSHeight(frame) - 1000;
++        return frame;
++    }
++
+     - (void) setFrameAndWineFrame:(NSRect)frame
+     {
++        frame = [self heldFrame:frame];
++        settingWineFrame = TRUE;
+         [self setFrame:frame display:YES];
++        settingWineFrame = FALSE;
+ 
+         wineFrame = frame;
+         roundedWineFrame = self.frame;
+@@ -1974,7 +1992,7 @@
+             NSRect frame, oldFrame;
+ 
+             oldFrame = self.wine_fractionalFrame;
+-            frame = [self frameRectForContentRect:contentRect];
++            frame = [self heldFrame:[self frameRectForContentRect:contentRect]];
+             if (!NSEqualRects(frame, oldFrame))
+             {
+                 BOOL equalSizes = NSEqualSizes(frame.size, oldFrame.size);
+@@ -2003,7 +2021,9 @@
+                     needEnableScreenUpdates = TRUE;
+ 
+                     ignore_windowResize = TRUE;
++                    settingWineFrame = TRUE;
+                     [self setFrame:bogusFrame display:NO];
++                    settingWineFrame = FALSE;
+                     ignore_windowResize = FALSE;
+                 }
+ 
+@@ -2770,13 +2790,51 @@
+         [super displayIfNeeded];
+         if (_lastDisplayID)
+             [self setAutodisplay:NO];
++    }
++
++    /* Meridian (HoldWindowsOffscreen): ordering in or focusing a window that
++       is off every screen makes Cocoa carry it onto one (-[NSWindow
++       _positionWindowOnBestScreen], through -setFrame:display:). While these
++       run, a held window refuses that move. Moves from outside
++       (Accessibility) also come through -setFrame:display:, but on their own,
++       so they still decide (-windowDidMove:). */
++    - (void) placeKeepingHold:(void (^)(void))place
++    {
++        BOOL wasPlacing = placingHeldWindow;
++        placingHeldWindow = heldOffscreen;
++        place();
++        placingHeldWindow = wasPlacing;
++    }
++
++    - (void) orderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)otherWin
++    {
++        [self placeKeepingHold:^{ [super orderWindow:place relativeTo:otherWin]; }];
++    }
++
++    - (void) orderFront:(id)sender
++    {
++        [self placeKeepingHold:^{ [super orderFront:sender]; }];
++    }
++
++    - (void) makeKeyWindow
++    {
++        [self placeKeepingHold:^{ [super makeKeyWindow]; }];
+     }
+ 
+     - (void) setFrame:(NSRect)frameRect display:(BOOL)flag
+     {
++        BOOL cocoaMove = heldOffscreen && placingHeldWindow && !settingWineFrame;
++
++        if (cocoaMove)
++        {
++            frameRect = [self heldFrame:frameRect];
++            settingWineFrame = TRUE;
++        }
+         if (flag)
+             [self setAutodisplay:YES];
+         [super setFrame:frameRect display:flag];
++        if (cocoaMove)
++            settingWineFrame = FALSE;
+     }
+ 
+     - (void) setFrame:(NSRect)frameRect display:(BOOL)displayFlag animate:(BOOL)animateFlag
+@@ -3147,6 +3205,12 @@
+ 
+     - (void)windowDidMove:(NSNotification *)notification
+     {
++        /* Meridian (HoldWindowsOffscreen): a move winemac didn't make (another
++           process, through Accessibility) decides: onto a screen releases the
++           window, off every screen holds it again. Cocoa sends this during
++           setFrame:display:, so settingWineFrame is still set for our own. */
++        if (hold_windows_offscreen && !settingWineFrame)
++            heldOffscreen = !frame_intersects_screens([self frame], [NSScreen screens]);
+         [self windowDidResize:notification];
+     }
+ 

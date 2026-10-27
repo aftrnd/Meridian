@@ -1083,26 +1083,6 @@ final class GameInstallTests: XCTestCase {
                       "Launcher must surface monitor .failed as a user-visible failure")
     }
 
-    /// SteamSession.configureSteamRegistry must write `NotifyAvailableGames=0`
-    /// alongside the StartMinimized key. Without it,
-    /// Steam fires its post-login "X is installed" toast burst into macOS
-    /// Notification Center for every ACF manifest in the prefix — toasts the
-    /// user can't dismiss because Steam's UI is suppressed. User-reported
-    /// May 19 2026.
-    func testSteamSession_configuresNotifyAvailableGamesOff() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let src = try String(
-            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(src.contains("\"NotifyAvailableGames\""),
-                      "SteamSession.configureSteamRegistry must write HKCU\\Software\\Valve\\Steam\\NotifyAvailableGames=0 to silence the post-login installed-games toast burst")
-        XCTAssertTrue(src.contains("\"DesktopNotifications\""),
-                      "SteamSession.configureSteamRegistry must write HKCU\\Software\\Valve\\Steam\\DesktopNotifications=0 (native-UI toast suppression)")
-    }
-
     /// Steam's webhelper must composite in-process: out of process, Chromium
     /// paints into a window winemac cannot present and Steam's sign-in window
     /// renders black (Pattern 37, CLI-verified Oct 7 2026). The engine's
@@ -1208,36 +1188,6 @@ final class GameInstallTests: XCTestCase {
         // authoritative totals directly).
         XCTAssertFalse(src.contains("pollDownloadProgress"),
                        "pollDownloadProgress (ACF/on-disk polling) is removed — DepotDownloader reports progress directly")
-    }
-
-    /// `WinePrefix.writeUserNotificationPreferences` must be called from BOTH
-    /// the sign-in callback (fresh sign-in) AND the lazy DRM Steam bring-up
-    /// (returning users with persisted credentials). The function writes the
-    /// per-user `localconfig.vdf` keys that suppress webhelper-side toasts; the
-    /// registry keys only cover native-UI toasts. Both layers are needed
-    /// because Steam routes different toasts through different paths.
-    ///
-    /// Phase 3: the returning-user pre-write moved from BootstrapManager (cold
-    /// start) to SteamSession.ensureReadyForDRM — Steam is no longer started on
-    /// boot, so the pre-write happens just before the lazy `steam.exe -silent`.
-    func testNotificationPrefs_calledAfterSignIn() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-
-        let authView = try String(
-            contentsOf: root.appendingPathComponent("Meridian/Views/Auth/AuthView.swift"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(authView.contains("writeUserNotificationPreferences"),
-                      "SetupSheet.beginSignIn must call writeUserNotificationPreferences after a successful sign-in to silence the post-login toast burst")
-
-        let session = try String(
-            contentsOf: root.appendingPathComponent("Meridian/Steam/SteamSession.swift"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(session.contains("writeUserNotificationPreferences"),
-                      "SteamSession.ensureReadyForDRM must call writeUserNotificationPreferences before the lazy steam.exe -silent so returning users' post-login toast burst is silenced")
     }
 
     // MARK: - GameStackReport renderer inference

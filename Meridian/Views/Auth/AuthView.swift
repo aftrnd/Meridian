@@ -584,25 +584,7 @@ private func makeSignInHandler(
         //    exist, so onboarding skipped Steam's own sign-in. Steam's
         //    session comes only from its own sign-in (Online Play step).
 
-        // 3. Pre-write per-user webhelper notification toggles BEFORE
-        //     Steam starts. Steam reads `userdata/<accountID>/config/
-        //     localconfig.vdf` at post-login hydration and merges its
-        //     in-memory state with the file on disk. Writing the
-        //     suppression keys ahead of `steam.exe -silent` means the
-        //     "X is installed" / "Download complete" toast burst that
-        //     Steam fires immediately after a fresh sign-in is silenced
-        //     before the first toast can render. Pairs with the
-        //     `NotifyAvailableGames=0` HKCU registry key written by
-        //     `SteamSession.configureSteamRegistry` for the native-UI
-        //     side. Both layers are needed.
-        do {
-            try WinePrefix.defaultPrefix.writeUserNotificationPreferences(steamID64: steamID)
-            setupLog.info("[signIn] notification preferences pre-written ✓")
-        } catch {
-            setupLog.warning("[signIn] could not pre-write notification prefs: \(error.localizedDescription)")
-        }
-
-        // 4. Do NOT start steam.exe here. Starting steam.exe -silent at
+        // 3. Do NOT start steam.exe here. Starting steam.exe -silent at
         //    sign-in popped the Steam login/UI window AND poisoned the
         //    freshly-minted refresh token (CLI-verified Jun 20 2026,
         //    HANDOFF-2026-06-20). Steam is now lazy: it starts only for
@@ -612,7 +594,7 @@ private func makeSignInHandler(
         //    persisted refresh_token, and DRM-free launches go direct —
         //    neither needs a running steam.exe.
 
-        // 5. Update SteamAuthService → triggers SetupSheet advance.
+        // 4. Update SteamAuthService → triggers SetupSheet advance.
         auth.setAuthenticatedFromCredentialFlow(steamID: steamID, accountName: accountName)
         setupLog.info("[signIn] ✅ steamID=\(steamID) needsAPIKey=\(auth.needsAPIKey)")
         onDone()
