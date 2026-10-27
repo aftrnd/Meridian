@@ -176,24 +176,38 @@ struct ToolbarMidXReader: NSViewRepresentable {
 }
 
 /// The glass macOS 27 puts behind NavigationSplitView's sidebar:
-/// NSGlassEffectView in its sidebar variant (`_variant` 17, read off a native
-/// sidebar on 27.0.1; toolbar buttons are 0). There's no public way to pick a
-/// variant, and SwiftUI's `.glassEffect` draws far lighter (#3b3b39 against
-/// the native #2b2a28 over the dark window background; the variant matches it
-/// exactly). Private, so it's only used while the setter exists; a macOS
-/// without it gets SwiftUI's glass instead.
+/// NSGlassEffectView in its sidebar variant (private `_variant`; toolbar
+/// buttons are 0). There's no public way to pick a variant, and SwiftUI's
+/// `.glassEffect` draws far lighter (#3b3b39 against the native #2b2a28 over
+/// the dark window background; the variant matches it exactly). Private, so
+/// it's only used while the variant can be read and set; a macOS without it
+/// gets SwiftUI's glass instead.
 @available(macOS 26.0, *)
 private struct SidebarGlass: NSViewRepresentable {
     let cornerRadius: CGFloat
 
-    static var isSupported: Bool {
-        NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:"))
-    }
+    /// The variant AppKit gives a sidebar, read off one it builds, because
+    /// macOS renumbers them: the sidebar was 17 on 27.0.1 and is 18 on 27.2,
+    /// where 17 became a lighter glass with a rim (probed Oct 26). The split
+    /// view needs no window; about 1 ms, once.
+    static let sidebarVariant: Int? = {
+        guard NSGlassEffectView.instancesRespond(to: NSSelectorFromString("set_variant:")) else { return nil }
+        let sidebar = NSViewController()
+        sidebar.view = NSView()
+        let split = NSSplitViewController()
+        split.addSplitViewItem(NSSplitViewItem(sidebarWithViewController: sidebar))
+        _ = split.view
+        guard let glass = sequence(first: sidebar.view, next: \.superview).lazy.compactMap({ $0 as? NSGlassEffectView }).first,
+              glass.responds(to: NSSelectorFromString("_variant")) else { return nil }
+        return glass.value(forKey: "_variant") as? Int
+    }()
+
+    static var isSupported: Bool { sidebarVariant != nil }
 
     func makeNSView(context: Context) -> NSGlassEffectView {
         let view = NSGlassEffectView()
         view.cornerRadius = cornerRadius
-        view.setValue(17, forKey: "_variant")
+        if let variant = Self.sidebarVariant { view.setValue(variant, forKey: "_variant") }
         return view
     }
 
