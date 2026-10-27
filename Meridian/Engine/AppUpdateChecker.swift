@@ -96,6 +96,15 @@ final class AppUpdateChecker {
         Task { await performCheck() }
     }
 
+    /// "Check for Updates…" (the app menu, Control Center): checks now and
+    /// opens Settings on Updates, where the result shows.
+    func checkAndShow(installedEngineTag: String?) {
+        self.installedEngineTag = installedEngineTag
+        checkNow()
+        UserDefaults.standard.set("updates", forKey: "meridian.settingsTab")
+        NotificationCenter.default.post(name: .meridianOpenSettings, object: nil)
+    }
+
     /// Checks for updates only if the last successful check was more than 24 hours ago.
     func checkIfStale() {
         if let last = settings.lastUpdateCheck,

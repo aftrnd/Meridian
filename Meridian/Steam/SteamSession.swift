@@ -104,6 +104,13 @@ final class SteamSession {
         return false
     }
 
+    /// Steam is on its way up: starting, or a background warm-up is under
+    /// way (including the moment the launch warm-up waits before it starts
+    /// Steam). Control Center's button shows it.
+    var isConnecting: Bool {
+        !isReady && (state == .startingSilent || warmUpTask != nil)
+    }
+
     // MARK: - Private state
 
     private var persistentProcess: Process?
@@ -260,7 +267,10 @@ final class SteamSession {
     /// running Steam that started before that is restarted now, in the background,
     /// instead of when the player presses Play: Steam reads install
     /// manifests only when it starts (Pattern 43).
-    func warmUp(engine: WineEngine, appID: Int? = nil) {
+    ///
+    /// With `delay`, Steam starts that much later, but the warm-up is under
+    /// way from now: `isConnecting` holds, and a Play pressed meanwhile joins it.
+    func warmUp(engine: WineEngine, appID: Int? = nil, after delay: Duration = .zero) {
         guard warmUpTask == nil, AppSettings.shared.steamClientSignedIn else { return }
         let missingGame = isReady && appID.map { !appsSteamLoaded.contains($0) } == true
         guard state == .idle || missingGame else { return }
@@ -270,6 +280,7 @@ final class SteamSession {
         warmUpStatus = nil
         warmUpTask = Task {
             do {
+                try await Task.sleep(for: delay)
                 try await bringUpForDRM(engine: engine, appID: appID, onStatus: { status in
                     self.warmUpStatus = status
                     self.warmUpListener?(status)
@@ -959,6 +970,69 @@ final class SteamSession {
         log.info("[cancelInstall] no-op — IPC installs run inside the persistent Steam process; Launcher handles UI cancellation")
     }
 
+    // MARK: - Public API: friends status
+
+    /// The statuses Steam's own Friends menu offers, as Valve's EPersonaState
+    /// values. Each case name is its `steam://friends/status/<name>` route
+    /// (steamui sp.js, Oct 27 2026). Busy has no route.
+    enum PersonaState: Int, CaseIterable, Identifiable {
+        case online = 1
+        case away = 3
+        case invisible = 7
+        case offline = 0
+
+        var id: Int { rawValue }
+
+        var title: String {
+            switch self {
+            case .online:    "Online"
+            case .away:      "Away"
+            case .invisible: "Invisible"
+            case .offline:   "Offline"
+            }
+        }
+    }
+
+    /// The status steam.exe signs in with (read before each start), then
+    /// whatever Meridian last set or `syncPersonaState` found. nil before
+    /// Steam first starts.
+    private(set) var personaState: PersonaState?
+
+    /// The status Steam had saved when last read (localconfig.vdf).
+    @ObservationIgnored private var savedPersonaState: Int?
+
+    /// Picks up a status chosen in Steam itself, in its overlay or window:
+    /// Steam saves Online, Away and Invisible within the second. Only a
+    /// change in what Steam saved is taken, so this never undoes an Offline
+    /// set here. Offline chosen in Steam can't be seen: Steam never saves it
+    /// and logs nothing (steamui sp.js, console and configstore logs, Oct 27
+    /// 2026), and friends see Invisible and Offline alike.
+    func syncPersonaState() async {
+        guard isReady else { return }
+        let prefix = prefix
+        let steamID = AppSettings.shared.steamCredentialSteamID
+        let saved = await Task.detached { prefix.savedPersonaState(steamID64: steamID) }.value
+        guard let saved, saved != savedPersonaState else { return }
+        savedPersonaState = saved
+        if let state = PersonaState(rawValue: saved), state != personaState {
+            log.info("[syncPersonaState] Steam saved \(state.title), set in Steam")
+            personaState = state
+        }
+    }
+
+    /// Verified Oct 27 2026: picking Away logged `ExecCommandLine: … steam.exe
+    /// steam://friends/status/away` in Steam's console_log.txt, and its
+    /// friends store saved `"ePersonaState":3` to localconfig.vdf within the
+    /// second. No Steam window opens.
+    func setPersonaState(_ newState: PersonaState, engine: WineEngine) throws {
+        guard isReady else { throw SessionError.steamNotReady }
+        try sendSteamCommand(["steam://friends/status/\(newState)"], engine: engine)
+        personaState = newState
+        // What Steam is about to save, so its save doesn't read as a change
+        // made in Steam (an Away it saves after a quick Offline would undo it).
+        if newState != .offline { savedPersonaState = newState.rawValue }
+    }
+
     // MARK: - Private: Steam IPC
 
     /// Send a command-line argument (or `steam://` URL) to the already-running
@@ -1194,6 +1268,9 @@ final class SteamSession {
             // Steam shows its own screen instead (Launcher brings its window up).
             log.error("[launchSteamProcess] couldn't turn off Steam's controller screen: \(error.localizedDescription)")
         }
+        // Steam signs in with the player's last status; Online when none is saved.
+        savedPersonaState = prefix.savedPersonaState(steamID64: AppSettings.shared.steamCredentialSteamID)
+        personaState = savedPersonaState.flatMap(PersonaState.init(rawValue:)) ?? .online
         connectionLogOffset = connectionLogFileSize()
         webhelperLogOffset = fileSize(of: prefix.steamInstallDir
             .appending(path: "logs/webhelper_js.txt")

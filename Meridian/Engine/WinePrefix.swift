@@ -1223,9 +1223,33 @@ struct WinePrefix: Sendable {
     /// nil without a SteamID64. Steam's userdata/ uses the 32-bit account ID:
     /// SteamID64 - 76561197960265728 (the public-universe base).
     func localConfigURL(steamID64: String) -> URL? {
-        guard let sid = UInt64(steamID64) else { return nil }
-        let accountID = sid &- 76561197960265728
+        guard let accountID = Self.accountID(steamID64: steamID64) else { return nil }
         return steamInstallDir.appending(path: "userdata/\(accountID)/config/localconfig.vdf")
+    }
+
+    static func accountID(steamID64: String) -> UInt64? {
+        UInt64(steamID64).map { $0 &- 76561197960265728 }
+    }
+
+    /// The status (Valve's EPersonaState) Steam signs in with: the last one
+    /// the player chose. Steam's friends store keeps it as JSON in
+    /// `localconfig.vdf > WebStorage > FriendStoreLocalPrefs_<account>`
+    /// (`{"ePersonaState":1,…}`), reads it at logon and never saves Offline;
+    /// with no entry it signs in Online (steamui sp.js, Oct 27 2026).
+    func savedPersonaState(steamID64: String) -> Int? {
+        guard let accountID = Self.accountID(steamID64: steamID64),
+              let url = localConfigURL(steamID64: steamID64),
+              let config = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return Self.savedPersonaState(in: config, accountID: accountID)
+    }
+
+    static func savedPersonaState(in config: String, accountID: UInt64) -> Int? {
+        let key = "\"FriendStoreLocalPrefs_\(accountID)\""
+        guard let line = config.split(separator: "\n").first(where: {
+                  $0.trimmingCharacters(in: .whitespaces).hasPrefix(key)
+              }),
+              let match = line.firstMatch(of: /ePersonaState\\":(\d+)/) else { return nil }
+        return Int(match.1)
     }
 
     /// Steam's app info cache, which lists each game's license agreements.

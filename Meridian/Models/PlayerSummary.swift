@@ -90,7 +90,10 @@ struct PlayerSummary: Decodable, Sendable, Identifiable {
     /// Status dot color: in-game and online green (user direction July 12
     /// 2026 — no Steam blue), away/snooze yellow, busy red, offline gray.
     var statusColor: Color {
-        if isInGame { return .green }
+        isInGame ? .green : Self.statusColor(personaState: personaState)
+    }
+
+    static func statusColor(personaState: Int) -> Color {
         switch personaState {
         case 1, 5, 6: return .green
         case 3, 4:    return .yellow

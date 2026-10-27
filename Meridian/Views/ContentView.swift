@@ -33,6 +33,7 @@ struct ContentView: View {
     /// Guards the onAppear setup check so it runs exactly once per app session.
     @State private var hasCheckedSetup = false
     @State private var showingDownloadsPopover = false
+    @State private var showControlCenter = false
     @State private var showFriendsPanel = false
     /// Feature flag (Developer › Feature Flags). Off: no toolbar button, the
     /// inspector can never open. Everything else about the panel stays wired
@@ -164,15 +165,17 @@ struct ContentView: View {
                         }
                     }
                     .task {
-                        await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                         // Steam boots in the background so Play is instant. A
                         // moment after the window settles, so Wine's start-up
                         // never competes with the launch animation; only for
-                        // players (something installed) already signed in to Steam.
-                        try? await Task.sleep(for: .seconds(2))
-                        if !Task.isCancelled, library.games.contains(where: \.isInstalled) {
-                            session.warmUp(engine: engine)
+                        // players (something installed) already signed in to
+                        // Steam. Decided from the installs the last refresh
+                        // saw, not after this one: waiting on the network kept
+                        // Control Center's button from connecting for ~8 s.
+                        if !AppSettings.shared.installedAppIDs.isEmpty {
+                            session.warmUp(engine: engine, after: .seconds(2))
                         }
+                        await library.refresh(steamID: steamAuth.steamID, apiKey: steamAuth.apiKey)
                     }
                     .onAppear {
                         guard !hasCheckedSetup else { return }
@@ -302,7 +305,13 @@ struct ContentView: View {
                 }
             }
         }
+        // Control Center, in the window's top-right corner under its
+        // toolbar button, over the sidebar and pages alike.
+        .modifier(ControlCenterPresenter(isPresented: $showControlCenter,
+                                         onViewProfile: { sidebarDestination = .steamProfile }))
         .onChange(of: sidebarDestination) { _, newValue in
+            // Its button lives on Home only.
+            showControlCenter = false
             if case .library(let filter) = newValue {
                 library.filter = filter
             }
@@ -377,6 +386,13 @@ struct ContentView: View {
                                 // No buttonStyle override — macOS supplies the
                                 // toolbar circle / liquid glass, same as Downloads.
                                 .help(showFriendsPanel ? "Hide Friends" : "Show Friends")
+                            }
+                        }
+                        // Last, so it holds the window's top-right corner.
+                        // Home only: it's the app's Control Center, not a page's.
+                        ToolbarItem(placement: .automatic) {
+                            if steamAuth.isAuthenticated, sidebarDestination == .home {
+                                ControlCenterButton(isPresented: $showControlCenter)
                             }
                         }
                     }

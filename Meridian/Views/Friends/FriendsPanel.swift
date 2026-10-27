@@ -274,7 +274,7 @@ private func gameHeaderURL(for gameID: String?) -> URL? {
 /// row, Game Center's profile): no bezel, no island. Whitespace and type
 /// hierarchy do the work: the avatar is the largest in the panel, the name
 /// a step above the friend rows, the status line carries the colour.
-/// Read-only — Meridian can't change persona state — but it opens the same
+/// Read-only (Control Center sets the status), but it opens the same
 /// detail popover a friend row does.
 private struct OwnProfileHeader: View {
     let me: PlayerSummary
@@ -618,6 +618,14 @@ struct SteamAvatarView: View {
     let size: CGFloat
 
     @State private var image: NSImage?
+
+    /// Starts from the memory cache, so a view that mounts on demand
+    /// (Control Center) shows the photo on its first frame, not the placeholder.
+    init(url: URL?, size: CGFloat) {
+        self.url = url
+        self.size = size
+        _image = State(initialValue: url.flatMap { ImageCache.shared.memoryImage(for: $0) })
+    }
 
     var body: some View {
         Group {
